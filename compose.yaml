@@ -1,0 +1,56 @@
+# compliance-claw — local linux/amd64 deployment.
+#
+#   docker compose build
+#   docker compose up -d                      # gateway on http://127.0.0.1:18789
+#   docker compose run --rm cli pretorin version
+#   docker compose run --rm cli openclaw --version
+#
+# Phase 2 proves the image and the mounts. The gateway is not configured yet
+# (Phase 3: OpenClaw config, MCP registration, gateway token), so a running
+# container is expected to be incomplete rather than usable.
+
+name: compliance-claw
+
+# Both services are the same image with the same mounts; only the gateway
+# publishes a port. The anchor is what keeps them from drifting apart — a `cli`
+# whose mounts differ from the gateway's would debug a different container than
+# the one that runs.
+x-compliance-claw: &compliance-claw
+  build:
+    context: .
+  # Upstream publishes no linux/arm64 Pretorin binary, so amd64 is the
+  # deployment target even on Apple Silicon (emulated, and slow to build).
+  # This belongs to the service, not to `build:` — the Compose schema rejects
+  # `build.platform`, and the service key covers both the build and the run.
+  platform: linux/amd64
+  image: compliance-claw:local
+  env_file:
+    # Gitignored and dockerignored, so nothing here is ever baked into a layer.
+    # required:false because a fresh clone has no .env — Phase 4's bootstrap
+    # writes it, and Phase 2 reads no value out of it.
+    - path: .env
+      required: false
+  volumes:
+    # Named volume, not a bind: auth, gateway and MCP state live here and must
+    # survive `docker compose down`. `down -v` is what deletes it.
+    - openclaw-state:/home/node/.openclaw
+    # The PARENT of every review target, mounted read-only — the agent reviews
+    # code, it never edits it. No repo is named here or in the image; Phase 4
+    # introduces targets.yaml to select among whatever is in this directory.
+    - ./workspace/targets:/workspace/targets:ro
+
+services:
+  openclaw:
+    <<: *compliance-claw
+    ports:
+      # Never "18789:18789" — a bare port publishes on 0.0.0.0 and exposes the
+      # gateway to the whole LAN. The 127.0.0.1 prefix is the security control.
+      - "127.0.0.1:18789:18789"
+
+  cli:
+    <<: *compliance-claw
+    # Run-only: the profile keeps `up` from starting a second gateway.
+    profiles: ["cli"]
+
+volumes:
+  openclaw-state:

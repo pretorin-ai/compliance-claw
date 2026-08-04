@@ -1,20 +1,18 @@
 # compliance-claw — OpenClaw + Pretorin CLI, local linux/amd64 deployment.
 #
-# Phase 1 provides the `pretorin-verify` stage only: it produces a
-# supply-chain-verified Pretorin binary at /usr/local/bin/pretorin. Later phases
-# add stages alongside it and consume the result with:
-#
-#   COPY --from=pretorin-verify /usr/local/bin/pretorin /usr/local/bin/
+# Two stages: `pretorin-verify` produces a supply-chain-verified Pretorin binary
+# at /usr/local/bin/pretorin, and the final runtime stage joins it to OpenClaw.
 #
 # Build (amd64 is the deployment target; upstream ships no linux/arm64 binary):
+#   docker build --platform linux/amd64 -t compliance-claw:local .
 #   docker build --platform linux/amd64 --target pretorin-verify -t cc-verify .
 #
 # No --build-arg needed, and no credentials are involved because the release
 # source is a public repository.
 #
-# Pin carve-out: every pin lives in versions.env EXCEPT the base image digest on
-# the FROM line below, because FROM cannot read a sourced file. That is the one
-# pin to bump here rather than there; versions.env says the same.
+# Pin carve-out: every pin lives in versions.env EXCEPT the image digests on the
+# FROM lines below, because FROM cannot read a sourced file. Those are the only
+# pins to bump here rather than there; versions.env says the same.
 #
 # Note: intentionally no `# syntax=` directive — nothing here needs a BuildKit
 # frontend, and requiring one adds a network pull that can fail the build.
@@ -56,3 +54,40 @@ COPY scripts/ scripts/
 RUN bash scripts/fetch-pretorin.sh dist \
  && bash scripts/verify-pretorin.sh dist \
  && rm -rf dist
+
+
+# Runtime: OpenClaw, with the verified Pretorin binary and its skill added.
+#
+# The digest is the OCI index, not the amd64 manifest — same as the debian pin
+# above. An index digest still resolves per-platform, so the multi-arch work
+# later needs no change here, and `--platform` keeps meaning what it says.
+#
+# The base is node:24-bookworm-slim underneath, i.e. glibc: what the dynamically
+# linked Pretorin binary needs. An Alpine-based OpenClaw image would not run it.
+FROM ghcr.io/openclaw/openclaw:2026.7.1@sha256:6a31d44b2944e7adcd2b582bf6fb463111264ebca97a0201795b799135bd102c
+
+# The image already runs as `node`; switch back at the end of the stage.
+USER root
+
+COPY --from=pretorin-verify /usr/local/bin/pretorin /usr/local/bin/
+
+# --path, not --agent: the built-in agent registry knows only claude and codex
+# and roots both under /root, which this image's non-root user cannot read.
+# Installing to an explicit directory instead keeps the skill outside both the
+# state volume and the read-only target mount, so neither can shadow or hide it.
+# Making OpenClaw actually load this directory is Phase 3 (skills.load.extraDirs).
+RUN install -d /opt/compliance-claw/skills \
+ && pretorin skill install --path /opt/compliance-claw/skills \
+ && chown -R node:node /opt/compliance-claw
+
+# /home/node/.openclaw already exists in the base image, owned by node — a fresh
+# named volume is seeded from it, so the state mount needs no ownership fixup.
+# The target mount point is created here rather than left to the daemon, which
+# would create a missing mount point as root and leave it unreadable.
+RUN install -d -o node -g node /workspace/targets
+
+USER node
+
+# Entrypoint and CMD are inherited: `tini -s --` + `node openclaw.mjs gateway`.
+# tini passes arguments through unchanged, so the CLI service needs no override —
+# `docker compose run --rm cli pretorin version` runs exactly that.
