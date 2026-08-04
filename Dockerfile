@@ -86,8 +86,39 @@ RUN install -d /opt/compliance-claw/skills \
 # would create a missing mount point as root and leave it unreadable.
 RUN install -d -o node -g node /workspace/targets
 
+# Config is generated on first start, not baked: ~/.openclaw is a named volume,
+# so anything baked there would be shadowed on first start. These are the
+# templates the entrypoint installs from.
+COPY scripts/openclaw-config.template.json scripts/agents-md.template /opt/compliance-claw/
+COPY scripts/entrypoint.sh /usr/local/bin/compliance-claw-entrypoint
+
+# versions.env is the single source of truth for MODEL, and neither ENV nor FROM
+# can read a sourced file — so the substitution happens here, at build time. The
+# shipped template is therefore concrete and inspectable, and an unset MODEL
+# fails the build instead of producing a config with a placeholder model.
+#
+# The tini assertion is not ceremony: the entrypoint execs this exact path to
+# stay PID 1, and an OpenClaw base image that ever moves or drops tini should
+# break the build rather than every deployment.
+COPY versions.env /opt/compliance-claw/versions.env
+RUN . /opt/compliance-claw/versions.env \
+ && test -n "${MODEL}" \
+ && sed -i "s|@MODEL@|${MODEL}|" /opt/compliance-claw/openclaw-config.template.json \
+ && ! grep -q '@MODEL@' /opt/compliance-claw/openclaw-config.template.json \
+ && test -x /usr/bin/tini \
+ && chmod 0755 /usr/local/bin/compliance-claw-entrypoint \
+ && chown -R node:node /opt/compliance-claw
+
 USER node
 
-# Entrypoint and CMD are inherited: `tini -s --` + `node openclaw.mjs gateway`.
-# tini passes arguments through unchanged, so the CLI service needs no override —
-# `docker compose run --rm cli pretorin version` runs exactly that.
+# The wrapper seeds config, then execs the base image's own `tini -s --`, so
+# tini is still PID 1 and still passes arguments through — `docker compose run
+# --rm cli pretorin version` runs exactly that, and gets the seeded config too.
+#
+# CMD must be RESTATED, not inherited: Docker resets an inherited CMD to null
+# whenever a stage sets ENTRYPOINT. Omitting it hands tini zero arguments, and
+# tini answers by printing its usage and exiting 1 — found by the Phase 3 gate,
+# not by reading the docs. WorkingDir stays the inherited /app, which is where
+# openclaw.mjs lives.
+ENTRYPOINT ["/usr/local/bin/compliance-claw-entrypoint"]
+CMD ["node", "openclaw.mjs", "gateway"]

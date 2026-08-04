@@ -1,0 +1,91 @@
+// openclaw-config.template.json — the config entrypoint.sh installs to
+// ~/.openclaw/openclaw.json on first start, and never overwrites afterwards.
+//
+// Parsed as JSON5 (OpenClaw's documented config format), which is why the
+// comments below are legal. They live in the state volume once installed, and
+// would be lost only if OpenClaw ever rewrites the file itself (doctor --fix).
+//
+// @MODEL@ is substituted at BUILD time from versions.env, so the copy inside
+// the image is concrete and the build fails if MODEL is ever unset.
+//
+// ${VAR} is OpenClaw's own config-load substitution, NOT shell: the literal
+// text is what lands on disk and the value is resolved in memory from the
+// container environment. That is what keeps secrets out of the volume.
+{
+  gateway: {
+    // Without mode:"local" the gateway refuses to start and exits 78.
+    mode: "local",
+    port: 18789,
+    // Container-internal bind. With Docker bridge networking a "loopback" bind
+    // listens on the CONTAINER's 127.0.0.1, where a published port can never
+    // reach it. The exposure boundary is compose's 127.0.0.1:18789 publish plus
+    // the token below, not this value.
+    bind: "lan",
+    auth: { mode: "token", token: "${OPENCLAW_GATEWAY_TOKEN}" },
+    controlUi: {
+      allowedOrigins: ["http://127.0.0.1:18789", "http://localhost:18789"],
+    },
+  },
+
+  // Pins agent turns to OpenClaw's embedded runtime. This is load-bearing:
+  // OpenAI models otherwise default to the bundled Codex app-server PLUGIN
+  // (which needs no codex binary and is present in this image). That path uses
+  // a different auth store and a different billing path, and it does not
+  // receive tools.toolSearch below. Drift alarm: with this pin the gateway logs
+  // "8 plugins" with no `codex`; without it, 9 plugins including `codex`.
+  models: { providers: { openai: { agentRuntime: { id: "openclaw" } } } },
+
+  agents: {
+    defaults: {
+      model: "@MODEL@",
+      // Stated explicitly rather than left to the default so that the path
+      // entrypoint.sh seeds AGENTS.md into is provably the path the runtime
+      // reads from. Inside the state volume, so it stays writable.
+      workspace: "/home/node/.openclaw/workspace",
+    },
+  },
+
+  // Cost control, not access control. Pretorin advertises 192 tools whose full
+  // schemas are ~163 KB (~40k tokens) per turn if sent directly. "directory"
+  // keeps a bounded name+description directory in the prompt and defers the
+  // schemas behind tool_search/tool_describe/tool_call.
+  //
+  // Deliberately not `true`: that selects "code" mode, which instead exposes a
+  // JavaScript bridge (tool_search_code) running in a sandboxed subprocess.
+  // Upstream marks all Tool Search modes experimental.
+  tools: { toolSearch: { mode: "directory" } },
+
+  mcp: {
+    servers: {
+      pretorin: {
+        command: "/usr/local/bin/pretorin",
+        args: ["mcp-serve"],
+        env: { PRETORIN_API_KEY: "${PRETORIN_API_KEY}" },
+
+        // OPTIONAL, operator-configured, commented out by default.
+        //
+        // This is a COST/CONTEXT lever and defence in depth. It is NOT an
+        // authorization control. Authorization is the Pretorin API key's
+        // scopes, enforced server-side by the platform: a read-only key
+        // rejects write tools no matter what is listed here.
+        //
+        // Uncomment and edit only to shrink the prompt further, or as a
+        // fallback if tools.toolSearch above misbehaves.
+        // toolFilter: {
+        //   include: ["check_context", "list_frameworks", "list_controls", "get_control"],
+        // },
+      },
+    },
+  },
+
+  // Lowest-precedence skill root, so a same-named skill in the workspace or the
+  // state volume would silently win. `openclaw skills info pretorin` must
+  // report Source: openclaw-extra to prove ours is the one that loaded.
+  skills: {
+    load: {
+      extraDirs: ["/opt/compliance-claw/skills"],
+      // The skill tree is baked into the image and never changes at runtime.
+      watch: false,
+    },
+  },
+}

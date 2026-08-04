@@ -5,9 +5,10 @@
 #   docker compose run --rm cli pretorin version
 #   docker compose run --rm cli openclaw --version
 #
-# Phase 2 proves the image and the mounts. The gateway is not configured yet
-# (Phase 3: OpenClaw config, MCP registration, gateway token), so a running
-# container is expected to be incomplete rather than usable.
+# The gateway generates ~/.openclaw/openclaw.json into the state volume on first
+# start and never overwrites it. `.env` must supply OPENCLAW_GATEWAY_TOKEN or the
+# gateway exits 1; PRETORIN_API_KEY may be empty, which only costs platform
+# access. See .env.example and docs/plans/phase3.md.
 
 name: compliance-claw
 
@@ -27,7 +28,7 @@ x-compliance-claw: &compliance-claw
   env_file:
     # Gitignored and dockerignored, so nothing here is ever baked into a layer.
     # required:false because a fresh clone has no .env — Phase 4's bootstrap
-    # writes it, and Phase 2 reads no value out of it.
+    # writes it, and `cli` commands still work without one.
     - path: .env
       required: false
   volumes:
