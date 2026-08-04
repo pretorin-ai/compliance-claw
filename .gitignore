@@ -1,0 +1,11 @@
+# Local secrets — never commit. See .env.example.
+.env
+
+# Agent working tree (read-only compliance review scratch space).
+workspace/
+
+# Downloaded release artifacts. Never committed; re-stage with
+# scripts/fetch-pretorin.sh. `tamper/` holds deliberately corrupted copies
+# used by the supply-chain validation gate.
+dist/
+tamper/
