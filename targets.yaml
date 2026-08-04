@@ -1,0 +1,26 @@
+# targets.yaml — the repositories this deployment reviews, and the compliance
+# scope they belong to. This file is the POC source of truth: no repository name
+# or URL appears in compose.yaml, in the image, or in the agent's instructions.
+#
+# scripts/bootstrap.sh clones every target into ./workspace/targets/<name>, which
+# compose bind-mounts read-only at /workspace/targets. scripts/onboard-targets.sh
+# then registers each one with Pretorin as a code_repository source resolver.
+#
+# BOTH VALUES BELOW ARE DEPLOYMENT-SPECIFIC. They are committed with working
+# values so a fresh clone is reproducible end to end; change them for your own
+# system. `system_id` may be the UUID or the system name, and the pair matters:
+# Pretorin keys preflight state and the active recipe set on system+framework,
+# so the same system under two frameworks is two separate compliance efforts.
+# List what you have access to with:
+#   docker compose run --rm -T cli pretorin --json context list
+system_id: 7b74d8f3-d77c-49e4-8792-c372dd154d38
+framework_id: soc2
+
+# One or many targets. `name` becomes a directory name and a container path, so
+# it is restricted to [A-Za-z0-9._-]. `url` must be an https:// git remote that
+# clones anonymously — private and SSH remotes are future work. `ref` is
+# optional; without it the clone stays on the remote's default branch.
+targets:
+  - name: simple-crm
+    url: https://github.com/pretorin-ai/simple-crm.git
+    ref: main

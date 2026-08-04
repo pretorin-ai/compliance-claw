@@ -84,13 +84,48 @@ RUN install -d /opt/compliance-claw/skills \
 # named volume is seeded from it, so the state mount needs no ownership fixup.
 # The target mount point is created here rather than left to the daemon, which
 # would create a missing mount point as root and leave it unreadable.
-RUN install -d -o node -g node /workspace/targets
+#
+# /home/node/.pretorin gets the same treatment for the same reason, and it is
+# NOT optional: Pretorin keeps its active context, preflight resolvers and
+# active recipe set there, outside ~/.openclaw, so compose mounts a second named
+# volume over it. Without this line the daemon creates that mount point as root
+# and onboarding fails with a permission error on the first write.
+RUN install -d -o node -g node /workspace/targets \
+ && install -d -m 0700 -o node -g node /home/node/.pretorin
+
+# The working directory for the `pretorin mcp-serve` child, referenced as
+# mcp.servers.pretorin.cwd in the config template. A sentinel, not a workspace:
+# no .git, no .md, no code, so Pretorin's CWD-based host discovery finds nothing
+# plausible here. Without it the child inherits /app and can register the
+# OpenClaw install tree as the repository under review. The notice is .txt on
+# purpose — the document_repository default marker is **/*.md.
+RUN install -d -o node -g node /opt/compliance-claw/no-repo \
+ && printf '%s\n' \
+      'This directory is intentionally empty.' \
+      '' \
+      'It is the working directory of the `pretorin mcp-serve` child process' \
+      '(mcp.servers.pretorin.cwd in ~/.openclaw/openclaw.json). Pretorin can' \
+      'derive host-local source resolvers from the current directory, so that' \
+      'directory must contain nothing that looks like a repository or a document' \
+      'set. Do not add files here, and do not point it at a real repository.' \
+      '' \
+      'Repositories under review are declared in targets.yaml, bind-mounted' \
+      'read-only at /workspace/targets, and bound explicitly by' \
+      'scripts/onboard-targets.sh.' \
+      > /opt/compliance-claw/no-repo/README-DO-NOT-ADD-FILES.txt \
+ && chown node:node /opt/compliance-claw/no-repo/README-DO-NOT-ADD-FILES.txt
 
 # Config is generated on first start, not baked: ~/.openclaw is a named volume,
 # so anything baked there would be shadowed on first start. These are the
 # templates the entrypoint installs from.
 COPY scripts/openclaw-config.template.json scripts/agents-md.template /opt/compliance-claw/
 COPY scripts/entrypoint.sh /usr/local/bin/compliance-claw-entrypoint
+
+# The MCP stdio client used by scripts/smoke.sh to prove key posture — a read
+# tool succeeds, a write tool is rejected server-side — through the same
+# transport the agent uses. In the image rather than on the host because it
+# speaks to `pretorin mcp-serve`, which lives here.
+COPY scripts/mcp-call.py /opt/compliance-claw/
 
 # versions.env is the single source of truth for MODEL, and neither ENV nor FROM
 # can read a sourced file — so the substitution happens here, at build time. The
@@ -100,11 +135,17 @@ COPY scripts/entrypoint.sh /usr/local/bin/compliance-claw-entrypoint
 # The tini assertion is not ceremony: the entrypoint execs this exact path to
 # stay PID 1, and an OpenClaw base image that ever moves or drops tini should
 # break the build rather than every deployment.
+#
+# CONFIG_TEMPLATE_VERSION lands in a file next to the templates for the same
+# reason: the entrypoint reads it to detect a state volume whose config predates
+# this image, and it must come from the one place versions are declared.
 COPY versions.env /opt/compliance-claw/versions.env
 RUN . /opt/compliance-claw/versions.env \
  && test -n "${MODEL}" \
  && sed -i "s|@MODEL@|${MODEL}|" /opt/compliance-claw/openclaw-config.template.json \
  && ! grep -q '@MODEL@' /opt/compliance-claw/openclaw-config.template.json \
+ && test -n "${CONFIG_TEMPLATE_VERSION}" \
+ && printf '%s\n' "${CONFIG_TEMPLATE_VERSION}" > /opt/compliance-claw/config-template.version \
  && test -x /usr/bin/tini \
  && chmod 0755 /usr/local/bin/compliance-claw-entrypoint \
  && chown -R node:node /opt/compliance-claw

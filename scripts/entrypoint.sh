@@ -22,6 +22,13 @@ CONFIG="${OPENCLAW_CONFIG_PATH:-/home/node/.openclaw/openclaw.json}"
 # explicitly for exactly this reason.
 WORKSPACE="/home/node/.openclaw/workspace"
 TEMPLATES="/opt/compliance-claw"
+# Sidecar marker for the shipped template set (config + AGENTS.md), living in
+# the state volume next to the config it describes. A sidecar rather than a key
+# inside openclaw.json: it needs no JSON parsing, it is not an OpenClaw config
+# property (so it can never be rejected as unknown), and one marker covers both
+# templates. Warn-only by design — see the drift check below.
+STAMP="/home/node/.openclaw/.compliance-claw-templates"
+SHIPPED_VERSION_FILE="${TEMPLATES}/config-template.version"
 
 # The gateway needs the token; `docker compose run --rm cli pretorin version`
 # does not, and must keep working on a fresh clone with no .env (compose marks
@@ -40,11 +47,60 @@ case " $* " in
     ;;
 esac
 
+# The shipped template revision, baked at build time from versions.env.
+SHIPPED=0
+if [ -r "$SHIPPED_VERSION_FILE" ]; then
+  SHIPPED="$(cat "$SHIPPED_VERSION_FILE")"
+fi
+
 if [ -e "$CONFIG" ]; then
   echo "compliance-claw: ${CONFIG} exists, keeping it (template not applied)" >&2
+
+  # Drift check. Never-clobber means a newer image ships newer templates while
+  # an existing volume keeps the old ones, so the operator has to be told rather
+  # than silently running a config that predates the image. Warn only: this
+  # never edits or replaces anything.
+  #
+  # The compare is numeric, so a garbled marker must not reach `-lt` — under
+  # `set -e` that would abort every container start, including
+  # `docker compose run --rm cli pretorin version`. Unreadable or non-numeric is
+  # treated as 0, which warns.
+  HAVE=0
+  if [ -r "$STAMP" ]; then
+    HAVE="$(cat "$STAMP")"
+  fi
+  case "$HAVE" in
+    '' | *[!0-9]*) HAVE=0 ;;
+  esac
+  case "$SHIPPED" in
+    '' | *[!0-9]*) SHIPPED=0 ;;
+  esac
+
+  if [ "$HAVE" -lt "$SHIPPED" ]; then
+    echo "compliance-claw: WARNING — this volume's config predates the image." >&2
+    echo "  volume template version ${HAVE}, image ships ${SHIPPED}." >&2
+    echo "  Nothing was overwritten. The config in the volume stays authoritative," >&2
+    echo "  so template fixes in this image are NOT active — including" >&2
+    echo "  mcp.servers.pretorin.cwd, without which the Pretorin MCP server runs" >&2
+    echo "  with its working directory at /app and can register /app as the" >&2
+    echo "  repository under review." >&2
+    echo "  Diff ${CONFIG} against ${TEMPLATES}/openclaw-config.template.json, or reset with:" >&2
+    echo "    docker compose down -v   # DELETES BOTH named volumes: OpenClaw config," >&2
+    echo "                             # sessions, agent workspace and custom AGENTS.md," >&2
+    echo "                             # AND all Pretorin onboarding state (active" >&2
+    echo "                             # context, preflight resolvers, active recipes)." >&2
+    echo "                             # Bind-mounted target repos are NOT touched." >&2
+    echo "    scripts/bootstrap.sh && scripts/onboard-targets.sh   # both idempotent" >&2
+    echo "  After merging the template by hand: echo ${SHIPPED} > ${STAMP}" >&2
+  fi
 else
   echo "compliance-claw: seeding ${CONFIG}" >&2
   install -D -m 0600 "${TEMPLATES}/openclaw-config.template.json" "$CONFIG"
+  # Written only on a fresh seed. An existing config with no marker keeps
+  # warning on purpose: writing the marker there would silence a drift that is
+  # real, and the operator has not merged anything yet.
+  printf '%s\n' "$SHIPPED" > "$STAMP"
+  chmod 0600 "$STAMP"
 fi
 
 # 0700 matches the mode OpenClaw itself uses for the workspace, so a seeded

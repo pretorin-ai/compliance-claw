@@ -1,0 +1,71 @@
+# Build the amd64 image and run the no-credential smoke section.
+#
+# NO CREDENTIALS EVER LIVE HERE. No Pretorin API key, no model key, no gateway
+# token from a secret. Everything CI exercises is reachable without them:
+# the supply-chain verification of the Pretorin binary, the generated config,
+# the mount posture, the stale-template warning, the targets.yaml parser, and
+# the CWD fix — including the proof that no /app source resolver survives
+# onboarding, which needs no key because resolver binding is host-local.
+#
+# The credentialed section of scripts/smoke.sh self-skips when PRETORIN_API_KEY
+# does not authenticate, so `--no-creds` is belt-and-braces rather than the only
+# thing keeping CI honest.
+#
+# ubuntu-latest is amd64, so the image builds natively here: no qemu, and the
+# emulation probe in bootstrap.sh short-circuits.
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          docker version
+          docker compose version
+          python3 --version
+          git --version
+
+      # Runs the documented operator path rather than a CI-only shortcut, so a
+      # break in bootstrap.sh fails here instead of on someone's laptop. It
+      # clones the public target from targets.yaml, writes a throwaway .env with
+      # a generated gateway token (PRETORIN_API_KEY stays empty), and builds.
+      - name: Bootstrap (clone targets, write .env, build image)
+        run: bash scripts/bootstrap.sh
+
+      - name: Assert no credentials are configured
+        run: |
+          set -e
+          if grep -qE '^PRETORIN_API_KEY=.+' .env; then
+            echo "::error::CI generated a .env with a Pretorin key. It must stay empty."
+            exit 1
+          fi
+          echo "PRETORIN_API_KEY is empty, as required."
+
+      - name: Smoke test (no-credential section only)
+        run: bash scripts/smoke.sh --no-creds
+
+      - name: Gateway logs on failure
+        if: failure()
+        run: docker compose logs --no-color openclaw || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v || true

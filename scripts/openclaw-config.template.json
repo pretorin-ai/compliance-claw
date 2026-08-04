@@ -55,11 +55,32 @@
   // Upstream marks all Tool Search modes experimental.
   tools: { toolSearch: { mode: "directory" } },
 
+  // mcp.sessionIdleTtlMs is deliberately NOT set here: the default is 600000,
+  // which is MILLISECONDS, i.e. 10 minutes of idleness before a session's MCP
+  // child is reaped. 0 disables idle cleanup entirely. Each session spawns its
+  // own `pretorin mcp-serve` child (a 23 MB binary), so this is the knob that
+  // bounds how many can be alive at once — left untuned until multi-session
+  // usage is actually measured.
   mcp: {
     servers: {
       pretorin: {
         command: "/usr/local/bin/pretorin",
         args: ["mcp-serve"],
+
+        // THE CWD FIX. Without this the child inherits the image's WorkingDir
+        // /app, and Pretorin's own host-local discovery (`preflight init` with
+        // no --workspace) registers the CURRENT DIRECTORY as a code_repository
+        // — so /app, the OpenClaw install tree, gets bound as the repository
+        // under review. Verified by reading /proc/<pid>/cwd of the spawned
+        // child with and without this line.
+        //
+        // The directory is baked into the image, owned by node, and contains
+        // one .txt notice: no .git, no .md, no code. It is a sentinel, not a
+        // workspace — anything CWD-derived that lands here is obviously wrong
+        // and is named `no-repo`, instead of looking like a plausible repo.
+        // Real repositories are bound explicitly by scripts/onboard-targets.sh.
+        cwd: "/opt/compliance-claw/no-repo",
+
         env: { PRETORIN_API_KEY: "${PRETORIN_API_KEY}" },
 
         // OPTIONAL, operator-configured, commented out by default.

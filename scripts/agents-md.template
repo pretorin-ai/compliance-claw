@@ -15,3 +15,23 @@ prefer Pretorin recipes when available.
 
 Repositories under /workspace/targets are mounted read-only. Review them, never
 edit them.
+
+Before reading any file in a target, state which target you are working on. There
+may be several, and a review that silently mixes two repositories produces
+evidence that cannot be traced back to either. One target per piece of work.
+
+Each target is already registered with Pretorin as a source resolver by the
+operator (scripts/onboard-targets.sh). Do not bind resolvers or run
+`preflight init` yourself: those write host-local state that the operator owns,
+and discovery run from the wrong directory registers the wrong repository.
+
+Every piece of evidence carries its provenance, gathered from the target itself:
+
+- repository URL — `git -C /workspace/targets/<name> remote get-url origin`
+- commit SHA — `git -C /workspace/targets/<name> rev-parse HEAD`
+- repository-relative file path — not the /workspace/targets/... path
+- line range, whenever you quote or excerpt
+
+Pretorin's evidence tools take these directly as code_repository,
+code_commit_hash, code_file_path and code_line_numbers. Evidence without them is
+not reviewable by anyone who did not run this container.

@@ -1,14 +1,26 @@
 # compliance-claw — local linux/amd64 deployment.
 #
-#   docker compose build
+#   scripts/bootstrap.sh                      # clone targets, write .env, build
+#   scripts/onboard-targets.sh                # register targets with Pretorin
 #   docker compose up -d                      # gateway on http://127.0.0.1:18789
 #   docker compose run --rm cli pretorin version
-#   docker compose run --rm cli openclaw --version
+#
+# Onboard BEFORE `up`. Onboarding writes host-local Pretorin state, and a running
+# gateway keeps a per-session `pretorin mcp-serve` child alive that can serve the
+# older view (the preflight artifact carries a 3600s TTL). If you must onboard
+# while the gateway is up, follow it with:
+#   docker compose run --rm cli openclaw mcp reload   # or restart the gateway
 #
 # The gateway generates ~/.openclaw/openclaw.json into the state volume on first
 # start and never overwrites it. `.env` must supply OPENCLAW_GATEWAY_TOKEN or the
 # gateway exits 1; PRETORIN_API_KEY may be empty, which only costs platform
-# access. See .env.example and docs/plans/phase3.md.
+# access. See .env.example, docs/plans/phase3.md and docs/plans/phase4.md.
+#
+# `docker compose down -v` deletes BOTH named volumes: the OpenClaw state volume
+# (config, sessions, agent workspace, custom AGENTS.md) AND the Pretorin state
+# volume (active context, preflight resolvers, active recipe set). It does NOT
+# touch the bind-mounted target repositories under workspace/targets. Recovery is
+# re-running bootstrap.sh and onboard-targets.sh; both are idempotent.
 
 name: compliance-claw
 
@@ -35,9 +47,16 @@ x-compliance-claw: &compliance-claw
     # Named volume, not a bind: auth, gateway and MCP state live here and must
     # survive `docker compose down`. `down -v` is what deletes it.
     - openclaw-state:/home/node/.openclaw
+    # Pretorin's own state — active context, preflight source resolvers, active
+    # recipe set — which lives OUTSIDE ~/.openclaw. It needs its own volume, and
+    # it must be mounted on BOTH services: scripts/onboard-targets.sh writes it
+    # from a one-off `run --rm cli` container, and the gateway's per-session
+    # `pretorin mcp-serve` children are what read it back. Without this, every
+    # onboarding run would evaporate with the container that performed it.
+    - pretorin-state:/home/node/.pretorin
     # The PARENT of every review target, mounted read-only — the agent reviews
-    # code, it never edits it. No repo is named here or in the image; Phase 4
-    # introduces targets.yaml to select among whatever is in this directory.
+    # code, it never edits it. No repo is named here or in the image: targets.yaml
+    # declares them and scripts/bootstrap.sh clones them into this directory.
     - ./workspace/targets:/workspace/targets:ro
 
 services:
@@ -55,3 +74,4 @@ services:
 
 volumes:
   openclaw-state:
+  pretorin-state:
