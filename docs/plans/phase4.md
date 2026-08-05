@@ -5,9 +5,10 @@ provides. Phase 4 adds only that layer — a target declaration, host bootstrap,
 the working-directory fix, and the test/CI harness. No second "Compliance Claw" skill, no duplicated
 Pretorin logic, no version bump past 0.26.14.
 
-**Status: IMPLEMENTED and validated.** 63 of 64 checks pass, including the full credentialed
-integration test against a real read-only key. The one skip needs model credentials this deployment
-does not have. Results in "Validation" below.
+**Status: IMPLEMENTED and validated.** 65 of 66 checks pass locally on macOS, including the full
+credentialed integration test against a real read-only key; the one skip needs model credentials this
+deployment does not have. CI runs the no-credential section on Linux. Results in "Validation" below,
+including the portability bugs the first CI run caught — one of them in a shipped script.
 
 ## Established facts, discovered from the shipped 0.26.14 binary
 
@@ -154,7 +155,7 @@ still present, and the next `bootstrap.sh` re-seeded config and `AGENTS.md` with
 
 ## Validation — observed results
 
-`docker compose down -v` first, so every seeding path ran fresh. `scripts/smoke.sh` → **63 pass,
+`docker compose down -v` first, so every seeding path ran fresh. `scripts/smoke.sh` → **65 pass,
 0 fail, 1 skip**.
 
 ### Section A — no credentials (what CI runs): 51 checks
@@ -194,9 +195,44 @@ bootstrap.sh   → exit 0 in 7.4s: emulation probe ok, cloned simple-crm at 276b
 smoke.sh --no-creds → 51 pass, 0 fail, credentialed section skipped cleanly
 ```
 
-### Four bugs found by running the gate, not by reading the code
+### Bugs found by running the gate, not by reading the code
 
-Worth recording because three are general shell hazards, not project quirks:
+Worth recording because most are general shell hazards, not project quirks.
+
+**Found by CI, on Linux, after the first push — the macOS-only syntax class.** The image built and
+`bootstrap.sh` passed; 12 smoke checks failed. One of the three was in a **shipped** script, so a Linux
+operator could not have onboarded at all:
+
+- **`mktemp -t NAME` is BSD-only.** GNU coreutils rejects a template with fewer than three `X`s and
+  exits 1, leaving the variable empty. In `onboard-targets.sh` that meant the analysis program was
+  never written; in `smoke.sh` it meant `TARGETS_FILE=""`, which `${VAR:-default}` then resolved to the
+  *real* `targets.yaml`, so the negative tests silently exercised the wrong file and "passed by
+  failing to fail". Fixed with an explicit `"${TMPDIR:-/tmp}/name.XXXXXX"`, which both implementations
+  accept.
+- **`stat -f '%Lp'` fails *successfully* on GNU**, where `-f` means "filesystem status": it exits 0 and
+  prints a filesystem dump, so a BSD-first `||` chain never reaches its fallback. GNU `stat -c '%a'`
+  first, BSD second.
+- **`md5sum` is absent on macOS, but `awk` still exits 0**, so `md5sum … | awk … || md5 -q …` returned
+  an empty digest and the "byte-identical" comparison passed vacuously on the operator platform.
+  Selected by `command -v` now, not by exit code.
+
+The common shape: a fallback chain that keys off exit status when the failing command reports success,
+or reports failure by producing nothing. All three primitives are now verified on both platforms.
+
+**Two checks that lied, found by re-running against a long-lived deployment:**
+
+- **`docker compose logs | tail -60` lost the startup banner** on a gateway that had been up six hours,
+  so the "8 plugins" check failed — and the codex-absence check next to it *passed against an empty
+  string*. The banner is printed once; the whole log is searched now, and its absence fails loudly
+  instead of licensing a vacuous pass.
+- **The agent-turn provenance check passed while the turn had died on `ProviderAuthError`.** It looked
+  for "a hex string" and "a filename-shaped token", which an error wall full of paths and hashes
+  satisfies. It now requires the target's **actual** commit SHA and remote URL, read from git on the
+  host and deliberately absent from the prompt, so an echoed or hallucinated answer cannot pass; and
+  the auth-failure detection was widened (`FailoverError`, `missing-provider-auth`, `EMBEDDED
+  FALLBACK`) so a dead turn skips rather than scores.
+
+**Four bugs found during the first local run:**
 
 1. **`docker compose run` inside `while read` ate the loop's own stdin.** The sweep unbound only the
    first of two foreign resolvers — `/app` went away, `/app/docs` silently stayed. `-T` does not
@@ -248,7 +284,17 @@ above with no credentials.
 - **Evidence work needs platform-side scope approval** (`Scope is not approved with a confirmed scale
   yet`), which is outside this repository.
 - **The credentialed agent-turn check is unproven here.** It is implemented and self-skipping; it needs
-  an OpenAI device-code login in the state volume.
+  an OpenAI device-code login in the state volume. Observed failure mode without one: the turn falls
+  back to the embedded agent and dies with `ProviderAuthError: No API key found for provider "openai"`.
+- **OpenClaw rewrites the config, and the JSON5 comments do not survive it.** Observed on a volume after
+  the gateway had been running for hours: `gateway: {` had become `"gateway": {` and all 69 comment
+  lines were gone. Phase 3 predicted this as a possibility; it is now a fact. What matters survived —
+  the `cwd` fix, the port, and `${PRETORIN_API_KEY}` still a literal substitution rather than a value,
+  so no secret was written. The trigger was not identified: `mcp probe`, `mcp list`, `mcp doctor`,
+  `skills info` and an agent turn were each tested against a fresh config and none of them rewrote it,
+  and the volume was destroyed before it could be traced further. Consequence: the comments in the
+  template are documentation for whoever reads it in the image, not a durable feature of a running
+  deployment, and no check may assert on the file's formatting.
 
 ## Future work
 

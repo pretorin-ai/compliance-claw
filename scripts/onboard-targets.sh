@@ -85,7 +85,10 @@ pcli_quiet() { docker compose run --rm -T cli pretorin "$@" < /dev/null; }
 # `python3 - <<EOF`: with `python3 -` the interpreter reads the PROGRAM from
 # stdin, so the artifact JSON piped in would never reach sys.stdin. That mistake
 # is silent — every check just sees empty input — so it is worth the temp file.
-PF_PY="$(mktemp -t onboard-pf)"
+# `mktemp -t NAME` is BSD-only: GNU coreutils rejects a template without at
+# least three X's and exits 1, which left this variable empty and broke every
+# check on Linux. An explicit template works on both.
+PF_PY="$(mktemp "${TMPDIR:-/tmp}/onboard-pf.XXXXXX")"
 trap 'rm -f "$PF_PY"' EXIT
 cat > "$PF_PY" <<'PYEOF'
 import json, sys

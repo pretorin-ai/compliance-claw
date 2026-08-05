@@ -148,7 +148,10 @@ if [ -e .env ]; then
   # Never overwritten: it holds the operator's Pretorin key and the token every
   # existing session authenticated with. Rotating either is a deliberate act.
   log ".env exists, keeping it (contents not modified)"
-  MODE="$(stat -f '%Lp' .env 2>/dev/null || stat -c '%a' .env 2>/dev/null || echo '?')"
+  # GNU first, BSD second, and the order is not cosmetic: on GNU coreutils
+  # `stat -f` means "filesystem status" and SUCCEEDS, so a BSD-first chain never
+  # reaches its fallback and hands back a filesystem dump instead of a mode.
+  MODE="$(stat -c '%a' .env 2>/dev/null || stat -f '%Lp' .env 2>/dev/null || echo '?')"
   if [ "$MODE" != "600" ]; then
     # Tightening the mode is not the same as overwriting the file, and this one
     # holds an API key: leaving it group/world-readable is the leak the 600 was

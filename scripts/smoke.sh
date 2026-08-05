@@ -120,13 +120,28 @@ for _ in $(seq 1 60); do
 done
 [ "$READY" = 1 ] && pass "gateway answers /healthz" || fail "gateway answers /healthz" "timed out after 120s"
 
-LOGS="$(docker compose logs openclaw 2>&1 | tail -60)"
-has   "runtime pin holds: 8 plugins" "8 plugins" "$LOGS"
+# The WHOLE log, not `tail -N`: the plugin banner is printed once at startup, so
+# on a gateway that has been up for hours a tail no longer contains it — and then
+# the codex-absence check below passes against an empty string, which is a lie
+# rather than a pass.
+LOGS="$(docker compose logs openclaw 2>&1)"
 PLUGIN_LINE="$(printf '%s' "$LOGS" | grep -o '([0-9]* plugins:[^)]*)' | tail -1)"
-hasnt "codex plugin absent (agentRuntime pin active)" "codex" "$PLUGIN_LINE"
+if [ -z "$PLUGIN_LINE" ]; then
+  fail "runtime pin holds: plugin banner found in the log" \
+       "no '(N plugins: ...)' line; the codex-absence check cannot be trusted without it"
+else
+  has   "runtime pin holds: 8 plugins" "8 plugins" "$PLUGIN_LINE"
+  hasnt "codex plugin absent (agentRuntime pin active)" "codex" "$PLUGIN_LINE"
+fi
 
+# Assert on values, not on formatting. OpenClaw can rewrite this file as strict
+# JSON (observed: `gateway: {` becomes `"gateway": {` and every comment is
+# dropped), so matching JSON5 syntax makes this check fail on a healthy
+# deployment. These three survive any reformat.
 CFG="$(val cat /home/node/.openclaw/openclaw.json)"
-has "config seeded into the state volume" 'gateway:' "$CFG"
+has "config seeded into the state volume" '18789' "$CFG"
+has "config registers the Pretorin MCP server" '/usr/local/bin/pretorin' "$CFG"
+has "config keeps the key as a substitution, not a value" '${PRETORIN_API_KEY}' "$CFG"
 has "config carries the MCP cwd fix" '/opt/compliance-claw/no-repo' "$CFG"
 AG="$(val cat /home/node/.openclaw/workspace/AGENTS.md)"
 has "AGENTS.md seeded" "Review targets" "$AG"
@@ -196,7 +211,7 @@ CFG_AFTER="$(val md5sum /home/node/.openclaw/openclaw.json | awk '{print $1}')"
   || fail "config never modified by the warning path" "md5 ${CFG_BEFORE} -> ${CFG_AFTER}"
 
 head2 "A8. onboarding mechanics with NO credentials (scratch scope)"
-SCRATCH_YAML="$(mktemp -t smoke-targets)"
+SCRATCH_YAML="$(mktemp "${TMPDIR:-/tmp}/smoke-targets.XXXXXX")"
 {
   printf 'system_id: %s\n' "$SCRATCH_SYS"
   printf 'framework_id: %s\n' "$SCRATCH_FW"
@@ -246,7 +261,7 @@ else
 fi
 
 head2 "A9. bootstrap refuses to clobber (negative paths)"
-NEG_YAML="$(mktemp -t smoke-neg)"
+NEG_YAML="$(mktemp "${TMPDIR:-/tmp}/smoke-neg.XXXXXX")"
 mkdir -p workspace/targets/smoke-mismatch
 SCRATCH_CLONES+=("workspace/targets/smoke-mismatch" "workspace/targets/smoke-broken")
 git -C workspace/targets/smoke-mismatch init -q . >/dev/null 2>&1
@@ -270,7 +285,16 @@ has "the refusal explains it will not delete" "remove it yourself" "$OUT"
 rm -f "$NEG_YAML"
 
 head2 "A10. bootstrap is idempotent and never overwrites .env"
-digest() { md5sum "$1" 2>/dev/null | awk '{print $1}' || md5 -q "$1"; }
+# Chosen by availability, not by exit code: a missing md5sum still leaves awk
+# exiting 0, so an `||` chain silently returns an empty digest and every
+# comparison passes vacuously. That is how this check first "passed" on macOS.
+if command -v md5sum >/dev/null 2>&1; then
+  digest() { md5sum "$1" | awk '{print $1}'; }
+elif command -v md5 >/dev/null 2>&1; then
+  digest() { md5 -q "$1"; }
+else
+  digest() { echo "no-md5-tool"; }
+fi
 if [ -e .env ]; then
   grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env && pass ".env carries a gateway token" \
     || fail ".env carries a gateway token"
@@ -285,7 +309,9 @@ if [ -e .env ]; then
   fi
   # Asserted AFTER the run, because tightening a loose mode is something
   # bootstrap DOES rather than something it merely expects.
-  MODE="$(stat -f '%Lp' .env 2>/dev/null || stat -c '%a' .env)"
+  # GNU first: on GNU coreutils `stat -f` is filesystem status and succeeds,
+  # so a BSD-first chain never reaches its fallback.
+  MODE="$(stat -c '%a' .env 2>/dev/null || stat -f '%Lp' .env 2>/dev/null || echo '?')"
   [ "$MODE" = "600" ] && pass ".env mode is 600 after bootstrap" \
     || fail ".env mode is 600 after bootstrap" "found ${MODE}"
   [ "$(digest .env)" = "$ENV_BEFORE" ] && pass ".env byte-identical after a bootstrap re-run" \
@@ -378,20 +404,36 @@ PY
   notok "targets still read-only" cli touch /workspace/targets/smoke-canary-2
 
   head2 "B6. agent turn with provenance (needs model credentials)"
-  TURN="$(cli openclaw agent --agent main 2>&1 -m \
+  # The prompt deliberately does NOT contain the commit SHA or the remote URL.
+  # The assertions below check for those exact values, read from git on the host,
+  # so a response that merely echoes the prompt cannot pass. The first version of
+  # this check looked for "a hex string" and "a filename-shaped token", which an
+  # error message full of paths and hashes satisfied — it reported a pass while
+  # the turn had actually died on ProviderAuthError.
+  REAL_SHA="$(git -C "workspace/targets/${FIRST_TARGET}" rev-parse HEAD)"
+  REAL_URL="$(git -C "workspace/targets/${FIRST_TARGET}" remote get-url origin)"
+  TURN="$(cli openclaw agent --agent main -m \
     "Select the ${FIRST_TARGET} target under /workspace/targets. Report its repository URL, its HEAD commit SHA, and one repository-relative file path you read. Do not call any Pretorin write tool." 2>&1)"
   LOWT="$(printf '%s' "$TURN" | tr 'A-Z' 'a-z')"
   case "$LOWT" in
-    *providerautherror*|*"auth store"*|*"not authenticated"*|*"no api key"*|*login*)
-      skip "agent turn provenance check" "no usable model credentials in this deployment" ;;
+    *providerautherror*|*failovererror*|*"missing-provider-auth"*|*"no api key"*|*"auth store"*|*"embedded fallback"*)
+      skip "agent turn provenance check" \
+           "no usable model credentials in this deployment (the turn never reached a model)" ;;
     *)
       P=0
-      case "$LOWT" in *"github.com/pretorin-ai/${FIRST_TARGET}"*|*"${FIRST_TARGET}.git"*) P=$((P+1)) ;; esac
-      printf '%s' "$TURN" | grep -qE '\b[0-9a-f]{7,40}\b' && P=$((P+1))
-      printf '%s' "$TURN" | grep -qE '\.(py|js|ts|go|rb|java|yml|yaml|md|json|tf|sh)\b' && P=$((P+1))
-      [ "$P" -ge 3 ] && pass "agent response carries repo + commit + path provenance" \
-        || fail "agent response carries repo + commit + path provenance" \
-                "matched ${P}/3 provenance markers; see the turn output above" ;;
+      case "$TURN" in *"$REAL_URL"*) P=$((P+1)) ;; esac
+      # Accept the abbreviated form too, but it must be THIS commit.
+      case "$TURN" in *"$REAL_SHA"*|*"${REAL_SHA:0:7}"*) P=$((P+1)) ;; esac
+      # A path that exists in the target, quoted repository-relative.
+      for f in README.md docker-compose.yml dev.env; do
+        case "$TURN" in *"$f"*) P=$((P+1)); break ;; esac
+      done
+      if [ "$P" -ge 3 ]; then
+        pass "agent response carries repo + commit + path provenance"
+      else
+        fail "agent response carries repo + commit + path provenance" \
+             "matched ${P}/3: url=${REAL_URL} sha=${REAL_SHA:0:7}; turn output was: $(printf '%s' "$TURN" | tail -3)"
+      fi ;;
   esac
 fi
 
