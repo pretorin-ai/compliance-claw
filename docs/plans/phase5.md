@@ -138,6 +138,12 @@ of the supported minimal set while DMs are closed one layer up by
 `dmPolicy: "disabled"`; granted-but-unused is stated in SECURITY.md rather than
 hidden.
 
+Reusing an existing Slack app is fully supported and needs no manifest at all —
+any app with Socket Mode, `connections:write` on its app-level token, and a bot
+token works. The manifest earns its place on a *new* app, where it removes the
+hand-picking of scopes and the over-granting that follows. **It was not imported
+during this phase**; see the completion-criteria notes.
+
 ## Design 2 — Private repositories via a read-only GitHub App
 
 ### The credential is host-only, and that is a deliberate carve-out
@@ -491,13 +497,75 @@ the reproducible path this phase adds.
 | 2 | Configure secrets from `.env.example` | **partial** | `.env.example` documents all eight variables; the operator's `.env` has the Pretorin key and gateway token, and lacks the Slack channel id, the GitHub App and `PRETORIN_KEY_MODE` |
 | 3 | Pull the released GHCR image | **blocked-on-operator** | Needs `feat/poc` and tag `v0.1.0` pushed. Workflow implemented; tag gate, pins and downloads verified offline |
 | 4 | `docker compose up -d` | pass | Gateway healthy throughout the smoke run |
-| 5 | Slack connects automatically, reply from Slack | **mechanism pass, round-trip blocked** | A12 proves a fresh volume comes up Slack-configured with zero manual JSON and the plugin loads. The live round-trip needs a Slack app created from the committed manifest and a working model login |
-| 6 | Claw reads a selected PRIVATE repo | **blocked-on-operator** | Needs the read-only GitHub App on `crm-deploy`, then uncommenting that block in `targets.yaml`. Refusal paths, parser contract and credential hygiene all verified (A11) |
+| 5 | Slack connects automatically, reply from Slack | **pending the release run** | A12 already proves a fresh volume comes up Slack-configured with zero manual JSON and that the plugin loads. The live round-trip runs against the pulled image using the EXISTING Slack app; see "Slack: reused app" below |
+| 6 | Claw reads a selected PRIVATE repo | **BLOCKED-ON-OPERATOR** | Creating a GitHub App on `pretorin-ai` needs organisation-owner permission, which this operator does not have. Not skipped and not deferred quietly — see "Criterion 6" below for exactly what is shipped, what is verified, and what an owner has to do |
 | 7 | Read workflows on a read-only key; write workflow after opt-in, all four provenance fields | **partial / blocked-on-operator** | Read paths pass (B1–B3, B5). The write half needs the formal recipe run and a model login; note the accidental write in bug 3 above was a bare `create_risk`, **not** the recipe workflow, and does not count |
 | 8 | Zero manual container modification | pass | Every state change in the run came from `bootstrap.sh`, `onboard-targets.sh`, the entrypoint or `smoke.sh` |
 
-Nothing above is marked pass on the strength of an argument. The four incomplete
-rows each name the specific artifact that does not exist yet.
+Nothing above is marked pass on the strength of an argument. Every incomplete row
+names the specific artifact that does not exist yet.
+
+### Criterion 6 — BLOCKED-ON-OPERATOR, and what that does and does not mean
+
+**Why.** Creating a GitHub App on the `pretorin-ai` organisation requires
+**organisation owner** permission. The operator running this phase is a member,
+not an owner, so no App exists and no private repository can be cloned. This is an
+access-control fact about the organisation, not a defect in the implementation and
+not a decision to descope.
+
+**What is shipped and unaffected.** The whole private path is implemented and in
+the tree: `scripts/github-app-token.sh`, the `private` key in the parser, the
+private clone path in `bootstrap.sh` with its non-persisting credential helper,
+and the post-clone credential assertion. Nothing about it is stubbed.
+
+**What is verified without an App**, all in Section A11 and the parser self-test:
+
+- a private target with no App configured → refusal naming `GITHUB_APP_ID`,
+  **no clone attempted**, and no hang on a credential prompt
+- a missing key file → refusal naming the path
+- `private: true` on a non-github host → rejected by the parser
+- a non-boolean `private` (`yes`, `True`, `1`) → rejected
+- no clone under `workspace/targets/` carries a credential in `.git/config`
+- the RS256 JWT construction, proven end to end against a throwaway key
+  (`Verified OK`, `exp-iat = 540`, base64url clean)
+
+**What is NOT verified**, and will not be until an owner acts: a live
+authenticated clone, and therefore the agent reading a private repository with
+provenance. No amount of local testing substitutes for that.
+
+**The deliverable for this criterion is therefore documentation**, and it is
+written to be executed by an org owner who was not part of this work:
+`README.md` → *Private repositories* is an eight-step runbook — App creation with
+`Contents: Read-only` and the webhook disabled, installation on selected
+repositories only, App ID and `.pem` handover, key placement and mode, `.env`
+wiring, uncommenting the target, `bootstrap.sh` + `onboard-targets.sh`, and three
+commands to verify the clone carries no credential. It ends with a table mapping
+every refusal message the tooling can emit to its cause.
+
+`crm-deploy` stays commented out in `targets.yaml`, so the committed default still
+clones with no credentials at all.
+
+### Slack — the existing app is reused, and the manifest is not exercised
+
+The acceptance run uses the Slack app that already exists in this workspace, whose
+app-level token, bot token and channel id are already in `.env` (all three
+confirmed to reach the container, including the final unterminated line, which
+compose's `env_file` parser handles correctly).
+
+Two honest consequences:
+
+- **Criterion 5 is still fully verified.** What it asserts is that a *fresh volume*
+  auto-configures Slack with zero manual JSON or plugin editing. That property
+  depends on the entrypoint, the pinned plugin and the patch — not on which Slack
+  app the tokens belong to. A12 already proves it in throwaway containers, and the
+  release run repeats it against the pulled image.
+- **`slack/app-manifest.json` ships documented but NOT imported.** No Slack app in
+  this run was created from it, so its import path is unverified: an error in the
+  manifest — a malformed scope, a field Slack rejects on import — would not have
+  been caught here. It is a faithful copy of upstream's minimal socket-mode
+  manifest with the display name and slash command changed, and it parses as JSON
+  with 12 bot scopes and no `request_url`, but that is a review, not a test.
+  **Flagged for verification the next time an app is created from it.**
 
 ## Accepted limitations
 

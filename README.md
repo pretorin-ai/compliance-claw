@@ -157,31 +157,111 @@ Nothing to configure. Any `https://` remote that clones anonymously works.
 `private: true` is a flag only — **no token, no credential and no path to one ever
 appears in `targets.yaml`**, which is committed.
 
-The supported path is a **read-only GitHub App**:
+The supported path is a **read-only GitHub App**. Creating one on an organisation
+requires **organisation owner** permission; a member cannot do it. If you are not
+an owner, everything below is the request to hand to one — steps 1–5 are theirs,
+steps 6–8 are yours once they give you the App ID and the `.pem`.
 
-1. Settings → Developer settings → **New GitHub App**.
-2. Permissions: **Repository → Contents → Read-only**. Nothing else. Do not grant
-   write anywhere; Compliance Claw reviews code and never pushes.
-3. **Generate a private key**, save the `.pem` as
-   `secrets/compliance-claw.private-key.pem` and `chmod 600` it. Both `secrets/`
-   and `*.pem` are gitignored.
-4. **Install App** → choose the account → **Only select repositories** → pick
-   exactly the repositories you want reviewed.
-5. Put the numeric **App ID** and the key path in `.env`.
+#### 1. Create the App (org owner)
 
-Then mark the target `private: true` and run `scripts/bootstrap.sh`. It mints an
-installation token scoped to `contents:read` on exactly the private targets you
-declared, clones with it, and deletes it. If the App is not installed on a
-declared repository, it says which one and links the installation page.
+`https://github.com/organizations/<ORG>/settings/apps/new`
+— or Organisation settings → Developer settings → GitHub Apps → **New GitHub App**.
+
+| Field | Value |
+| --- | --- |
+| GitHub App name | `Compliance Claw <org>` (must be globally unique) |
+| Homepage URL | your repo URL — unused, but required |
+| **Webhook** | **UNCHECK "Active"**. Compliance Claw pulls; it receives nothing. |
+| Where can this be installed | **Only on this account** |
+
+#### 2. Permissions — exactly one
+
+Repository permissions → **Contents: Read-only**. Nothing else. Leave every other
+permission at *No access*, and grant **no** organisation or account permissions.
+
+`Metadata: Read-only` will be selected for you automatically — that is a GitHub
+requirement and is expected. Do not add write access anywhere: this agent reviews
+code and never pushes.
+
+#### 3. Generate a private key (org owner)
+
+On the App's page after creation: **Private keys → Generate a private key**. GitHub
+downloads a `.pem` once and never shows it again.
+
+#### 4. Install it on selected repositories only (org owner)
+
+App page → **Install App** → the organisation → **Only select repositories** →
+choose exactly the repositories to be reviewed. Not "All repositories".
+
+#### 5. Hand over two things (org owner → operator)
+
+- The numeric **App ID** — top of the App's settings page, e.g. `1234567`. This is
+  *not* the Client ID and *not* the App name.
+- The **`.pem` file**, over a secure channel. It is a private key.
+
+#### 6. Place the key (operator)
+
+```sh
+mkdir -p secrets
+mv ~/Downloads/<app-name>.<date>.private-key.pem secrets/compliance-claw.private-key.pem
+chmod 600 secrets/compliance-claw.private-key.pem
+```
+
+`secrets/` and `*.pem` are both gitignored, and `.dockerignore` is an allowlist, so
+the key can reach neither git nor a Docker build context.
+
+#### 7. Point `.env` at it (operator)
+
+```sh
+GITHUB_APP_ID=1234567
+GITHUB_APP_PRIVATE_KEY_FILE=secrets/compliance-claw.private-key.pem
+GITHUB_APP_INSTALLATION_ID=          # leave empty; discovered automatically
+```
+
+Only fill `GITHUB_APP_INSTALLATION_ID` if the App is installed on more than one
+account, in which case bootstrap lists the candidates and asks you to pick.
+
+#### 8. Declare the target and run (operator)
+
+Uncomment the private block in `targets.yaml` — the committed file ships it
+commented out so a clone with no App still works — then:
+
+```sh
+scripts/bootstrap.sh        # mints the token, clones, deletes the token
+scripts/onboard-targets.sh  # registers it with Pretorin like any other target
+```
+
+Bootstrap mints an installation token scoped to `contents:read` on exactly the
+private targets you declared, clones with it, and deletes it. Verify afterwards:
+
+```sh
+git -C workspace/targets/<name> log --oneline -1        # the clone worked
+git -C workspace/targets/<name> remote get-url origin   # a clean https URL
+grep -c x-access-token workspace/targets/<name>/.git/config   # must print 0
+```
+
+#### If something is wrong
+
+| Message | Meaning |
+| --- | --- |
+| `GITHUB_APP_ID is not set` | Step 7 not done, or `.env` not saved |
+| `GITHUB_APP_ID must be numeric` | You used the Client ID or the App name |
+| `cannot read the GitHub App private key` | Wrong path in step 6/7; paths are relative to the repo root |
+| `is not a usable RSA private key` | Not the `.pem` — probably the manifest or a certificate |
+| `the App JWT was rejected` | App ID and key are from different Apps, or the host clock is off |
+| `the App is installed on 0 or several accounts` | Set `GITHUB_APP_INSTALLATION_ID` to the one listed |
+| `the GitHub App installation does not include:` | Step 4 missed that repository; the message links the installation page |
+| `needs Repository -> Contents -> Read-only` | Step 2 permission missing, or the org owner has not accepted a permission change |
 
 **The container never holds a git credential.** The token is used on the host, is
 passed to git through a credential helper rather than in the URL or in `argv`, is
-never written into any clone's `.git/config` (asserted after every clone), and the
-container only ever sees the resulting working tree over its read-only mount.
+never written into any clone's `.git/config` (asserted after every clone, and
+independently by `scripts/smoke.sh`), and the container only ever sees the
+resulting working tree over its read-only mount.
 
 A **fine-grained PAT is a development fallback only** and is not recommended: it
-carries a person's identity and is much harder to scope down. Set
-`GITHUB_APP_PRIVATE_KEY_FILE` aside and clone by hand if you must.
+carries a person's identity, expires on a human's schedule, and is much harder to
+scope down to one repository and one permission.
 
 ## Slack
 
@@ -204,6 +284,14 @@ Import the manifest rather than assembling scopes by hand — that is the whole
 reason it is committed. It requests upstream's **minimal** socket-mode scope set:
 **12 bot scopes instead of the recommended 23**, dropping files, reactions, pins,
 group DMs, `emoji:read` and `usergroups:read`.
+
+**Already have a Slack app?** You do not need to recreate it. Any app with Socket
+Mode enabled, an app-level token carrying `connections:write`, and a bot token
+works — put its three values in `.env` and the rest of this section applies
+unchanged. The manifest matters for a *new* app, where it saves you from
+hand-picking scopes and from over-granting. Worth knowing if you reuse an older
+app: it probably carries the broader recommended scope set, so it can read files,
+reactions and group DMs that this deployment never uses.
 
 Verify:
 
