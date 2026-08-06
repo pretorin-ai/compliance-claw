@@ -8,8 +8,8 @@
 #
 # THIS FILE PULLS, IT NEVER BUILDS. There is deliberately no `build:` section:
 # with one present, `docker compose up` builds whenever the image is missing
-# locally, which would let a local build quietly stand in for the released,
-# scanned and signed image. Development builds are opt-in through an overlay:
+# locally, which would let an unscanned local build quietly stand in for the
+# released, scanned image. Development builds are opt-in through an overlay:
 #
 #   export COMPOSE_FILE=compose.yaml:compose.build.yaml
 #   scripts/bootstrap.sh --build
@@ -53,9 +53,14 @@ x-compliance-claw: &compliance-claw
   #
   # PIN THE DIGEST once a release is published:
   #   image: ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:<digest>
-  # A tag is mutable, and the digest an operator verified with `cosign verify` is
-  # not necessarily the digest they later pull. The release workflow prints the
-  # digest in its job summary for exactly this step; see README.md ('Releasing').
+  #
+  # This is the integrity control, not decoration. A tag is a mutable pointer: the
+  # same :0.1.0 can be made to resolve to different bytes later, and nothing here
+  # would notice. A digest is a content address — it either resolves to the exact
+  # image the release scanned, or it does not resolve. The image is NOT signed, so
+  # the digest pin is the whole of what guarantees what you are running; see
+  # README.md ('Verifying what you pulled'). The release workflow prints the digest
+  # in its job summary for exactly this step.
   image: ghcr.io/pretorin-ai/compliance-claw:0.1.0
   env_file:
     # Gitignored and dockerignored, so nothing here is ever baked into a layer.

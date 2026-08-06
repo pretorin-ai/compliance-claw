@@ -83,29 +83,57 @@ supply. Those need a Connected Source on the platform side, which is future work
 
 ## Verifying what you pulled
 
-The image is signed with cosign keyless, so the signature is bound to the release
-workflow's identity rather than to a key anyone could copy:
+**Pull by digest, not by tag.** A tag is a mutable pointer — the same
+`:0.1.0` can be made to resolve to different bytes tomorrow. A digest is the
+bytes: `@sha256:…` is a content address, so if it resolves at all, it resolves to
+exactly the image that was built, smoked, scanned and inventoried by the release
+run that produced it.
 
 ```sh
-cosign verify ghcr.io/pretorin-ai/compliance-claw:0.1.0 \
-  --certificate-identity-regexp '^https://github\.com/pretorin-ai/compliance-claw/\.github/workflows/release\.yml@refs/tags/v' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-
-# and the SBOM attached to it:
-cosign verify-attestation --type spdxjson ghcr.io/pretorin-ai/compliance-claw:0.1.0 \
-  --certificate-identity-regexp '^https://github\.com/pretorin-ai/compliance-claw/\.github/workflows/release\.yml@refs/tags/v' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+docker login ghcr.io          # the package is not public
+docker pull ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:<digest>
 ```
 
-`cosign` uses your Docker credentials, so log in first. Verify the **digest**
-rather than the tag when you can — a tag is mutable, and `compose.yaml` carries a
-comment showing where to pin the digest.
+The digest is printed in the release run's job summary, and `compose.yaml` carries
+the line to paste it into. The release job also proves the round trip itself: it
+deletes the local image, pulls the digest back from the registry, runs it, and
+regenerates the SBOM from the pulled bytes to confirm the package inventory
+matches the one taken from the build.
+
+Check what you are actually running at any time:
+
+```sh
+docker compose images                      # what compose resolved
+docker inspect --format '{{index .RepoDigests 0}}' \
+  ghcr.io/pretorin-ai/compliance-claw:0.1.0
+```
+
+### What this does and does not prove
+
+> **The image is not signed.** A digest gives **integrity** — these exact bytes,
+> not some other bytes wearing the same tag. It does not give **authenticity**:
+> it is no proof of *who* built the image. Anyone who can push to the registry can
+> publish a different digest, and nothing in a digest alone tells you which one
+> came from this repository's release workflow.
+
+Signing was designed in and deliberately dropped for this POC. Keyless cosign
+would have written a permanent, publicly searchable Sigstore transparency-log
+entry naming this repository, which is internal — a disclosure decision, not just
+a technical one. The alternative, a signing key in CI, contradicts this
+repository's rule that CI holds zero credentials.
+
+If you need authenticity, treat that as the next step rather than assuming it:
+see the hardening ledger in [SECURITY.md](SECURITY.md).
+
+The SBOM is generated for every release in SPDX JSON and attached to the run as a
+build artifact. It is not attached to the image, because attaching it as an OCI
+attestation is a signing operation.
 
 ### Building locally instead (development)
 
 The default path pulls, and `compose.yaml` deliberately has no `build:` section so
-`docker compose up` can never quietly substitute a local build for the released,
-scanned, signed image. To build:
+`docker compose up` can never quietly substitute an unscanned local build for the
+released, scanned image. To build:
 
 ```sh
 export COMPOSE_FILE=compose.yaml:compose.build.yaml
@@ -454,15 +482,20 @@ scripts/onboard-targets.sh --verify-only
 ## Releasing
 
 Tag-triggered. `.github/workflows/release.yml` builds `linux/amd64`, smokes the
-image, blocks on fixable CRITICAL vulnerabilities, attaches an SPDX SBOM, pushes
-to GHCR, and signs the digest keyless. It holds **no** Pretorin, model or Slack
-credentials — only the automatic `GITHUB_TOKEN`, and it asserts that itself.
+image, blocks on fixable CRITICAL vulnerabilities, generates an SPDX SBOM, pushes
+to GHCR, and then **pulls the published digest back and re-verifies it** — the
+image is removed locally first so the pull cannot be served from cache, and the
+SBOM is regenerated from the pulled bytes and compared against the built one.
+It holds **no** Pretorin, model or Slack credentials — only the automatic
+`GITHUB_TOKEN`, and it asserts that itself. It does not sign; see "Verifying what
+you pulled".
 
 ```sh
 # 1. bump IMAGE_VERSION in versions.env AND the image line in compose.yaml
 #    (smoke.sh asserts the two agree; the workflow refuses a mismatched tag)
 git tag v0.1.0 && git push origin v0.1.0
-# 2. take the digest from the job summary and pin it in compose.yaml
+# 2. take the digest from the job summary and pin it in compose.yaml:
+#      image: ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:<digest>
 ```
 
 Step 2 is not optional bookkeeping: a tag is mutable, so without the digest the

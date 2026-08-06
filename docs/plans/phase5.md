@@ -2,8 +2,8 @@
 
 Goal: make the Phase 1–4 deployment shippable to someone who did not build it.
 Reproducible Slack from a fresh volume, private repository targets, a published
-and signed image that operators pull instead of build, and the documentation pass
-that ties the four previous phases together.
+image that operators pull by immutable digest instead of building, and the
+documentation pass that ties the four previous phases together.
 
 Every earlier convention stands: pins in `versions.env`, write-if-absent seeding,
 never-clobber, the runtime pin and its drift alarm, `toolSearch` directory mode,
@@ -199,30 +199,55 @@ value that quietly parses as "not true" turns a private repo into a public one a
 produces an auth error that reads like a network fault. A private target must be
 on `github.com`, since that is where the App token works.
 
-## Design 3 — GHCR publish, scan, SBOM, signature
+## Design 3 — build, scan, SBOM, publish by immutable digest, pull it back
 
-### Two cosign pins, deliberately
+### No signing. The digest is the guarantee, and it is verified rather than asserted
 
-`COSIGN_VERSION=v2.4.1` stays frozen: cosign v3 removed `verify-blob --signature`
-and cannot verify the Pretorin release at all. Image signing gets its own
-`COSIGN_CI_VERSION=v2.6.5` with its own checksum. Keyless signing transacts with
-the live Fulcio/Rekor trust root and cannot be exercised outside CI, so reusing a
-2024-line build would surface the failure on the release tag — the most expensive
-possible moment. Both pins carry a comment naming the job that uses them.
+Signing was designed in — keyless cosign, a second pinned cosign, `id-token:
+write` — and then deliberately removed. Keyless signing writes a permanent,
+publicly searchable Sigstore transparency-log entry naming the repository, and
+this repository is internal; that is a disclosure decision, not only a technical
+one. The alternative, a signing key held in CI, contradicts the standing rule that
+CI holds zero credentials.
+
+What stands in its place is a content address, plus a proof that it round-trips:
+
+| | Guarantees | Does **not** guarantee |
+| --- | --- | --- |
+| `@sha256:...` | **Integrity** — these exact bytes, the ones that were scanned | **Authenticity** — nothing attests who built them |
+
+The release job deletes the built image locally so the pull cannot be served from
+cache, pulls the published digest back from the registry, runs it, and regenerates
+the SBOM from the pulled bytes to compare package counts against the SBOM taken
+from the build. A digest nobody pulls back is an assertion; this makes it a
+measurement.
+
+Two things were removed rather than left lying around, because both would have
+implied a guarantee that no longer exists: `id-token: write`, which exists solely
+to mint OIDC tokens for keyless signing, and the second cosign pin — a pin no job
+consumes advertises a verification that does not happen.
+`COSIGN_VERSION=v2.4.1` stays, because the Dockerfile still uses it to verify the
+Pretorin release blob, which is a different job with a different constraint.
+
+The integrity-versus-authenticity distinction is stated in `README.md`,
+`SECURITY.md`, `compose.yaml` and the job summary, rather than left for a reader
+to infer from the absence of a `cosign verify` command. Signing is a
+hardening-ledger item.
 
 ### Pipeline
 
 ```
 1. assert release.yml references no secret but GITHUB_TOKEN   (self-check)
 2. assert the git tag equals v${IMAGE_VERSION} from versions.env
-3. install cosign / trivy / syft, each checksum-verified
+3. install trivy / syft, each checksum-verified against versions.env
 4. docker build --platform linux/amd64
 5. in-image smoke: pretorin, openclaw, arch, Slack plugin present
-6. trivy: FAIL on fixable CRITICAL; a second non-blocking run reports HIGH
-7. syft SPDX SBOM, refused if it contains zero packages
-8. push, then read the digest from RepoDigests
-9. cosign sign the DIGEST (keyless); cosign attest the SBOM
-10. job summary prints the digest and the operator verify command
+6. print the .trivyignore.yaml exceptions and their remaining lifetime
+7. trivy: FAIL on fixable CRITICAL; a second non-blocking run reports HIGH
+8. syft SPDX SBOM, refused if it contains zero packages
+9. push, then read the digest from RepoDigests
+10. rmi, PULL THE DIGEST BACK, run it, re-generate the SBOM, compare
+11. job summary prints the digest, the compose pin line, and the exceptions
 ```
 
 Scanning precedes the push, so a failing image is never published.
@@ -411,12 +436,11 @@ failing.
 
 ### Release tooling, verified offline
 
-The tag gate, the pin extraction and the three checksum-pinned downloads were
-exercised on the host rather than assumed:
+The tag gate, the pin extraction and the checksum-pinned downloads were exercised
+on the host rather than assumed:
 
 ```
 tag v0.1.0 -> ACCEPT      tag v0.2.0 -> REJECT      tag 0.1.0 -> REJECT
-cosign-linux-amd64 (v2.6.5)            : OK
 trivy_0.73.0_Linux-64bit.tar.gz        : OK
 syft_1.50.0_linux_amd64.tar.gz         : OK
 ```
@@ -549,7 +573,7 @@ the reproducible path this phase adds.
 | --- | --- | --- | --- |
 | 1 | Fresh clone, clean directory | **not yet run** | Deferred until the image is published, so the run exercises the real pull path |
 | 2 | Configure secrets from `.env.example` | **partial** | `.env.example` documents all eight variables; the operator's `.env` has the Pretorin key and gateway token, and lacks the Slack channel id, the GitHub App and `PRETORIN_KEY_MODE` |
-| 3 | Pull the released GHCR image | **blocked-on-operator** | Needs `feat/poc` and tag `v0.1.0` pushed. Workflow implemented; tag gate, pins and downloads verified offline |
+| 3 | Pull the released GHCR image | **blocked-on-operator** | Needs tag `v0.1.0` pushed. Workflow implemented; tag gate, pin extraction, all three checksum-pinned downloads and the Trivy gate verified by hand against the real image. The image is published and pulled BY DIGEST and is not signed — see "No signing" above |
 | 4 | `docker compose up -d` | pass | Gateway healthy throughout the smoke run |
 | 5 | Slack connects automatically, reply from Slack | **pending the release run** | A12 already proves a fresh volume comes up Slack-configured with zero manual JSON and that the plugin loads. The live round-trip runs against the pulled image using the EXISTING Slack app; see "Slack: reused app" below |
 | 6 | Claw reads a selected PRIVATE repo | **BLOCKED-ON-OPERATOR** | Creating a GitHub App on `pretorin-ai` needs organisation-owner permission, which this operator does not have. Not skipped and not deferred quietly — see "Criterion 6" below for exactly what is shipped, what is verified, and what an owner has to do |

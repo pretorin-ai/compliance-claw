@@ -1,4 +1,4 @@
-# Publish a versioned, scanned, SBOM-bearing, signed linux/amd64 image to GHCR.
+# Publish a versioned, scanned, SBOM-bearing linux/amd64 image to GHCR, by digest.
 #
 # Triggered by a tag:
 #   git tag v0.1.0 && git push origin v0.1.0
@@ -6,17 +6,28 @@
 # The tag must match IMAGE_VERSION in versions.env or the job refuses to run —
 # versions.env stays the single source of truth for what version this is.
 #
+# What this pipeline delivers: BUILD -> SCAN -> SBOM -> PUBLISH BY IMMUTABLE
+# DIGEST -> and an operator who pulls that digest gets exactly those bytes.
+#
+# THE IMAGE IS NOT SIGNED, deliberately. Keyless cosign would write a permanent,
+# publicly searchable entry to the Sigstore transparency log naming this
+# repository, and this repository is internal. A content-addressed digest still
+# gives INTEGRITY — `@sha256:...` cannot resolve to different bytes than the ones
+# scanned here — but it does not give AUTHENTICITY: it is no proof of who built
+# the image. Anyone who can push to the registry can publish a different digest.
+# That distinction is stated in README.md and SECURITY.md rather than glossed,
+# and signing is a tracked hardening item, not an oversight.
+#
 # NO CREDENTIALS LIVE HERE. The only secret used is the automatic GITHUB_TOKEN,
-# and only to push to GHCR. There is no Pretorin API key, no model key, no Slack
-# token, and no cosign private key: image signing is keyless, using the workflow's
-# own OIDC identity. The "no credentials" step below asserts that rather than
-# trusting this comment.
+# and only to push to GHCR. There is no Pretorin API key, no model key and no
+# Slack token. The "no credentials" step below asserts that rather than trusting
+# this comment.
 #
 # Scanning happens BEFORE the push, so a failing image is never published.
 #
 # Pin carve-out: `uses:` cannot read versions.env, so action SHAs are pinned here.
-# Everything else — cosign, trivy, syft — is installed from a pinned version with
-# a pinned SHA256, the same way the Dockerfile installs cosign.
+# Everything else — trivy, syft — is installed from a pinned version with a pinned
+# SHA256, the same way the Dockerfile installs cosign for the Pretorin blob.
 name: release
 
 on:
@@ -25,14 +36,16 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build, scan and SBOM only — do not push, sign or attest"
+        description: "Build, scan and SBOM only — do not push"
         type: boolean
         default: true
 
+# id-token is deliberately ABSENT. It exists only to mint OIDC tokens for keyless
+# signing, and this pipeline does not sign. Requesting a permission nothing uses
+# is how a workflow quietly accumulates authority nobody can account for.
 permissions:
   contents: read
-  packages: write     # push to GHCR
-  id-token: write     # keyless signing via OIDC; no private key exists
+  packages: write     # push to GHCR — the only write this job performs
 
 concurrency:
   group: release-${{ github.ref }}
@@ -64,8 +77,8 @@ jobs:
         run: |
           set -euo pipefail
           . ./versions.env
-          for v in IMAGE_REPO IMAGE_VERSION COSIGN_CI_VERSION COSIGN_CI_SHA256 \
-                   COSIGN_ASSET TRIVY_VERSION TRIVY_SHA256 SYFT_VERSION SYFT_SHA256; do
+          for v in IMAGE_REPO IMAGE_VERSION \
+                   TRIVY_VERSION TRIVY_SHA256 SYFT_VERSION SYFT_SHA256; do
             eval "val=\${$v:-}"
             [ -n "$val" ] || { echo "::error::$v is not set in versions.env"; exit 1; }
             echo "$v=$val" >> "$GITHUB_OUTPUT"
@@ -88,14 +101,11 @@ jobs:
           fi
           echo "tag ${TAG} matches versions.env"
 
-      # cosign, trivy and syft installed from pinned versions and compared against
+      # trivy and syft installed from pinned versions and compared against
       # pinned digests. CI installs no unverified binary, for the same reason the
       # build does not: the tool that does the verifying gets verified too.
       - name: Install pinned release tooling
         env:
-          COSIGN_CI_VERSION: ${{ steps.pins.outputs.COSIGN_CI_VERSION }}
-          COSIGN_CI_SHA256: ${{ steps.pins.outputs.COSIGN_CI_SHA256 }}
-          COSIGN_ASSET: ${{ steps.pins.outputs.COSIGN_ASSET }}
           TRIVY_VERSION: ${{ steps.pins.outputs.TRIVY_VERSION }}
           TRIVY_SHA256: ${{ steps.pins.outputs.TRIVY_SHA256 }}
           SYFT_VERSION: ${{ steps.pins.outputs.SYFT_VERSION }}
@@ -103,11 +113,6 @@ jobs:
         run: |
           set -euo pipefail
           cd "$(mktemp -d)"
-
-          curl -fsSL --retry 3 --retry-all-errors -o cosign \
-            "https://github.com/sigstore/cosign/releases/download/${COSIGN_CI_VERSION}/${COSIGN_ASSET}"
-          echo "${COSIGN_CI_SHA256}  cosign" | sha256sum -c -
-          sudo install -m 0755 cosign /usr/local/bin/cosign
 
           TRIVY_TGZ="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
           curl -fsSL --retry 3 --retry-all-errors -o "$TRIVY_TGZ" \
@@ -123,7 +128,6 @@ jobs:
           tar xzf "$SYFT_TGZ" syft
           sudo install -m 0755 syft /usr/local/bin/syft
 
-          cosign version
           trivy --version | head -1
           syft version | head -2
 
@@ -233,7 +237,7 @@ jobs:
           set -euo pipefail
           syft "docker:${IMAGE_REF}" -o spdx-json > sbom.spdx.json
           # An SBOM that parses but describes nothing is worse than none at all:
-          # it would be signed and published as if it were evidence.
+          # it would be published alongside the image as if it were evidence.
           N="$(python3 -c 'import json;print(len(json.load(open("sbom.spdx.json")).get("packages",[])))')"
           echo "SBOM packages: ${N}"
           [ "$N" -gt 0 ] || { echo "::error::the SBOM contains no packages"; exit 1; }
@@ -259,7 +263,7 @@ jobs:
           set -euo pipefail
           docker push "$IMAGE_REF"
           # RepoDigests is populated by the push, and the digest is what gets
-          # signed: a tag is mutable, a digest is the artifact.
+          # published and pinned: a tag is mutable, a digest is the artifact.
           DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d@ -f2)"
           case "$DIGEST" in
             sha256:*) ;;
@@ -268,28 +272,37 @@ jobs:
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "pushed ${IMAGE_REF}@${DIGEST}"
 
-      # Keyless: the signing identity is this workflow, certified by GitHub's OIDC
-      # provider through Fulcio, and recorded in Rekor. There is no private key to
-      # store, rotate, or lose — which is the whole reason this is right-sized for
-      # a POC. An operator verifies with the identity regexp printed in the summary.
-      - name: Sign the image
+      # THE POINT OF THE WHOLE PIPELINE: prove that pulling the published digest
+      # returns the bytes that were just built, smoked, scanned and inventoried.
+      #
+      # Without this the digest is only an assertion. The image is removed from the
+      # local daemon first, so the pull cannot be served from cache, and the SBOM is
+      # regenerated from the PULLED image and compared against the one produced from
+      # the local build. A mismatch means the registry did not return what we sent.
+      - name: Verify the published digest round-trips
         if: ${{ !inputs.dry_run }}
         env:
           IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          cosign sign --yes "${IMAGE_REF}@${DIGEST}"
+          docker rmi "$IMAGE_REF" >/dev/null 2>&1 || true
+          docker image prune -f >/dev/null 2>&1 || true
 
-      - name: Attach the SBOM as a signed attestation
-        if: ${{ !inputs.dry_run }}
-        env:
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
-          DIGEST: ${{ steps.push.outputs.digest }}
-        run: |
-          set -euo pipefail
-          cosign attest --yes --predicate sbom.spdx.json --type spdxjson \
-            "${IMAGE_REF}@${DIGEST}"
+          docker pull "${IMAGE_REF}@${DIGEST}"
+
+          # The pulled image must run and be the right architecture.
+          ARCH="$(docker run --rm --entrypoint bash "${IMAGE_REF}@${DIGEST}" -lc 'uname -m')"
+          [ "$ARCH" = x86_64 ] || { echo "::error::pulled image arch is ${ARCH}"; exit 1; }
+          docker run --rm --entrypoint bash "${IMAGE_REF}@${DIGEST}" -lc 'pretorin version'
+
+          # Same package inventory from the pulled bytes as from the built bytes.
+          syft "docker:${IMAGE_REF}@${DIGEST}" -o spdx-json > sbom.pulled.json
+          BUILT="$(python3 -c 'import json;d=json.load(open("sbom.spdx.json"));print(len(d.get("packages",[])))')"
+          PULLED="$(python3 -c 'import json;d=json.load(open("sbom.pulled.json"));print(len(d.get("packages",[])))')"
+          echo "SBOM packages: built=${BUILT} pulled=${PULLED}"
+          [ "$BUILT" = "$PULLED" ] || { echo "::error::pulled image inventory differs from the built image"; exit 1; }
+          echo "digest round-trip verified: ${IMAGE_REF}@${DIGEST}"
 
       - name: Summary
         if: ${{ !inputs.dry_run }}
@@ -312,17 +325,16 @@ jobs:
             echo "  image: ${IMAGE_REF}@${DIGEST}"
             echo '```'
             echo ""
-            echo "Operator verification (the package is not public, so log in first):"
+            echo "Pull it by digest — the tag is mutable, the digest is the artifact:"
             echo ""
             echo '```sh'
-            echo "docker login ghcr.io"
-            echo "cosign verify ${IMAGE_REF}@${DIGEST} \\"
-            echo "  --certificate-identity-regexp '^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/tags/v' \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
-            echo ""
-            echo "# and the SBOM attestation:"
-            echo "cosign verify-attestation --type spdxjson ${IMAGE_REF}@${DIGEST} \\"
-            echo "  --certificate-identity-regexp '^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/tags/v' \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo "docker login ghcr.io          # the package is not public"
+            echo "docker pull ${IMAGE_REF}@${DIGEST}"
             echo '```'
+            echo ""
+            echo "**Not signed.** A digest guarantees INTEGRITY — these exact bytes —"
+            echo "but not AUTHENTICITY: it is no proof of who built them. Image signing"
+            echo "is a tracked hardening item; see SECURITY.md."
+            echo ""
+            echo "The SBOM for this digest is attached to this run as an artifact."
           } >> "$GITHUB_STEP_SUMMARY"

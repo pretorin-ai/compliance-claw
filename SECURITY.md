@@ -171,44 +171,53 @@ Ordered roughly by how much it matters, not by effort.
    once upstream rebuilds. The `libgnutls30` pair is the one to watch: unlike the
    others it sits on a live TLS path, and the reason for deferring it is
    inability to patch, not a claim that it is unreachable.
-5. **OpenClaw base-image attestation.** Phase 1's chain guarantees the *Pretorin
+5. **Image signing and provenance.** The release publishes and verifies an
+   immutable digest, which is integrity but not authenticity — nothing attests
+   who built a given digest. Keyless cosign was rejected for this POC because it
+   writes a permanent public transparency-log entry naming an internal
+   repository, and a CI-held signing key was rejected because CI holds zero
+   credentials. The likely resolution is GitHub's own artifact attestation, which
+   for a private or internal repository records to GitHub's instance rather than
+   the public log — unevaluated here, and the reason this is a ledger item rather
+   than a decision.
+6. **OpenClaw base-image attestation.** Phase 1's chain guarantees the *Pretorin
    binary* and Phase 5's gate guarantees the *Slack plugin*; the OpenClaw base
    image is trusted on its digest pin alone. Verifying upstream's own GHCR
    attestation would close the last unverified link in the image.
-6. **The release workflow cannot be rehearsed.** GitHub only exposes
+7. **The release workflow cannot be rehearsed.** GitHub only exposes
    `workflow_dispatch` for workflows present on the **default branch**, and
    `release.yml` lives on the feature branch, so its first real execution is the
    first tag push. Its individual stages were exercised by hand — the tag gate,
    the pin extraction, all three checksum-pinned downloads, the Trivy gate against
    the real image — but the assembled pipeline has never run. Merging to the
    default branch removes this limitation.
-7. **Connected Sources (`source_admin`) as the eventual binding source.** Local
+8. **Connected Sources (`source_admin`) as the eventual binding source.** Local
    `preflight` resolvers are a host-local approximation. Connected Sources is also
    the **only** path to `branch_protection`, `code_review_records` and
    `pull_request_records` — i.e. the thing that resolves `code_repository`
    reporting `degraded`, which is expected today and cannot be fixed from a local
    checkout. Requires a scope this POC deliberately does not use.
-8. **Config reconciliation instead of warn-and-`down -v`.** Templates are seeded
+9. **Config reconciliation instead of warn-and-`down -v`.** Templates are seeded
    write-if-absent and never overwritten, so a newer image cannot tighten an
    existing deployment's config. Today the entrypoint warns — including a specific
    warning when Slack is configured in `.env` but absent from an existing
    config — and `down -v` is the only reset.
-9. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
+10. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
    observed working (`cataloged 223 tools behind compact directory surface`) but
    upstream marks all Tool Search modes experimental. If it regresses, the prompt
    returns to roughly 40k tokens per turn and the commented `toolFilter` block is
    the lever.
-10. **Per-repository authorization.** Every target shares one Pretorin key and one
+11. **Per-repository authorization.** Every target shares one Pretorin key and one
    scope. A reviewer who should see one repository sees all of them.
-11. **`mcp.sessionIdleTtlMs` is untuned.** Default 600000 ms — ten minutes of
+12. **`mcp.sessionIdleTtlMs` is untuned.** Default 600000 ms — ten minutes of
    idleness before a session's `pretorin mcp-serve` child (a 23 MB binary) is
    reaped; `0` disables idle cleanup. Fine for one operator, unmeasured for a
    shared channel where each session spawns its own child.
-12. **Multi-arch is blocked upstream.** `SHA256SUMS` publishes only
+13. **Multi-arch is blocked upstream.** `SHA256SUMS` publishes only
     `linux-x86_64` and `macos-arm64`, so there is no linux/arm64 Pretorin binary
     to build against. Not deferred by choice — blocked. Apple Silicon runs amd64
     under emulation.
-13. **Upstream feedback: `pretorin preflight unbind --id <resolver-id>`.**
+14. **Upstream feedback: `pretorin preflight unbind --id <resolver-id>`.**
     `unbind --name` removes *every* resolver with that name, and names derive from
     directory basenames, so two targets that both own `docs/` collide. The
     sweep-then-bind ordering makes this safe rather than merely tolerable; an
@@ -229,6 +238,14 @@ Ordered roughly by how much it matters, not by effort.
   image with no upstream patch would otherwise make every release unshippable,
   and an unsatisfiable gate gets disabled. Unfixed criticals are printed in the
   job summary rather than dropped.
-- **The published image is referenced by tag until a release exists.** A tag is
-  mutable; the digest is the artifact. The release workflow prints the digest for
-  pinning in `compose.yaml`, and that pin is the intended steady state.
+- **The published image is not signed.** The release publishes by immutable
+  digest and the round trip is verified in CI — the image is deleted locally,
+  pulled back by digest, run, and its SBOM regenerated and compared against the
+  built one. That is **integrity**: the bytes are the bytes that were scanned. It
+  is not **authenticity**: nothing proves which digest came from this
+  repository's workflow, so anyone who can push to the registry can publish
+  another. Keyless signing was designed in and dropped deliberately — it writes a
+  permanent, publicly searchable Sigstore transparency-log entry naming an
+  internal repository, and the alternative, a signing key in CI, contradicts the
+  zero-credentials rule. Listed in the ledger above as future work rather than
+  quietly omitted.

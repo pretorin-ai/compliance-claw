@@ -112,8 +112,22 @@ head1 "SECTION A — no credentials (this is what CI runs)"
 
 head2 "A1. versions and supply chain"
 V="$(val pretorin version)"
-has "pretorin is the pinned 0.26.14" "0.26.14" "$V"
-has "openclaw is the pinned 2026.7.1" "2026.7.1" "$(val openclaw --version)"
+# Read from versions.env rather than hardcoded here. Two literals in a test are
+# two more places to forget on a bump — and a pin nothing reads is decoration, not
+# a source of truth. OPENCLAW_VERSION in particular had no consumer at all until
+# this line; the Dockerfile FROM carries the tag as a literal beside its digest.
+# shellcheck disable=SC1091
+. ./versions.env
+has "pretorin matches versions.env (${PRETORIN_VERSION})" "$PRETORIN_VERSION" "$V"
+has "openclaw matches versions.env (${OPENCLAW_VERSION})" "$OPENCLAW_VERSION" "$(val openclaw --version)"
+# The FROM line restates the tag next to its digest, because FROM cannot source a
+# file. If they drift, the image is not the version versions.env claims it is.
+if grep -q "ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION}@sha256:" Dockerfile; then
+  pass "Dockerfile FROM tag agrees with OPENCLAW_VERSION"
+else
+  fail "Dockerfile FROM tag agrees with OPENCLAW_VERSION" \
+       "versions.env says ${OPENCLAW_VERSION}; FROM says $(grep -oE 'openclaw/openclaw:[^@]+' Dockerfile | head -1)"
+fi
 ok  "image runs as x86_64" bash -c '[ "$(docker compose run --rm -T cli uname -m | tr -d "\r\n")" = x86_64 ]'
 
 head2 "A2. Pretorin MCP tool surface (mock-based, no key)"
