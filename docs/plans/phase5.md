@@ -10,11 +10,17 @@ never-clobber, the runtime pin and its drift alarm, `toolSearch` directory mode,
 key scopes as the authorization boundary, sweep-then-bind onboarding, and `.env`
 as the single **container** secret file.
 
-**Status: IMPLEMENTED.** Design, implementation and the no-credential half of the
-verification gate are complete and recorded below. The criteria that need operator
-prerequisites — a GitHub App, a Slack app created from the committed manifest, and
-a pushed release tag — are recorded as blocked-on-operator with exactly what is
-missing, never as passes.
+**Status: IMPLEMENTED and RELEASED.** `v0.1.0` is published to GHCR and pinned by
+digest, and 7 of the 8 completion criteria were verified against that pulled image
+on a fresh clone. Criterion 6 (a live private-repository read) is
+**blocked-on-operator**: creating a GitHub App on the organisation needs owner
+permission this operator does not hold. It is recorded as blocked with the runbook
+an owner needs, never as a pass.
+
+Six bugs surfaced by running things rather than reading them, all recorded below
+with what they were and how they were found. One of them was a wrong diagnosis of
+mine that contaminated the first acceptance attempt; the run was redone from a
+destroyed volume rather than reported with the contamination glossed over.
 
 ## Established facts, measured against the shipped 2026.7.1 image
 
@@ -552,6 +558,108 @@ This never affects CI, which runs one project on a clean runner. It affected the
 verification, which is worse: it is the tooling that is supposed to catch
 problems quietly reporting success.
 
+### The dead check that finally ran, and the documented command that never worked
+
+`smoke.sh` B6 asserts that an agent turn carries provenance. It had reported `skip`
+on every run since Phase 4 — no model credentials — so nobody noticed that the way
+it invoked the agent could not have worked either:
+
+```sh
+TURN="$(cli openclaw agent --agent main -m "...")"     # cli = docker compose run --rm cli
+```
+
+`openclaw agent` reaches the gateway over `127.0.0.1:18789`. The `cli` service is a
+**separate container** with nothing on its own loopback, so the command silently
+falls back to the embedded agent. Embedded model resolution is stricter and dies:
+
+```
+FailoverError: Unknown model: openai/gpt-5.6-sol. Found agents.defaults.models[...],
+but no matching models.providers["openai"].models[] entry.
+```
+
+Two things worth knowing about that error. `agents.defaults.models` is written into
+the config by **OpenClaw itself** — it is not in our template — and it is what makes
+the embedded path demand a provider `models[]` entry. And setting
+`OPENCLAW_GATEWAY_URL=ws://openclaw:18789` does **not** help: the URL is accepted
+(`Source: env OPENCLAW_GATEWAY_URL`) but resolution happens before dispatch.
+
+The same wrong command was in **README.md** as the documented way to drive the
+agent. Both are fixed to `docker compose exec openclaw openclaw agent ...`, which
+works because inside the gateway container the gateway *is* on localhost:
+
+```
+$ docker compose exec -T openclaw openclaw agent --agent main -m "Reply with exactly: OK"
+OK
+```
+
+B6 then passed for the first time in its existence. The prompt contains neither the
+SHA nor the URL; the turn returned the repository URL, `276b5fd8716636…` matching
+the host-read HEAD, and a repository-relative path:
+
+```
+- Repository URL: https://github.com/pretorin-ai/simple-crm.git
+- HEAD commit SHA: 276b5fd871663605138fce5486831a422368b130
+- File read: .dockerignore
+```
+
+Fixing the invocation then exposed a second flaw in the same check, one that had
+been latent for the same reason. Its path assertion was:
+
+```sh
+for f in README.md docker-compose.yml dev.env; do   # "did the agent guess one of these?"
+```
+
+That asks whether the agent happened to pick one of three filenames, not whether it
+reported a repository-relative path. It failed a completely correct answer of
+`backend/app/auth.py`. The assertion now resolves whatever path-shaped token the
+reply contains against the checkout on disk — so a real path passes regardless of
+which file the agent chose, a fabricated one cannot, and an absolute
+`/workspace/targets/...` path is rejected as not repository-relative and separately
+noted, since AGENTS.md asks for the relative form and evidence carrying a container
+path is not reviewable by anyone who did not run this container.
+
+Both flaws were invisible for the same reason: the check had never executed.
+
+Everything else — `pretorin ...`, `openclaw mcp ...`, `openclaw config ...` — is
+correct under `run --rm cli`, because none of it needs the gateway. Only agent turns
+do. This is the third dead check this phase found, after the plugin-banner grep and
+the `/healthz` cross-project pass, and all three shared a shape: a check that could
+never pass, kept invisible by a skip or a coincidence.
+
+### The config I patched for no reason
+
+Recorded because the acceptance run had to be redone because of it.
+
+When the CLI probe above failed with `Unknown model`, the conclusion drawn was that
+the shipped config template was broken — that it set `agents.defaults.model` without
+registering the model under `models.providers.openai.models[]`. Two
+`openclaw config patch` calls then added this to the **running deployment**:
+
+```json
+"models": [{ "id": "gpt-5.6-sol", "name": "gpt-5.6-sol", "api": "openai-chatgpt-responses" }]
+```
+
+That diagnosis was wrong, in two ways that a single check would have caught. The
+gateway had been serving Slack turns with `status=200` **before** the first patch —
+the deployment was working the whole time. And the template needs no such entry:
+after destroying the volume and re-seeding from the image alone, Slack turns return
+`status=200` with `models[] present: False`.
+
+A second wrong conclusion followed the first. When the patched config produced
+`401 Missing scopes: api.responses.write`, that was reported as the operator's
+OpenAI account lacking a permission. It was a transient cooldown from the earlier
+failed attempts (`cooldown until 07:48:30` on the profile); the same account was
+returning 200s minutes later.
+
+The cost was evidential, not functional: nothing broke, no volume was lost, and the
+added block was inert for the gateway path. But criterion 8 is "zero manual
+container modification", and that had been violated, so the run could not be
+recorded. The volumes were destroyed and every criterion above was re-observed on a
+config seeded only by the image.
+
+The lesson is narrow and worth keeping: **check whether the system works before
+concluding it is broken.** The probe was new; the deployment was not.
+
 ### Operator prerequisite destroyed during validation
 
 Running `docker compose down -v` to force a fresh seed deleted the OpenClaw state
@@ -567,21 +675,68 @@ docker compose run --rm cli openclaw models auth login
 The hand-configured Slack block in that volume went with it; it is superseded by
 the reproducible path this phase adds.
 
-## Completion criteria
+## Completion criteria — the release run
 
-| # | Criterion | Status | Evidence / what is missing |
+Run against the **published image pulled by digest**
+(`ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:58690e31…d188da8b`), from a
+fresh clone of `feat/poc` in a clean directory, with an isolated
+`COMPOSE_PROJECT_NAME`.
+
+The volume was destroyed and re-seeded before the criteria below were recorded,
+because an earlier attempt had been hand-patched — see "The config I patched for no
+reason". Everything here is from the untouched re-run.
+
+| # | Criterion | Status | Observed |
 | --- | --- | --- | --- |
-| 1 | Fresh clone, clean directory | **not yet run** | Deferred until the image is published, so the run exercises the real pull path |
-| 2 | Configure secrets from `.env.example` | **partial** | `.env.example` documents all eight variables; the operator's `.env` has the Pretorin key and gateway token, and lacks the Slack channel id, the GitHub App and `PRETORIN_KEY_MODE` |
-| 3 | Pull the released GHCR image | **blocked-on-operator** | Needs tag `v0.1.0` pushed. Workflow implemented; tag gate, pin extraction, all three checksum-pinned downloads and the Trivy gate verified by hand against the real image. The image is published and pulled BY DIGEST and is not signed — see "No signing" above |
-| 4 | `docker compose up -d` | pass | Gateway healthy throughout the smoke run |
-| 5 | Slack connects automatically, reply from Slack | **pending the release run** | A12 already proves a fresh volume comes up Slack-configured with zero manual JSON and that the plugin loads. The live round-trip runs against the pulled image using the EXISTING Slack app; see "Slack: reused app" below |
-| 6 | Claw reads a selected PRIVATE repo | **BLOCKED-ON-OPERATOR** | Creating a GitHub App on `pretorin-ai` needs organisation-owner permission, which this operator does not have. Not skipped and not deferred quietly — see "Criterion 6" below for exactly what is shipped, what is verified, and what an owner has to do |
-| 7 | Read workflows on a read-only key; write workflow after opt-in, all four provenance fields | **partial / blocked-on-operator** | Read paths pass (B1–B3, B5). The write half needs the formal recipe run and a model login; note the accidental write in bug 3 above was a bare `create_risk`, **not** the recipe workflow, and does not count |
-| 8 | Zero manual container modification | pass | Every state change in the run came from `bootstrap.sh`, `onboard-targets.sh`, the entrypoint or `smoke.sh` |
+| 1 | Fresh clone, clean directory | **pass** | clone at `0852759`; no `.env`, no `workspace/` |
+| 2 | Configure secrets from `.env.example` | **pass** | 6 variables set; `PRETORIN_KEY_MODE=write` declared for the write half |
+| 3 | Pull the released GHCR image | **pass** | `docker compose pull` resolved the pinned digest; `compose.yaml` has no `build:` section, so a local build cannot substitute. CI additionally deleted the built image and re-pulled the digest, matching the SBOM at 1099 packages both ways |
+| 4 | `docker compose up -d` | **pass** | `running/healthy` |
+| 5a | Slack connects automatically | **pass** | `channels resolved: C0BNXD05X6U→compliance-claw-test`, then `socket mode connected` — on a volume where `models[] present: False`, i.e. seeded entirely by the image with **zero manual JSON** |
+| 5b | Message the agent from Slack, get a reply | **pass** | `Inbound app_mention … user:U0B35SD3PT2 -> bot:U0BN3549K5G`, followed by `model-fetch … status=200`; operator confirmed the replies in-channel |
+| 6 | Claw reads a selected PRIVATE repo | **BLOCKED-ON-OPERATOR** | Creating a GitHub App on the org needs owner permission this operator does not have. See below |
+| 7 | Read workflows on the key; write workflow via the recipe, four provenance fields | **pass** | see the evidence record below |
+| 8 | Zero manual container modification | **pass** | in the recorded re-run, every state change came from `bootstrap.sh`, `onboard-targets.sh`, the entrypoint, or an agent turn. The operator's device-code model login is a documented operator command, not a container modification |
 
-Nothing above is marked pass on the strength of an argument. Every incomplete row
-names the specific artifact that does not exist yet.
+### Criterion 7 in full — the signed attestation, not the agent's summary
+
+The agent was asked to use the `code-evidence-capture` recipe against `simple-crm`
+and to report what it submitted. What makes this a pass is not that report but the
+**signed DSSE attestation** read back from the platform
+(`get_evidence_attestation`), whose payload carries all four fields:
+
+```
+uri      https://github.com/pretorin-ai/simple-crm/blob/276b5fd871663605138fce5486831a422368b130/backend/app/auth.py
+version  276b5fd871663605138fce5486831a422368b130
+label    backend/app/auth.py password hashing and verification
+locator  lines 42-51
+```
+
+| Required field | Where it appears |
+| --- | --- |
+| repository URL | in `uri`, as a permalink pinned to the commit |
+| commit SHA | `version`, and again inside `uri` |
+| repo-relative path | `backend/app/auth.py` — **not** the `/workspace/targets/...` container path |
+| line range | `locator: "lines 42-51"` |
+
+Two independent reasons this is not self-reported:
+
+- `producer` records `{kind: "recipe", id: "code-evidence-capture", version: "0.1.0"}`
+  with a `recipe_context_id` and `capture.method: "repository_file_read"`. The
+  evidence went **through the recipe workflow**, not through a bare
+  `create_evidence` call.
+- The attestation's `excerpt` matches, byte for byte, what `sed -n '42,51p'` returns
+  from the checked-out file on the host — the bcrypt `verify_password` /
+  `get_password_hash` pair. The agent could not have fabricated the citation.
+
+Evidence id `ad893583-2af0-4b0d-ab54-cdd6148cf8e5`, attestation
+`089881cc-0b85-47c4-a42a-73ccfd0d9622`, signed `ECDSA_P256_SHA256` via Azure Key
+Vault. The read half of the criterion is covered by B1–B3 and by the provenance
+turn recorded under "The dead check that finally ran".
+
+Note that `search_evidence` returns a summary projection **without** the `code_*`
+fields. Reading the attestation is what proves provenance; the summary view alone
+would have looked like the fields were missing.
 
 ### Criterion 6 — BLOCKED-ON-OPERATOR, and what that does and does not mean
 

@@ -749,9 +749,22 @@ PY
   # this check looked for "a hex string" and "a filename-shaped token", which an
   # error message full of paths and hashes satisfied — it reported a pass while
   # the turn had actually died on ProviderAuthError.
+  # RUN IT IN THE GATEWAY CONTAINER, not via `run --rm cli`.
+  #
+  # `openclaw agent` reaches the gateway over 127.0.0.1:18789. The `cli` service is
+  # a SEPARATE container with nothing on its own loopback, so there the command
+  # silently falls back to the embedded agent, whose model resolution is stricter
+  # and dies with "Unknown model: ..." — it trips over agents.defaults.models, a
+  # key OpenClaw writes into the config itself and that our template never sets.
+  # Setting OPENCLAW_GATEWAY_URL does NOT fix it; resolution happens before
+  # dispatch. `exec openclaw` works because there the gateway IS on localhost.
+  #
+  # This check used the `cli` path from the day it was written and could therefore
+  # never have passed. It reported `skip` on every run — no credentials — so the
+  # dead path stayed invisible, exactly like the plugin-banner grep did.
   REAL_SHA="$(git -C "workspace/targets/${FIRST_TARGET}" rev-parse HEAD)"
   REAL_URL="$(git -C "workspace/targets/${FIRST_TARGET}" remote get-url origin)"
-  TURN="$(cli openclaw agent --agent main -m \
+  TURN="$(docker compose exec -T openclaw openclaw agent --agent main -m \
     "Select the ${FIRST_TARGET} target under /workspace/targets. Report its repository URL, its HEAD commit SHA, and one repository-relative file path you read. Do not call any Pretorin write tool." 2>&1)"
   LOWT="$(printf '%s' "$TURN" | tr 'A-Z' 'a-z')"
   case "$LOWT" in
@@ -763,15 +776,40 @@ PY
       case "$TURN" in *"$REAL_URL"*) P=$((P+1)) ;; esac
       # Accept the abbreviated form too, but it must be THIS commit.
       case "$TURN" in *"$REAL_SHA"*|*"${REAL_SHA:0:7}"*) P=$((P+1)) ;; esac
-      # A path that exists in the target, quoted repository-relative.
-      for f in README.md docker-compose.yml dev.env; do
-        case "$TURN" in *"$f"*) P=$((P+1)); break ;; esac
+
+      # THE PATH ASSERTION, done by resolving it rather than by guessing filenames.
+      #
+      # This used to be `for f in README.md docker-compose.yml dev.env`, which asked
+      # "did the agent happen to pick one of three files I guessed?" — not the
+      # property the criterion is about. It failed a perfectly correct answer of
+      # `backend/app/auth.py`. What actually matters is that the reported path is
+      # repository-relative AND resolves to a real file in the target, so that is
+      # what is checked: every path-shaped token in the reply is tested against the
+      # checkout on disk.
+      FOUND_PATH=""
+      for cand in $(printf '%s' "$TURN" | tr -d '`"'"'" | tr ' ,()[]' '\n' \
+                    | grep -E '^[A-Za-z0-9_./-]+\.[A-Za-z0-9]+$' | sort -u); do
+        case "$cand" in
+          /*) continue ;;                       # absolute: not repository-relative
+          *) [ -f "workspace/targets/${FIRST_TARGET}/${cand}" ] && { FOUND_PATH="$cand"; break; } ;;
+        esac
       done
+      [ -n "$FOUND_PATH" ] && P=$((P+1))
+
+      # A container path instead of a repository-relative one is a distinct failure:
+      # AGENTS.md tells the agent to report the repo-relative path, and evidence
+      # carrying /workspace/targets/... is not reviewable by anyone who did not run
+      # this container.
+      case "$TURN" in
+        *"/workspace/targets/"*)
+          note "the reply mentions a /workspace/targets/ path; AGENTS.md asks for repository-relative paths" ;;
+      esac
+
       if [ "$P" -ge 3 ]; then
-        pass "agent response carries repo + commit + path provenance"
+        pass "agent response carries repo + commit + path provenance (path: ${FOUND_PATH})"
       else
         fail "agent response carries repo + commit + path provenance" \
-             "matched ${P}/3: url=${REAL_URL} sha=${REAL_SHA:0:7}; turn output was: $(printf '%s' "$TURN" | tail -3)"
+             "matched ${P}/3: url=${REAL_URL} sha=${REAL_SHA:0:7} path=${FOUND_PATH:-<none resolved in the checkout>}; turn output was: $(printf '%s' "$TURN" | tail -3)"
       fi ;;
   esac
 fi

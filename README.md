@@ -54,8 +54,16 @@ docker compose up -d             # http://127.0.0.1:18789
 
 # anything one-off, in the same image with the same mounts:
 docker compose run --rm cli pretorin --json context show
-docker compose run --rm cli openclaw agent --agent main -m "..."
+docker compose exec openclaw openclaw agent --agent main -m "..."
 ```
+
+**`exec openclaw`, not `run --rm cli`, for agent turns.** `openclaw agent` talks to the
+gateway over `127.0.0.1:18789`, and the `cli` service is a *different container* with
+nothing on its own loopback — so there it silently falls back to running the agent
+embedded, where model resolution is stricter and fails with
+`Unknown model: ...`. Setting `OPENCLAW_GATEWAY_URL` does not help; resolution
+happens before dispatch. Everything else (`pretorin ...`, `openclaw mcp ...`,
+`openclaw config ...`) works fine under `run --rm cli`, because it needs no gateway.
 
 Two ordering rules, both of which bite silently if ignored:
 
