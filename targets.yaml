@@ -17,10 +17,27 @@ system_id: 7b74d8f3-d77c-49e4-8792-c372dd154d38
 framework_id: soc2
 
 # One or many targets. `name` becomes a directory name and a container path, so
-# it is restricted to [A-Za-z0-9._-]. `url` must be an https:// git remote that
-# clones anonymously — private and SSH remotes are future work. `ref` is
-# optional; without it the clone stays on the remote's default branch.
+# it is restricted to [A-Za-z0-9._-]. `url` must be an https:// git remote; SSH
+# remotes are not supported. `ref` is optional; without it the clone stays on the
+# remote's default branch.
+#
+# `private: true` marks a target that needs authentication to clone. It is a FLAG
+# ONLY — no token, no credential, and no path to one appears in this file, which is
+# committed. scripts/bootstrap.sh mints a short-lived read-only GitHub App
+# installation token on the host, clones with it, and deletes it; the container
+# receives the working tree over its read-only mount and never a git credential.
+# Private targets must be on github.com, since that is where the App token works.
+# Configure the App in .env (GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE).
 targets:
   - name: simple-crm
     url: https://github.com/pretorin-ai/simple-crm.git
     ref: main
+
+  # The private example. Present so a fresh clone exercises the private path end
+  # to end; it is a test/example target and nothing else depends on it. Remove it
+  # if you have no GitHub App configured — a private target with no App is a hard
+  # failure, on purpose, rather than a silent anonymous clone attempt.
+  - name: crm-deploy
+    url: https://github.com/pretorin-ai/crm-deploy.git
+    ref: master
+    private: true

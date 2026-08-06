@@ -11,6 +11,12 @@ before selecting MCP tools. Use start_task for compliance work involving a syste
 framework, control, questionnaire or campaign. Follow the returned workflow and
 prefer Pretorin recipes when available.
 
+Do not switch the active system or framework in conversation. This deployment is
+onboarded to one scope, and only that scope has repositories bound to it — asking
+to work on a different framework leaves the session with no bound sources and
+answers that reference nothing. If a different scope is needed, say so and stop:
+the operator re-runs scripts/onboard-targets.sh for it.
+
 ## Review targets
 
 Repositories under /workspace/targets are mounted read-only. Review them, never

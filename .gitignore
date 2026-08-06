@@ -1,6 +1,13 @@
 # Local secrets — never commit. See .env.example.
 .env
 
+# The GitHub App private key used to clone private targets. HOST ONLY — it is
+# never mounted into a container and never referenced by compose. .env names its
+# PATH; this is the key itself. Both patterns, because a key saved anywhere in the
+# tree by mistake still must not be committable.
+secrets/
+*.pem
+
 # Agent working tree (read-only compliance review scratch space).
 workspace/
 

@@ -33,8 +33,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # compose.yaml pulls the published image by default, which is wrong for CI:
+    # the point here is to test the code in this commit, not whatever was last
+    # released. The overlay adds the build section back. COMPOSE_FILE is docker
+    # compose's own mechanism, so bootstrap.sh, onboard-targets.sh and smoke.sh
+    # all inherit it without a CI-specific flag.
+    env:
+      COMPOSE_FILE: compose.yaml:compose.build.yaml
+
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to a commit: a tag is mutable, and this is the step that fetches
+      # the code everything else in the job then runs.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Show toolchain
         run: |
@@ -47,17 +57,28 @@ jobs:
       # break in bootstrap.sh fails here instead of on someone's laptop. It
       # clones the public target from targets.yaml, writes a throwaway .env with
       # a generated gateway token (PRETORIN_API_KEY stays empty), and builds.
-      - name: Bootstrap (clone targets, write .env, build image)
-        run: bash scripts/bootstrap.sh
+      - name: Bootstrap (write .env, clone targets, build image)
+        run: bash scripts/bootstrap.sh --build
 
       - name: Assert no credentials are configured
         run: |
           set -e
-          if grep -qE '^PRETORIN_API_KEY=.+' .env; then
-            echo "::error::CI generated a .env with a Pretorin key. It must stay empty."
-            exit 1
+          fail=0
+          # Phase 5 adds two more secret classes that must never reach CI: Slack
+          # tokens and the GitHub App private key. Checked by name rather than by
+          # value, because there is no value here to compare against.
+          for k in PRETORIN_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN GITHUB_APP_ID; do
+            if grep -qE "^${k}=.+" .env; then
+              echo "::error::CI generated a .env with ${k} set. It must stay empty."
+              fail=1
+            fi
+          done
+          if ls secrets/*.pem >/dev/null 2>&1; then
+            echo "::error::a private key is present under secrets/. CI must hold none."
+            fail=1
           fi
-          echo "PRETORIN_API_KEY is empty, as required."
+          [ "$fail" = 0 ] || exit 1
+          echo "No Pretorin, Slack, model or GitHub App credentials are configured."
 
       - name: Smoke test (no-credential section only)
         run: bash scripts/smoke.sh --no-creds

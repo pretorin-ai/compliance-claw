@@ -4,7 +4,10 @@
 #
 #   SECTION A — no credentials. This is what CI runs. It proves the image, the
 #               generated config, the mount posture, the stale-template warning,
-#               and the CWD fix, all without a Pretorin key or a model key.
+#               the CWD fix, the secret containment of every secret class, the
+#               private-target refusals, and that a FRESH volume comes up
+#               Slack-configured with no manual JSON — all without a Pretorin key,
+#               a model key, a Slack token or a GitHub App.
 #
 #   SECTION B — credentialed. Runs only when PRETORIN_API_KEY authenticates,
 #               skips cleanly otherwise. Proves onboarding end to end, that the
@@ -80,14 +83,28 @@ trap cleanup EXIT
 
 IFS=$'\t' read -r SYSTEM_ID FRAMEWORK_ID < <(python3 scripts/parse-targets.py scope)
 TARGET_NAMES=()
-while IFS=$'\t' read -r n _u _r; do [ -n "$n" ] && TARGET_NAMES+=("$n"); done \
-  < <(python3 scripts/parse-targets.py list)
+PRIVATE_NAMES=()
+# name/url/private/ref — private before ref, because tab is IFS whitespace and an
+# absent ref would otherwise collapse the fields. See parse-targets.py.
+while IFS=$'\t' read -r n _u p _r; do
+  [ -n "$n" ] || continue
+  TARGET_NAMES+=("$n")
+  [ "$p" = "true" ] && PRIVATE_NAMES+=("$n")
+done < <(python3 scripts/parse-targets.py list)
 FIRST_TARGET="${TARGET_NAMES[0]}"
 
 printf '\033[1mcompliance-claw smoke test\033[0m\n'
 printf 'repo:    %s\n' "$REPO_ROOT"
 printf 'scope:   %s / %s\n' "$SYSTEM_ID" "$FRAMEWORK_ID"
 printf 'targets: %s\n' "${TARGET_NAMES[*]}"
+printf 'private: %s\n' "${PRIVATE_NAMES[*]:-<none>}"
+# compose.yaml pulls by default. Anything here that re-runs bootstrap therefore
+# needs the released image to exist — except in build mode, which bootstrap.sh
+# detects from COMPOSE_FILE on its own.
+case "${COMPOSE_FILE:-}" in
+  *compose.build.yaml*) printf 'image:   local build (COMPOSE_FILE overlay)\n' ;;
+  *)                    printf 'image:   published (compose.yaml pulls; use the build overlay pre-release)\n' ;;
+esac
 
 # ===========================================================================
 head1 "SECTION A — no credentials (this is what CI runs)"
@@ -120,29 +137,82 @@ for _ in $(seq 1 60); do
 done
 [ "$READY" = 1 ] && pass "gateway answers /healthz" || fail "gateway answers /healthz" "timed out after 120s"
 
+# Read once, up front: the expected plugin profile below is decided by what is
+# actually in the config, and several later checks assert on the same text.
+CFG="$(val cat /home/node/.openclaw/openclaw.json)"
+CFG_RAW="$CFG"
+if printf '%s' "$CFG" | grep -q '/opt/compliance-claw/plugins/slack'; then
+  SLACK_PROFILE=1
+  printf '  config profile: SLACK (plugins.allow is exclusive, bundled set trimmed)\n'
+else
+  SLACK_PROFILE=0
+  printf '  config profile: no Slack (Phase 4 baseline, 8 bundled plugins)\n'
+fi
+
 # The WHOLE log, not `tail -N`: the plugin banner is printed once at startup, so
 # on a gateway that has been up for hours a tail no longer contains it — and then
 # the codex-absence check below passes against an empty string, which is a lie
 # rather than a pass.
+#
+# REGRESSION FIX. The Phase 4 pattern was '([0-9]* plugins:[^)]*)', which stopped
+# matching entirely once Slack shipped, for two independent reasons:
+#   - the banner says "1 plugin" (SINGULAR) when only one plugin activates
+#   - it now carries a timing suffix: "(1 plugin: slack; 0.6s)"
+# The check failed loudly rather than passing vacuously — Phase 4 fixed that class
+# — but a check that can never pass is still a dead check.
 LOGS="$(docker compose logs openclaw 2>&1)"
-PLUGIN_LINE="$(printf '%s' "$LOGS" | grep -o '([0-9]* plugins:[^)]*)' | tail -1)"
+PLUGIN_LINE="$(printf '%s' "$LOGS" | grep -oE '\([0-9]+ plugins?: [^)]*\)' | tail -1)"
 if [ -z "$PLUGIN_LINE" ]; then
   fail "runtime pin holds: plugin banner found in the log" \
-       "no '(N plugins: ...)' line; the codex-absence check cannot be trusted without it"
+       "no '(N plugin(s): ...)' line; the codex-absence check cannot be trusted without it"
 else
-  has   "runtime pin holds: 8 plugins" "8 plugins" "$PLUGIN_LINE"
-  hasnt "codex plugin absent (agentRuntime pin active)" "codex" "$PLUGIN_LINE"
+  # Strip the wrapper and the "; 0.6s" timing so what is compared is the name set.
+  PLUGIN_NAMES="$(printf '%s' "$PLUGIN_LINE" | sed -E 's/^\([0-9]+ plugins?: //; s/\)$//; s/;.*$//')"
+  # TWO PROFILES, and which one applies is decided by the config, not by hope.
+  # Slack's patch sets plugins.allow, which is an EXCLUSIVE allowlist and
+  # therefore also trims the bundled set. Asserting a single expected number would
+  # mean one of the two profiles is always failing.
+  if [ "$SLACK_PROFILE" = 1 ]; then
+    has "runtime plugin set is exactly 'slack' (Slack profile)" "slack" "$PLUGIN_NAMES"
+    if [ "$PLUGIN_NAMES" = "slack" ]; then
+      pass "no bundled plugin activates under the exclusive allowlist"
+    else
+      fail "no bundled plugin activates under the exclusive allowlist" "got: ${PLUGIN_NAMES}"
+    fi
+  else
+    has "runtime plugin set is the 8 bundled (no-Slack profile)" "8 plugins" "$PLUGIN_LINE"
+    for p in browser canvas device-pair file-transfer memory-core ollama phone-control talk-voice; do
+      has "  bundled plugin present: ${p}" "$p" "$PLUGIN_NAMES"
+    done
+  fi
+  # Independent of the profile, and still the point of the pin: the Codex
+  # app-server harness must not be the runtime. The allowlist would now mask codex
+  # on its own, so the log line below is what actually proves the pin.
+  hasnt "codex plugin absent from the banner" "codex" "$PLUGIN_LINE"
 fi
 
 # Assert on values, not on formatting. OpenClaw can rewrite this file as strict
 # JSON (observed: `gateway: {` becomes `"gateway": {` and every comment is
 # dropped), so matching JSON5 syntax makes this check fail on a healthy
 # deployment. These three survive any reformat.
-CFG="$(val cat /home/node/.openclaw/openclaw.json)"
 has "config seeded into the state volume" '18789' "$CFG"
 has "config registers the Pretorin MCP server" '/usr/local/bin/pretorin' "$CFG"
 has "config keeps the key as a substitution, not a value" '${PRETORIN_API_KEY}' "$CFG"
 has "config carries the MCP cwd fix" '/opt/compliance-claw/no-repo' "$CFG"
+
+# The orphaned-allowlist trap: plugins.allow is exclusive, so a config that keeps
+# it after channels.slack is removed silently runs with seven bundled plugins gone
+# and no Slack to show for it, and nothing in the log explains why. The two must
+# move together.
+HAS_ALLOW=0; HAS_CHAN=0
+printf '%s' "$CFG" | grep -q '"allow"' && HAS_ALLOW=1
+printf '%s' "$CFG" | grep -qE '"slack"[[:space:]]*:[[:space:]]*\{' && HAS_CHAN=1
+if [ "$HAS_ALLOW" = "$HAS_CHAN" ]; then
+  pass "plugins.allow and channels.slack are both-or-neither (allow=${HAS_ALLOW} slack=${HAS_CHAN})"
+else
+  fail "plugins.allow and channels.slack are both-or-neither" \
+       "allow=${HAS_ALLOW} slack=${HAS_CHAN} — an orphaned exclusive allowlist trims the bundled plugins for nothing"
+fi
 AG="$(val cat /home/node/.openclaw/workspace/AGENTS.md)"
 has "AGENTS.md seeded" "Review targets" "$AG"
 has "AGENTS.md requires target selection" "state which target" "$AG"
@@ -154,6 +224,88 @@ if [ "$STAMP_BACKUP" = "$SHIPPED" ]; then
 else
   fail "template marker written and current" "marker='${STAMP_BACKUP}' shipped='${SHIPPED}'"
 fi
+
+head2 "A4b. the published image version agrees with versions.env"
+V_REPO="$(awk -F= '/^IMAGE_REPO=/{print $2}' versions.env)"
+V_VER="$(awk -F= '/^IMAGE_VERSION=/{print $2}' versions.env)"
+# compose.yaml has to restate the literal because compose cannot source a file.
+# That duplication is documented in both files; this is what keeps it honest.
+if [ -n "$V_REPO" ] && [ -n "$V_VER" ]; then
+  if grep -qE "^[[:space:]]*image:[[:space:]]*${V_REPO}:${V_VER}([[:space:]]|@|\$)" compose.yaml; then
+    pass "compose.yaml image matches versions.env (${V_REPO}:${V_VER})"
+  else
+    fail "compose.yaml image matches versions.env" \
+         "expected ${V_REPO}:${V_VER}; found: $(grep -E '^[[:space:]]*image:' compose.yaml | head -1 | tr -s ' ')"
+  fi
+else
+  fail "versions.env declares IMAGE_REPO and IMAGE_VERSION"
+fi
+# The default compose file must never be able to build: with a build section
+# present, `up` builds whenever the image is absent locally, which would let an
+# unscanned, unsigned local image stand in for the released one.
+if grep -qE '^[[:space:]]*build:' compose.yaml; then
+  fail "compose.yaml has no build section (pull-only by default)" \
+       "a build: section lets 'docker compose up' silently build instead of pulling"
+else
+  pass "compose.yaml has no build section (pull-only by default)"
+fi
+ok "compose.build.yaml restores the build path" \
+   bash -c 'COMPOSE_FILE=compose.yaml:compose.build.yaml docker compose config --format json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)[\"services\"]
+assert all(s.get(\"build\") for s in d.values()), \"a service has no build section\"
+assert all(s[\"image\"]==\"compliance-claw:local\" for s in d.values()), \"image is not the local tag\"
+"'
+
+head2 "A4c. SECRET CONTAINMENT — every secret class, not just the Pretorin key"
+# Phase 3 canaried PRETORIN_API_KEY across the rendered config, the state volume,
+# the image layers and the container logs. Phase 5 adds two more classes and they
+# get the same treatment, because "the container never holds git credentials" is a
+# claim this repository makes and an unasserted claim is not a gate.
+#
+# Slack tokens DO reach the container environment (that is how OpenClaw reads
+# them) but must never be written to disk. The GitHub App private key must not
+# reach the container at all — not the filesystem, not the environment.
+SLACK_CANARY_BOT="CANARY-SLACK-BOT-7c1e9f2a4b"
+SLACK_CANARY_APP="CANARY-SLACK-APP-3d8b6a5e0c"
+
+# Config on disk: the Slack block must name no token at all, not even a ${VAR}.
+hasnt "config holds no Slack bot token value"   "xoxb-" "$CFG"
+hasnt "config holds no Slack app token value"   "xapp-" "$CFG"
+# The SUBSTITUTION MARKER, not the bare name: the template's own comments mention
+# SLACK_BOT_TOKEN by name to explain why it is deliberately absent, and matching
+# that is a false positive. `${SLACK_BOT_TOKEN}` is what an actual config
+# reference would look like.
+hasnt "config holds no Slack token substitution" '${SLACK_BOT_TOKEN}' "$CFG"
+hasnt "config holds no Slack app-token substitution" '${SLACK_APP_TOKEN}' "$CFG"
+
+# The whole state volume, with canary values actually present in the environment.
+CANARY_HITS="$(SLACK_BOT_TOKEN="$SLACK_CANARY_BOT" SLACK_APP_TOKEN="$SLACK_CANARY_APP" \
+  docker compose run --rm -T \
+    -e SLACK_BOT_TOKEN="$SLACK_CANARY_BOT" -e SLACK_APP_TOKEN="$SLACK_CANARY_APP" \
+    cli bash -c 'grep -rl "CANARY-SLACK-" /home/node/.openclaw /home/node/.pretorin 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r\n')"
+if [ "${CANARY_HITS:-x}" = 0 ]; then
+  pass "no Slack token value anywhere in either state volume"
+else
+  fail "no Slack token value anywhere in either state volume" "${CANARY_HITS} file(s) contain a canary token"
+fi
+
+# Image layers. `docker history` plus a filesystem sweep of the paths a secret
+# could plausibly have been copied into.
+IMG="$(docker compose config --format json 2>/dev/null | python3 -c 'import json,sys; print(list(json.load(sys.stdin)["services"].values())[0]["image"])')"
+ok "no .env baked into the image" \
+   bash -c "docker run --rm --entrypoint bash '$IMG' -lc '! test -e /app/.env && ! test -e /opt/compliance-claw/.env'"
+ok "no PEM private key anywhere in the image" \
+   bash -c "docker run --rm --entrypoint bash '$IMG' -lc '! grep -rl \"BEGIN RSA PRIVATE KEY\" /opt/compliance-claw /app/skills 2>/dev/null | grep -q .'"
+ok "no secrets/ directory in the image" \
+   bash -c "docker run --rm --entrypoint bash '$IMG' -lc '! test -d /opt/compliance-claw/secrets && ! test -d /secrets'"
+# The GitHub App key is host-only by design. Nothing mounts it, so it must be
+# absent from a running container even when it exists on the host.
+ok "the GitHub App key is not visible inside the container" \
+   cli bash -c '! find / -maxdepth 4 -name "*.pem" 2>/dev/null | grep -qv "^/usr/lib\|^/etc/ssl\|node_modules"'
+LOGCANARY="$(printf '%s' "$LOGS" | grep -c 'CANARY-SLACK-' || true)"
+[ "${LOGCANARY:-0}" = 0 ] && pass "no Slack token value in the gateway logs" \
+  || fail "no Slack token value in the gateway logs" "${LOGCANARY} line(s)"
 
 head2 "A5. mount posture"
 notok "targets are read-only in-container" cli touch /workspace/targets/smoke-canary
@@ -216,9 +368,12 @@ SCRATCH_YAML="$(mktemp "${TMPDIR:-/tmp}/smoke-targets.XXXXXX")"
   printf 'system_id: %s\n' "$SCRATCH_SYS"
   printf 'framework_id: %s\n' "$SCRATCH_FW"
   printf 'targets:\n'
-  while IFS=$'\t' read -r n u r; do
+  # FOUR fields, in the order name/url/private/ref. Reading them in any other
+  # order silently mangles the scratch file.
+  while IFS=$'\t' read -r n u p r; do
     [ -n "$n" ] || continue
     printf '  - name: %s\n    url: %s\n' "$n" "$u"
+    [ "$p" = "true" ] && printf '    private: true\n'
     [ -n "$r" ] && printf '    ref: %s\n' "$r"
   done < <(python3 scripts/parse-targets.py list)
 } > "$SCRATCH_YAML"
@@ -323,6 +478,116 @@ else
   skip ".env and bootstrap idempotency checks" "no .env present; run scripts/bootstrap.sh first"
 fi
 
+head2 "A11. private targets refuse rather than prompt (negative paths)"
+# Mirrors A9's shape: the interesting behaviour of the private path is its
+# refusals, and all three of them are reachable with no credentials at all.
+PRIV_YAML="$(mktemp "${TMPDIR:-/tmp}/smoke-priv.XXXXXX")"
+priv_yaml() {
+  printf 'system_id: %s\nframework_id: %s\ntargets:\n  - name: smoke-private\n    url: %s\n    private: true\n' \
+    "$SCRATCH_SYS" "$SCRATCH_FW" "${1:-https://github.com/pretorin-ai/does-not-exist.git}" > "$PRIV_YAML"
+}
+
+# 1. private target, no GitHub App configured at all.
+priv_yaml
+OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+       bash scripts/bootstrap.sh 2>&1)"; RC=$?
+[ "$RC" != 0 ] && pass "bootstrap refuses a private target with no GitHub App" \
+  || fail "bootstrap refuses a private target with no GitHub App" "it succeeded"
+has "the refusal names GITHUB_APP_ID" "GITHUB_APP_ID" "$OUT"
+hasnt "the refusal does not hang on a credential prompt" "Username for" "$OUT"
+
+# 2. App id present, key file missing.
+OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
+       GITHUB_APP_PRIVATE_KEY_FILE=secrets/definitely-not-here.pem \
+       bash scripts/bootstrap.sh 2>&1)"; RC=$?
+[ "$RC" != 0 ] && pass "bootstrap refuses a private target with a missing key file" \
+  || fail "bootstrap refuses a private target with a missing key file" "it succeeded"
+has "the refusal names the key path" "definitely-not-here.pem" "$OUT"
+
+# 3. A private target must not be silently cloned anonymously.
+[ ! -e workspace/targets/smoke-private ] \
+  && pass "no clone was attempted for the refused private target" \
+  || fail "no clone was attempted for the refused private target" "workspace/targets/smoke-private exists"
+
+# 4. The parser rejects a private target that could never work.
+notok "parser rejects private: true on a non-github host" \
+  bash -c 'printf "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://gitlab.com/o/r.git\n    private: true\n" > '"$PRIV_YAML"' && python3 scripts/parse-targets.py list '"$PRIV_YAML"
+notok "parser rejects a non-boolean private value" \
+  bash -c 'printf "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: yes\n" > '"$PRIV_YAML"' && python3 scripts/parse-targets.py list '"$PRIV_YAML"
+rm -f "$PRIV_YAML"
+
+# 5. No clone under workspace/targets may carry a persisted git credential. This
+#    is the assertion behind "the container never holds git credentials": the
+#    clones are what the container actually sees.
+LEAKS=0
+for d in workspace/targets/*/; do
+  [ -f "${d}.git/config" ] || continue
+  if grep -qE 'x-access-token|ghs_|github_pat_|://[^/@]*:[^/@]*@' "${d}.git/config" 2>/dev/null; then
+    LEAKS=$((LEAKS + 1))
+    printf '        leak in %s.git/config\n' "$d"
+  fi
+done
+[ "$LEAKS" = 0 ] && pass "no target clone has a credential in .git/config" \
+  || fail "no target clone has a credential in .git/config" "${LEAKS} clone(s)"
+
+head2 "A12. Slack seeds from a fresh volume with zero manual JSON"
+# Runs against a THROWAWAY container, never the operator's volume: the whole claim
+# is about what happens on a fresh seed, and the real volume is already seeded.
+SLACK_IMG="$IMG"
+slack_seed() {
+  # $1.. -> -e flags; prints the seeded config state plus entrypoint stderr.
+  #
+  # NO --entrypoint OVERRIDE. The seeding this section exists to test IS the
+  # entrypoint, so overriding it produces a container with no config at all and
+  # every assertion below fails for a reason that has nothing to do with Slack.
+  # The image's own ENTRYPOINT runs, seeds, then execs `tini -s -- bash -c ...`.
+  docker run --rm --platform linux/amd64 "$@" "$SLACK_IMG" bash -c '
+    grep -q "/opt/compliance-claw/plugins/slack" /home/node/.openclaw/openclaw.json \
+      && echo "SLACK_IN_CONFIG=yes" || echo "SLACK_IN_CONFIG=no"
+    openclaw --version >/dev/null 2>&1 && echo "STILL_WORKS=yes" || echo "STILL_WORKS=no"
+    grep -c CANARY /home/node/.openclaw/openclaw.json 2>/dev/null | sed "s/^/CANARY_HITS=/"
+  ' 2>&1
+}
+S_OK="$(slack_seed -e SLACK_BOT_TOKEN="$SLACK_CANARY_BOT" -e SLACK_APP_TOKEN="$SLACK_CANARY_APP" -e SLACK_CHANNEL_ID=C0SMOKE123)"
+has  "fresh volume + 3 vars -> Slack is in the config" "SLACK_IN_CONFIG=yes" "$S_OK"
+has  "  and the patch reports success"                 "Slack configured"    "$S_OK"
+has  "  and no token value reached the config"         "CANARY_HITS=0"       "$S_OK"
+ok   "  and the plugin loads from the image path" \
+     bash -c "docker run --rm --platform linux/amd64 -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y -e SLACK_CHANNEL_ID=C0SMOKE123 '$SLACK_IMG' bash -c 'openclaw plugins inspect slack 2>/dev/null | grep -q \"^Status: loaded\"'"
+
+S_NAME="$(slack_seed -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y -e SLACK_CHANNEL_ID='#a-channel-name')"
+has  "channel NAME instead of ID is refused" "is not a Slack channel id" "$S_NAME"
+has  "  and Slack is left unconfigured"      "SLACK_IN_CONFIG=no"        "$S_NAME"
+has  "  and the container still works"       "STILL_WORKS=yes"           "$S_NAME"
+
+S_INJ="$(slack_seed -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y -e SLACK_CHANNEL_ID='C123456","evil":{"x')"
+has  "a channel id carrying JSON is refused before substitution" "not A-Z or 0-9" "$S_INJ"
+has  "  and Slack is left unconfigured"                          "SLACK_IN_CONFIG=no" "$S_INJ"
+
+S_PART="$(slack_seed -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y)"
+has  "2-of-3 Slack vars warns instead of half-configuring" "only partially configured" "$S_PART"
+has  "  and names what is missing"                         "SLACK_CHANNEL_ID"          "$S_PART"
+has  "  and Slack is left unconfigured"                    "SLACK_IN_CONFIG=no"        "$S_PART"
+
+S_NONE="$(slack_seed)"
+hasnt "no Slack vars is silent (no warning)" "Slack"              "$S_NONE"
+has   "  and the config is the Phase 4 baseline" "SLACK_IN_CONFIG=no" "$S_NONE"
+
+# THE CRITICAL GAP this phase closes: an already-seeded volume plus Slack
+# credentials used to be silent. Two passes over one throwaway volume.
+T2_VOL="cc-smoke-t2-$$"
+docker volume create "$T2_VOL" >/dev/null 2>&1
+docker run --rm --platform linux/amd64 -v "$T2_VOL":/home/node/.openclaw \
+  "$SLACK_IMG" bash -c true >/dev/null 2>&1
+T2_OUT="$(docker run --rm --platform linux/amd64 -v "$T2_VOL":/home/node/.openclaw \
+  -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y -e SLACK_CHANNEL_ID=C0SMOKE123 \
+  "$SLACK_IMG" bash -c 'grep -c "plugins/slack" /home/node/.openclaw/openclaw.json || true' 2>&1)"
+docker volume rm "$T2_VOL" >/dev/null 2>&1
+has "existing config + Slack env warns specifically" "Slack is configured in .env but NOT in this volume" "$T2_OUT"
+has "  the warning offers the down -v reset"         "down -v"    "$T2_OUT"
+has "  the warning offers the by-hand patch"         "config patch" "$T2_OUT"
+hasnt "  and never-clobber still holds (config untouched)" "plugins/slack" "$(printf '%s' "$T2_OUT" | grep -v 'NOT in this volume')"
+
 # ===========================================================================
 head1 "SECTION B — credentialed integration test"
 # ===========================================================================
@@ -333,8 +598,16 @@ elif ! AUTH="$(val pretorin --json whoami)" \
      || ! printf '%s' "$AUTH" | grep -q '"authenticated": *true'; then
   skip "entire credentialed section" "PRETORIN_API_KEY is absent or does not authenticate"
 else
+  # FAIL SAFE ON AN ABSENT DECLARATION. This used to default to "read-only" when
+  # PRETORIN_KEY_MODE was missing, which is backwards: the probe below CREATES A
+  # REAL PLATFORM RECORD if the key turns out to be write-enabled, and a .env
+  # written before Phase 4 has no such line at all (never-clobber means it is
+  # never added retroactively). Observed exactly that — an undeclared,
+  # write-enabled key, and the probe succeeded and created a risk.
+  #
+  # Absence of a declaration now means "do not do the irreversible thing".
   KEY_MODE="${PRETORIN_KEY_MODE:-$(grep -E '^PRETORIN_KEY_MODE=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')}"
-  KEY_MODE="${KEY_MODE:-read-only}"
+  KEY_MODE="${KEY_MODE:-undeclared}"
   printf '  key authenticates; declared mode: %s\n' "$KEY_MODE"
 
   head2 "B1. real onboarding against the declared scope"
@@ -370,7 +643,12 @@ else
   fi
 
   head2 "B4. a write tool is rejected server-side"
-  if [ "$KEY_MODE" != "read-only" ]; then
+  if [ "$KEY_MODE" = "undeclared" ]; then
+    skip "write-tool rejection probe" \
+      "PRETORIN_KEY_MODE is not set in .env. This probe CREATES A REAL RECORD if the
+        key has write scope, so an undeclared key is never probed. Add
+        PRETORIN_KEY_MODE=read-only to .env if that is what you are running."
+  elif [ "$KEY_MODE" != "read-only" ]; then
     skip "write-tool rejection probe" "PRETORIN_KEY_MODE=${KEY_MODE}: a write-enabled key would CREATE a real record"
   else
     ARGS="$(python3 - "$SYSTEM_ID" "$FRAMEWORK_ID" <<'PY'

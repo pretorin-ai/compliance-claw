@@ -3,8 +3,22 @@
 
 Usage:
     parse-targets.py scope [FILE]    -> "<system_id>\\t<framework_id>"
-    parse-targets.py list  [FILE]    -> one line per target: "<name>\\t<url>\\t<ref>"
+    parse-targets.py list  [FILE]    -> "<name>\\t<url>\\t<private>\\t<ref>"
     parse-targets.py --self-test     -> run the validation case table
+
+FIELD ORDER IS LOAD-BEARING, and `ref` is last for a reason worth stating:
+
+    TAB IS AN IFS *WHITESPACE* CHARACTER, so `IFS=$'\\t' read -r A B C D`
+    collapses consecutive tabs into ONE delimiter. A target with no `ref`
+    emitted as "name<TAB>url<TAB><TAB>true" is read as THREE fields, and
+    `true` lands in the ref variable while private comes back empty — a
+    private repository silently treated as public, which then fails with an
+    authentication error that reads like a network fault.
+
+Only the LAST field may ever be empty. `private` is always the literal "true" or
+"false" and never empty, so it is safe in the middle; `ref` is optional, so it
+goes at the end. Any future optional field must also go after it, or the shell
+readers in bootstrap.sh and smoke.sh have to stop using tab.
 
 FILE defaults to targets.yaml beside this script's parent directory.
 
@@ -25,6 +39,7 @@ The subset:
       - name: <scalar>
         url: <scalar>
         ref: <scalar>        # optional
+        private: true|false  # optional, default false
 
 Comments (whole-line and trailing ` #`), single/double quoted scalars, and
 blank lines are handled. Everything else -- tabs, anchors, nested maps, flow
@@ -36,8 +51,14 @@ import re
 import sys
 
 TOP_KEYS = ("system_id", "framework_id")
-ITEM_KEYS = ("name", "url", "ref")
+ITEM_KEYS = ("name", "url", "ref", "private")
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# A private target is cloned by scripts/bootstrap.sh using a GitHub App
+# installation token, which only exists for github.com. Any other host would
+# silently fall back to an anonymous clone and fail as if the repo were missing,
+# so the host is restricted here where the error can name the real reason.
+PRIVATE_URL_PREFIX = "https://github.com/"
 
 
 class ParseError(Exception):
@@ -180,8 +201,28 @@ def validate(scope, targets):
         if not item["url"].startswith("https://"):
             raise ParseError(
                 line,
-                "target '%s' url must start with https:// (private/SSH remotes are future work)"
+                "target '%s' url must start with https:// (SSH remotes are not supported)"
                 % name,
+            )
+
+        # Strict boolean. YAML would accept yes/on/True for `private`, and a value
+        # that quietly parses as "not true" is the dangerous direction: a private
+        # repo treated as public fails with an authentication error that looks
+        # like a network problem. Two spellings, nothing else.
+        raw = item.get("private", "false")
+        if raw not in ("true", "false"):
+            raise ParseError(
+                line,
+                "target '%s' private must be exactly 'true' or 'false', got '%s'"
+                % (name, raw),
+            )
+        item["private"] = raw
+        if raw == "true" and not item["url"].startswith(PRIVATE_URL_PREFIX):
+            raise ParseError(
+                line,
+                "target '%s' is private but its url is not on github.com; private"
+                " targets are cloned with a GitHub App installation token, which"
+                " only works for %s" % (name, PRIVATE_URL_PREFIX),
             )
     return scope, targets
 
@@ -214,6 +255,9 @@ targets:
     ref: main
   - name: other
     url: 'https://example.com/b.git'   # trailing comment
+  - name: secret-repo
+    url: https://github.com/acme/secret-repo.git
+    private: true
 """
 
 CASES = [
@@ -239,11 +283,50 @@ CASES = [
     ("unbalanced quote", "system_id: 'a\nframework_id: b\ntargets:\n  - name: x\n    url: https://e/r.git\n", "unbalanced quote"),
     ("bare dash", "system_id: a\nframework_id: b\ntargets:\n  -\n", "expected '- name: <value>'"),
     ("no colon", "system_id: a\nframework_id b\n", "expected 'key: value'"),
+    # private: the dangerous direction is a value that parses as "not true", which
+    # turns a private repo into a public one and produces an auth error that reads
+    # like a network fault. Every YAML-truthy spelling other than `true` is rejected.
+    ("private: yes", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: yes\n", "must be exactly 'true' or 'false'"),
+    ("private: True", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: True\n", "must be exactly 'true' or 'false'"),
+    ("private: 1", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: 1\n", "must be exactly 'true' or 'false'"),
+    ("private on a non-github host", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://gitlab.com/o/r.git\n    private: true\n", "only works for https://github.com/"),
+    ("duplicate private key", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: true\n    private: false\n", "duplicate key 'private'"),
 ]
+
+
+def _shell_reads_private_correctly():
+    """Read our own `list` output the way bootstrap.sh does, in a real shell.
+
+    This is not a parser test. It guards the FIELD ORDER contract described in
+    the module docstring: tab is IFS whitespace, so a target with no `ref` would
+    collapse two tabs into one and shift `private` into the wrong variable.
+    A pure-Python assertion cannot catch that -- only bash can.
+    """
+    import subprocess
+    # A private target with NO ref: the exact shape that broke.
+    text = ("system_id: s\nframework_id: f\ntargets:\n"
+            "  - name: p\n    url: https://github.com/o/p.git\n    private: true\n"
+            "  - name: q\n    url: https://github.com/o/q.git\n    ref: main\n")
+    scope, targets = parse(text)
+    tsv = "".join("%s\t%s\t%s\t%s\n" % (t["name"], t["url"], t["private"], t.get("ref", ""))
+                  for t in targets)
+    script = ('while IFS="\t" read -r NAME URL PRIVATE REF; do '
+              'printf "%s:%s:%s\\n" "$NAME" "$PRIVATE" "$REF"; done')
+    out = subprocess.run(["bash", "-c", script], input=tsv,
+                         capture_output=True, text=True).stdout.strip().splitlines()
+    return out == ["p:true:", "q:false:main"], out
 
 
 def self_test():
     failures = 0
+
+    ok, observed = _shell_reads_private_correctly()
+    if ok:
+        print("PASS  bash reads private correctly when ref is absent")
+    else:
+        print("FAIL  bash misreads private when ref is absent: %r" % (observed,))
+        print("      field order must be name/url/private/ref -- tab is IFS whitespace")
+        failures += 1
 
     try:
         scope, targets = parse(GOOD)
@@ -253,11 +336,13 @@ def self_test():
     checks = [
         (scope.get("system_id") == "sys-1", "system_id"),
         (scope.get("framework_id") == "soc2", "framework_id"),
-        (len(targets) == 2, "target count"),
+        (len(targets) == 3, "target count"),
         (targets[0]["name"] == "simple-crm", "first name"),
         (targets[0].get("ref") == "main", "first ref"),
         (targets[1]["url"] == "https://example.com/b.git", "quoted url + trailing comment"),
         ("ref" not in targets[1], "absent ref stays absent"),
+        (targets[0]["private"] == "false", "absent private defaults to false"),
+        (targets[2]["private"] == "true", "private: true accepted on a github url"),
     ]
     for ok, label in checks:
         if ok:
@@ -281,7 +366,7 @@ def self_test():
 
     print("")
     print("parse-targets self-test: %d case(s) failed" % failures if failures else
-          "parse-targets self-test: all %d cases pass" % (len(CASES) + len(checks)))
+          "parse-targets self-test: all %d cases pass" % (len(CASES) + len(checks) + 1))
     return 1 if failures else 0
 
 
@@ -305,7 +390,12 @@ def main(argv):
         print("%s\t%s" % (scope["system_id"], scope["framework_id"]))
     else:
         for item in targets:
-            print("%s\t%s\t%s" % (item["name"], item["url"], item.get("ref", "")))
+            # private BEFORE ref: validate() always populates private, and only the
+            # last field may be empty. See the field-order note in the module
+            # docstring — getting this backwards silently turns a private
+            # repository into a public one.
+            print("%s\t%s\t%s\t%s" % (
+                item["name"], item["url"], item["private"], item.get("ref", "")))
     return 0
 
 

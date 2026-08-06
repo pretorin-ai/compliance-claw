@@ -1,9 +1,21 @@
 # compliance-claw — local linux/amd64 deployment.
 #
-#   scripts/bootstrap.sh                      # clone targets, write .env, build
+#   docker login ghcr.io                      # the package is not public
+#   scripts/bootstrap.sh                      # .env, clone targets, PULL the image
 #   scripts/onboard-targets.sh                # register targets with Pretorin
 #   docker compose up -d                      # gateway on http://127.0.0.1:18789
 #   docker compose run --rm cli pretorin version
+#
+# THIS FILE PULLS, IT NEVER BUILDS. There is deliberately no `build:` section:
+# with one present, `docker compose up` builds whenever the image is missing
+# locally, which would let a local build quietly stand in for the released,
+# scanned and signed image. Development builds are opt-in through an overlay:
+#
+#   export COMPOSE_FILE=compose.yaml:compose.build.yaml
+#   scripts/bootstrap.sh --build
+#
+# COMPOSE_FILE is docker compose's own mechanism, so every script in this repo
+# inherits the choice without a flag of its own.
 #
 # Onboard BEFORE `up`. Onboarding writes host-local Pretorin state, and a running
 # gateway keeps a per-session `pretorin mcp-serve` child alive that can serve the
@@ -29,14 +41,22 @@ name: compliance-claw
 # whose mounts differ from the gateway's would debug a different container than
 # the one that runs.
 x-compliance-claw: &compliance-claw
-  build:
-    context: .
   # Upstream publishes no linux/arm64 Pretorin binary, so amd64 is the
-  # deployment target even on Apple Silicon (emulated, and slow to build).
-  # This belongs to the service, not to `build:` — the Compose schema rejects
-  # `build.platform`, and the service key covers both the build and the run.
+  # deployment target even on Apple Silicon (emulated). This belongs to the
+  # service rather than under `build:` — the Compose schema rejects
+  # `build.platform`, and the service key covers both a build and the run.
   platform: linux/amd64
-  image: compliance-claw:local
+  # The published image. IMAGE_REPO and IMAGE_VERSION are authoritative in
+  # versions.env; this literal restates them because compose cannot source a
+  # file, and scripts/smoke.sh asserts the two agree. Same documented-duplication
+  # shape as the digest pins on the Dockerfile's FROM lines.
+  #
+  # PIN THE DIGEST once a release is published:
+  #   image: ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:<digest>
+  # A tag is mutable, and the digest an operator verified with `cosign verify` is
+  # not necessarily the digest they later pull. The release workflow prints the
+  # digest in its job summary for exactly this step; see README.md ('Releasing').
+  image: ghcr.io/pretorin-ai/compliance-claw:0.1.0
   env_file:
     # Gitignored and dockerignored, so nothing here is ever baked into a layer.
     # required:false because a fresh clone has no .env — Phase 4's bootstrap

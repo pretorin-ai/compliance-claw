@@ -56,6 +56,70 @@ RUN bash scripts/fetch-pretorin.sh dist \
  && rm -rf dist
 
 
+# The OpenClaw Slack channel plugin, resolved and integrity-checked at BUILD
+# time. Slack is NOT bundled in 2026.7.1 — `openclaw plugins list` reports 70
+# stock plugins and slack is not one of them — so it comes from npm.
+#
+# Why a build stage instead of `openclaw plugins install`: that command writes to
+# $OPENCLAW_STATE_DIR/npm/projects/..., i.e. INSIDE the ~/.openclaw named volume.
+# A managed install is therefore destroyed by `docker compose down -v` and can
+# never be pinned in an image. Installing here and pointing plugins.load.paths at
+# the image copy makes the plugin part of the image, like the Pretorin binary.
+#
+# This stage uses the OpenClaw image because it already carries the exact node
+# and npm the runtime will load the plugin with (node 24 / npm 11), so the
+# resolved tree is the tree that actually runs.
+FROM ghcr.io/openclaw/openclaw:2026.7.1@sha256:6a31d44b2944e7adcd2b582bf6fb463111264ebca97a0201795b799135bd102c AS slack-plugin
+
+USER root
+WORKDIR /build
+
+COPY versions.env ./
+
+# The gate: npm's own resolution is never trusted. The integrity recorded in the
+# generated package-lock.json is compared against the PINNED value in
+# versions.env, exactly as verify-pretorin.sh compares the binary against
+# PRETORIN_SHA256. A registry that serves different bytes under the same version
+# fails the build instead of shipping.
+#
+# No lock file is vendored here because the published package ships its own
+# npm-shrinkwrap.json, which pins all 103 transitive dependencies. That is also
+# why the tree ends up NESTED under the plugin directory rather than hoisted to
+# /build/node_modules, which is what makes copying just the plugin directory
+# self-contained.
+RUN . ./versions.env \
+ && test -n "${SLACK_PLUGIN_VERSION}" \
+ && test -n "${SLACK_PLUGIN_INTEGRITY}" \
+ && npm install --no-audit --no-fund --loglevel=error \
+      "@openclaw/slack@${SLACK_PLUGIN_VERSION}" \
+ && RESOLVED="$(node -e 'const e=require("/build/package-lock.json").packages["node_modules/@openclaw/slack"]; if(!e||!e.integrity){console.error("no package-lock entry for @openclaw/slack");process.exit(1)} process.stdout.write(e.integrity)')" \
+ && if [ "$RESOLVED" != "${SLACK_PLUGIN_INTEGRITY}" ]; then \
+      echo "SLACK PLUGIN INTEGRITY MISMATCH" >&2; \
+      echo "  pinned:   ${SLACK_PLUGIN_INTEGRITY}" >&2; \
+      echo "  resolved: ${RESOLVED}" >&2; \
+      echo "  Refusing to build. Re-derive the pin only after auditing the change:" >&2; \
+      echo "    npm view @openclaw/slack@${SLACK_PLUGIN_VERSION} dist.integrity" >&2; \
+      exit 1; \
+    fi \
+ && echo "SLACK PLUGIN VERIFIED: ${SLACK_PLUGIN_VERSION} ${RESOLVED}"
+
+# Structural assertions on what is about to be copied. Deliberately NOT
+# `import()` of dist/index.js: the plugin imports the host package `openclaw`,
+# which only resolves inside the gateway's own module graph, so a bare node
+# import always fails with "Cannot find package 'openclaw'" even on a perfectly
+# good install. What is checkable here is that the manifest says slack, the entry
+# point exists, and the nested dependency tree resolves. Proof that OpenClaw
+# actually LOADS it belongs to scripts/smoke.sh, which asserts
+# `openclaw plugins inspect slack` reports Status: loaded.
+RUN P=/build/node_modules/@openclaw/slack \
+ && test -f "$P/openclaw.plugin.json" \
+ && test "$(node -e 'process.stdout.write(require("/build/node_modules/@openclaw/slack/openclaw.plugin.json").id)')" = slack \
+ && test -f "$P/dist/index.js" \
+ && node -e 'require.resolve("@slack/bolt",{paths:["/build/node_modules/@openclaw/slack"]})' \
+ && node -e 'require.resolve("@slack/socket-mode",{paths:["/build/node_modules/@openclaw/slack"]})' \
+ && echo "slack plugin tree resolves"
+
+
 # Runtime: OpenClaw, with the verified Pretorin binary and its skill added.
 #
 # The digest is the OCI index, not the amd64 manifest — same as the debian pin
@@ -115,10 +179,27 @@ RUN install -d -o node -g node /opt/compliance-claw/no-repo \
       > /opt/compliance-claw/no-repo/README-DO-NOT-ADD-FILES.txt \
  && chown node:node /opt/compliance-claw/no-repo/README-DO-NOT-ADD-FILES.txt
 
+# The verified Slack plugin, outside the state volume so `down -v` cannot remove
+# it and a newer image always ships the pinned version. Just the package
+# directory: its dependency tree is nested inside it (the published package
+# carries npm-shrinkwrap.json), so nothing else from /build is needed.
+#
+# node-owned because OpenClaw refuses to load plugin files owned by a different
+# uid than the process — "blocked plugin candidate: suspicious ownership". The
+# runtime is uid 1000 (node), so this must be too.
+#
+# Referenced as plugins.load.paths in scripts/slack-channel.patch.json5.
+COPY --from=slack-plugin --chown=node:node \
+     /build/node_modules/@openclaw/slack /opt/compliance-claw/plugins/slack
+
 # Config is generated on first start, not baked: ~/.openclaw is a named volume,
 # so anything baked there would be shadowed on first start. These are the
-# templates the entrypoint installs from.
-COPY scripts/openclaw-config.template.json scripts/agents-md.template /opt/compliance-claw/
+# templates the entrypoint installs from. The Slack fragment is a separate patch
+# rather than part of the base template because Slack is optional: the entrypoint
+# applies it with `openclaw config patch` only on a fresh seed and only when the
+# operator supplied all three Slack variables.
+COPY scripts/openclaw-config.template.json scripts/agents-md.template \
+     scripts/slack-channel.patch.json5 /opt/compliance-claw/
 COPY scripts/entrypoint.sh /usr/local/bin/compliance-claw-entrypoint
 
 # The MCP stdio client used by scripts/smoke.sh to prove key posture — a read

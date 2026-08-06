@@ -11,6 +11,14 @@
 // ${VAR} is OpenClaw's own config-load substitution, NOT shell: the literal
 // text is what lands on disk and the value is resolved in memory from the
 // container environment. That is what keeps secrets out of the volume.
+//
+// SLACK IS NOT HERE ON PURPOSE. It is optional, and a config naming
+// channels.slack with no tokens retries a websocket forever. The Slack half
+// lives in slack-channel.patch.json5 and entrypoint.sh merges it with
+// `openclaw config patch` on a fresh seed, only when .env supplies all three of
+// SLACK_BOT_TOKEN, SLACK_APP_TOKEN and SLACK_CHANNEL_ID. Note that the patch sets
+// plugins.allow, which is an EXCLUSIVE allowlist and therefore also trims the
+// bundled plugin set — read that file before changing either.
 {
   gateway: {
     // Without mode:"local" the gateway refuses to start and exits 78.

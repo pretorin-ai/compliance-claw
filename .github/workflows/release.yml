@@ -1,0 +1,286 @@
+# Publish a versioned, scanned, SBOM-bearing, signed linux/amd64 image to GHCR.
+#
+# Triggered by a tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag must match IMAGE_VERSION in versions.env or the job refuses to run —
+# versions.env stays the single source of truth for what version this is.
+#
+# NO CREDENTIALS LIVE HERE. The only secret used is the automatic GITHUB_TOKEN,
+# and only to push to GHCR. There is no Pretorin API key, no model key, no Slack
+# token, and no cosign private key: image signing is keyless, using the workflow's
+# own OIDC identity. The "no credentials" step below asserts that rather than
+# trusting this comment.
+#
+# Scanning happens BEFORE the push, so a failing image is never published.
+#
+# Pin carve-out: `uses:` cannot read versions.env, so action SHAs are pinned here.
+# Everything else — cosign, trivy, syft — is installed from a pinned version with
+# a pinned SHA256, the same way the Dockerfile installs cosign.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build, scan and SBOM only — do not push, sign or attest"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write     # push to GHCR
+  id-token: write     # keyless signing via OIDC; no private key exists
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # actions/checkout v5, pinned to its commit.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Assert this workflow uses no credentials beyond GITHUB_TOKEN
+        run: |
+          set -euo pipefail
+          # Any other `secrets.` reference would mean a credential reached CI,
+          # which this repository's threat model does not allow.
+          if grep -oE 'secrets\.[A-Z_]+' .github/workflows/release.yml \
+             | grep -v 'secrets.GITHUB_TOKEN' ; then
+            echo "::error::release.yml references a secret other than GITHUB_TOKEN"
+            exit 1
+          fi
+          echo "No credentials configured beyond the automatic GITHUB_TOKEN."
+
+      - name: Resolve pins from versions.env
+        id: pins
+        run: |
+          set -euo pipefail
+          . ./versions.env
+          for v in IMAGE_REPO IMAGE_VERSION COSIGN_CI_VERSION COSIGN_CI_SHA256 \
+                   COSIGN_ASSET TRIVY_VERSION TRIVY_SHA256 SYFT_VERSION SYFT_SHA256; do
+            eval "val=\${$v:-}"
+            [ -n "$val" ] || { echo "::error::$v is not set in versions.env"; exit 1; }
+            echo "$v=$val" >> "$GITHUB_OUTPUT"
+          done
+          echo "image_ref=${IMAGE_REPO}:${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
+
+      # The tag is the release's claim about its version; versions.env is what the
+      # artifact is actually built from. A mismatch means compose.yaml, the image
+      # tag and the git tag would disagree, so it fails here rather than shipping.
+      - name: Assert the git tag matches IMAGE_VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          WANT="v${{ steps.pins.outputs.IMAGE_VERSION }}"
+          if [ "$TAG" != "$WANT" ]; then
+            echo "::error::tag ${TAG} does not match versions.env (expected ${WANT})."
+            echo "Bump IMAGE_VERSION in versions.env and compose.yaml, or retag."
+            exit 1
+          fi
+          echo "tag ${TAG} matches versions.env"
+
+      # cosign, trivy and syft installed from pinned versions and compared against
+      # pinned digests. CI installs no unverified binary, for the same reason the
+      # build does not: the tool that does the verifying gets verified too.
+      - name: Install pinned release tooling
+        env:
+          COSIGN_CI_VERSION: ${{ steps.pins.outputs.COSIGN_CI_VERSION }}
+          COSIGN_CI_SHA256: ${{ steps.pins.outputs.COSIGN_CI_SHA256 }}
+          COSIGN_ASSET: ${{ steps.pins.outputs.COSIGN_ASSET }}
+          TRIVY_VERSION: ${{ steps.pins.outputs.TRIVY_VERSION }}
+          TRIVY_SHA256: ${{ steps.pins.outputs.TRIVY_SHA256 }}
+          SYFT_VERSION: ${{ steps.pins.outputs.SYFT_VERSION }}
+          SYFT_SHA256: ${{ steps.pins.outputs.SYFT_SHA256 }}
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+
+          curl -fsSL --retry 3 --retry-all-errors -o cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_CI_VERSION}/${COSIGN_ASSET}"
+          echo "${COSIGN_CI_SHA256}  cosign" | sha256sum -c -
+          sudo install -m 0755 cosign /usr/local/bin/cosign
+
+          TRIVY_TGZ="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
+          curl -fsSL --retry 3 --retry-all-errors -o "$TRIVY_TGZ" \
+            "https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/${TRIVY_TGZ}"
+          echo "${TRIVY_SHA256}  ${TRIVY_TGZ}" | sha256sum -c -
+          tar xzf "$TRIVY_TGZ" trivy
+          sudo install -m 0755 trivy /usr/local/bin/trivy
+
+          SYFT_TGZ="syft_${SYFT_VERSION#v}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 --retry-all-errors -o "$SYFT_TGZ" \
+            "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/${SYFT_TGZ}"
+          echo "${SYFT_SHA256}  ${SYFT_TGZ}" | sha256sum -c -
+          tar xzf "$SYFT_TGZ" syft
+          sudo install -m 0755 syft /usr/local/bin/syft
+
+          cosign version
+          trivy --version | head -1
+          syft version | head -2
+
+      # ubuntu-latest is amd64, so this is a native build: no qemu, and the
+      # Dockerfile's own gates (Pretorin signature + digest, Slack plugin
+      # integrity) run here exactly as they do on an operator's machine.
+      - name: Build
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -t "$IMAGE_REF" .
+
+      - name: Smoke the built image
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          run() { docker run --rm --entrypoint bash "$IMAGE_REF" -lc "$1"; }
+          ARCH="$(run 'uname -m')"
+          [ "$ARCH" = x86_64 ] || { echo "::error::image arch is ${ARCH}"; exit 1; }
+          run 'pretorin version'
+          run 'openclaw --version'
+          # The Slack plugin has to be present in the image, not merely referenced
+          # by the config template — this is the check that a broken COPY would fail.
+          run 'test -f /opt/compliance-claw/plugins/slack/dist/index.js'
+          run 'test -f /opt/compliance-claw/slack-channel.patch.json5'
+          echo "image smoke passed (${ARCH})"
+
+      # FAIL POLICY, stated plainly:
+      #   CRITICAL with a fix available -> the release is blocked.
+      #   HIGH, and CRITICAL with no fix -> reported, does not block.
+      #
+      # --ignore-unfixed on the blocking scan is deliberate. A critical CVE in the
+      # base image with no upstream patch would otherwise make every release
+      # unshippable, and a gate that cannot be satisfied is a gate people disable.
+      # Unfixed criticals are still printed below so nobody has to trust that they
+      # were considered.
+      - name: Vulnerability scan (blocking — fixable CRITICAL)
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          trivy image --scanners vuln --severity CRITICAL --ignore-unfixed \
+            --exit-code 1 --format table "$IMAGE_REF"
+
+      - name: Vulnerability report (non-blocking — HIGH and unfixed CRITICAL)
+        if: always()
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Vulnerability report"
+            echo '```'
+            trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 \
+              --format table "$IMAGE_REF" 2>&1 | tail -60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: SBOM
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          syft "docker:${IMAGE_REF}" -o spdx-json > sbom.spdx.json
+          # An SBOM that parses but describes nothing is worse than none at all:
+          # it would be signed and published as if it were evidence.
+          N="$(python3 -c 'import json;print(len(json.load(open("sbom.spdx.json")).get("packages",[])))')"
+          echo "SBOM packages: ${N}"
+          [ "$N" -gt 0 ] || { echo "::error::the SBOM contains no packages"; exit 1; }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sbom-${{ steps.pins.outputs.IMAGE_VERSION }}
+          path: sbom.spdx.json
+          if-no-files-found: error
+
+      - name: Log in to GHCR
+        if: ${{ !inputs.dry_run }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push
+        id: push
+        if: ${{ !inputs.dry_run }}
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_REF"
+          # RepoDigests is populated by the push, and the digest is what gets
+          # signed: a tag is mutable, a digest is the artifact.
+          DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d@ -f2)"
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "::error::could not read the pushed digest (got '${DIGEST}')"; exit 1 ;;
+          esac
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "pushed ${IMAGE_REF}@${DIGEST}"
+
+      # Keyless: the signing identity is this workflow, certified by GitHub's OIDC
+      # provider through Fulcio, and recorded in Rekor. There is no private key to
+      # store, rotate, or lose — which is the whole reason this is right-sized for
+      # a POC. An operator verifies with the identity regexp printed in the summary.
+      - name: Sign the image
+        if: ${{ !inputs.dry_run }}
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_REF}@${DIGEST}"
+
+      - name: Attach the SBOM as a signed attestation
+        if: ${{ !inputs.dry_run }}
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign attest --yes --predicate sbom.spdx.json --type spdxjson \
+            "${IMAGE_REF}@${DIGEST}"
+
+      - name: Summary
+        if: ${{ !inputs.dry_run }}
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Published"
+            echo ""
+            echo '```'
+            echo "${IMAGE_REF}@${DIGEST}"
+            echo '```'
+            echo ""
+            echo "**Pin this digest in \`compose.yaml\`** — a tag is mutable, and the"
+            echo "digest an operator verified is not necessarily the one they later pull:"
+            echo ""
+            echo '```yaml'
+            echo "  image: ${IMAGE_REF}@${DIGEST}"
+            echo '```'
+            echo ""
+            echo "Operator verification (the package is not public, so log in first):"
+            echo ""
+            echo '```sh'
+            echo "docker login ghcr.io"
+            echo "cosign verify ${IMAGE_REF}@${DIGEST} \\"
+            echo "  --certificate-identity-regexp '^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/tags/v' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo ""
+            echo "# and the SBOM attestation:"
+            echo "cosign verify-attestation --type spdxjson ${IMAGE_REF}@${DIGEST} \\"
+            echo "  --certificate-identity-regexp '^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/tags/v' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

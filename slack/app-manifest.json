@@ -1,0 +1,110 @@
+{
+  "_comment": [
+    "Compliance Claw Slack app manifest — import this, do not assemble scopes by hand.",
+    "",
+    "  api.slack.com/apps/new -> Create New App -> From a manifest -> pick your",
+    "  workspace -> paste this file -> Next -> Create.",
+    "",
+    "Then, in the app you just created:",
+    "  Basic Information -> App-Level Tokens -> Generate Token and Scopes",
+    "      add connections:write, save, copy the token -> SLACK_APP_TOKEN in .env",
+    "  Install App -> Install to Workspace",
+    "      copy the Bot User OAuth Token       -> SLACK_BOT_TOKEN in .env",
+    "  Invite the bot to one channel, copy that channel's ID (right-click ->",
+    "  Copy link; the C... at the end of the URL) -> SLACK_CHANNEL_ID in .env",
+    "",
+    "This is upstream's MINIMAL socket-mode scope set: 12 bot scopes instead of the",
+    "recommended 23. The 11 dropped are emoji:read, files:read, files:write,",
+    "mpim:history, mpim:read, mpim:write, pins:read, pins:write, reactions:read,",
+    "reactions:write and usergroups:read. Compliance Claw needs none of them: it",
+    "answers mentions in one allowlisted channel and reads repositories from a",
+    "local read-only mount.",
+    "",
+    "The im:* scopes remain because they are part of upstream's supported minimal",
+    "set, but DMs are CLOSED at the OpenClaw layer by channels.slack.dmPolicy:",
+    "\"disabled\" (scripts/slack-channel.patch.json5). Granted-but-unused is stated",
+    "here rather than hidden — see SECURITY.md.",
+    "",
+    "socket_mode_enabled means the gateway dials OUT to slack.com. There is no",
+    "request_url and no public endpoint, so the gateway port stays loopback-only.",
+    "",
+    "The /claw slash command is declared but INERT unless an operator sets",
+    "channels.slack.commands.native: true. Mentions are the supported path here.",
+    "",
+    "Slack ignores unknown top-level keys such as this one on import."
+  ],
+  "display_information": {
+    "name": "Compliance Claw",
+    "description": "Compliance review agent backed by Pretorin",
+    "background_color": "#1f2d3d"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Compliance Claw",
+      "always_online": true
+    },
+    "app_home": {
+      "home_tab_enabled": true,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "assistant_view": {
+      "assistant_description": "Compliance Claw reviews mounted repositories against your Pretorin compliance scope.",
+      "suggested_prompts": [
+        {
+          "title": "What targets are onboarded?",
+          "message": "Which repositories are registered with Pretorin for this deployment?"
+        },
+        {
+          "title": "Check the active scope",
+          "message": "What system and framework is this deployment reviewing for?"
+        },
+        {
+          "title": "Review a file",
+          "message": "Review a file in the target repository and report its provenance."
+        }
+      ]
+    },
+    "slash_commands": [
+      {
+        "command": "/claw",
+        "description": "Send a message to Compliance Claw",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "assistant:write",
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "commands",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "im:read",
+        "im:write",
+        "users:read"
+      ]
+    }
+  },
+  "settings": {
+    "socket_mode_enabled": true,
+    "event_subscriptions": {
+      "bot_events": [
+        "app_home_opened",
+        "app_mention",
+        "assistant_thread_context_changed",
+        "assistant_thread_started",
+        "message.channels",
+        "message.groups",
+        "message.im"
+      ]
+    },
+    "org_deploy_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
