@@ -126,15 +126,21 @@ targets:
   - name: simple-crm                              # becomes the directory name
     url: https://github.com/pretorin-ai/simple-crm.git
     ref: main                                     # optional
-  - name: crm-deploy
-    url: https://github.com/pretorin-ai/crm-deploy.git
-    ref: master
-    private: true                                 # needs a GitHub App
+  # - name: crm-deploy                            # shipped commented out
+  #   url: https://github.com/pretorin-ai/crm-deploy.git
+  #   ref: master
+  #   private: true                               # needs a GitHub App
 ```
 
 One system and framework for the whole file; one or many targets. `bootstrap.sh`
 clones each into `workspace/targets/<name>`, which compose bind-mounts
 **read-only** at `/workspace/targets`.
+
+The private example ships **commented out**, and deliberately: the committed file
+has to work for a fresh clone that has nothing but a Pretorin key, and for CI,
+which holds zero credentials. A private target with no GitHub App is a hard
+failure — correct behaviour, wrong default. Uncomment it once your App is
+configured.
 
 List the scopes your key can see:
 

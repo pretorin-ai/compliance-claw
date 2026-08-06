@@ -331,9 +331,7 @@ log "image runs as ${IMAGE_ARCH}"
 cat <<EOF
 
 bootstrap: done.
-  targets:   ${TARGET_COUNT} under ${TARGETS_DIR} (bind-mounted read-only at /workspace/targets)
-             ${#PRIVATE_SLUGS[@]} private, cloned with a read-only GitHub App token that
-             stayed on this host and is now deleted
+  targets:   ${TARGET_COUNT} under ${TARGETS_DIR} (bind-mounted read-only at /workspace/targets)$([ "${#PRIVATE_SLUGS[@]}" -gt 0 ] && printf '\n             %s private, cloned with a read-only GitHub App token that\n             stayed on this host and has been deleted' "${#PRIVATE_SLUGS[@]}")
   scope:     ${SYSTEM_ID} / ${FRAMEWORK_ID}
   image:     $([ "$DO_BUILD" = 1 ] && echo 'built locally (compose.build.yaml)' || echo "pulled ${IMAGE_REF:-}")
 

@@ -53,6 +53,22 @@ jobs:
           python3 --version
           git --version
 
+      # The committed targets.yaml must be clonable with NO credentials at all.
+      # CI holds none by design, and neither does someone doing a fresh clone with
+      # nothing but a Pretorin key — so a `private: true` target in the default
+      # file breaks both. This is a guard, not a preference: it shipped once and
+      # failed here in 21 seconds.
+      - name: Assert the committed targets.yaml needs no credentials
+        run: |
+          set -euo pipefail
+          if python3 scripts/parse-targets.py list | cut -f3 | grep -qx true; then
+            echo "::error::targets.yaml declares a private target. The committed"
+            echo "::error::default must clone anonymously — CI has no GitHub App, and"
+            echo "::error::neither does a first-time reader. Comment it out."
+            exit 1
+          fi
+          echo "targets.yaml is credential-free, as required."
+
       # Runs the documented operator path rather than a CI-only shortcut, so a
       # break in bootstrap.sh fails here instead of on someone's laptop. It
       # clones the public target from targets.yaml, writes a throwaway .env with

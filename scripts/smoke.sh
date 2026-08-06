@@ -128,14 +128,61 @@ if docker compose ps --status running --services 2>/dev/null | grep -qx openclaw
   note "gateway already running; leaving it up at the end"
 else
   GATEWAY_STARTED=1
-  docker compose up -d >/dev/null 2>&1
+  # Output is NOT discarded. `up -d` fails for ordinary reasons — most commonly a
+  # port already bound by another compose project — and swallowing that turns a
+  # gateway that never started into a silent prerequisite for twenty later checks.
+  if ! UP_OUT="$(docker compose up -d 2>&1)"; then
+    fail "gateway starts" "$(printf '%s' "$UP_OUT" | tail -3)"
+  fi
 fi
+
+# Readiness is asserted against THIS PROJECT'S CONTAINER, not against the host
+# port. `curl 127.0.0.1:18789/healthz` proves only that something is listening —
+# and when a second compose project holds that port, the reply comes from a
+# DIFFERENT deployment entirely. Observed: a run where `up -d` had failed on a
+# port clash still reported "gateway answers /healthz", because the neighbouring
+# gateway answered it. Every gateway-dependent check after that was meaningless.
+#
+# Docker's own healthcheck already probes 127.0.0.1:18789/healthz from inside the
+# container, so container health is the same signal, correctly attributed.
 READY=0
 for _ in $(seq 1 60); do
-  if curl -fsS -m 2 http://127.0.0.1:18789/healthz >/dev/null 2>&1; then READY=1; break; fi
+  HSTATE="$(docker compose ps --format json 2>/dev/null | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("Service") == "openclaw":
+        print("%s/%s" % (d.get("State"), d.get("Health") or "none"))
+        break
+' 2>/dev/null || true)"
+  [ "$HSTATE" = "running/healthy" ] && { READY=1; break; }
   sleep 2
 done
-[ "$READY" = 1 ] && pass "gateway answers /healthz" || fail "gateway answers /healthz" "timed out after 120s"
+if [ "$READY" = 1 ]; then
+  pass "this project's gateway container is running and healthy"
+else
+  fail "this project's gateway container is running and healthy" \
+       "state was '${HSTATE:-absent}' after 120s. A port clash with another compose
+        project is the usual cause; \`docker compose ps -a\` and COMPOSE_PROJECT_NAME."
+fi
+# The host port is only meaningful once our own container is known to be up.
+# Skipped rather than run when it is not: a reply from a neighbouring project's
+# gateway would be a pass that means nothing, which is the bug this block exists
+# to prevent, reintroduced two lines lower down.
+if [ "$READY" = 1 ]; then
+  curl -fsS -m 5 http://127.0.0.1:18789/healthz >/dev/null 2>&1 \
+    && pass "gateway answers /healthz on the published port" \
+    || fail "gateway answers /healthz on the published port" "container healthy but the published port did not answer"
+else
+  skip "gateway answers /healthz on the published port" \
+       "our container is not up; any reply on that port would come from another deployment"
+fi
 
 # Read once, up front: the expected plugin profile below is decided by what is
 # actually in the config, and several later checks assert on the same text.

@@ -253,7 +253,7 @@ rule, recorded here so it is not forgotten.
 | `scripts/parse-targets.py` | `private` key with strict boolean validation and a github.com restriction; 4th TSV column; 29 → 36 self-test cases |
 | `scripts/smoke.sh` | Drift-alarm regression fix + two-profile assertion; A4b image/version agreement; A4c extended secret canary; A11 private negatives; A12 Slack fresh-seed section |
 | `scripts/agents-md.template` | One line: do not switch system/framework in chat |
-| `targets.yaml` | `crm-deploy` as the private example, `ref: master` |
+| `targets.yaml` | `crm-deploy` as the private example, **commented out** — see the CI failure below |
 | `compose.yaml` | GHCR image, `build:` removed, digest-pin instruction |
 | `compose.build.yaml` | New dev overlay |
 | `.env.example` | Slack and GitHub App blocks; the shared-channel warning |
@@ -285,7 +285,7 @@ blocked-on-operator below, not as a pass.
 | A1 versions | pass | `pretorin 0.26.14`, `OpenClaw 2026.7.1`, image `x86_64` |
 | A2 MCP surface | pass | `mcp-smoke-test` → `PASSED` |
 | A3 parser | pass | `all 37 cases pass` (was 29) |
-| A4 gateway + seeding | pass | `/healthz` ok; config, `AGENTS.md` and marker seeded at v3 |
+| A4 gateway + seeding | pass | container `running/healthy`, then `/healthz` on the published port; config, `AGENTS.md` and marker seeded at v3 |
 | **A4 drift alarm** | **pass** | fixed grep matches; no-Slack profile asserts all 8 bundled plugins by name; `codex` absent |
 | A4 allowlist coupling | pass | `plugins.allow and channels.slack are both-or-neither (allow=0 slack=0)` |
 | **A4b image/version** | **pass** | `compose.yaml` matches `versions.env`; `compose.yaml` has **no** build section; the overlay restores it |
@@ -408,6 +408,66 @@ Two test-side bugs were fixed alongside them: the Slack section overrode
 "no token substitution" check matched the template's own explanatory comment
 rather than a real `${SLACK_BOT_TOKEN}` reference.
 
+### The fourth bug, found by CI in 21 seconds
+
+The local gate ran against a public-only target set, so it never exercised the
+committed `targets.yaml`. CI did, and failed immediately:
+
+```
+bootstrap: 1 private target(s): pretorin-ai/crm-deploy
+github-app: ERROR — GITHUB_APP_ID is not set.
+bootstrap: ERROR — could not mint a GitHub App token for the private target(s).
+```
+
+Every individual behaviour here is correct — the refusal is exactly what a private
+target with no App should produce. The defect is the **default**: shipping
+`crm-deploy` enabled put a credential requirement into the committed file, and two
+readers can never satisfy it. CI holds zero credentials by design, and a fresh
+clone is supposed to reach a running deployment "with one script and one key"
+(Phase 4's acceptance property). The private example now ships commented out.
+
+The general shape is worth keeping: a correct refusal in the wrong default is
+still a broken first run, and a local gate that substitutes its own fixture for
+the committed configuration cannot see it. `build.yml` now asserts the committed
+`targets.yaml` parses with no `private: true` target, so this cannot regress
+silently:
+
+```yaml
+- name: Assert the committed targets.yaml needs no credentials
+```
+
+### A fifth bug, found by the fresh-clone rehearsal of that fix
+
+Re-running the CI path in an isolated `COMPOSE_PROJECT_NAME` surfaced a check that
+lied, in the same family as the two Phase 4 recorded:
+
+```sh
+docker compose up -d >/dev/null 2>&1          # error discarded
+curl -fsS http://127.0.0.1:18789/healthz      # answered by SOMEONE
+```
+
+The isolated project could not start at all — `Bind for 127.0.0.1:18789 failed:
+port is already allocated`, because another compose project already held the
+published port. `up -d` swallowed that, and the readiness probe was then answered
+by the **neighbouring deployment's** gateway. `gateway answers /healthz` passed
+while this project had **zero containers**, and every gateway-dependent check
+after it was measuring something else.
+
+Two fixes, both about attributing a signal to the thing that produced it:
+
+- `up -d` output is captured and a failure is reported with the daemon's own
+  message, rather than discarded.
+- Readiness is asserted on **this project's container** —
+  `docker compose ps` reporting `running/healthy`, which is Docker's own
+  healthcheck already probing `127.0.0.1:18789/healthz` from inside the
+  container. The published-port check still runs, but only after that, and it
+  **skips** rather than passes when our container is absent, since a reply from
+  another deployment would mean nothing.
+
+This never affects CI, which runs one project on a clean runner. It affected the
+verification, which is worse: it is the tooling that is supposed to catch
+problems quietly reporting success.
+
 ### Operator prerequisite destroyed during validation
 
 Running `docker compose down -v` to force a fresh seed deleted the OpenClaw state
@@ -432,7 +492,7 @@ the reproducible path this phase adds.
 | 3 | Pull the released GHCR image | **blocked-on-operator** | Needs `feat/poc` and tag `v0.1.0` pushed. Workflow implemented; tag gate, pins and downloads verified offline |
 | 4 | `docker compose up -d` | pass | Gateway healthy throughout the smoke run |
 | 5 | Slack connects automatically, reply from Slack | **mechanism pass, round-trip blocked** | A12 proves a fresh volume comes up Slack-configured with zero manual JSON and the plugin loads. The live round-trip needs a Slack app created from the committed manifest and a working model login |
-| 6 | Claw reads a selected PRIVATE repo | **blocked-on-operator** | Needs the read-only GitHub App on `crm-deploy`. Refusal paths, parser contract and credential hygiene all verified (A11) |
+| 6 | Claw reads a selected PRIVATE repo | **blocked-on-operator** | Needs the read-only GitHub App on `crm-deploy`, then uncommenting that block in `targets.yaml`. Refusal paths, parser contract and credential hygiene all verified (A11) |
 | 7 | Read workflows on a read-only key; write workflow after opt-in, all four provenance fields | **partial / blocked-on-operator** | Read paths pass (B1–B3, B5). The write half needs the formal recipe run and a model login; note the accidental write in bug 3 above was a bare `create_risk`, **not** the recipe workflow, and does not count |
 | 8 | Zero manual container modification | pass | Every state change in the run came from `bootstrap.sh`, `onboard-targets.sh`, the entrypoint or `smoke.sh` |
 

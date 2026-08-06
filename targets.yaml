@@ -33,11 +33,17 @@ targets:
     url: https://github.com/pretorin-ai/simple-crm.git
     ref: main
 
-  # The private example. Present so a fresh clone exercises the private path end
-  # to end; it is a test/example target and nothing else depends on it. Remove it
-  # if you have no GitHub App configured — a private target with no App is a hard
-  # failure, on purpose, rather than a silent anonymous clone attempt.
-  - name: crm-deploy
-    url: https://github.com/pretorin-ai/crm-deploy.git
-    ref: master
-    private: true
+  # THE PRIVATE EXAMPLE, COMMENTED OUT ON PURPOSE. Uncomment it once you have a
+  # read-only GitHub App configured in .env (see README.md, 'Private
+  # repositories'). It is a test/example target; nothing else depends on it.
+  #
+  # It does not ship enabled because the committed file has to work for two
+  # readers who have no GitHub App and never will: someone doing a fresh clone
+  # with nothing but a Pretorin key, and CI, which deliberately holds zero
+  # credentials. A private target with no App is a hard failure by design —
+  # correct behaviour, but the wrong default to hand a first-time reader.
+  #
+  # - name: crm-deploy
+  #   url: https://github.com/pretorin-ai/crm-deploy.git
+  #   ref: master
+  #   private: true
