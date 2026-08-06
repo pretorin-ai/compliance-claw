@@ -44,7 +44,12 @@ jobs:
     steps:
       # Pinned to a commit: a tag is mutable, and this is the step that fetches
       # the code everything else in the job then runs.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      #
+      # v5. Keep this in step with .github/workflows/release.yml — they were
+      # briefly on v4 and v5 respectively, and the runner flagged the v4 pin as
+      # targeting a deprecated Node 20. Two workflows checking out the same repo
+      # two different ways is a difference with no reason behind it.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
       - name: Show toolchain
         run: |
