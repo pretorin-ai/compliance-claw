@@ -259,6 +259,10 @@ configured**, and no secret/token/`.env` reaches the build context, any image la
 - **`MODEL` lives in `versions.env`** though it is runtime config rather than a version pin, because
   the Phase 1 spec put it there. If `versions.env` accumulates more runtime settings, move them to
   `.env`/`.env.example` and keep this file to pins.
+  *(Phase 5 correction: `MODEL` is consumed at BUILD time — the Dockerfile substitutes it into the
+  config template — so it is a build-time choice, not runtime config. Runtime model selection from
+  `.env` is still not implemented; an existing deployment changes model with
+  `openclaw models set <provider/model>`. See README.md, 'The model'.)*
 - **The 3-asset list is stated in both scripts.** Read as each script declaring its own
   preconditions rather than a shared list; worth extracting only if a phase adds a fourth asset.
 

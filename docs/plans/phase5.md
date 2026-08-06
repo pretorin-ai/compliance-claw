@@ -11,11 +11,31 @@ key scopes as the authorization boundary, sweep-then-bind onboarding, and `.env`
 as the single **container** secret file.
 
 **Status: IMPLEMENTED and RELEASED.** `v0.1.0` is published to GHCR and pinned by
-digest, and 7 of the 8 completion criteria were verified against that pulled image
-on a fresh clone. Criterion 6 (a live private-repository read) is
-**blocked-on-operator**: creating a GitHub App on the organisation needs owner
-permission this operator does not hold. It is recorded as blocked with the runbook
-an owner needs, never as a pass.
+immutable digest. Verified against that pulled image, on a fresh clone:
+
+- **Public-repository operation** — passed
+- **Slack connectivity, and a real message/reply round trip** — passed
+- **Read-only Pretorin key** — passed
+- **Write-enabled Pretorin key, through the recipe workflow** — passed
+- **Published image pulled by digest** — passed
+
+Two items are deliberately **not** claimed as passed:
+
+- **Private GitHub repository support is implemented, but its live happy path is
+  deferred.** Creating and installing the read-only GitHub App requires Pretorin
+  **organisation-owner** permission, which the operator running this phase does not
+  hold. Isaac or Ian will perform that validation post-merge, against the published
+  image. Everything reachable without an App — the refusal paths, the parser
+  contract, credential hygiene on every clone, and the JWT construction — is
+  verified.
+- **Slack was validated with an existing, manually created app.** The committed
+  `slack/app-manifest.json` is the reproducible setup path for a *new* app, and it
+  is reviewed, but importing it from scratch was not separately tested.
+
+The image is **unsigned**. Its integrity controls today are the digest pin, the
+per-release SBOM, the release-time vulnerability scan, and documented release
+provenance. Azure Key Vault–backed signing, following the Pretorin CLI's approach,
+is planned production / internal-pilot work — see `SECURITY.md` ledger item 5.
 
 Six bugs surfaced by running things rather than reading them, all recorded below
 with what they were and how they were found. One of them was a wrong diagnosis of
@@ -237,8 +257,20 @@ Pretorin release blob, which is a different job with a different constraint.
 
 The integrity-versus-authenticity distinction is stated in `README.md`,
 `SECURITY.md`, `compose.yaml` and the job summary, rather than left for a reader
-to infer from the absence of a `cosign verify` command. Signing is a
-hardening-ledger item.
+to infer from the absence of a `cosign verify` command.
+
+**The image ships unsigned, and nothing in the repository tells an operator to
+verify a signature that does not exist.** The current image-integrity controls are
+the digest pin, the per-release SBOM (a workflow artifact, not an attached
+attestation), the release-time vulnerability scan, and the documented release
+provenance.
+
+**Planned work, not in this phase:** signing backed by **Azure Key Vault**,
+following the approach the Pretorin CLI already uses for its own releases — a
+KMS-held key rather than a key in CI, and no public transparency-log entry. That
+reuses infrastructure the organisation already operates, which is why it is
+preferred over the keyless route considered above. Tracked as ledger item 5 in
+`SECURITY.md`.
 
 ### Pipeline
 
@@ -279,7 +311,7 @@ rule, recorded here so it is not forgotten.
 
 | File | Change |
 | --- | --- |
-| `versions.env` | `SLACK_PLUGIN_VERSION` + `SLACK_PLUGIN_INTEGRITY`, `IMAGE_REPO` + `IMAGE_VERSION`, `COSIGN_CI_*`, `TRIVY_*`, `SYFT_*`; `CONFIG_TEMPLATE_VERSION` 2→3; the carve-out note now names three places |
+| `versions.env` | `SLACK_PLUGIN_VERSION` + `SLACK_PLUGIN_INTEGRITY`, `IMAGE_REPO` + `IMAGE_VERSION`, `TRIVY_*`, `SYFT_*`; `CONFIG_TEMPLATE_VERSION` 2→3; the carve-out note now names three places. A `COSIGN_CI_*` pin was added mid-phase for image signing and then **removed** with the signing itself — the surviving `COSIGN_*` pin is for the Pretorin blob only |
 | `Dockerfile` | `slack-plugin` stage with the integrity gate and structural assertions; runtime copies the plugin and the Slack patch |
 | `scripts/slack-channel.patch.json5` | New. The Slack config fragment, `@SLACK_CHANNEL_ID@`, and the escape-hatch block |
 | `scripts/entrypoint.sh` | Fresh-seed Slack patch behind three gates; all-or-nothing on the three variables; the Slack-specific warning for an existing config |
@@ -692,17 +724,19 @@ reason". Everything here is from the untouched re-run.
 | 2 | Configure secrets from `.env.example` | **pass** | 6 variables set; `PRETORIN_KEY_MODE=write` declared for the write half |
 | 3 | Pull the released GHCR image | **pass** | `docker compose pull` resolved the pinned digest; `compose.yaml` has no `build:` section, so a local build cannot substitute. CI additionally deleted the built image and re-pulled the digest, matching the SBOM at 1099 packages both ways |
 | 4 | `docker compose up -d` | **pass** | `running/healthy` |
-| 5a | Slack connects automatically | **pass** | `channels resolved: C0BNXD05X6U→compliance-claw-test`, then `socket mode connected` — on a volume where `models[] present: False`, i.e. seeded entirely by the image with **zero manual JSON** |
+| 5a | Slack connects automatically | **pass** | `channels resolved: C0BNXD05X6U→compliance-claw-test`, then `socket mode connected` — on a volume seeded entirely by the image, with **zero manual JSON**. Validated with an **existing, manually created Slack app**; importing `slack/app-manifest.json` from scratch was not separately tested (see below) |
 | 5b | Message the agent from Slack, get a reply | **pass** | `Inbound app_mention … user:U0B35SD3PT2 -> bot:U0BN3549K5G`, followed by `model-fetch … status=200`; operator confirmed the replies in-channel |
-| 6 | Claw reads a selected PRIVATE repo | **BLOCKED-ON-OPERATOR** | Creating a GitHub App on the org needs owner permission this operator does not have. See below |
+| 6 | Claw reads a selected PRIVATE repo | **implemented; live validation DEFERRED** | The private path is complete and its refusal paths, parser contract and credential hygiene are all verified. The live happy path is deferred: creating and installing the GitHub App needs Pretorin **organisation-owner** permission, which this operator does not hold. Isaac or Ian will run it post-merge **against the published image**. See below |
 | 7 | Read workflows on the key; write workflow via the recipe, four provenance fields | **pass** | see the evidence record below |
 | 8 | Zero manual container modification | **pass** | in the recorded re-run, every state change came from `bootstrap.sh`, `onboard-targets.sh`, the entrypoint, or an agent turn. The operator's device-code model login is a documented operator command, not a container modification |
 
-### Criterion 7 in full — the signed attestation, not the agent's summary
+### Criterion 7 in full — the signed EVIDENCE attestation, not the agent's summary
 
 The agent was asked to use the `code-evidence-capture` recipe against `simple-crm`
 and to report what it submitted. What makes this a pass is not that report but the
-**signed DSSE attestation** read back from the platform
+**signed DSSE attestation** read back from the platform — note this is a *Pretorin
+evidence* attestation produced platform-side, and has nothing to do with the
+container image, which is unsigned —
 (`get_evidence_attestation`), whose payload carries all four fields:
 
 ```
@@ -738,13 +772,16 @@ Note that `search_evidence` returns a summary projection **without** the `code_*
 fields. Reading the attestation is what proves provenance; the summary view alone
 would have looked like the fields were missing.
 
-### Criterion 6 — BLOCKED-ON-OPERATOR, and what that does and does not mean
+### Criterion 6 — implemented, live validation DEFERRED to an org owner
 
-**Why.** Creating a GitHub App on the `pretorin-ai` organisation requires
-**organisation owner** permission. The operator running this phase is a member,
-not an owner, so no App exists and no private repository can be cloned. This is an
-access-control fact about the organisation, not a defect in the implementation and
-not a decision to descope.
+**Why deferred.** Creating and installing a GitHub App on the `pretorin-ai`
+organisation requires **organisation-owner** permission. The operator running this
+phase is a member, not an owner, so no App exists and no private repository can be
+cloned here. This is an access-control fact about the organisation, not a defect in
+the implementation and not a decision to descope.
+
+**Who closes it.** Isaac or Ian, post-merge, against the published image — the
+runbook in `README.md` is written for exactly that handover.
 
 **What is shipped and unaffected.** The whole private path is implemented and in
 the tree: `scripts/github-app-token.sh`, the `private` key in the parser, the
@@ -764,7 +801,8 @@ and the post-clone credential assertion. Nothing about it is stubbed.
 
 **What is NOT verified**, and will not be until an owner acts: a live
 authenticated clone, and therefore the agent reading a private repository with
-provenance. No amount of local testing substitutes for that.
+provenance. No amount of local testing substitutes for that, and it is recorded
+here as deferred rather than converted into a pass.
 
 **The deliverable for this criterion is therefore documentation**, and it is
 written to be executed by an org owner who was not part of this work:
@@ -778,7 +816,7 @@ every refusal message the tooling can emit to its cause.
 `crm-deploy` stays commented out in `targets.yaml`, so the committed default still
 clones with no credentials at all.
 
-### Slack — the existing app is reused, and the manifest is not exercised
+### Slack — validated with an existing app; the manifest is not exercised
 
 The acceptance run uses the Slack app that already exists in this workspace, whose
 app-level token, bot token and channel id are already in `.env` (all three

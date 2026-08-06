@@ -12,10 +12,12 @@
 # the export line to run for the rest of the shell session.
 #
 # This is the DOCUMENTED FALLBACK, not the default path. The default is the
-# published image, which has been vulnerability-scanned, has an SBOM attached and
-# is signed — none of which is true of a local build. Use this overlay when you
-# are changing the Dockerfile, the entrypoint, the config templates or the pinned
-# Slack plugin, and want to see the effect before cutting a release.
+# published image, which was vulnerability-scanned at release, has an SBOM
+# retained on its release run, and is pinned by immutable digest — none of which
+# is true of a local build. (Neither is signed: see README.md, 'Verifying what you
+# pulled'.) Use this overlay when you are changing the Dockerfile, the entrypoint,
+# the config templates or the pinned Slack plugin, and want to see the effect
+# before cutting a release.
 #
 # The image name differs from compose.yaml's on purpose. A local build tagged with
 # the release name would be indistinguishable from the released image in

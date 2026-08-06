@@ -314,3 +314,6 @@ above with no credentials.
 - **Config reconciliation** rather than warn-and-`down -v`.
 - **Per-target document-resolver naming**, per the limitation above.
 - **GHCR publish and attestation verification** for the image itself.
+  *(Phase 5: the GHCR publish shipped and the image is pinned by immutable digest.
+  Attestation/signing did NOT ship — the image is unsigned; Azure Key Vault–backed
+  signing is tracked as ledger item 5 in SECURITY.md.)*

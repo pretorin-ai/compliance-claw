@@ -16,6 +16,34 @@ verified, and what is deliberately not done yet. **Read [SECURITY.md](SECURITY.m
 before pointing this at anything that matters** — in particular the shared-channel
 attribution limit and the unsandboxed-tool-execution boundary.
 
+## Status
+
+Verified against the published image, pulled by digest, on a fresh clone:
+
+| | |
+| --- | --- |
+| Public-repository operation | **passed** |
+| Slack connectivity, and a real message/reply round trip | **passed** |
+| Read-only Pretorin key | **passed** |
+| Write-enabled Pretorin key, through the recipe workflow | **passed** |
+| Published image pulled by immutable digest | **passed** |
+| Private GitHub repository support | **implemented; live validation deferred** |
+
+Two honest caveats, not passes:
+
+- **Private repositories:** the path is complete and its refusal paths, parser
+  contract and credential hygiene are verified, but the live happy path needs
+  Pretorin **organisation-owner** permission to create and install the GitHub App.
+  That validation is deferred to an owner, post-merge, against the published image.
+  The step-by-step runbook is under "Private repositories" below.
+- **Slack:** validated with an existing, manually created app. The committed
+  `slack/app-manifest.json` is the reproducible setup path for a *new* app and is
+  reviewed, but importing it from scratch was not separately tested.
+
+The image is **unsigned**. Its integrity controls are the digest pin, the
+per-release SBOM, the release-time vulnerability scan, and documented release
+provenance — see "Verifying what you pulled".
+
 ## Requirements
 
 - Docker Desktop (or another daemon) with **linux/amd64** support. Upstream ships
@@ -118,24 +146,30 @@ docker inspect --format '{{index .RepoDigests 0}}' \
 
 ### What this does and does not prove
 
-> **The image is not signed.** A digest gives **integrity** — these exact bytes,
-> not some other bytes wearing the same tag. It does not give **authenticity**:
-> it is no proof of *who* built the image. Anyone who can push to the registry can
-> publish a different digest, and nothing in a digest alone tells you which one
-> came from this repository's release workflow.
+> **The image is not signed.** There is no signature to verify, so do not reach for
+> `cosign verify` — it will not find anything. A digest gives **integrity**: these
+> exact bytes, not some other bytes wearing the same tag. It does not give
+> **authenticity** — it is no proof of *who* built the image. Anyone who can push
+> to the registry can publish a different digest, and a digest alone does not tell
+> you which one came from this repository's release workflow.
 
-Signing was designed in and deliberately dropped for this POC. Keyless cosign
-would have written a permanent, publicly searchable Sigstore transparency-log
-entry naming this repository, which is internal — a disclosure decision, not just
-a technical one. The alternative, a signing key in CI, contradicts this
-repository's rule that CI holds zero credentials.
+The image's current integrity controls, in full:
 
-If you need authenticity, treat that as the next step rather than assuming it:
-see the hardening ledger in [SECURITY.md](SECURITY.md).
+| Control | What it gives you |
+| --- | --- |
+| GHCR image pinned by **immutable digest** | the bytes are the bytes that were built and scanned |
+| **SBOM** generated per release (SPDX JSON) | a package inventory, retained as a workflow artifact on the release run |
+| **Vulnerability scan** at release | fixable CRITICAL findings block publication |
+| Documented release provenance | the workflow, the digest, and the version pin are all recorded |
 
-The SBOM is generated for every release in SPDX JSON and attached to the run as a
-build artifact. It is not attached to the image, because attaching it as an OCI
-attestation is a signing operation.
+The SBOM is **not** attached to the image and **not** signed — attaching an SBOM as
+an OCI attestation is itself a signing operation. Read it from the release run's
+artifacts.
+
+**Planned, not implemented:** image signing backed by **Azure Key Vault**,
+following the approach the Pretorin CLI already uses for its own releases. That is
+production / internal-pilot work; see the hardening ledger in
+[SECURITY.md](SECURITY.md). Until it lands, the digest pin is the control.
 
 ### Building locally instead (development)
 
@@ -316,18 +350,41 @@ config is then byte-identical to a Slack-less deployment.
    && scripts/onboard-targets.sh && docker compose up -d
 ```
 
-Import the manifest rather than assembling scopes by hand — that is the whole
-reason it is committed. It requests upstream's **minimal** socket-mode scope set:
-**12 bot scopes instead of the recommended 23**, dropping files, reactions, pins,
-group DMs, `emoji:read` and `usergroups:read`.
+For a **new** app, import the manifest rather than assembling scopes by hand — that
+is the whole reason it is committed. It requests upstream's **minimal** socket-mode
+scope set: **12 bot scopes instead of the recommended 23**, dropping files,
+reactions, pins, group DMs, `emoji:read` and `usergroups:read`.
 
-**Already have a Slack app?** You do not need to recreate it. Any app with Socket
-Mode enabled, an app-level token carrying `connections:write`, and a bot token
-works — put its three values in `.env` and the rest of this section applies
-unchanged. The manifest matters for a *new* app, where it saves you from
-hand-picking scopes and from over-granting. Worth knowing if you reuse an older
-app: it probably carries the broader recommended scope set, so it can read files,
-reactions and group DMs that this deployment never uses.
+### Already have a Slack app? Reuse it.
+
+**You do not need to create another one.** Any app with Socket Mode enabled, an
+app-level token carrying `connections:write`, and a bot token works: put its three
+values in `.env` and the rest of this section applies unchanged. The manifest is
+the reproducible path for a *new* app, not a requirement for an existing one.
+
+Two things to know when reusing an older app. It probably carries the broader
+*recommended* scope set, so it can read files, reactions and group DMs this
+deployment never touches. And **separate, independent Claws should generally use
+separate Slack apps** — Slack may deliver a given event to any one of an app's
+Socket Mode connections, so two deployments sharing one app get ambiguous routing
+and a message can be answered by whichever Claw happened to receive it.
+
+### What lives where
+
+The **image** contains the pinned Slack plugin and the logic that generates the
+Slack configuration. It contains **no Slack credentials**, and no channel id.
+
+`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` are **deployment-time
+values supplied through `.env`**, read from the environment at load time. They are
+never baked into an image and never written into the config in the state volume.
+
+- On a **fresh** OpenClaw volume, Slack is configured **automatically** when all
+  three are present — no manual JSON, no plugin editing.
+- An **existing** config volume is **never overwritten**. Adding the Slack
+  variables to a volume that was previously Slack-less does nothing on its own; the
+  container detects exactly that and prints the two ways forward — the documented
+  reset (`down -v`, then bootstrap and onboard) or the manual
+  `openclaw config patch` procedure. See "Upgrading".
 
 Verify:
 
@@ -360,6 +417,46 @@ them, delete the `allow` line. If you remove `channels.slack`, remove `allow` to
 > attribution**. Use a **read-only key for shared channels**. A write-enabled key
 > in a shared channel is explicitly warned against until RBAC exists — see
 > [SECURITY.md](SECURITY.md).
+
+## The model
+
+`MODEL=openai/gpt-5.6-sol` in `versions.env` is baked into the config template at
+**image build time**. It is an image-build choice: changing that line needs a
+rebuild.
+
+**No model credential is ever baked into the image.** Provider authentication
+happens at **deployment time** and persists in the OpenClaw state volume, which is
+why it survives `docker compose down` and is destroyed by `down -v`.
+
+The POC's tested path is OpenAI/ChatGPT **device-code** login:
+
+```sh
+docker compose run --rm cli openclaw models auth login --provider openai --device-code
+docker compose restart openclaw
+```
+
+It needs a TTY, so run it yourself rather than from a script. Check it took with
+`openclaw models auth list` — but only an actual turn proves it reaches the model:
+
+```sh
+docker compose exec openclaw openclaw agent --agent main -m "Reply with exactly: OK"
+```
+
+### Changing the model on an existing deployment
+
+No rebuild required:
+
+```sh
+docker compose run --rm cli openclaw models set <provider/model>
+docker compose restart openclaw
+```
+
+`openclaw models list` shows what the authenticated provider offers.
+
+**Selecting the model from `.env` at runtime is not implemented.** `versions.env`'s
+`MODEL` is a build-time value and there is no runtime override — use
+`openclaw models set` above. Runtime model selection is recorded as internal-pilot
+/ product work, not a feature of this POC.
 
 ## Read-only vs write-enabled keys
 
@@ -506,8 +603,9 @@ git tag v0.1.0 && git push origin v0.1.0
 #      image: ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:<digest>
 ```
 
-Step 2 is not optional bookkeeping: a tag is mutable, so without the digest the
-artifact an operator verified is not necessarily the one they later pull.
+Step 2 is not optional bookkeeping. A tag is mutable, and the image is unsigned, so
+the digest pin is the only thing tying a deployment to the bytes that were actually
+built and scanned.
 
 ## Notes
 
@@ -521,5 +619,10 @@ artifact an operator verified is not necessarily the one they later pull.
 - `mcp.sessionIdleTtlMs` stays at its default `600000` — milliseconds, so 10
   minutes of idleness before a session's MCP child is reaped; `0` disables idle
   cleanup. Untuned until multi-session usage is measured.
+- The image is **unsigned**; the digest pin is its integrity control. Azure Key
+  Vault–backed signing, following the Pretorin CLI's approach, is planned
+  production / internal-pilot work.
+- Runtime model selection from `.env` is **not implemented**. `MODEL` is a
+  build-time value; change an existing deployment with `openclaw models set`.
 - Outstanding hardening is tracked in [SECURITY.md](SECURITY.md), including Docker
   file-based secrets, RBAC before shared channels, and the sandbox boundary.

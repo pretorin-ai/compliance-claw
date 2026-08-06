@@ -312,10 +312,7 @@ else
     docker compose pull || die "could not pull ${IMAGE_REF}.
   The package is not public, so an anonymous pull is refused. Log in first:
     echo \$GITHUB_TOKEN | docker login ghcr.io -u <your-github-username> --password-stdin
-  A classic token needs read:packages. Verify the image signature with:
-    cosign verify ${IMAGE_REF} \\
-      --certificate-identity-regexp '^https://github\\.com/pretorin-ai/compliance-claw/' \\
-      --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  A classic token needs the read:packages scope.
   To build locally instead of pulling:  scripts/bootstrap.sh --build"
   fi
 fi

@@ -171,15 +171,23 @@ Ordered roughly by how much it matters, not by effort.
    once upstream rebuilds. The `libgnutls30` pair is the one to watch: unlike the
    others it sits on a live TLS path, and the reason for deferring it is
    inability to patch, not a claim that it is unreachable.
-5. **Image signing and provenance.** The release publishes and verifies an
-   immutable digest, which is integrity but not authenticity — nothing attests
-   who built a given digest. Keyless cosign was rejected for this POC because it
-   writes a permanent public transparency-log entry naming an internal
-   repository, and a CI-held signing key was rejected because CI holds zero
-   credentials. The likely resolution is GitHub's own artifact attestation, which
-   for a private or internal repository records to GitHub's instance rather than
-   the public log — unevaluated here, and the reason this is a ledger item rather
-   than a decision.
+5. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
+   publishes and verifies an immutable digest, which is integrity but not
+   authenticity: nothing attests *who* built a given digest. **The image is
+   unsigned today**, and there is no signature for an operator to verify.
+
+   The planned resolution for production and the internal pilot is signing backed
+   by **Azure Key Vault**, mirroring the approach the Pretorin CLI already uses for
+   its own releases — a KMS-held key, not a key in CI, and not a public
+   transparency-log entry. That reuses infrastructure and a review path the
+   organisation already has, which is why it is preferred over the two options
+   considered and rejected for this POC: keyless cosign, which writes a permanent
+   publicly searchable transparency-log entry naming an internal repository, and a
+   CI-held signing key, which contradicts the zero-credentials rule.
+
+   Until it ships, the digest pin in `compose.yaml` is the image-integrity
+   control. Nothing in this repository should tell an operator to run
+   `cosign verify` against the Compliance Claw image.
 6. **OpenClaw base-image attestation.** Phase 1's chain guarantees the *Pretorin
    binary* and Phase 5's gate guarantees the *Slack plugin*; the OpenClaw base
    image is trusted on its digest pin alone. Verifying upstream's own GHCR
@@ -230,22 +238,21 @@ Ordered roughly by how much it matters, not by effort.
   an otherwise fully pinned chain. Pinning exact Debian package versions breaks
   builds whenever a mirror drops an old version, which is the worse failure mode
   at POC stage.
-- **cosign is pinned twice, deliberately.** `v2.4.1` verifies the Pretorin release
-  blob and cannot move: cosign v3 removed `verify-blob --signature`. A separate
-  `COSIGN_CI_VERSION` signs the published image, because keyless signing
-  transacts with the live Sigstore trust root and cannot be exercised outside CI.
+- **cosign is pinned once, and only for the Pretorin binary.** `COSIGN_VERSION`
+  `v2.4.1` verifies the Pretorin release blob at build time and cannot move:
+  cosign v3 removed `verify-blob --signature`. There is deliberately no second
+  pin, because nothing signs the container image — a pin no job consumes would
+  advertise a verification that does not happen.
 - **Trivy's release gate ignores unfixed CRITICALs.** A critical CVE in the base
   image with no upstream patch would otherwise make every release unshippable,
   and an unsatisfiable gate gets disabled. Unfixed criticals are printed in the
   job summary rather than dropped.
-- **The published image is not signed.** The release publishes by immutable
-  digest and the round trip is verified in CI — the image is deleted locally,
-  pulled back by digest, run, and its SBOM regenerated and compared against the
-  built one. That is **integrity**: the bytes are the bytes that were scanned. It
-  is not **authenticity**: nothing proves which digest came from this
-  repository's workflow, so anyone who can push to the registry can publish
-  another. Keyless signing was designed in and dropped deliberately — it writes a
-  permanent, publicly searchable Sigstore transparency-log entry naming an
-  internal repository, and the alternative, a signing key in CI, contradicts the
-  zero-credentials rule. Listed in the ledger above as future work rather than
-  quietly omitted.
+- **The published image is not signed, and the SBOM is not an attestation.** The
+  release publishes by immutable digest and verifies the round trip in CI — the
+  image is deleted locally, pulled back by digest, run, and its SBOM regenerated
+  from the pulled bytes and compared against the built one. That is **integrity**:
+  the bytes are the bytes that were scanned. It is not **authenticity**: nothing
+  proves which digest came from this repository's workflow, so anyone who can push
+  to the registry can publish another. The SBOM is retained as a workflow artifact,
+  not attached to the image and not signed. Azure Key Vault–backed signing is
+  ledger item 5 above — recorded as planned work, not quietly omitted.
