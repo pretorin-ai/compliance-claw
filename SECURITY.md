@@ -158,37 +158,57 @@ Ordered roughly by how much it matters, not by effort.
    app-server plugin, which does not receive `tools.toolSearch` and bypasses
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
-4. **OpenClaw base-image attestation.** Phase 1's chain guarantees the *Pretorin
+4. **The base image ships five fixable CRITICAL vulnerabilities.** Measured, not
+   estimated: two `libgnutls30` (Debian has `3.7.9-2+deb12u7`), one
+   `@vitest/browser` — a test framework upstream ships inside a runtime image —
+   and two vendored copies of `node-tar`, one inside npm and one inside
+   corepack's pnpm. **Nothing this repository adds contributes any of them**; the
+   Pretorin binary and the Slack plugin scan clean at CRITICAL. They cannot be
+   patched here without running an unpinned `apt upgrade` over a digest-pinned
+   base, so they are documented per-id in `.trivyignore.yaml` with a written
+   justification and a **90-day expiry**, printed into every release job summary,
+   and fixed properly by bumping `OPENCLAW_VERSION` and the runtime `FROM` digest
+   once upstream rebuilds. The `libgnutls30` pair is the one to watch: unlike the
+   others it sits on a live TLS path, and the reason for deferring it is
+   inability to patch, not a claim that it is unreachable.
+5. **OpenClaw base-image attestation.** Phase 1's chain guarantees the *Pretorin
    binary* and Phase 5's gate guarantees the *Slack plugin*; the OpenClaw base
    image is trusted on its digest pin alone. Verifying upstream's own GHCR
    attestation would close the last unverified link in the image.
-5. **Connected Sources (`source_admin`) as the eventual binding source.** Local
+6. **The release workflow cannot be rehearsed.** GitHub only exposes
+   `workflow_dispatch` for workflows present on the **default branch**, and
+   `release.yml` lives on the feature branch, so its first real execution is the
+   first tag push. Its individual stages were exercised by hand — the tag gate,
+   the pin extraction, all three checksum-pinned downloads, the Trivy gate against
+   the real image — but the assembled pipeline has never run. Merging to the
+   default branch removes this limitation.
+7. **Connected Sources (`source_admin`) as the eventual binding source.** Local
    `preflight` resolvers are a host-local approximation. Connected Sources is also
    the **only** path to `branch_protection`, `code_review_records` and
    `pull_request_records` — i.e. the thing that resolves `code_repository`
    reporting `degraded`, which is expected today and cannot be fixed from a local
    checkout. Requires a scope this POC deliberately does not use.
-6. **Config reconciliation instead of warn-and-`down -v`.** Templates are seeded
+8. **Config reconciliation instead of warn-and-`down -v`.** Templates are seeded
    write-if-absent and never overwritten, so a newer image cannot tighten an
    existing deployment's config. Today the entrypoint warns — including a specific
    warning when Slack is configured in `.env` but absent from an existing
    config — and `down -v` is the only reset.
-7. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
+9. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
    observed working (`cataloged 223 tools behind compact directory surface`) but
    upstream marks all Tool Search modes experimental. If it regresses, the prompt
    returns to roughly 40k tokens per turn and the commented `toolFilter` block is
    the lever.
-8. **Per-repository authorization.** Every target shares one Pretorin key and one
+10. **Per-repository authorization.** Every target shares one Pretorin key and one
    scope. A reviewer who should see one repository sees all of them.
-9. **`mcp.sessionIdleTtlMs` is untuned.** Default 600000 ms — ten minutes of
+11. **`mcp.sessionIdleTtlMs` is untuned.** Default 600000 ms — ten minutes of
    idleness before a session's `pretorin mcp-serve` child (a 23 MB binary) is
    reaped; `0` disables idle cleanup. Fine for one operator, unmeasured for a
    shared channel where each session spawns its own child.
-10. **Multi-arch is blocked upstream.** `SHA256SUMS` publishes only
+12. **Multi-arch is blocked upstream.** `SHA256SUMS` publishes only
     `linux-x86_64` and `macos-arm64`, so there is no linux/arm64 Pretorin binary
     to build against. Not deferred by choice — blocked. Apple Silicon runs amd64
     under emulation.
-11. **Upstream feedback: `pretorin preflight unbind --id <resolver-id>`.**
+13. **Upstream feedback: `pretorin preflight unbind --id <resolver-id>`.**
     `unbind --name` removes *every* resolver with that name, and names derive from
     directory basenames, so two targets that both own `docs/` collide. The
     sweep-then-bind ordering makes this safe rather than merely tolerable; an

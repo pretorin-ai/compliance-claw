@@ -355,6 +355,60 @@ reports `Status: loaded`, `Source: /opt/compliance-claw/plugins/slack/dist/index
 | B5 mount posture with credentials | pass | targets still `ro` |
 | B6 agent turn provenance | **skip** | no model credentials in the volume |
 
+### A sixth bug: the release gate would have blocked the first release
+
+`release.yml` cannot be rehearsed — GitHub only offers `workflow_dispatch` for
+workflows on the **default branch**, and this one lives on the feature branch, so
+its first execution is the first tag push. That made rehearsing its stages by hand
+worth the effort, and running the Trivy gate locally against the built image found
+this:
+
+```
+CVE-2026-33845       libgnutls30      3.7.9-2+deb12u6 -> 3.7.9-2+deb12u7
+CVE-2026-42010       libgnutls30      3.7.9-2+deb12u6 -> 3.7.9-2+deb12u7
+GHSA-p63j-vcc4-9vmv  @vitest/browser  4.1.9 -> 4.1.10        app/node_modules/...
+CVE-2026-59873       tar              7.5.13 -> 7.5.19       npm/node_modules/...
+CVE-2026-59873       tar              7.5.15 -> 7.5.19       corepack/pnpm/...
+TOTAL BLOCKING: 5
+```
+
+Five fixable CRITICALs, **every one of them in the OpenClaw base image**. Verified
+that nothing this repository adds contributes any: scanning by path, the Pretorin
+binary and the Slack plugin tree produce zero CRITICALs, and the plugin's single
+HIGH (`axios 1.16.0`) is the exact version OpenClaw's own managed installer pins
+through its `overrides` block.
+
+That check answered a second question worth recording. The Dockerfile stage runs a
+bare `npm install`, which does **not** apply the 28 `overrides` OpenClaw's managed
+installer uses. Comparing the two trees package by package, every override-affected
+package present resolves identically — `axios 1.16.0`, `follow-redirects 1.16.0`,
+`form-data 2.5.6`, `path-to-regexp 8.4.0`, `qs 6.15.2`, `typebox 1.3.3` — because
+the published `npm-shrinkwrap.json` already pins them. Skipping the overrides costs
+nothing, which is now a measurement rather than an assumption.
+
+The gate itself was the defect. Its own comment said an unsatisfiable gate is one
+people disable, and then it shipped unsatisfiable, because `--ignore-unfixed` does
+nothing about CVEs that *are* fixed upstream but not in the base image we pin.
+
+The fix is not a weaker gate. `.trivyignore.yaml` carries one entry per
+vulnerability id — never a package wildcard, never a severity-wide exclusion — each
+with a written justification and a **90-day `expired_at`**. A new fixable CRITICAL
+still blocks the release; these come back for review on 2026-11-04 rather than
+being forgiven permanently. The release job prints every exception and its
+remaining lifetime into the job summary before the gate runs, so nobody approving a
+release has to open the file to know what is being shipped past it.
+
+The honest part of that file is the `libgnutls30` pair: unlike the others it sits
+on a live TLS path, and it is deferred because it cannot be patched without an
+unpinned `apt upgrade` over a digest-pinned base — not because it is unreachable.
+Bumping `OPENCLAW_VERSION` and the runtime `FROM` digest is the real fix for all
+five, and is tracked in SECURITY.md.
+
+One self-inflicted detail, since it cost two runs: `paths:` in a Trivy ignore entry
+matches a finding's `PkgPath`, and Debian package findings have none. Adding a
+`paths:` filter to the two OS entries made them match nothing and the gate kept
+failing.
+
 ### Release tooling, verified offline
 
 The tag gate, the pin extraction and the three checksum-pinned downloads were

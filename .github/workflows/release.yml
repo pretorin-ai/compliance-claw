@@ -153,21 +153,63 @@ jobs:
           run 'test -f /opt/compliance-claw/slack-channel.patch.json5'
           echo "image smoke passed (${ARCH})"
 
+      # The exceptions are printed BEFORE the gate runs, not buried in a file
+      # nobody opens. Whoever approves a release sees exactly what is being
+      # shipped past the gate and when each exception expires.
+      - name: Show the vulnerability exceptions being applied
+        run: |
+          set -euo pipefail
+          {
+            echo "### Vulnerability exceptions in effect"
+            echo ""
+            echo "From \`.trivyignore.yaml\`. Each is a fixable CRITICAL being shipped anyway."
+            echo ""
+            python3 - <<'PY'
+          import datetime, re
+          text = open(".trivyignore.yaml").read()
+          # Deliberately not PyYAML: the runner has no guarantee of it, and this
+          # is a summary, not a parser. The gate itself is Trivy's job.
+          entries = re.findall(r"- id:\s*(\S+)(.*?)(?=\n  - id:|\Z)", text, re.S)
+          today = datetime.date.today()
+          for vid, body in entries:
+              exp = re.search(r"expired_at:\s*(\S+)", body)
+              exp = exp.group(1) if exp else "NEVER"
+              flag = ""
+              if exp != "NEVER":
+                  d = datetime.date.fromisoformat(exp)
+                  left = (d - today).days
+                  flag = f" ({left} days left)" if left >= 0 else " (EXPIRED)"
+              print(f"- `{vid}` expires {exp}{flag}")
+          print()
+          print(f"{len(entries)} exception(s).")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY" | tail -20
+
       # FAIL POLICY, stated plainly:
       #   CRITICAL with a fix available -> the release is blocked.
       #   HIGH, and CRITICAL with no fix -> reported, does not block.
+      #   listed in .trivyignore.yaml   -> shipped, with a dated reason, until it expires.
       #
-      # --ignore-unfixed on the blocking scan is deliberate. A critical CVE in the
-      # base image with no upstream patch would otherwise make every release
-      # unshippable, and a gate that cannot be satisfied is a gate people disable.
-      # Unfixed criticals are still printed below so nobody has to trust that they
-      # were considered.
+      # --ignore-unfixed is deliberate: a critical CVE with no upstream patch would
+      # otherwise make every release unshippable, and a gate that cannot be
+      # satisfied is a gate people disable.
+      #
+      # --ignorefile exists for the same reason, learned the hard way. This gate
+      # was written without one and would have blocked the FIRST release: the
+      # OpenClaw base image ships five fixable CRITICALs (two libgnutls30, one
+      # @vitest/browser, two vendored copies of node-tar) that this repository
+      # cannot patch without abandoning its digest-pinned base. Every exception is
+      # per-id, carries a written justification, and EXPIRES — so a new fixable
+      # CRITICAL still stops the release, and the existing ones come back for
+      # review rather than being forgiven forever.
       - name: Vulnerability scan (blocking — fixable CRITICAL)
         env:
           IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
         run: |
           set -euo pipefail
           trivy image --scanners vuln --severity CRITICAL --ignore-unfixed \
+            --ignorefile .trivyignore.yaml \
             --exit-code 1 --format table "$IMAGE_REF"
 
       - name: Vulnerability report (non-blocking — HIGH and unfixed CRITICAL)

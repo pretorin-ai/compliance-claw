@@ -1,0 +1,80 @@
+# Trivy exceptions for the release gate.
+#
+# READ THIS BEFORE ADDING AN ENTRY.
+#
+# The release gate blocks on CRITICAL findings that have a fix available. Every
+# entry below is a finding that meets that bar and is being shipped anyway, so
+# each one needs a reason that survives being read out loud in an audit.
+#
+# Three rules:
+#   1. NEVER a blanket ignore. One entry per vulnerability id, never a package
+#      wildcard and never a severity-wide exclusion. A new fixable CRITICAL must
+#      still stop the release.
+#   2. EVERY entry expires. `expired_at` is what stops this file becoming a
+#      permanent amnesty. When an entry expires the gate starts failing again,
+#      which is the point: the exception is reviewed or the base image moves.
+#   3. `statement` says what it is, why it is not fixable HERE, and how reachable
+#      it actually is. "Low risk" on its own is not a statement.
+#
+# EVERY ENTRY HERE IS IN THE OPENCLAW BASE IMAGE, not in anything this repository
+# adds. The Dockerfile's own additions — the Pretorin binary and the Slack plugin —
+# contribute zero CRITICAL findings, verified by scanning their paths directly.
+# None of these can be fixed without either diverging from the pinned base image
+# digest or waiting for upstream to rebuild, so the real fix for all five is a
+# base-image bump: raise OPENCLAW_VERSION and the runtime FROM digest, re-scan,
+# and delete whichever entries below have gone away.
+#
+# Tracked as a hardening item in SECURITY.md. The release workflow prints every
+# ignored entry into its job summary, so these are never invisible to whoever
+# approves a release.
+#
+# Reviewed: 2026-08-06, against ghcr.io/openclaw/openclaw:2026.7.1
+#           (sha256:6a31d44b...) resolving to debian 12.14 / node 24.16.0.
+
+vulnerabilities:
+  # No `paths:` on the two OS entries. `paths` matches a finding's PkgPath, and
+  # Debian package findings have none — adding one makes the entry match nothing
+  # and the gate keeps failing, which is how this was first written.
+  - id: CVE-2026-33845
+    statement: >-
+      libgnutls30 3.7.9-2+deb12u6 in the base image's Debian 12 layer; Debian has
+      3.7.9-2+deb12u7. This is a real TLS library on the runtime path, so it is
+      NOT unreachable — the honest position is that it cannot be patched here
+      without running an unpinned apt upgrade over a digest-pinned base image,
+      which trades a known CVE for an unreproducible build. Fixed by an upstream
+      base-image rebuild.
+    expired_at: 2026-11-04
+
+  - id: CVE-2026-42010
+    statement: >-
+      libgnutls30 authentication bypass via a NUL character in a username, same
+      package and same base-image layer as CVE-2026-33845, fixed in the same
+      Debian point release. Compliance Claw performs no gnutls-based username
+      authentication of its own — gateway auth is a bearer token compared in
+      OpenClaw, and Pretorin auth is an API key over HTTPS — but the library is
+      present and linked, so this is deferred on inability to patch, not on
+      certainty that it cannot matter.
+    expired_at: 2026-11-04
+
+  - id: GHSA-p63j-vcc4-9vmv
+    statement: >-
+      @vitest/browser 4.1.9 at /app/node_modules — a TEST framework that upstream
+      ships inside its runtime image. Browser Mode's file-access permission gate
+      can be bypassed by provider commands. Not reachable in this deployment:
+      nothing invokes vitest, and the browser plugin is not even loaded when Slack
+      is configured (plugins.allow is exclusive). The deeper issue is that a test
+      dependency is present in a production image at all; that is upstream's to
+      fix, and worth raising with them.
+    expired_at: 2026-11-04
+
+  - id: CVE-2026-59873
+    statement: >-
+      node-tar denial of service via a crafted gzip bomb, present TWICE in the
+      base image and in neither case as an application dependency: 7.5.13 vendored
+      inside npm's own node_modules, and 7.5.15 inside the corepack copy of pnpm.
+      Both are package managers, and neither npm nor pnpm is invoked at container
+      runtime — the only npm run in this build happens in the discarded
+      slack-plugin build stage. Note that the Slack plugin's own dependency tree
+      does NOT contain a vulnerable tar; OpenClaw's published npm-shrinkwrap pins
+      it to a fixed version.
+    expired_at: 2026-11-04
