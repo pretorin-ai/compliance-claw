@@ -192,13 +192,19 @@ Ordered roughly by how much it matters, not by effort.
    binary* and Phase 5's gate guarantees the *Slack plugin*; the OpenClaw base
    image is trusted on its digest pin alone. Verifying upstream's own GHCR
    attestation would close the last unverified link in the image.
-7. **The release workflow cannot be rehearsed.** GitHub only exposes
-   `workflow_dispatch` for workflows present on the **default branch**, and
-   `release.yml` lives on the feature branch, so its first real execution is the
-   first tag push. Its individual stages were exercised by hand — the tag gate,
-   the pin extraction, all three checksum-pinned downloads, the Trivy gate against
-   the real image — but the assembled pipeline has never run. Merging to the
-   default branch removes this limitation.
+7. **RESOLVED — the release workflow can now be rehearsed.** It previously could
+   not: GitHub only exposes `workflow_dispatch` for workflows on the **default
+   branch**, and `release.yml` lived on a feature branch, so its first execution
+   was the v0.1.0 tag push. It is now on `master` and carries a `dry_run` input
+   (default true) that builds, smokes, scans and produces an SBOM without pushing
+   or tagging:
+
+   ```sh
+   gh workflow run release.yml -f dry_run=true
+   ```
+
+   Kept in the ledger as history, because the reasoning still applies to any new
+   workflow: a pipeline whose first run is a real release has never been tested.
 8. **Connected Sources (`source_admin`) as the eventual binding source.** Local
    `preflight` resolvers are a host-local approximation. Connected Sources is also
    the **only** path to `branch_protection`, `code_review_records` and

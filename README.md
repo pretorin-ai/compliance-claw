@@ -510,10 +510,15 @@ published image.
 ## Upgrading
 
 ```sh
-# 1. bump IMAGE_VERSION in versions.env and the image line in compose.yaml
+# 1. point compose.yaml at the release you want, pinned by digest, and set the
+#    matching IMAGE_VERSION in versions.env (smoke.sh asserts the two agree)
 # 2. pull and restart
 docker compose pull && docker compose up -d
 ```
+
+Each release's digest is in its job summary, and on `master` the pair is already
+set to the current release — so upgrading usually means pulling `master` rather than
+editing anything.
 
 **A newer image does not update an existing volume's config.** Templates are
 seeded write-if-absent and never overwritten, so a tightened template has no
@@ -586,26 +591,45 @@ scripts/onboard-targets.sh --verify-only
 
 ## Releasing
 
-Tag-triggered. `.github/workflows/release.yml` builds `linux/amd64`, smokes the
-image, blocks on fixable CRITICAL vulnerabilities, generates an SPDX SBOM, pushes
-to GHCR, and then **pulls the published digest back and re-verifies it** — the
-image is removed locally first so the pull cannot be served from cache, and the
-SBOM is regenerated from the pulled bytes and compared against the built one.
-It holds **no** Pretorin, model or Slack credentials — only the automatic
+**The release is the source of truth for the version.** Nothing needs bumping
+first — create the release, and CI derives the version from its tag. Two steps:
+
+```sh
+# 1. cut it
+gh release create v0.1.1 --generate-notes
+
+# 2. when it finishes, take the two lines from the job summary and land them
+#    in ONE commit: the digest pin in compose.yaml and IMAGE_VERSION in versions.env
+```
+
+`.github/workflows/release.yml` builds `linux/amd64`, smokes the image, blocks on
+fixable CRITICAL vulnerabilities, generates an SPDX SBOM, then:
+
+1. **pushes by digest** under a throwaway `build-<sha>` ref — no version tag yet
+2. **pulls that digest back and re-verifies it** — the local image is removed first
+   so the pull cannot be served from cache, and the SBOM is regenerated from the
+   pulled bytes and compared against the built one
+3. **only then applies the version tag** to the verified digest, and resolves the
+   tag to confirm it lands there
+
+That ordering is deliberate: a floating tag should never point at bytes nobody has
+checked. The SBOM is also attached to the GitHub Release, so it outlives
+workflow-artifact retention.
+
+CI holds **no** Pretorin, model or Slack credentials — only the automatic
 `GITHUB_TOKEN`, and it asserts that itself. It does not sign; see "Verifying what
 you pulled".
 
-```sh
-# 1. bump IMAGE_VERSION in versions.env AND the image line in compose.yaml
-#    (smoke.sh asserts the two agree; the workflow refuses a mismatched tag)
-git tag v0.1.0 && git push origin v0.1.0
-# 2. take the digest from the job summary and pin it in compose.yaml:
-#      image: ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:<digest>
-```
-
 Step 2 is not optional bookkeeping. A tag is mutable, and the image is unsigned, so
 the digest pin is the only thing tying a deployment to the bytes that were actually
-built and scanned.
+built and scanned. `IMAGE_VERSION` and the pin describe **what this checkout
+deploys**, which is why they move together, once, after the release.
+
+Rehearse the pipeline without publishing anything:
+
+```sh
+gh workflow run release.yml -f dry_run=true
+```
 
 ## Notes
 
