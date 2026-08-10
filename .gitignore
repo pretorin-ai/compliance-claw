@@ -16,3 +16,9 @@ workspace/
 # used by the supply-chain validation gate.
 dist/
 tamper/
+
+# Per-developer coding-agent state (Claude Code settings, local permissions).
+# Machine-specific and not part of the deployment. Ignored HERE rather than
+# relying on a developer's global gitignore, so a fresh clone is clean for
+# everyone rather than only for whoever happens to have the global rule.
+.claude/
