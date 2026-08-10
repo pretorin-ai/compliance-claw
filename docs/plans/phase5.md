@@ -272,6 +272,43 @@ reuses infrastructure the organisation already operates, which is why it is
 preferred over the keyless route considered above. Tracked as ledger item 5 in
 `SECURITY.md`.
 
+### Addendum — the release flow was restructured after v0.1.0
+
+v0.1.0 shipped with `versions.env` as the version source and a `release.yml` gate
+requiring the tag to equal `IMAGE_VERSION`. Cutting a release therefore took **two
+PRs around one image**: bump the version, tag, publish, then pin the digest. The
+operator called that out, and comparing it against `pretorin-ai/pretorin-cli`'s
+`release-binaries.yml` showed the design was simply inverted.
+
+pretorin-cli triggers on `release: published`, derives the version from the release
+tag, validates the build output against it, publishes the image **by digest**, signs
+it, and only then applies the version tag. Adopted here, minus the signing:
+
+| | before (v0.1.0) | after |
+| --- | --- | --- |
+| trigger | `push: tags: [v*]` | `release: published` |
+| version source | `IMAGE_VERSION` in `versions.env`, tag must match | the **release tag** |
+| commits per release | 2 (pre-bump PR + pin PR) | 1 (pin, after) |
+| publish order | tag and digest together | digest → verify → **then** tag |
+| SBOM retention | workflow artifact (expires) | artifact **+ attached to the release** |
+| rehearsal | impossible until on `master` | `gh workflow run release.yml -f dry_run=true` |
+
+`IMAGE_VERSION` changed meaning rather than disappearing: it is now *the version
+this checkout deploys*, moving with `compose.yaml`'s digest pin in the single commit
+that closes a release. `smoke.sh`'s agreement check still holds, and is now a
+statement about the deployment rather than about the release.
+
+The publish-then-tag split is the part worth keeping even at POC scale: the version
+tag is applied only after the digest has been pulled back from the registry and
+re-inventoried, so a floating tag can never point at bytes nobody checked.
+
+What did **not** change: the image is still unsigned, Trivy still gates on fixable
+CRITICALs with the dated `.trivyignore.yaml` waivers, and CI still holds zero
+credentials beyond `GITHUB_TOKEN`. pretorin-cli's signing needs an Azure Key Vault
+HSM key on a private ARC runner — real infrastructure this repository has no access
+to, which is why ledger item 5 names it as the planned route rather than something
+that could have been switched on here.
+
 ### Pipeline
 
 ```

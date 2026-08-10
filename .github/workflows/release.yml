@@ -1,51 +1,55 @@
-# Publish a versioned, scanned, SBOM-bearing linux/amd64 image to GHCR, by digest.
+# Publish a scanned, SBOM-bearing linux/amd64 image to GHCR, by immutable digest.
 #
-# Triggered by a tag:
-#   git tag v0.1.0 && git push origin v0.1.0
+# Cut a release:
+#   gh release create v0.1.1 --generate-notes
 #
-# The tag must match IMAGE_VERSION in versions.env or the job refuses to run —
-# versions.env stays the single source of truth for what version this is.
+# THE RELEASE IS THE SOURCE OF TRUTH FOR THE VERSION. Modelled on
+# pretorin-ai/pretorin-cli's release-binaries.yml, which triggers on
+# `release: published`, derives the version from the release tag, and validates the
+# build against it. The earlier design here inverted that — versions.env held the
+# version and the tag had to match it — which forced a version-bump commit BEFORE
+# every release and a digest-pin commit AFTER it. Two PRs to ship one image.
+# Deriving from the tag removes the first one entirely.
 #
-# What this pipeline delivers: BUILD -> SCAN -> SBOM -> PUBLISH BY IMMUTABLE
-# DIGEST -> and an operator who pulls that digest gets exactly those bytes.
+# So `IMAGE_VERSION` in versions.env no longer means "the version we are about to
+# release". It means "the version this checkout deploys", and it moves together with
+# compose.yaml's digest pin in the single post-release commit. scripts/smoke.sh still
+# asserts the two agree, which is now a statement about the deployment rather than
+# about the release.
 #
-# THE IMAGE IS NOT SIGNED, deliberately. Keyless cosign would write a permanent,
-# publicly searchable entry to the Sigstore transparency log naming this
-# repository, and this repository is internal. A content-addressed digest still
-# gives INTEGRITY — `@sha256:...` cannot resolve to different bytes than the ones
-# scanned here — but it does not give AUTHENTICITY: it is no proof of who built
-# the image. Anyone who can push to the registry can publish a different digest.
-# That distinction is stated in README.md and SECURITY.md rather than glossed,
-# and signing is a tracked hardening item, not an oversight.
+# PUBLISH ORDER, also from pretorin-cli: push BY DIGEST first, verify the digest
+# round-trips, and only THEN apply the human-readable version tag. A floating tag
+# must never point at bytes that have not been checked.
 #
-# NO CREDENTIALS LIVE HERE. The only secret used is the automatic GITHUB_TOKEN,
-# and only to push to GHCR. There is no Pretorin API key, no model key and no
-# Slack token. The "no credentials" step below asserts that rather than trusting
-# this comment.
+# THE IMAGE IS NOT SIGNED. Integrity comes from the immutable digest, the
+# release-time vulnerability scan, and the SBOM. pretorin-cli signs with an Azure
+# Key Vault HSM key over OIDC on a private ARC runner (no Fulcio, no Rekor); this
+# repository has no ARC runner and asserts CI holds zero credentials, so signing is
+# tracked as planned work in SECURITY.md ledger item 5 rather than half-done here.
 #
-# Scanning happens BEFORE the push, so a failing image is never published.
+# NO CREDENTIALS LIVE HERE beyond the automatic GITHUB_TOKEN. The first step asserts
+# that rather than trusting this comment.
 #
 # Pin carve-out: `uses:` cannot read versions.env, so action SHAs are pinned here.
-# Everything else — trivy, syft — is installed from a pinned version with a pinned
-# SHA256, the same way the Dockerfile installs cosign for the Pretorin blob.
+# trivy and syft install from versions.env pins with checksum verification.
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build, scan and SBOM only — do not push"
+        description: "Build, scan and SBOM only — do not push or tag"
         type: boolean
         default: true
 
-# id-token is deliberately ABSENT. It exists only to mint OIDC tokens for keyless
-# signing, and this pipeline does not sign. Requesting a permission nothing uses
-# is how a workflow quietly accumulates authority nobody can account for.
+# Workflow default, inherited by `publish`. `attach-sbom` overrides it — a job-level
+# permissions block REPLACES this one, so that job gets contents:write and no
+# packages access at all. No job holds both.
 permissions:
   contents: read
-  packages: write     # push to GHCR — the only write this job performs
+  packages: write     # push to GHCR — the only write `publish` performs
 
 concurrency:
   group: release-${{ github.ref }}
@@ -55,6 +59,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      version: ${{ steps.pins.outputs.version }}
+      digest: ${{ steps.push.outputs.digest }}
 
     steps:
       # actions/checkout v5, pinned to its commit.
@@ -63,8 +70,6 @@ jobs:
       - name: Assert this workflow uses no credentials beyond GITHUB_TOKEN
         run: |
           set -euo pipefail
-          # Any other `secrets.` reference would mean a credential reached CI,
-          # which this repository's threat model does not allow.
           if grep -oE 'secrets\.[A-Z_]+' .github/workflows/release.yml \
              | grep -v 'secrets.GITHUB_TOKEN' ; then
             echo "::error::release.yml references a secret other than GITHUB_TOKEN"
@@ -72,38 +77,44 @@ jobs:
           fi
           echo "No credentials configured beyond the automatic GITHUB_TOKEN."
 
-      - name: Resolve pins from versions.env
+      # THE VERSION COMES FROM THE RELEASE TAG. On workflow_dispatch there is no
+      # tag, so a dry run labels itself from versions.env — enough to rehearse the
+      # pipeline without inventing a release.
+      - name: Resolve version and pins
         id: pins
         run: |
           set -euo pipefail
           . ./versions.env
-          for v in IMAGE_REPO IMAGE_VERSION \
-                   TRIVY_VERSION TRIVY_SHA256 SYFT_VERSION SYFT_SHA256; do
+          for v in IMAGE_REPO TRIVY_VERSION TRIVY_SHA256 SYFT_VERSION SYFT_SHA256; do
             eval "val=\${$v:-}"
             [ -n "$val" ] || { echo "::error::$v is not set in versions.env"; exit 1; }
             echo "$v=$val" >> "$GITHUB_OUTPUT"
           done
-          echo "image_ref=${IMAGE_REPO}:${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
 
-      # The tag is the release's claim about its version; versions.env is what the
-      # artifact is actually built from. A mismatch means compose.yaml, the image
-      # tag and the git tag would disagree, so it fails here rather than shipping.
-      - name: Assert the git tag matches IMAGE_VERSION
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          set -euo pipefail
-          TAG="${GITHUB_REF#refs/tags/}"
-          WANT="v${{ steps.pins.outputs.IMAGE_VERSION }}"
-          if [ "$TAG" != "$WANT" ]; then
-            echo "::error::tag ${TAG} does not match versions.env (expected ${WANT})."
-            echo "Bump IMAGE_VERSION in versions.env and compose.yaml, or retag."
-            exit 1
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            case "$TAG" in
+              v[0-9]*.[0-9]*.[0-9]*) ;;
+              *) echo "::error::release tag '${TAG}' is not vMAJOR.MINOR.PATCH"; exit 1 ;;
+            esac
+            VERSION="${TAG#v}"
+            echo "release ${TAG} -> version ${VERSION}"
+            # versions.env is ALLOWED to lag here: it describes what the checkout
+            # DEPLOYS, and the pin commit that updates it lands after this run.
+            if [ "${VERSION}" != "${IMAGE_VERSION:-}" ]; then
+              echo "::notice::versions.env still says IMAGE_VERSION=${IMAGE_VERSION:-unset}; the post-release pin commit moves it to ${VERSION}."
+            fi
+          else
+            VERSION="${IMAGE_VERSION:?IMAGE_VERSION unset and no release tag}"
+            echo "dry run, labelling from versions.env -> ${VERSION}"
           fi
-          echo "tag ${TAG} matches versions.env"
 
-      # trivy and syft installed from pinned versions and compared against
-      # pinned digests. CI installs no unverified binary, for the same reason the
-      # build does not: the tool that does the verifying gets verified too.
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_REPO}:${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_ref=${IMAGE_REPO}:build-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      # trivy and syft from pinned versions, compared against pinned digests. CI
+      # installs no unverified binary, for the same reason the build does not.
       - name: Install pinned release tooling
         env:
           TRIVY_VERSION: ${{ steps.pins.outputs.TRIVY_VERSION }}
@@ -132,34 +143,32 @@ jobs:
           syft version | head -2
 
       # ubuntu-latest is amd64, so this is a native build: no qemu, and the
-      # Dockerfile's own gates (Pretorin signature + digest, Slack plugin
-      # integrity) run here exactly as they do on an operator's machine.
+      # Dockerfile's own gates (Pretorin signature + digest, Slack plugin integrity)
+      # run here exactly as they do on an operator's machine.
       - name: Build
         env:
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
         run: |
           set -euo pipefail
-          docker build --platform linux/amd64 -t "$IMAGE_REF" .
+          docker build --platform linux/amd64 -t "$BUILD_REF" .
 
       - name: Smoke the built image
         env:
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
         run: |
           set -euo pipefail
-          run() { docker run --rm --entrypoint bash "$IMAGE_REF" -lc "$1"; }
+          run() { docker run --rm --entrypoint bash "$BUILD_REF" -lc "$1"; }
           ARCH="$(run 'uname -m')"
           [ "$ARCH" = x86_64 ] || { echo "::error::image arch is ${ARCH}"; exit 1; }
           run 'pretorin version'
           run 'openclaw --version'
           # The Slack plugin has to be present in the image, not merely referenced
-          # by the config template — this is the check that a broken COPY would fail.
+          # by the config template — this is the check a broken COPY would fail.
           run 'test -f /opt/compliance-claw/plugins/slack/dist/index.js'
           run 'test -f /opt/compliance-claw/slack-channel.patch.json5'
           echo "image smoke passed (${ARCH})"
 
-      # The exceptions are printed BEFORE the gate runs, not buried in a file
-      # nobody opens. Whoever approves a release sees exactly what is being
-      # shipped past the gate and when each exception expires.
+      # Exceptions printed BEFORE the gate, not buried in a file nobody opens.
       - name: Show the vulnerability exceptions being applied
         run: |
           set -euo pipefail
@@ -171,8 +180,6 @@ jobs:
             python3 - <<'PY'
           import datetime, re
           text = open(".trivyignore.yaml").read()
-          # Deliberately not PyYAML: the runner has no guarantee of it, and this
-          # is a summary, not a parser. The gate itself is Trivy's job.
           entries = re.findall(r"- id:\s*(\S+)(.*?)(?=\n  - id:|\Z)", text, re.S)
           today = datetime.date.today()
           for vid, body in entries:
@@ -188,64 +195,54 @@ jobs:
           print(f"{len(entries)} exception(s).")
           PY
           } >> "$GITHUB_STEP_SUMMARY"
-          cat "$GITHUB_STEP_SUMMARY" | tail -20
 
-      # FAIL POLICY, stated plainly:
+      # FAIL POLICY:
       #   CRITICAL with a fix available -> the release is blocked.
       #   HIGH, and CRITICAL with no fix -> reported, does not block.
       #   listed in .trivyignore.yaml   -> shipped, with a dated reason, until it expires.
       #
-      # --ignore-unfixed is deliberate: a critical CVE with no upstream patch would
-      # otherwise make every release unshippable, and a gate that cannot be
-      # satisfied is a gate people disable.
-      #
-      # --ignorefile exists for the same reason, learned the hard way. This gate
-      # was written without one and would have blocked the FIRST release: the
-      # OpenClaw base image ships five fixable CRITICALs (two libgnutls30, one
-      # @vitest/browser, two vendored copies of node-tar) that this repository
-      # cannot patch without abandoning its digest-pinned base. Every exception is
-      # per-id, carries a written justification, and EXPIRES — so a new fixable
-      # CRITICAL still stops the release, and the existing ones come back for
-      # review rather than being forgiven forever.
+      # --ignore-unfixed and --ignorefile both exist because the OpenClaw base image
+      # ships five fixable CRITICALs this repository cannot patch without abandoning
+      # its digest-pinned base. Every exception is per-id, justified, and EXPIRES, so
+      # a new fixable CRITICAL still stops the release.
       - name: Vulnerability scan (blocking — fixable CRITICAL)
         env:
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
         run: |
           set -euo pipefail
           trivy image --scanners vuln --severity CRITICAL --ignore-unfixed \
             --ignorefile .trivyignore.yaml \
-            --exit-code 1 --format table "$IMAGE_REF"
+            --exit-code 1 --format table "$BUILD_REF"
 
       - name: Vulnerability report (non-blocking — HIGH and unfixed CRITICAL)
         if: always()
         env:
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
         run: |
           set -euo pipefail
           {
             echo "### Vulnerability report"
             echo '```'
             trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 \
-              --format table "$IMAGE_REF" 2>&1 | tail -60
+              --format table "$BUILD_REF" 2>&1 | tail -60
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: SBOM
         env:
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
+          VERSION: ${{ steps.pins.outputs.version }}
         run: |
           set -euo pipefail
-          syft "docker:${IMAGE_REF}" -o spdx-json > sbom.spdx.json
-          # An SBOM that parses but describes nothing is worse than none at all:
-          # it would be published alongside the image as if it were evidence.
-          N="$(python3 -c 'import json;print(len(json.load(open("sbom.spdx.json")).get("packages",[])))')"
+          syft "docker:${BUILD_REF}" -o spdx-json > "sbom-${VERSION}.spdx.json"
+          N="$(python3 -c "import json;print(len(json.load(open('sbom-${VERSION}.spdx.json')).get('packages',[])))")"
           echo "SBOM packages: ${N}"
           [ "$N" -gt 0 ] || { echo "::error::the SBOM contains no packages"; exit 1; }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: sbom-${{ steps.pins.outputs.IMAGE_VERSION }}
-          path: sbom.spdx.json
+          name: sbom-${{ steps.pins.outputs.version }}
+          path: sbom-${{ steps.pins.outputs.version }}.spdx.json
           if-no-files-found: error
 
       - name: Log in to GHCR
@@ -254,60 +251,78 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Push
+      # STEP 1 OF 2: publish BY DIGEST under a throwaway build ref. The version tag
+      # is deliberately NOT applied yet — see the verify step below. This is
+      # pretorin-cli's ordering: bytes are published and checked before any
+      # human-readable tag points at them.
+      - name: Push by digest
         id: push
         if: ${{ !inputs.dry_run }}
         env:
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
         run: |
           set -euo pipefail
-          docker push "$IMAGE_REF"
-          # RepoDigests is populated by the push, and the digest is what gets
-          # published and pinned: a tag is mutable, a digest is the artifact.
-          DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d@ -f2)"
+          docker push "$BUILD_REF"
+          DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$BUILD_REF" | cut -d@ -f2)"
           case "$DIGEST" in
             sha256:*) ;;
             *) echo "::error::could not read the pushed digest (got '${DIGEST}')"; exit 1 ;;
           esac
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "pushed ${IMAGE_REF}@${DIGEST}"
+          echo "pushed by digest: ${DIGEST}"
 
-      # THE POINT OF THE WHOLE PIPELINE: prove that pulling the published digest
-      # returns the bytes that were just built, smoked, scanned and inventoried.
-      #
-      # Without this the digest is only an assertion. The image is removed from the
-      # local daemon first, so the pull cannot be served from cache, and the SBOM is
-      # regenerated from the PULLED image and compared against the one produced from
-      # the local build. A mismatch means the registry did not return what we sent.
+      # Prove the registry returns what we sent, BEFORE the version tag exists. The
+      # local image is removed first so the pull cannot be served from cache, and the
+      # SBOM is regenerated from the pulled bytes and compared.
       - name: Verify the published digest round-trips
         if: ${{ !inputs.dry_run }}
         env:
+          IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ steps.pins.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker rmi "$BUILD_REF" >/dev/null 2>&1 || true
+          docker image prune -f >/dev/null 2>&1 || true
+
+          docker pull "${IMAGE_REPO}@${DIGEST}"
+
+          ARCH="$(docker run --rm --entrypoint bash "${IMAGE_REPO}@${DIGEST}" -lc 'uname -m')"
+          [ "$ARCH" = x86_64 ] || { echo "::error::pulled image arch is ${ARCH}"; exit 1; }
+          docker run --rm --entrypoint bash "${IMAGE_REPO}@${DIGEST}" -lc 'pretorin version'
+
+          syft "docker:${IMAGE_REPO}@${DIGEST}" -o spdx-json > sbom.pulled.json
+          BUILT="$(python3 -c "import json;print(len(json.load(open('sbom-${VERSION}.spdx.json')).get('packages',[])))")"
+          PULLED="$(python3 -c 'import json;print(len(json.load(open("sbom.pulled.json")).get("packages",[])))')"
+          echo "SBOM packages: built=${BUILT} pulled=${PULLED}"
+          [ "$BUILT" = "$PULLED" ] || { echo "::error::pulled image inventory differs from the built image"; exit 1; }
+          echo "digest round-trip verified"
+
+      # STEP 2 OF 2: only now does the version tag point at the digest, and only at a
+      # digest that has been pulled back and re-inventoried. `buildx imagetools
+      # create` retags server-side without re-pushing layers, then the tag is
+      # resolved to confirm it lands on the digest we verified.
+      - name: Apply the version tag to the verified digest
+        if: ${{ !inputs.dry_run }}
+        env:
+          IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
           IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          docker rmi "$IMAGE_REF" >/dev/null 2>&1 || true
-          docker image prune -f >/dev/null 2>&1 || true
-
-          docker pull "${IMAGE_REF}@${DIGEST}"
-
-          # The pulled image must run and be the right architecture.
-          ARCH="$(docker run --rm --entrypoint bash "${IMAGE_REF}@${DIGEST}" -lc 'uname -m')"
-          [ "$ARCH" = x86_64 ] || { echo "::error::pulled image arch is ${ARCH}"; exit 1; }
-          docker run --rm --entrypoint bash "${IMAGE_REF}@${DIGEST}" -lc 'pretorin version'
-
-          # Same package inventory from the pulled bytes as from the built bytes.
-          syft "docker:${IMAGE_REF}@${DIGEST}" -o spdx-json > sbom.pulled.json
-          BUILT="$(python3 -c 'import json;d=json.load(open("sbom.spdx.json"));print(len(d.get("packages",[])))')"
-          PULLED="$(python3 -c 'import json;d=json.load(open("sbom.pulled.json"));print(len(d.get("packages",[])))')"
-          echo "SBOM packages: built=${BUILT} pulled=${PULLED}"
-          [ "$BUILT" = "$PULLED" ] || { echo "::error::pulled image inventory differs from the built image"; exit 1; }
-          echo "digest round-trip verified: ${IMAGE_REF}@${DIGEST}"
+          docker buildx imagetools create --tag "$IMAGE_REF" "${IMAGE_REPO}@${DIGEST}"
+          RETAGGED="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [ "$RETAGGED" = "$DIGEST" ] \
+            || { echo "::error::tag ${IMAGE_REF} resolves to ${RETAGGED}, expected ${DIGEST}"; exit 1; }
+          echo "tag ${IMAGE_REF} -> ${DIGEST}"
 
       - name: Summary
         if: ${{ !inputs.dry_run }}
         env:
+          IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
           IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          VERSION: ${{ steps.pins.outputs.version }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
@@ -315,26 +330,62 @@ jobs:
             echo "### Published"
             echo ""
             echo '```'
-            echo "${IMAGE_REF}@${DIGEST}"
+            echo "${IMAGE_REPO}@${DIGEST}"
+            echo "${IMAGE_REF}   (tag applied only after the digest was verified)"
             echo '```'
             echo ""
-            echo "**Pin this digest in \`compose.yaml\`** — a tag is mutable, and the"
-            echo "digest an operator verified is not necessarily the one they later pull:"
+            echo "**One commit closes the release.** Pin the digest and move"
+            echo "\`IMAGE_VERSION\` together — both describe what this checkout deploys:"
             echo ""
             echo '```yaml'
-            echo "  image: ${IMAGE_REF}@${DIGEST}"
+            echo "# compose.yaml"
+            echo "  image: ${IMAGE_REPO}:${VERSION}@${DIGEST}"
+            echo '```'
+            echo '```sh'
+            echo "# versions.env"
+            echo "IMAGE_VERSION=${VERSION}"
             echo '```'
             echo ""
-            echo "Pull it by digest — the tag is mutable, the digest is the artifact:"
+            echo "Pull it:"
             echo ""
             echo '```sh'
             echo "docker login ghcr.io          # the package is not public"
-            echo "docker pull ${IMAGE_REF}@${DIGEST}"
+            echo "docker pull ${IMAGE_REPO}@${DIGEST}"
             echo '```'
             echo ""
             echo "**Not signed.** A digest guarantees INTEGRITY — these exact bytes —"
-            echo "but not AUTHENTICITY: it is no proof of who built them. Image signing"
-            echo "is a tracked hardening item; see SECURITY.md."
-            echo ""
-            echo "The SBOM for this digest is attached to this run as an artifact."
+            echo "but not AUTHENTICITY. Azure Key Vault signing, as pretorin-cli does"
+            echo "it, is SECURITY.md ledger item 5."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # SEPARATE JOB, and the only one with `contents: write`.
+  #
+  # Attaching the SBOM to the release makes it outlive workflow-artifact retention,
+  # which matters for a compliance artifact — but `gh release upload` needs
+  # contents:write, and the publish job above must not have it. pretorin-cli keeps
+  # its `attach` job as the sole contents:write job for the same reason. Splitting
+  # costs one artifact round-trip and keeps the build/push job read-only on contents.
+  #
+  # `needs: publish` means a failed or blocked release attaches nothing.
+  attach-sbom:
+    needs: publish
+    if: ${{ github.event_name == 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # upload a release asset — the ONLY write here
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: sbom-${{ needs.publish.outputs.version }}
+
+      - name: Attach the SBOM to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          test -f "sbom-${VERSION}.spdx.json"
+          gh release upload "$TAG" "sbom-${VERSION}.spdx.json" --clobber --repo "$GITHUB_REPOSITORY"
+          echo "attached sbom-${VERSION}.spdx.json to ${TAG}"
