@@ -63,7 +63,7 @@ x-compliance-claw: &compliance-claw
   # the digest pin is the whole of what guarantees what you are running; see
   # README.md ('Verifying what you pulled'). The release workflow prints the digest
   # in its job summary for exactly this step.
-  image: ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:58690e31c6d31159ce945c423c4fdcd75da1b3d3a25b9654c7cae258d188da8b
+  image: ghcr.io/pretorin-ai/compliance-claw:0.1.1
   env_file:
     # Gitignored and dockerignored, so nothing here is ever baked into a layer.
     # required:false because a fresh clone has no .env — Phase 4's bootstrap
