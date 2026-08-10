@@ -1,0 +1,7 @@
+# Allowlist, not denylist: exclude everything, then re-include only what the
+# build actually needs. This guarantees .env and downloaded artifacts can never
+# reach the build context even if someone adds new files at the repo root.
+*
+!versions.env
+!vendor/
+!scripts/

@@ -1,0 +1,103 @@
+// slack-channel.patch.json5 — the Slack half of the generated config.
+//
+// entrypoint.sh applies this with `openclaw config patch` on a FRESH SEED only,
+// and only when .env supplies all three of SLACK_BOT_TOKEN, SLACK_APP_TOKEN and
+// SLACK_CHANNEL_ID. A deployment without Slack never sees any of this and gets a
+// config byte-identical to Phase 4's.
+//
+// Why a patch rather than part of openclaw-config.template.json:
+//   - Slack is optional, and a config naming channels.slack with no tokens would
+//     retry a websocket forever.
+//   - `openclaw config patch` is upstream's own documented Slack setup command,
+//     so the merge is schema-validated rather than hand-rolled JSON editing.
+//   - The channel allowlist entry is a config KEY, and OpenClaw's ${VAR}
+//     substitution only works on config VALUES — so the channel id has to be
+//     substituted before the file is applied, which a patch file makes explicit.
+//
+// @SLACK_CHANNEL_ID@ is replaced by entrypoint.sh from $SLACK_CHANNEL_ID, but
+// only after the value matches ^C[A-Z0-9]{6,}$ and only into a temporary copy —
+// this file is never modified. `config patch --dry-run` then validates the result
+// against the schema before anything is applied, so a malformed value is
+// rejected twice over.
+//
+// NOTE ON COMMENTS: `config patch` rewrites ~/.openclaw/openclaw.json as strict
+// JSON, so none of these comments reach the volume. They document the shipped
+// intent for whoever reads the image, which is the same status Phase 4 assigned
+// to the base template's comments after observing OpenClaw reformat the file.
+{
+  plugins: {
+    // TRUST PIN for the one non-bundled plugin in this image. Upstream asks for
+    // this: a plugin loaded from an explicit path with no install provenance is
+    // reported as such in diagnostics, and plugins.allow is the documented way
+    // to say "yes, this one, deliberately".
+    //
+    // ESCAPE HATCH — READ BEFORE EDITING. plugins.allow is an EXCLUSIVE
+    // allowlist, not an addition. Naming slack here is therefore also a
+    // tool-surface trim: it takes the enabled set from 50 to 2 and the gateway's
+    // startup banner from
+    //     (8 plugins: browser, canvas, device-pair, file-transfer,
+    //                 memory-core, ollama, phone-control, talk-voice)
+    // to
+    //     (1 plugin: slack)
+    // That is intended — it removes the browser plugin and six others from a
+    // container whose tool execution is unsandboxed. Agent turns, the Pretorin
+    // MCP server, skills and tools.toolSearch are all unaffected (verified).
+    //
+    // To restore a bundled plugin, add its id to this list. To restore all of
+    // them, delete the `allow` line entirely.
+    //
+    // IF YOU REMOVE channels.slack BELOW, REMOVE THIS `allow` TOO. An orphaned
+    // allowlist keeps the seven bundled plugins off with no Slack to show for
+    // it, and nothing in the logs explains why. scripts/smoke.sh asserts the two
+    // move together.
+    allow: ["slack"],
+
+    entries: { slack: { enabled: true } },
+
+    // The image copy, outside the state volume. Baked by the Dockerfile's
+    // slack-plugin stage after an integrity check against SLACK_PLUGIN_INTEGRITY
+    // in versions.env, and node-owned because OpenClaw blocks plugin files owned
+    // by another uid.
+    load: { paths: ["/opt/compliance-claw/plugins/slack"] },
+  },
+
+  channels: {
+    slack: {
+      enabled: true,
+
+      // Socket Mode: the gateway dials OUT to slack.com over a websocket. It
+      // needs no public URL, no inbound port and no reverse proxy, so
+      // compose.yaml's 127.0.0.1:18789 publish stays exactly as strict as it is
+      // without Slack. Upstream's transport table states "Public Gateway URL:
+      // Not required" for this mode.
+      mode: "socket",
+
+      // NO botToken / appToken KEYS ON PURPOSE. OpenClaw falls back to
+      // SLACK_BOT_TOKEN and SLACK_APP_TOKEN from the environment for the default
+      // account, and compose's env_file already puts them there. The result is
+      // stronger than the PRETORIN_API_KEY arrangement: the state volume holds
+      // not even a ${VAR} marker for a Slack credential.
+
+      // No DMs. A DM would be an unattributed private session speaking with the
+      // deployment's Pretorin key, and OpenClaw's default for Slack DMs is
+      // pairing rather than refusal. "disabled" is the posture this POC ships
+      // until user-level attribution and RBAC exist.
+      dmPolicy: "disabled",
+
+      // Slack traffic may not rewrite the gateway's own configuration.
+      configWrites: false,
+
+      // Only the channels listed below are served, and only on an explicit
+      // @mention. Keys MUST be Slack channel IDs (C...): a name-based key such
+      // as "#compliance" silently never routes under groupPolicy "allowlist",
+      // which looks identical to the bot being broken.
+      //
+      // Find the id: right-click the channel in Slack -> Copy link -> the C...
+      // value at the end of the URL.
+      groupPolicy: "allowlist",
+      channels: {
+        "@SLACK_CHANNEL_ID@": { requireMention: true },
+      },
+    },
+  },
+}

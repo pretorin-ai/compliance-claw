@@ -1,0 +1,24 @@
+# Local secrets — never commit. See .env.example.
+.env
+
+# The GitHub App private key used to clone private targets. HOST ONLY — it is
+# never mounted into a container and never referenced by compose. .env names its
+# PATH; this is the key itself. Both patterns, because a key saved anywhere in the
+# tree by mistake still must not be committable.
+secrets/
+*.pem
+
+# Agent working tree (read-only compliance review scratch space).
+workspace/
+
+# Downloaded release artifacts. Never committed; re-stage with
+# scripts/fetch-pretorin.sh. `tamper/` holds deliberately corrupted copies
+# used by the supply-chain validation gate.
+dist/
+tamper/
+
+# Per-developer coding-agent state (Claude Code settings, local permissions).
+# Machine-specific and not part of the deployment. Ignored HERE rather than
+# relying on a developer's global gitignore, so a fresh clone is clean for
+# everyone rather than only for whoever happens to have the global rule.
+.claude/

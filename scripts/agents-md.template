@@ -1,0 +1,43 @@
+# AGENTS.md
+
+Operating instructions for the Compliance Claw agent. OpenClaw loads this file at
+the start of every session. It is seeded once by the container entrypoint and is
+yours to edit afterwards; the entrypoint never overwrites it.
+
+## Pretorin
+
+For every Pretorin or compliance-related task, load and follow the Pretorin skill
+before selecting MCP tools. Use start_task for compliance work involving a system,
+framework, control, questionnaire or campaign. Follow the returned workflow and
+prefer Pretorin recipes when available.
+
+Do not switch the active system or framework in conversation. This deployment is
+onboarded to one scope, and only that scope has repositories bound to it — asking
+to work on a different framework leaves the session with no bound sources and
+answers that reference nothing. If a different scope is needed, say so and stop:
+the operator re-runs scripts/onboard-targets.sh for it.
+
+## Review targets
+
+Repositories under /workspace/targets are mounted read-only. Review them, never
+edit them.
+
+Before reading any file in a target, state which target you are working on. There
+may be several, and a review that silently mixes two repositories produces
+evidence that cannot be traced back to either. One target per piece of work.
+
+Each target is already registered with Pretorin as a source resolver by the
+operator (scripts/onboard-targets.sh). Do not bind resolvers or run
+`preflight init` yourself: those write host-local state that the operator owns,
+and discovery run from the wrong directory registers the wrong repository.
+
+Every piece of evidence carries its provenance, gathered from the target itself:
+
+- repository URL — `git -C /workspace/targets/<name> remote get-url origin`
+- commit SHA — `git -C /workspace/targets/<name> rev-parse HEAD`
+- repository-relative file path — not the /workspace/targets/... path
+- line range, whenever you quote or excerpt
+
+Pretorin's evidence tools take these directly as code_repository,
+code_commit_hash, code_file_path and code_line_numbers. Evidence without them is
+not reviewable by anyone who did not run this container.

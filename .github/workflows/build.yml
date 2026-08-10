@@ -1,0 +1,113 @@
+# Build the amd64 image and run the no-credential smoke section.
+#
+# NO CREDENTIALS EVER LIVE HERE. No Pretorin API key, no model key, no gateway
+# token from a secret. Everything CI exercises is reachable without them:
+# the supply-chain verification of the Pretorin binary, the generated config,
+# the mount posture, the stale-template warning, the targets.yaml parser, and
+# the CWD fix — including the proof that no /app source resolver survives
+# onboarding, which needs no key because resolver binding is host-local.
+#
+# The credentialed section of scripts/smoke.sh self-skips when PRETORIN_API_KEY
+# does not authenticate, so `--no-creds` is belt-and-braces rather than the only
+# thing keeping CI honest.
+#
+# ubuntu-latest is amd64, so the image builds natively here: no qemu, and the
+# emulation probe in bootstrap.sh short-circuits.
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # compose.yaml pulls the published image by default, which is wrong for CI:
+    # the point here is to test the code in this commit, not whatever was last
+    # released. The overlay adds the build section back. COMPOSE_FILE is docker
+    # compose's own mechanism, so bootstrap.sh, onboard-targets.sh and smoke.sh
+    # all inherit it without a CI-specific flag.
+    env:
+      COMPOSE_FILE: compose.yaml:compose.build.yaml
+
+    steps:
+      # Pinned to a commit: a tag is mutable, and this is the step that fetches
+      # the code everything else in the job then runs.
+      #
+      # v5. Keep this in step with .github/workflows/release.yml — they were
+      # briefly on v4 and v5 respectively, and the runner flagged the v4 pin as
+      # targeting a deprecated Node 20. Two workflows checking out the same repo
+      # two different ways is a difference with no reason behind it.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Show toolchain
+        run: |
+          docker version
+          docker compose version
+          python3 --version
+          git --version
+
+      # The committed targets.yaml must be clonable with NO credentials at all.
+      # CI holds none by design, and neither does someone doing a fresh clone with
+      # nothing but a Pretorin key — so a `private: true` target in the default
+      # file breaks both. This is a guard, not a preference: it shipped once and
+      # failed here in 21 seconds.
+      - name: Assert the committed targets.yaml needs no credentials
+        run: |
+          set -euo pipefail
+          if python3 scripts/parse-targets.py list | cut -f3 | grep -qx true; then
+            echo "::error::targets.yaml declares a private target. The committed"
+            echo "::error::default must clone anonymously — CI has no GitHub App, and"
+            echo "::error::neither does a first-time reader. Comment it out."
+            exit 1
+          fi
+          echo "targets.yaml is credential-free, as required."
+
+      # Runs the documented operator path rather than a CI-only shortcut, so a
+      # break in bootstrap.sh fails here instead of on someone's laptop. It
+      # clones the public target from targets.yaml, writes a throwaway .env with
+      # a generated gateway token (PRETORIN_API_KEY stays empty), and builds.
+      - name: Bootstrap (write .env, clone targets, build image)
+        run: bash scripts/bootstrap.sh --build
+
+      - name: Assert no credentials are configured
+        run: |
+          set -e
+          fail=0
+          # Phase 5 adds two more secret classes that must never reach CI: Slack
+          # tokens and the GitHub App private key. Checked by name rather than by
+          # value, because there is no value here to compare against.
+          for k in PRETORIN_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN GITHUB_APP_ID; do
+            if grep -qE "^${k}=.+" .env; then
+              echo "::error::CI generated a .env with ${k} set. It must stay empty."
+              fail=1
+            fi
+          done
+          if ls secrets/*.pem >/dev/null 2>&1; then
+            echo "::error::a private key is present under secrets/. CI must hold none."
+            fail=1
+          fi
+          [ "$fail" = 0 ] || exit 1
+          echo "No Pretorin, Slack, model or GitHub App credentials are configured."
+
+      - name: Smoke test (no-credential section only)
+        run: bash scripts/smoke.sh --no-creds
+
+      - name: Gateway logs on failure
+        if: failure()
+        run: docker compose logs --no-color openclaw || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v || true

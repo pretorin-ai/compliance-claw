@@ -1,0 +1,120 @@
+// openclaw-config.template.json — the config entrypoint.sh installs to
+// ~/.openclaw/openclaw.json on first start, and never overwrites afterwards.
+//
+// Parsed as JSON5 (OpenClaw's documented config format), which is why the
+// comments below are legal. They live in the state volume once installed, and
+// would be lost only if OpenClaw ever rewrites the file itself (doctor --fix).
+//
+// @MODEL@ is substituted at BUILD time from versions.env, so the copy inside
+// the image is concrete and the build fails if MODEL is ever unset.
+//
+// ${VAR} is OpenClaw's own config-load substitution, NOT shell: the literal
+// text is what lands on disk and the value is resolved in memory from the
+// container environment. That is what keeps secrets out of the volume.
+//
+// SLACK IS NOT HERE ON PURPOSE. It is optional, and a config naming
+// channels.slack with no tokens retries a websocket forever. The Slack half
+// lives in slack-channel.patch.json5 and entrypoint.sh merges it with
+// `openclaw config patch` on a fresh seed, only when .env supplies all three of
+// SLACK_BOT_TOKEN, SLACK_APP_TOKEN and SLACK_CHANNEL_ID. Note that the patch sets
+// plugins.allow, which is an EXCLUSIVE allowlist and therefore also trims the
+// bundled plugin set — read that file before changing either.
+{
+  gateway: {
+    // Without mode:"local" the gateway refuses to start and exits 78.
+    mode: "local",
+    port: 18789,
+    // Container-internal bind. With Docker bridge networking a "loopback" bind
+    // listens on the CONTAINER's 127.0.0.1, where a published port can never
+    // reach it. The exposure boundary is compose's 127.0.0.1:18789 publish plus
+    // the token below, not this value.
+    bind: "lan",
+    auth: { mode: "token", token: "${OPENCLAW_GATEWAY_TOKEN}" },
+    controlUi: {
+      allowedOrigins: ["http://127.0.0.1:18789", "http://localhost:18789"],
+    },
+  },
+
+  // Pins agent turns to OpenClaw's embedded runtime. This is load-bearing:
+  // OpenAI models otherwise default to the bundled Codex app-server PLUGIN
+  // (which needs no codex binary and is present in this image). That path uses
+  // a different auth store and a different billing path, and it does not
+  // receive tools.toolSearch below. Drift alarm: with this pin the gateway logs
+  // "8 plugins" with no `codex`; without it, 9 plugins including `codex`.
+  models: { providers: { openai: { agentRuntime: { id: "openclaw" } } } },
+
+  agents: {
+    defaults: {
+      model: "@MODEL@",
+      // Stated explicitly rather than left to the default so that the path
+      // entrypoint.sh seeds AGENTS.md into is provably the path the runtime
+      // reads from. Inside the state volume, so it stays writable.
+      workspace: "/home/node/.openclaw/workspace",
+    },
+  },
+
+  // Cost control, not access control. Pretorin advertises 192 tools whose full
+  // schemas are ~163 KB (~40k tokens) per turn if sent directly. "directory"
+  // keeps a bounded name+description directory in the prompt and defers the
+  // schemas behind tool_search/tool_describe/tool_call.
+  //
+  // Deliberately not `true`: that selects "code" mode, which instead exposes a
+  // JavaScript bridge (tool_search_code) running in a sandboxed subprocess.
+  // Upstream marks all Tool Search modes experimental.
+  tools: { toolSearch: { mode: "directory" } },
+
+  // mcp.sessionIdleTtlMs is deliberately NOT set here: the default is 600000,
+  // which is MILLISECONDS, i.e. 10 minutes of idleness before a session's MCP
+  // child is reaped. 0 disables idle cleanup entirely. Each session spawns its
+  // own `pretorin mcp-serve` child (a 23 MB binary), so this is the knob that
+  // bounds how many can be alive at once — left untuned until multi-session
+  // usage is actually measured.
+  mcp: {
+    servers: {
+      pretorin: {
+        command: "/usr/local/bin/pretorin",
+        args: ["mcp-serve"],
+
+        // THE CWD FIX. Without this the child inherits the image's WorkingDir
+        // /app, and Pretorin's own host-local discovery (`preflight init` with
+        // no --workspace) registers the CURRENT DIRECTORY as a code_repository
+        // — so /app, the OpenClaw install tree, gets bound as the repository
+        // under review. Verified by reading /proc/<pid>/cwd of the spawned
+        // child with and without this line.
+        //
+        // The directory is baked into the image, owned by node, and contains
+        // one .txt notice: no .git, no .md, no code. It is a sentinel, not a
+        // workspace — anything CWD-derived that lands here is obviously wrong
+        // and is named `no-repo`, instead of looking like a plausible repo.
+        // Real repositories are bound explicitly by scripts/onboard-targets.sh.
+        cwd: "/opt/compliance-claw/no-repo",
+
+        env: { PRETORIN_API_KEY: "${PRETORIN_API_KEY}" },
+
+        // OPTIONAL, operator-configured, commented out by default.
+        //
+        // This is a COST/CONTEXT lever and defence in depth. It is NOT an
+        // authorization control. Authorization is the Pretorin API key's
+        // scopes, enforced server-side by the platform: a read-only key
+        // rejects write tools no matter what is listed here.
+        //
+        // Uncomment and edit only to shrink the prompt further, or as a
+        // fallback if tools.toolSearch above misbehaves.
+        // toolFilter: {
+        //   include: ["check_context", "list_frameworks", "list_controls", "get_control"],
+        // },
+      },
+    },
+  },
+
+  // Lowest-precedence skill root, so a same-named skill in the workspace or the
+  // state volume would silently win. `openclaw skills info pretorin` must
+  // report Source: openclaw-extra to prove ours is the one that loaded.
+  skills: {
+    load: {
+      extraDirs: ["/opt/compliance-claw/skills"],
+      // The skill tree is baked into the image and never changes at runtime.
+      watch: false,
+    },
+  },
+}

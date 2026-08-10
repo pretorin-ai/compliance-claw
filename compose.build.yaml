@@ -1,0 +1,40 @@
+# compose.build.yaml — development overlay: build the image locally instead of
+# pulling the released one.
+#
+#   export COMPOSE_FILE=compose.yaml:compose.build.yaml
+#   scripts/bootstrap.sh --build
+#   docker compose up -d
+#
+# Everything else in the repo then follows automatically, because COMPOSE_FILE is
+# docker compose's own file-selection variable: onboard-targets.sh and smoke.sh
+# call plain `docker compose` and inherit this overlay with no flag of their own.
+# `scripts/bootstrap.sh --build` also sets it for its own invocation, and prints
+# the export line to run for the rest of the shell session.
+#
+# This is the DOCUMENTED FALLBACK, not the default path. The default is the
+# published image, which was vulnerability-scanned at release, has an SBOM
+# retained on its release run, and is pinned by immutable digest — none of which
+# is true of a local build. (Neither is signed: see README.md, 'Verifying what you
+# pulled'.) Use this overlay when you are changing the Dockerfile, the entrypoint,
+# the config templates or the pinned Slack plugin, and want to see the effect
+# before cutting a release.
+#
+# The image name differs from compose.yaml's on purpose. A local build tagged with
+# the release name would be indistinguishable from the released image in
+# `docker images`, and `up` would then happily run it while the operator believed
+# they were running the published one.
+#
+# CI uses this overlay too (.github/workflows/build.yml), because the
+# no-credential smoke section has to test the code in the pull request rather than
+# whatever was last published.
+
+services:
+  openclaw:
+    build:
+      context: .
+    image: compliance-claw:local
+
+  cli:
+    build:
+      context: .
+    image: compliance-claw:local
