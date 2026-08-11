@@ -1,7 +1,12 @@
 # Publish a scanned, SBOM-bearing linux/amd64 image to GHCR, by immutable digest.
 #
 # Cut a release:
-#   gh release create v0.1.1 --generate-notes
+#   gh release create vX.Y.Z --target master --generate-notes
+#
+# That is the whole trigger. NO VERSION-BUMP PR IS REQUIRED BEFOREHAND. Afterwards,
+# ONE post-release PR pins what this run published — IMAGE_VERSION in versions.env
+# and the matching version tag plus immutable digest in compose.yaml — because the
+# digest cannot be known until the image has been built.
 #
 # THE RELEASE IS THE SOURCE OF TRUTH FOR THE VERSION. Modelled on
 # pretorin-ai/pretorin-cli's release-binaries.yml, which triggers on
@@ -290,10 +295,11 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # STEP 1 OF 2: publish BY DIGEST under a throwaway build ref. The version tag
-      # is deliberately NOT applied yet — see the verify step below. This is
-      # pretorin-cli's ordering: bytes are published and checked before any
-      # human-readable tag points at them.
+      # STEP 1 OF 2: publish BY DIGEST under the constant staging ref resolved
+      # above (`:build`), never a per-release name. The version tag is deliberately
+      # NOT applied yet — see the verify step below. This is pretorin-cli's
+      # ordering: bytes are published and checked before any human-readable tag
+      # points at them.
       - name: Push by digest
         id: push
         if: ${{ !inputs.dry_run }}
