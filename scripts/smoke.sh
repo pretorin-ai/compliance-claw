@@ -310,6 +310,45 @@ if grep -qE '^[[:space:]]*build:' compose.yaml; then
 else
   pass "compose.yaml has no build section (pull-only by default)"
 fi
+# Is the RUNNING deployment actually on the image this checkout pins? An
+# operator who pulled the repo but never restarted is running last release's
+# bytes while every file here describes the new one — invisible, and exactly the
+# state scripts/update.sh exists to fix.
+#
+# NOTE, never FAIL. Being mid-update is not being broken, and CI runs this with
+# no deployment at all. Local comparison only: no registry call, so the
+# no-credential section stays offline.
+PINNED_DIGEST="$(awk '/^[[:space:]]*image:/{ if (match($0, /@sha256:[0-9a-f]+/)) { print substr($0, RSTART+1, RLENGTH-1); exit } }' compose.yaml)"
+RUNNING_CID="$(docker compose ps -q openclaw 2>/dev/null | head -1)"
+if [ -z "$PINNED_DIGEST" ]; then
+  skip "the running image matches the digest compose.yaml pins" \
+       "compose.yaml pins no digest (build overlay, or a tag-only reference)"
+elif [ -z "$RUNNING_CID" ]; then
+  skip "the running image matches the digest compose.yaml pins" \
+       "no gateway container in this project; nothing to compare"
+else
+  # .Config.Image is the reference the container was CREATED from, which compose
+  # sets to the digest-pinned literal. A container created before the pin moved
+  # keeps the old one, which is the whole point. Falling back to the image's own
+  # RepoDigests covers a container created from a bare tag or a local build.
+  RUNNING_DIGEST="$(docker inspect "$RUNNING_CID" --format '{{.Config.Image}}' 2>/dev/null \
+                    | grep -oE 'sha256:[0-9a-f]+' | head -1)"
+  if [ -z "$RUNNING_DIGEST" ]; then
+    RUNNING_IMG="$(docker inspect "$RUNNING_CID" --format '{{.Image}}' 2>/dev/null)"
+    RUNNING_DIGEST="$(docker image inspect "$RUNNING_IMG" --format '{{join .RepoDigests "\n"}}' 2>/dev/null \
+                      | grep -oE 'sha256:[0-9a-f]+' | head -1)"
+  fi
+  if [ -z "$RUNNING_DIGEST" ]; then
+    skip "the running image matches the digest compose.yaml pins" \
+         "the running container reports no digest (a local build has none until pushed)"
+  elif [ "$RUNNING_DIGEST" = "$PINNED_DIGEST" ]; then
+    pass "the running image matches the digest compose.yaml pins"
+  else
+    note "deployment is behind the repo pin: run scripts/update.sh"
+    printf '        running %s\n        pinned  %s\n' "$RUNNING_DIGEST" "$PINNED_DIGEST"
+  fi
+fi
+
 ok "compose.build.yaml restores the build path" \
    bash -c 'COMPOSE_FILE=compose.yaml:compose.build.yaml docker compose config --format json 2>/dev/null | python3 -c "
 import json,sys

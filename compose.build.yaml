@@ -28,13 +28,22 @@
 # no-credential smoke section has to test the code in the pull request rather than
 # whatever was last published.
 
+# IMAGE_SELF_VERSION is what the image reports as its own version, in the OCI
+# label and in its copy of versions.env. A local build must never impersonate a
+# release, so the default here is an honest dev version rather than whatever
+# release number versions.env currently names. scripts/bootstrap.sh --build
+# exports the sharper `0.0.0-dev+<shortsha>` before calling compose.
 services:
   openclaw:
     build:
       context: .
+      args:
+        IMAGE_SELF_VERSION: "${IMAGE_SELF_VERSION:-0.0.0-dev}"
     image: compliance-claw:local
 
   cli:
     build:
       context: .
+      args:
+        IMAGE_SELF_VERSION: "${IMAGE_SELF_VERSION:-0.0.0-dev}"
     image: compliance-claw:local

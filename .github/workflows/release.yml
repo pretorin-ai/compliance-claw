@@ -51,8 +51,16 @@ permissions:
   contents: read
   packages: write     # push to GHCR — the only write `publish` performs
 
+# ONE release at a time, repo-wide — deliberately not per-ref. Two runs on
+# different tags would otherwise overlap on the shared `:build` staging ref
+# below. That race is not corrupting (the digest is read from the local image
+# right after push, never by resolving the tag), but a publish pipeline that can
+# interleave with itself is a bad thing to have to reason about.
+#
+# cancel-in-progress stays false: a half-cancelled release is worse than a slow
+# one, and a run that has pushed but not yet tagged must be allowed to finish.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -111,7 +119,19 @@ jobs:
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "image_ref=${IMAGE_REPO}:${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "build_ref=${IMAGE_REPO}:build-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          # A CONSTANT staging ref, not build-${GITHUB_SHA}.
+          #
+          # `docker push` needs a tag, so publishing by digest requires some tag
+          # to exist first. A per-commit name made that tag accumulate forever,
+          # and it CANNOT BE CLEANED UP AFTERWARDS: on GHCR a package version IS
+          # a digest and tags are attributes of it, so once the version tag is
+          # applied, the staging tag and the release tag are the same version.
+          # Deleting "the staging tag" would delete the released image.
+          #
+          # A constant name means at most one such tag exists, permanently
+          # pointing at the most recent successful build. Nothing accumulates,
+          # and nothing has to be deleted on the success path.
+          echo "build_ref=${IMAGE_REPO}:build" >> "$GITHUB_OUTPUT"
 
       # trivy and syft from pinned versions, compared against pinned digests. CI
       # installs no unverified binary, for the same reason the build does not.
@@ -145,12 +165,31 @@ jobs:
       # ubuntu-latest is amd64, so this is a native build: no qemu, and the
       # Dockerfile's own gates (Pretorin signature + digest, Slack plugin integrity)
       # run here exactly as they do on an operator's machine.
+      # IMAGE_SELF_VERSION is what the image will say it is: the OCI version label
+      # and the IMAGE_VERSION line of the versions.env copy inside it. It comes
+      # from the release TAG, because versions.env in this checkout still holds
+      # the PREVIOUS release's number -- the commit that moves it lands after this
+      # run. Baking that stale line is exactly how v0.2.0 shipped saying 0.1.0.
       - name: Build
         env:
           BUILD_REF: ${{ steps.pins.outputs.build_ref }}
+          VERSION: ${{ steps.pins.outputs.version }}
         run: |
           set -euo pipefail
-          docker build --platform linux/amd64 -t "$BUILD_REF" .
+          docker build --platform linux/amd64 \
+            --build-arg "IMAGE_SELF_VERSION=${VERSION}" \
+            -t "$BUILD_REF" .
+
+          # Assert it took, here rather than at the end: a mislabelled image must
+          # not reach a scan, a push or an operator.
+          LABEL="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$BUILD_REF")"
+          [ "$LABEL" = "$VERSION" ] \
+            || { echo "::error::image label says '${LABEL}', expected '${VERSION}'"; exit 1; }
+          BAKED="$(docker run --rm --entrypoint bash "$BUILD_REF" -lc \
+            'awk -F= "/^IMAGE_VERSION=/{print \$2}" /opt/compliance-claw/versions.env')"
+          [ "$BAKED" = "$VERSION" ] \
+            || { echo "::error::baked versions.env says '${BAKED}', expected '${VERSION}'"; exit 1; }
+          echo "image self-reports ${VERSION} (OCI label and baked versions.env)"
 
       - name: Smoke the built image
         env:
@@ -362,6 +401,53 @@ jobs:
           [ "$RESOLVED" = "$DIGEST" ] \
             || { echo "::error::tag ${IMAGE_REF} resolves to ${RESOLVED}, expected ${DIGEST}"; exit 1; }
           echo "tag ${IMAGE_REF} -> ${DIGEST}"
+
+      # Reclaim a digest that was pushed but never tagged -- a run that died
+      # between "Push by digest" and the tagging step. Such a version carries the
+      # staging tag and nothing else, which is precisely the condition tested
+      # below, and it is the ONLY case where deleting is safe.
+      #
+      # THE TAG SET IS THE SAFETY INTERLOCK, not a nicety. GHCR deletes VERSIONS
+      # (digests), never individual tags. Once the version tag has been applied,
+      # the staging tag and the release tag name the same version, so deleting
+      # "the leftover staging tag" would delete the release. The guard makes that
+      # impossible: a tagged release always has more than one tag by then.
+      #
+      # Best-effort throughout. GITHUB_TOKEN may not carry package-delete rights
+      # depending on org policy, and a release must never fail over housekeeping.
+      - name: Reclaim the digest if it was never tagged
+        if: ${{ always() && !inputs.dry_run }}
+        env:
+          IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          [ -n "${DIGEST:-}" ] || { echo "nothing was pushed; nothing to reclaim"; exit 0; }
+
+          REPO_PATH="${IMAGE_REPO#ghcr.io/}"
+          ORG="${REPO_PATH%%/*}"
+          PKG="${REPO_PATH#*/}"
+
+          gh api --paginate "/orgs/${ORG}/packages/container/${PKG}/versions" \
+            > versions.json 2>/dev/null || {
+              echo "::notice::cannot list package versions (permissions); skipping cleanup"; exit 0; }
+
+          ID="$(jq -r --arg d "$DIGEST" '.[] | select(.name==$d) | .id' versions.json)"
+          TAGS="$(jq -r --arg d "$DIGEST" '.[] | select(.name==$d) | (.metadata.container.tags // []) | join(",")' versions.json)"
+          rm -f versions.json
+
+          [ -n "${ID:-}" ] || { echo "digest ${DIGEST} not found in the package listing; nothing to do"; exit 0; }
+
+          if [ "${TAGS:-}" != "build" ]; then
+            echo "digest ${DIGEST} carries tags [${TAGS:-<none>}] -- it is tagged for release, keeping it"
+            exit 0
+          fi
+
+          echo "digest ${DIGEST} carries only the staging tag: the run never tagged it, reclaiming"
+          gh api -X DELETE "/orgs/${ORG}/packages/container/${PKG}/versions/${ID}" >/dev/null 2>&1 \
+            && echo "deleted abandoned version ${ID}" \
+            || echo "::notice::could not delete version ${ID} (permissions); delete it by hand if it matters"
 
       - name: Summary
         if: ${{ !inputs.dry_run }}

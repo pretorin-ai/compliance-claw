@@ -301,6 +301,14 @@ if [ "$DO_BUILD" = 1 ]; then
   export COMPOSE_FILE="compose.yaml:compose.build.yaml"
   log "--build: building locally (amd64; slow under emulation on first run)"
   log "  COMPOSE_FILE=${COMPOSE_FILE}"
+  # What the image will report as its own version. A local build is NOT a
+  # release and must never claim to be one: it says 0.0.0-dev, plus the commit
+  # it came from when there is one to name. Outside a git checkout the plain
+  # default in compose.build.yaml applies.
+  if SHORT_SHA="$(git rev-parse --short HEAD 2>/dev/null)"; then
+    export IMAGE_SELF_VERSION="0.0.0-dev+${SHORT_SHA}"
+    log "  image self-version: ${IMAGE_SELF_VERSION}"
+  fi
   docker compose build
   log "for later commands in this shell:  export COMPOSE_FILE=${COMPOSE_FILE}"
 else
