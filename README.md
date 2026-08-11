@@ -120,15 +120,18 @@ supply. Those need a Connected Source on the platform side, which is future work
 ## Verifying what you pulled
 
 **Pull by digest, not by tag.** A tag is a mutable pointer — the same
-`:0.1.0` can be made to resolve to different bytes tomorrow. A digest is the
+`:<version>` can be made to resolve to different bytes tomorrow. A digest is the
 bytes: `@sha256:…` is a content address, so if it resolves at all, it resolves to
 exactly the image that was built, smoked, scanned and inventoried by the release
 run that produced it.
 
 ```sh
 docker login ghcr.io          # the package is not public
-docker pull ghcr.io/pretorin-ai/compliance-claw:0.1.0@sha256:<digest>
+docker pull ghcr.io/pretorin-ai/compliance-claw:<version>@sha256:<digest>
 ```
+
+The pair this checkout deploys is in [compose.yaml](compose.yaml) — copy it from
+there rather than retyping a version seen in these examples.
 
 The digest is printed in the release run's job summary, and `compose.yaml` carries
 the line to paste it into. The release job also proves the round trip itself: it
@@ -141,8 +144,21 @@ Check what you are actually running at any time:
 ```sh
 docker compose images                      # what compose resolved
 docker inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/pretorin-ai/compliance-claw:0.1.0
+  ghcr.io/pretorin-ai/compliance-claw:<version>@sha256:<digest>
 ```
+
+The image also states its own version, set from the release tag at build time:
+
+```sh
+docker compose run --rm cli \
+  grep '^IMAGE_VERSION=' /opt/compliance-claw/versions.env
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+  ghcr.io/pretorin-ai/compliance-claw:<version>@sha256:<digest>
+```
+
+A local build reports `0.0.0-dev` (or `0.0.0-dev+<shortsha>` via
+`scripts/bootstrap.sh --build`), never a release number — so an image built on
+someone's laptop can never be mistaken for a published one.
 
 ### What this does and does not prove
 
@@ -628,39 +644,69 @@ scripts/onboard-targets.sh --verify-only
 
 ## Releasing
 
-**The release is the source of truth for the version.** Nothing needs bumping
-first — create the release, and CI derives the version from its tag. Two steps:
+**The GitHub Release tag is the source of truth for the version.** Releasing means
+publishing `vX.Y.Z` — nothing is bumped first, and **no version-bump PR is required
+before releasing**. CI derives the version from the tag and builds the image with
+it, so the image states the version it was released as.
 
 ```sh
-# 1. cut it
-gh release create v0.1.1 --generate-notes
+# 1. cut the release — this is the whole release trigger
+gh release create vX.Y.Z --target master --generate-notes
 
-# 2. when it finishes, take the two lines from the job summary and land them
-#    in ONE commit: the digest pin in compose.yaml and IMAGE_VERSION in versions.env
+# 2. wait for the release workflow to succeed
+
+# 3. one POST-RELEASE PR pins what it published:
+#      versions.env   IMAGE_VERSION=X.Y.Z
+#      compose.yaml   image: ghcr.io/pretorin-ai/compliance-claw:X.Y.Z@sha256:<digest>
+#    both lines are printed in the release run's job summary
 ```
+
+**Why step 3 is a separate PR, and not a bump beforehand:** the digest does not
+exist until the image is built. Nothing can pin `@sha256:…` in advance, because
+that value is the hash of bytes that have not been produced yet. So the version
+flows *forward* from the tag into the image, and the digest flows *back* from the
+completed run into the checkout. Any attempt to bump first would either invent a
+digest or leave the pin stale.
+
+Step 3 is not optional bookkeeping. A tag is mutable and the image is unsigned, so
+the digest pin is the only thing tying a deployment to the bytes that were actually
+built and scanned. `IMAGE_VERSION` and the pin describe **what this checkout
+deploys**, which is why they move together, once, after the release.
 
 `.github/workflows/release.yml` builds `linux/amd64`, smokes the image, blocks on
 fixable CRITICAL vulnerabilities, generates an SPDX SBOM, then:
 
-1. **pushes by digest** under a throwaway `build-<sha>` ref — no version tag yet
+1. **pushes by digest** under a single constant staging ref,
+   `ghcr.io/pretorin-ai/compliance-claw:build` — no version tag yet. `docker push`
+   requires *some* tag before a digest can be published; a constant name means at
+   most one such ref ever exists instead of one per release
 2. **pulls that digest back and re-verifies it** — the local image is removed first
    so the pull cannot be served from cache, and the SBOM is regenerated from the
    pulled bytes and compared against the built one
-3. **only then applies the version tag** to the verified digest, and resolves the
+3. **only then applies the version tag** to the verified digest, by re-PUTting the
+   same manifest bytes so the digest is preserved by construction, and resolves the
    tag to confirm it lands there
 
 That ordering is deliberate: a floating tag should never point at bytes nobody has
 checked. The SBOM is also attached to the GitHub Release, so it outlives
 workflow-artifact retention.
 
+### Not part of releasing
+
+Releasing is the four steps above and nothing else. None of the following is a
+prerequisite, a blocker, or part of the procedure:
+
+| | Status |
+| --- | --- |
+| release-please or other release automation | not implemented; releases are cut by hand |
+| Azure Key Vault image signing | planned, SECURITY.md ledger item 5 — the image is unsigned |
+| cleaning up old GHCR package versions | separate housekeeping, never required to release |
+| `scripts/update.sh` | for operators updating a deployment, unrelated to publishing |
+| a pre-release version bump | explicitly not required — see step 3 above |
+
 CI holds **no** Pretorin, model or Slack credentials — only the automatic
 `GITHUB_TOKEN`, and it asserts that itself. It does not sign; see "Verifying what
 you pulled".
-
-Step 2 is not optional bookkeeping. A tag is mutable, and the image is unsigned, so
-the digest pin is the only thing tying a deployment to the bytes that were actually
-built and scanned. `IMAGE_VERSION` and the pin describe **what this checkout
-deploys**, which is why they move together, once, after the release.
 
 Rehearse the pipeline without publishing anything:
 
