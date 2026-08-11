@@ -51,7 +51,7 @@ x-compliance-claw: &compliance-claw
   # file, and scripts/smoke.sh asserts the two agree. Same documented-duplication
   # shape as the digest pins on the Dockerfile's FROM lines.
   #
-  # PINNED TO THE PUBLISHED DIGEST of the v0.2.0 release run, which verified the
+  # PINNED TO THE PUBLISHED DIGEST of the v0.2.1 release run, which verified the
   # round trip: it deleted the built image, pulled this digest back, ran it, and
   # confirmed the SBOM regenerated from the pulled bytes matched the built one
   # (1099 packages both ways). Re-pin on every release — this line and
@@ -64,7 +64,7 @@ x-compliance-claw: &compliance-claw
   # the digest pin is the whole of what guarantees what you are running; see
   # README.md ('Verifying what you pulled'). The release workflow prints the digest
   # in its job summary for exactly this step.
-  image: ghcr.io/pretorin-ai/compliance-claw:0.2.0@sha256:e123bf533b7433bd65726319bb52a7275a4a88c71e26a52d43dbf67693a10013
+  image: ghcr.io/pretorin-ai/compliance-claw:0.2.1@sha256:eb1132f8c881d12af4fbace9284babc1c64b630d09b521549a8a1f0a588df374
   env_file:
     # Gitignored and dockerignored, so nothing here is ever baked into a layer.
     # required:false because a fresh clone has no .env — Phase 4's bootstrap
