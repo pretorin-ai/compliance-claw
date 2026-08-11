@@ -300,21 +300,67 @@ jobs:
           echo "digest round-trip verified"
 
       # STEP 2 OF 2: only now does the version tag point at the digest, and only at a
-      # digest that has been pulled back and re-inventoried. `buildx imagetools
-      # create` retags server-side without re-pushing layers, then the tag is
-      # resolved to confirm it lands on the digest we verified.
+      # digest that has been pulled back and re-inventoried.
+      #
+      # A tag is added by re-PUTting THE SAME MANIFEST BYTES under the tag name. A
+      # digest IS the hash of those bytes, so this preserves it by construction --
+      # there is no operation to get wrong.
+      #
+      # `docker buildx imagetools create --tag X repo@digest` is NOT that operation
+      # and must not be used here. It does not move a tag; it BUILDS A NEW MANIFEST
+      # LIST wrapping the source, which by definition hashes differently. v0.2.0's
+      # first release attempt proved it: the step published
+      # `sha256:351ecb37...` (a manifest.list) for a verified
+      # `sha256:34619259...` (a manifest.v2), and the assertion below correctly
+      # refused to let a tag point at bytes nothing had verified.
+      #
+      # `docker tag` + `docker push` would probably preserve the digest for a
+      # single manifest, but only as a side effect of the client regenerating an
+      # identical manifest. "Probably" is not a supply-chain control.
       - name: Apply the version tag to the verified digest
         if: ${{ !inputs.dry_run }}
         env:
           IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
           IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          VERSION: ${{ steps.pins.outputs.version }}
           DIGEST: ${{ steps.push.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create --tag "$IMAGE_REF" "${IMAGE_REPO}@${DIGEST}"
-          RETAGGED="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          [ "$RETAGGED" = "$DIGEST" ] \
-            || { echo "::error::tag ${IMAGE_REF} resolves to ${RETAGGED}, expected ${DIGEST}"; exit 1; }
+          REPO_PATH="${IMAGE_REPO#ghcr.io/}"
+          ACCEPT='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
+
+          # A registry bearer token for this repository only, exchanged from the
+          # automatic GITHUB_TOKEN. Same credential `docker login` already used.
+          TOKEN="$(curl -fsSL -u "${GITHUB_ACTOR}:${GH_TOKEN}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull,push" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+          [ -n "$TOKEN" ] || { echo "::error::could not obtain a ghcr.io token"; exit 1; }
+
+          # Content-Type must be echoed back exactly: it is part of what the digest
+          # covers, so guessing it would change the bytes and hence the digest.
+          CT="$(curl -fsSL -o manifest.json -w '%{content_type}' \
+            -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
+            "https://ghcr.io/v2/${REPO_PATH}/manifests/${DIGEST}")"
+
+          # Gate 1: the bytes we are about to re-PUT really are the verified image.
+          LOCAL="sha256:$(sha256sum manifest.json | cut -d' ' -f1)"
+          [ "$LOCAL" = "$DIGEST" ] \
+            || { echo "::error::fetched manifest hashes to ${LOCAL}, expected ${DIGEST}"; exit 1; }
+
+          # Gate 2: the registry's own accounting of what it just stored.
+          STORED="$(curl -fsSL -X PUT -o /dev/null -w '%header{docker-content-digest}' \
+            -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: ${CT}" \
+            --data-binary @manifest.json \
+            "https://ghcr.io/v2/${REPO_PATH}/manifests/${VERSION}")"
+          [ "$STORED" = "$DIGEST" ] \
+            || { echo "::error::registry stored the tag as ${STORED}, expected ${DIGEST}"; exit 1; }
+
+          # Gate 3: resolve the tag through the docker client, so the check does not
+          # depend on the same API call that wrote it.
+          RESOLVED="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [ "$RESOLVED" = "$DIGEST" ] \
+            || { echo "::error::tag ${IMAGE_REF} resolves to ${RESOLVED}, expected ${DIGEST}"; exit 1; }
           echo "tag ${IMAGE_REF} -> ${DIGEST}"
 
       - name: Summary
