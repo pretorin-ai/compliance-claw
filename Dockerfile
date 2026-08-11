@@ -220,6 +220,25 @@ COPY scripts/mcp-call.py /opt/compliance-claw/
 # CONFIG_TEMPLATE_VERSION lands in a file next to the templates for the same
 # reason: the entrypoint reads it to detect a state volume whose config predates
 # this image, and it must come from the one place versions are declared.
+# WHAT VERSION THIS IMAGE IS, decided by whoever builds it — because the image
+# cannot know. versions.env's IMAGE_VERSION describes what a CHECKOUT DEPLOYS,
+# and the commit that moves it lands AFTER the release is published. Baking that
+# line unchanged is how the v0.2.0 image ended up self-reporting 0.1.0.
+#
+# So the release passes the version derived from the GIT TAG, which is the single
+# source of truth at release time, and it is recorded in two places an operator
+# might look: the OCI label, and the copy of versions.env inside the image.
+#
+# The default is deliberately NOT a release number. An unlabelled local build
+# must never impersonate a release, so it says 0.0.0-dev and means it;
+# scripts/bootstrap.sh --build refines that to 0.0.0-dev+<shortsha>.
+#
+# This is an ARG rather than something computed in the RUN below because a LABEL
+# can only reference a build argument — a value derived inside a shell is not
+# visible to it.
+ARG IMAGE_SELF_VERSION=0.0.0-dev
+LABEL org.opencontainers.image.version="${IMAGE_SELF_VERSION}"
+
 COPY versions.env /opt/compliance-claw/versions.env
 RUN . /opt/compliance-claw/versions.env \
  && test -n "${MODEL}" \
@@ -227,6 +246,10 @@ RUN . /opt/compliance-claw/versions.env \
  && ! grep -q '@MODEL@' /opt/compliance-claw/openclaw-config.template.json \
  && test -n "${CONFIG_TEMPLATE_VERSION}" \
  && printf '%s\n' "${CONFIG_TEMPLATE_VERSION}" > /opt/compliance-claw/config-template.version \
+ && test -n "${IMAGE_SELF_VERSION}" \
+ && sed -i "s|^IMAGE_VERSION=.*|IMAGE_VERSION=${IMAGE_SELF_VERSION}|" \
+      /opt/compliance-claw/versions.env \
+ && grep -qx "IMAGE_VERSION=${IMAGE_SELF_VERSION}" /opt/compliance-claw/versions.env \
  && test -x /usr/bin/tini \
  && chmod 0755 /usr/local/bin/compliance-claw-entrypoint \
  && chown -R node:node /opt/compliance-claw

@@ -507,18 +507,54 @@ Pre-release, run the tests against a local build (`export
 COMPOSE_FILE=compose.yaml:compose.build.yaml`), since the pull path needs a
 published image.
 
-## Upgrading
+## Updating an existing deployment
 
 ```sh
-# 1. point compose.yaml at the release you want, pinned by digest, and set the
-#    matching IMAGE_VERSION in versions.env (smoke.sh asserts the two agree)
-# 2. pull and restart
-docker compose pull && docker compose up -d
+scripts/update.sh
 ```
 
-Each release's digest is in its job summary, and on `master` the pair is already
-set to the current release — so upgrading usually means pulling `master` rather than
-editing anything.
+One command: fast-forward the checkout, pull the image this checkout pins, restart
+the gateway on it, then report anything you have to act on. It is idempotent — run
+it twice and the second run pulls nothing and recreates nothing.
+
+On `master` the digest pin and `IMAGE_VERSION` are already set to the current
+release, so updating means pulling `master` rather than editing anything. To move
+to a *specific* release instead, point `compose.yaml` at that digest and set the
+matching `IMAGE_VERSION` in `versions.env` before running it — `smoke.sh` asserts
+the two agree.
+
+`update.sh` refuses rather than guessing, and names the exact command each time:
+a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
+diverged from its upstream, or a shell with `COMPOSE_FILE` set to the local build
+overlay (that is a rebuild, not an update).
+
+### What survives an update, and what does not
+
+| | Survives `update.sh` | Survives `down -v` |
+| --- | --- | --- |
+| The image | replaced — that is the point | n/a |
+| Model login (`openclaw-state`) | **yes** | **no** |
+| Seeded config, sessions, `AGENTS.md` | **yes** | **no** |
+| Pretorin context, resolvers, recipes (`pretorin-state`) | **yes** | **no** |
+| `.env` | **yes** | **yes** — never touched by either |
+| `workspace/targets` clones | **yes** | **yes** — bind-mounted, not a volume |
+
+So an update never costs you a re-login or a re-onboard. Re-run
+`scripts/onboard-targets.sh` only after `down -v`, or when `targets.yaml` changes;
+it is idempotent either way.
+
+`smoke.sh` also reports this state on its own:
+
+```
+NOTE  deployment is behind the repo pin: run scripts/update.sh
+      running sha256:58690e31...
+      pinned  sha256:e123bf53...
+```
+
+A warning, not a failure — being mid-update is not being broken.
+
+**Known state:** a deployment still on **v0.1.x** is running Pretorin CLI 0.26.14.
+Updating to v0.2.0 is what moves it to **0.28.2**.
 
 **A newer image does not update an existing volume's config.** Templates are
 seeded write-if-absent and never overwritten, so a tightened template has no
@@ -564,6 +600,7 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `pull access denied` / `unauthorized` | The package is not public | `docker login ghcr.io`; a classic token needs `read:packages` |
+| `deployment is behind the repo pin` | Repo was pulled, deployment never restarted | `scripts/update.sh` |
 | Gateway exits 1 immediately | `OPENCLAW_GATEWAY_TOKEN` empty | `scripts/bootstrap.sh` generates one; check `.env` |
 | Gateway exits 78 `Missing config` | Config was never seeded | `docker compose down -v` then bootstrap |
 | Slack never connects | Credentials added after the first `up` | Look for the Slack-specific warning; `down -v` and re-bootstrap |
