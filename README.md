@@ -444,6 +444,12 @@ rebuild.
 happens at **deployment time** and persists in the OpenClaw state volume, which is
 why it survives `docker compose down` and is destroyed by `down -v`.
 
+For VM deployments, OpenAI and Anthropic API keys can instead arrive through the
+file-secret overlay and remain outside Docker's configured environment. See
+[file-backed runtime secrets](docs/file-secrets.md). Model selection remains a
+separate runtime action (`openclaw models set`); supplying a credential does not
+silently change the selected model.
+
 The POC's tested path is OpenAI/ChatGPT **device-code** login:
 
 ```sh
