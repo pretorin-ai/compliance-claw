@@ -357,6 +357,45 @@ assert all(s.get(\"build\") for s in d.values()), \"a service has no build secti
 assert all(s[\"image\"]==\"compliance-claw:local\" for s in d.values()), \"image is not the local tag\"
 "'
 
+head2 "A4d. FILE-BACKED SECRET DEPLOYMENT"
+# Static assertions run in CI without credentials. The overlay must remove the
+# base env_file entirely, mount every secret explicitly, and expose only *_FILE
+# paths plus documented non-secret configuration to Docker.
+FILE_SECRET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cc-file-secrets.XXXXXX")"
+for f in pretorin-api-key openclaw-gateway-token slack-app-token slack-bot-token openai-api-key anthropic-api-key; do
+  : > "${FILE_SECRET_DIR}/${f}"
+done
+FILE_SECRET_CONFIG="$(COMPLIANCE_CLAW_SECRET_DIR="$FILE_SECRET_DIR" \
+  COMPOSE_FILE=compose.yaml:compose.secrets.yaml docker compose --profile cli config --format json 2>/dev/null || true)"
+rm -rf "$FILE_SECRET_DIR"
+if [ -n "$FILE_SECRET_CONFIG" ]; then
+  pass "file-secret overlay renders"
+else
+  fail "file-secret overlay renders" "docker compose config returned no JSON"
+fi
+FILE_SECRET_CHECK="$(printf '%s' "$FILE_SECRET_CONFIG" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)["services"]
+secret_names={"PRETORIN_API_KEY","OPENCLAW_GATEWAY_TOKEN","SLACK_APP_TOKEN","SLACK_BOT_TOKEN","OPENAI_API_KEY","ANTHROPIC_API_KEY"}
+for name,svc in d.items():
+    assert not svc.get("env_file"), f"{name} still has env_file"
+    env=svc.get("environment",{})
+    assert not (secret_names & set(env)), f"{name} has direct secret values"
+    common={n+"_FILE" for n in {"PRETORIN_API_KEY","OPENCLAW_GATEWAY_TOKEN","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"}}
+    assert common <= set(env), f"{name} lacks common *_FILE paths"
+    expected=6 if name=="openclaw" else 4
+    assert len(svc.get("secrets",[])) == expected, f"{name} mounts the wrong secret set"
+assert {"OPENAI_API_KEY_FILE","ANTHROPIC_API_KEY_FILE"} <= set(d["openclaw"].get("environment",{}))
+assert "OPENAI_API_KEY_FILE" not in d["cli"].get("environment",{})
+assert "ANTHROPIC_API_KEY_FILE" not in d["cli"].get("environment",{})
+print("ok")
+' 2>&1 || true)"
+if [ "$FILE_SECRET_CHECK" = ok ]; then
+  pass "overlay removes env_file and mounts only file-secret references"
+else
+  fail "overlay removes env_file and mounts only file-secret references" "$FILE_SECRET_CHECK"
+fi
+
 head2 "A4c. SECRET CONTAINMENT — every secret class, not just the Pretorin key"
 # Phase 3 canaried PRETORIN_API_KEY across the rendered config, the state volume,
 # the image layers and the container logs. Phase 5 adds two more classes and they
@@ -683,7 +722,7 @@ T2_OUT="$(docker run --rm --platform linux/amd64 -v "$T2_VOL":/home/node/.opencl
   -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y -e SLACK_CHANNEL_ID=C0SMOKE123 \
   "$SLACK_IMG" bash -c 'grep -c "plugins/slack" /home/node/.openclaw/openclaw.json || true' 2>&1)"
 docker volume rm "$T2_VOL" >/dev/null 2>&1
-has "existing config + Slack env warns specifically" "Slack is configured in .env but NOT in this volume" "$T2_OUT"
+has "existing config + Slack credentials warn specifically" "Slack credentials are supplied but NOT in this volume" "$T2_OUT"
 has "  the warning offers the down -v reset"         "down -v"    "$T2_OUT"
 has "  the warning offers the by-hand patch"         "config patch" "$T2_OUT"
 hasnt "  and never-clobber still holds (config untouched)" "plugins/slack" "$(printf '%s' "$T2_OUT" | grep -v 'NOT in this volume')"

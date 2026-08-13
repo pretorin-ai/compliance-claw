@@ -36,6 +36,58 @@ SLACK_PATCH="${TEMPLATES}/slack-channel.patch.json5"
 # invocation too, of which scripts/smoke.sh makes dozens.
 SLACK_MARKER="/opt/compliance-claw/plugins/slack"
 
+# --- File-backed runtime secrets -------------------------------------------
+#
+# Docker Compose and cloud secret stores deliver secrets as files. OpenClaw and
+# the Pretorin MCP child currently consume their credentials from environment
+# variables, so this entrypoint is the deliberately small bridge between those
+# two interfaces: read the mounted file, export the value inside PID 1's process
+# tree, then exec the real runtime. Docker never receives the value as container
+# configuration, which keeps it out of `docker inspect .Config.Env`.
+#
+# Direct environment values remain supported for the existing local deployment.
+# Supplying BOTH forms is refused instead of silently choosing one: two
+# authoritative copies make rotation and incident response ambiguous.
+load_secret_file() {
+  local name="$1" file_name="${1}_FILE" current="" path="" value=""
+  eval "current=\${${name}:-}"
+  eval "path=\${${file_name}:-}"
+
+  [ -n "$path" ] || return 0
+
+  if [ -n "$current" ]; then
+    echo "compliance-claw: ERROR — ${name} and ${file_name} are both set." >&2
+    echo "  Configure exactly one secret source. File-backed secrets are the cloud deployment path." >&2
+    exit 1
+  fi
+  if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+    echo "compliance-claw: ERROR — ${file_name} is not a readable regular file: ${path}" >&2
+    exit 1
+  fi
+
+  # Command substitution removes the conventional final newline written by
+  # secret managers. These credentials are single-line tokens; a NUL cannot be
+  # represented in a shell variable and is not a valid value for any of them.
+  value="$(cat -- "$path")"
+  if [ -n "$value" ]; then
+    printf -v "$name" '%s' "$value"
+    export "$name"
+  fi
+  unset value current path
+}
+
+for secret_name in \
+  PRETORIN_API_KEY \
+  OPENCLAW_GATEWAY_TOKEN \
+  SLACK_APP_TOKEN \
+  SLACK_BOT_TOKEN \
+  OPENAI_API_KEY \
+  ANTHROPIC_API_KEY
+do
+  load_secret_file "$secret_name"
+done
+unset secret_name
+
 # The gateway needs the token; `docker compose run --rm cli pretorin version`
 # does not, and must keep working on a fresh clone with no .env (compose marks
 # .env required:false). So the check is scoped to gateway invocations instead of
@@ -47,7 +99,8 @@ case " $* " in
     if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
       echo "compliance-claw: OPENCLAW_GATEWAY_TOKEN is unset or empty." >&2
       echo "  The gateway will not start without it." >&2
-      echo "  Copy .env.example to .env and set a token (Phase 4's bootstrap generates one)." >&2
+      echo "  Set it directly for the legacy local path, or mount a secret and set" >&2
+      echo "  OPENCLAW_GATEWAY_TOKEN_FILE. See docs/file-secrets.md." >&2
       exit 1
     fi
     ;;
@@ -205,7 +258,7 @@ if [ -e "$CONFIG" ]; then
   # template versions and says nothing about Slack. That silence is the single
   # worst failure mode in this phase, so it gets its own warning naming both fixes.
   if [ "$SLACK_SET" = 1 ] && ! grep -q "$SLACK_MARKER" "$CONFIG"; then
-    echo "compliance-claw: WARNING — Slack is configured in .env but NOT in this volume's config." >&2
+    echo "compliance-claw: WARNING — Slack credentials are supplied but NOT in this volume's config." >&2
     echo "  All three Slack variables are set, yet ${CONFIG} has no channels.slack" >&2
     echo "  and does not load the Slack plugin, so the agent will never appear in Slack." >&2
     echo "  Nothing was overwritten. Two ways forward:" >&2
@@ -238,8 +291,8 @@ else
     echo "compliance-claw: WARNING — Slack is only partially configured; it was NOT enabled." >&2
     echo "  Missing:${SLACK_MISSING}" >&2
     echo "  All three of SLACK_BOT_TOKEN, SLACK_APP_TOKEN and SLACK_CHANNEL_ID are" >&2
-    echo "  required together. See .env.example and README.md ('Slack')." >&2
-    echo "  Fix .env, then reset the config: docker compose down -v && scripts/bootstrap.sh" >&2
+    echo "  required together. See .env.example or docs/file-secrets.md." >&2
+    echo "  Fix the selected secret source, then reset the config: docker compose down -v" >&2
   fi
 
   # Written only on a fresh seed. An existing config with no marker keeps

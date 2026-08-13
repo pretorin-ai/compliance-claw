@@ -81,22 +81,31 @@ unused. Removing them is untested against the plugin.
 
 ## Credentials and where they live
 
-| Secret | Lives in | Reaches the container? | In `docker inspect`? |
+| Secret | Legacy `.env` path | File-secret path | In `docker inspect` with file secrets? |
 | --- | --- | --- | --- |
-| `PRETORIN_API_KEY` | `.env` | yes (env) | **yes** |
-| `OPENCLAW_GATEWAY_TOKEN` | `.env` | yes (env) | **yes** |
-| `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | `.env` | yes (env) | **yes** |
-| GitHub App private key | `secrets/*.pem`, **host only** | **no** | no |
-| Model credentials | OpenClaw state volume (device-code login) | volume | no |
+| `PRETORIN_API_KEY` | value in container env | `/run/secrets/pretorin_api_key` | no |
+| `OPENCLAW_GATEWAY_TOKEN` | value in container env | `/run/secrets/openclaw_gateway_token` | no |
+| Slack tokens | values in container env | two `/run/secrets/*` mounts | no |
+| Model API keys | values in container env | provider `/run/secrets/*` mount | no |
+| GitHub App private key | host only | host only | no |
+| Device-code model credential | state volume | state volume | no |
 
-Verified, with canary values: no secret of any class reaches the rendered
-`openclaw.json`, either state volume, an image layer, or the container logs. The
-Slack block in the config names no token at all — not even a `${VAR}` marker —
-because OpenClaw reads both Slack tokens from the environment.
+The file-secret path is `compose.secrets.yaml`; how to select it, what it requires
+and how it maps onto Azure Key Vault are in
+[file-backed runtime secrets](docs/file-secrets.md).
 
-**The GitHub App private key is deliberately outside `.env`.** `.env` is handed to
-the container wholesale by compose's `env_file`, so a key there would be a git
-credential inside the container by construction. Instead the key stays on the
+Verified, with canary values: no **complete** secret of any class reaches the
+rendered `openclaw.json`, either state volume, an image layer, `docker inspect`,
+or the container logs. The Slack block in the config names no token at all — not
+even a `${VAR}` marker — because OpenClaw reads both Slack tokens from the
+environment. One upstream caveat was measured during the file-secret test: an
+OpenAI `401 invalid_api_key` response includes a masked key fingerprint, and
+OpenClaw logs that response (prefix and suffix, not the complete key). Treat
+runtime logs as sensitive and do not paste them into public issues.
+
+**The GitHub App private key is deliberately outside every container secret
+path.** It is needed only for host-side cloning; mounting it would create an
+unnecessary git credential inside the agent. Instead the key stays on the
 host, `bootstrap.sh` uses it to mint a token scoped to `contents:read` on exactly
 the declared repositories, clones with it through a credential helper that keeps
 it out of both the URL and the process table, deletes it on exit, and asserts that
@@ -105,10 +114,17 @@ working tree, read-only.
 
 ## What the POC does NOT protect against
 
-- **`docker inspect` and anyone who can reach the Docker socket.** `env_file` is
-  how three secrets reach the container, so they are visible to any process that
-  can query the daemon. Docker file-based secrets would close this; see the
-  ledger. The realistic vector is `docker inspect` output pasted into a ticket.
+- **Legacy `.env` deployments.** The base Compose file still uses `env_file` for
+  backward compatibility, so those deployments expose secret values to anyone
+  who can query the daemon. `compose.secrets.yaml` closes that specific path.
+- **The running process and Docker administrator.** The entrypoint must export
+  mounted values because OpenClaw and the Pretorin child consume environment
+  variables. Root, the same UID inside the container, or a Docker administrator
+  can inspect a live process. File secrets protect delivery and routine inspect
+  output; they do not make a compromised workload unable to use its credential.
+- **Provider error fingerprints in logs.** An invalid OpenAI key produces a
+  masked prefix/suffix in OpenClaw's error log. Full canary values remained
+  absent, but log access and export still require access control and redaction.
 - **A malicious or compromised review target.** Tool execution inside the
   container is **unsandboxed** (`sandbox` is off). See the boundary statement
   below — this is the single most important limitation in this document.
@@ -145,10 +161,11 @@ substituted for it.
 
 Ordered roughly by how much it matters, not by effort.
 
-1. **Docker file-based secrets instead of `env_file`.** Keeps `PRETORIN_API_KEY`,
-   `OPENCLAW_GATEWAY_TOKEN` and the Slack tokens out of `docker inspect`. Reopens
-   the "single authoritative token source" decision, so it needs a call rather
-   than a patch.
+1. **Adopt the file-secret deployment path everywhere.** `compose.secrets.yaml`
+   now keeps `PRETORIN_API_KEY`, `OPENCLAW_GATEWAY_TOKEN`, Slack tokens and model
+   API keys out of `docker inspect`; the legacy `.env` path remains for backward
+   compatibility and retains its documented exposure. Azure still needs the
+   managed-identity startup service that materialises these files from Key Vault.
 2. **RBAC and user-level attribution before any shared channel with a
    write-enabled key.** The prerequisite for treating Slack as more than a
    read-only surface. Until it exists, the read-only posture above is the control.

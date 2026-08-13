@@ -104,6 +104,15 @@ jobs:
       - name: Smoke test (no-credential section only)
         run: bash scripts/smoke.sh --no-creds
 
+      # smoke.sh's A4d asserts the file-secret OVERLAY renders correctly, which is
+      # a static compose-config check. It cannot prove the other half of the
+      # contract — that the entrypoint actually loads a mounted file, that the
+      # value stays out of `docker inspect`, and that a dual source is refused.
+      # That half is the whole point of the deployment interface, so it gets its
+      # own gate. It uses fake canary values only and needs no credentials.
+      - name: File-secret contract (runtime behaviour)
+        run: bash scripts/test-file-secrets.sh compliance-claw:local
+
       - name: Gateway logs on failure
         if: failure()
         run: docker compose logs --no-color openclaw || true
