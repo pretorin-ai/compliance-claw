@@ -212,6 +212,17 @@ jobs:
           run 'test -f /opt/compliance-claw/slack-channel.patch.json5'
           echo "image smoke passed (${ARCH})"
 
+      # File-backed secrets are a DEPLOYMENT INTERFACE, so the gate belongs on the
+      # bytes operators actually pull, not only on the pull request that changed
+      # them. build.yml runs this against the PR's local build; without it here, a
+      # release could publish an image whose entrypoint no longer honours a mounted
+      # secret and nothing between the merge and the VM would notice. Canary values
+      # only — this workflow asserts it holds no credentials, and this keeps that true.
+      - name: File-secret contract on the built image
+        env:
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
+        run: bash scripts/test-file-secrets.sh "$BUILD_REF"
+
       # Exceptions printed BEFORE the gate, not buried in a file nobody opens.
       - name: Show the vulnerability exceptions being applied
         run: |
