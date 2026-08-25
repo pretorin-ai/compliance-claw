@@ -199,5 +199,80 @@ printf '  adapter: no model key -> %s | openai key -> %s\n' "$A_NOKEY" "$A_KEY"
 [ "$A_KEY" = "openai-responses" ] || {
   echo "file-secret-test: FAIL — adapter with an OpenAI key should be openai-responses, got '${A_KEY}'" >&2; exit 1; }
 
+# ===========================================================================
+# FRESH BOOTSTRAP ON THE FILE-SECRET PATH
+# ===========================================================================
+#
+# The regression this guards: bootstrap.sh used to generate a gateway token into
+# .env unconditionally. On the file-secret path that is not merely redundant — the
+# token is then supplied twice, the entrypoint refuses ("... and ..._FILE are both
+# set"), and the gateway exits before serving. So the documented Quickstart has to
+# produce a .env with NO secret values at all.
+#
+# Runs in a SCRATCH COPY of the repo, so the operator's real .env and
+# secrets/runtime are never touched. bootstrap is allowed to fail at the target
+# clone (the fixture points at a URL that cannot resolve) — everything under test
+# happens before that, and stopping there keeps the test off the network.
+echo "file-secret-test: checking a fresh bootstrap on the file-secret path"
+
+SCRATCH="$TMP/scratch"
+mkdir -p "$SCRATCH"
+cp -R scripts "$SCRATCH/"
+cp .env.example versions.env Dockerfile compose.yaml compose.secrets.yaml compose.build.yaml "$SCRATCH/"
+cat > "$SCRATCH/targets.yaml" <<'FIXTURE'
+system_id: 00000000-0000-0000-0000-000000000000
+framework_id: soc2
+targets:
+  - name: unreachable-fixture
+    url: https://github.invalid/pretorin-ai/does-not-exist.git
+    ref: main
+FIXTURE
+
+# --- the file-secret path ---------------------------------------------------
+( cd "$SCRATCH" && COMPOSE_FILE=compose.yaml:compose.secrets.yaml     bash scripts/bootstrap.sh >bootstrap-fs.log 2>&1 ) || true
+
+[ -f "$SCRATCH/.env" ] || {
+  echo "file-secret-test: FAIL — bootstrap wrote no .env on the file-secret path" >&2
+  tail -15 "$SCRATCH/bootstrap-fs.log" >&2; exit 1; }
+
+# THE ASSERTION. Every secret line must be present-but-empty: present so the
+# operator can see what exists, empty so nothing collides with a mounted file.
+if grep -qE '^(PRETORIN_API_KEY|OPENCLAW_GATEWAY_TOKEN|SLACK_APP_TOKEN|SLACK_BOT_TOKEN)=.+' "$SCRATCH/.env"; then
+  echo "file-secret-test: FAIL — .env carries a secret value on the file-secret path:" >&2
+  grep -nE '^(PRETORIN_API_KEY|OPENCLAW_GATEWAY_TOKEN|SLACK_APP_TOKEN|SLACK_BOT_TOKEN)=.+' "$SCRATCH/.env"     | sed 's/=.*/=<redacted>/' >&2
+  exit 1
+fi
+echo "  .env holds no secret values"
+
+# The gateway token still has to exist — just in its own file, generated.
+grep -qE '^[0-9a-f]{64}$' "$SCRATCH/secrets/runtime/openclaw-gateway-token" || {
+  echo "file-secret-test: FAIL — no generated gateway token in secrets/runtime/" >&2; exit 1; }
+echo "  gateway token generated into secrets/runtime/openclaw-gateway-token"
+
+for f in pretorin-api-key openclaw-gateway-token slack-app-token slack-bot-token          openai-api-key anthropic-api-key; do
+  [ -f "$SCRATCH/secrets/runtime/$f" ] || {
+    echo "file-secret-test: FAIL — secrets/runtime/${f} was not created" >&2; exit 1; }
+done
+echo "  all six secret files created"
+
+# It must also SAY what is still missing, by name. A silent empty key file becomes
+# an auth error three steps later, which is the worst place to learn it.
+grep -q 'pretorin-api-key' "$SCRATCH/bootstrap-fs.log" || {
+  echo "file-secret-test: FAIL — bootstrap did not name the still-empty pretorin-api-key" >&2
+  tail -20 "$SCRATCH/bootstrap-fs.log" >&2; exit 1; }
+echo "  bootstrap named the files still needing values"
+
+# --- the legacy path, as a contrast ----------------------------------------
+# Proves the branch is doing something: without the overlay selected, a token IS
+# generated into .env. Without this, an accidental always-empty .env would pass.
+rm -f "$SCRATCH/.env"
+rm -rf "$SCRATCH/secrets"
+( cd "$SCRATCH" && COMPOSE_FILE=compose.yaml     bash scripts/bootstrap.sh >bootstrap-legacy.log 2>&1 ) || true
+grep -qE '^OPENCLAW_GATEWAY_TOKEN=[0-9a-f]{64}$' "$SCRATCH/.env" || {
+  echo "file-secret-test: FAIL — the legacy path should still generate a token in .env" >&2
+  tail -15 "$SCRATCH/bootstrap-legacy.log" >&2; exit 1; }
+echo "  legacy path still generates a token in .env (branch is live, not vacuous)"
+
 echo "file-secret-test: PASS — values loaded at runtime, absent from docker inspect, dual source refused,"
-echo "                  delivery matrix holds per service, adapter derived per credential"
+echo "                  delivery matrix holds per service, adapter derived per credential,"
+echo "                  fresh bootstrap writes no .env secret on the file-secret path"

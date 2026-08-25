@@ -54,8 +54,10 @@ provenance — see "Verifying what you pulled".
   Tools, which `git` already requires. No PyYAML, no `jq`, no `gh`, nothing to
   `pip install`.
 - Access to the GHCR package. It is not public, so `docker login ghcr.io` first.
-- A Pretorin API key. **Read-only is the default and is sufficient** for
-  everything here.
+- A Pretorin API key. **A read-only key is sufficient** for everything here, and
+  a write-enabled key is equally supported — the key's own server-side scopes
+  decide what is permitted, and nothing in this repository filters on top of them.
+- A model-provider key (OpenAI or Anthropic), or an OpenAI device-code login.
 - Optional: a Slack workspace where you can install an app, and a read-only
   GitHub App if you want to review private repositories.
 
@@ -65,25 +67,58 @@ provenance — see "Verifying what you pulled".
 # 0. authenticate to the registry (the package is not public)
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
 
-# 1. declare what you are reviewing, and for which compliance scope
+# 1. select the file-backed credential path (recommended, and what Azure needs)
+export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
+
+# 2. declare what you are reviewing, and for which compliance scope
 vi targets.yaml                  # system_id, framework_id, one or more targets
 
-# 2. write .env, clone the targets, PULL the released image
-scripts/bootstrap.sh
+# 3. clone the targets, PULL the released image, create the secret files
+scripts/bootstrap.sh             # generates the gateway token; writes NO secret to .env
 
-# 3. fill in .env  — the read-only Pretorin key at minimum
-vi .env                          # PRETORIN_API_KEY=...  (+ Slack, + GitHub App)
+# 4. paste values into the files bootstrap just created — nothing goes in .env
+vi secrets/runtime/pretorin-api-key
+vi secrets/runtime/openai-api-key         # OR anthropic-api-key; exactly one
+#  optional: slack-app-token, slack-bot-token  (+ SLACK_CHANNEL_ID in .env)
+#  full checklist and per-service delivery matrix: docs/file-secrets.md
 
-# 4. register the targets with Pretorin (idempotent; safe to re-run)
+# 5. register the targets with Pretorin (idempotent; safe to re-run)
 scripts/onboard-targets.sh
 
-# 5. start the gateway
+# 6. start the gateway
 docker compose up -d             # http://127.0.0.1:18789
 
 # anything one-off, in the same image with the same mounts:
 docker compose run --rm cli pretorin --json context show
 docker compose exec openclaw openclaw agent --agent main -m "..."
 ```
+
+**Keep `COMPOSE_FILE` exported for every later command.** It is how compose knows
+to mount the secret files; without it a `docker compose` in a new shell falls back
+to the legacy path and the deployment loses its credentials. `bootstrap.sh` prints
+the line to re-export.
+
+<details>
+<summary>Legacy path — secret values in <code>.env</code></summary>
+
+Still supported, and still what an existing deployment uses. Omit step 1, and
+`bootstrap.sh` then generates a gateway token into `.env` and asks you to add the
+Pretorin key there:
+
+```sh
+scripts/bootstrap.sh
+vi .env                          # PRETORIN_API_KEY=...  (+ Slack, + GitHub App)
+scripts/onboard-targets.sh
+docker compose up -d
+```
+
+The cost is that compose's `env_file` hands every value in `.env` to the container
+**and to `docker inspect`**, so anyone who can query the daemon can read them. To
+migrate an existing deployment, `scripts/init-file-secrets.sh` copies what is
+already in `.env` into the secret files; then blank the secret lines in `.env`,
+because supplying a credential both ways is refused rather than silently resolved.
+
+</details>
 
 **`exec openclaw`, not `run --rm cli`, for agent turns.** `openclaw agent` talks to the
 gateway over `127.0.0.1:18789`, and the `cli` service is a *different container* with
@@ -95,9 +130,12 @@ happens before dispatch. Everything else (`pretorin ...`, `openclaw mcp ...`,
 
 Two ordering rules, both of which bite silently if ignored:
 
-- **Slack credentials must be in `.env` before the first `up`.** The config is
-  seeded once and never overwritten. Adding them later does nothing until you
-  reset — the container warns explicitly when it sees exactly that situation.
+- **Slack credentials must be in place before the first `up`** — in
+  `secrets/runtime/slack-{app,bot}-token` on the recommended path, or in `.env` on
+  the legacy one, plus `SLACK_CHANNEL_ID` in `.env` either way (it is not a
+  secret). The config is seeded once and never overwritten, so adding them later
+  does nothing until you reset — the container warns explicitly when it sees
+  exactly that situation.
 - **Onboard before `up`.** Onboarding writes host-local Pretorin state, and a
   running gateway keeps a per-session `pretorin mcp-serve` child that can serve
   the older view (the preflight artifact carries a 3600-second TTL). If you do
@@ -369,8 +407,10 @@ config is then byte-identical to a Slack-less deployment.
 3. Install App -> Install to Workspace -> SLACK_BOT_TOKEN   (xoxb-...)
 4. Invite the bot to ONE channel, right-click it -> Copy link
    -> the C... at the end of the URL   -> SLACK_CHANNEL_ID  (C...)
-5. Put all three in .env, then: docker compose down -v && scripts/bootstrap.sh
-   && scripts/onboard-targets.sh && docker compose up -d
+5. Supply the two tokens as secret files (recommended) or in .env (legacy), and
+   SLACK_CHANNEL_ID in .env either way. Then:
+     docker compose down -v && scripts/bootstrap.sh
+       && scripts/onboard-targets.sh && docker compose up -d
 ```
 
 For a **new** app, import the manifest rather than assembling scopes by hand — that
@@ -381,8 +421,10 @@ reactions, pins, group DMs, `emoji:read` and `usergroups:read`.
 ### Already have a Slack app? Reuse it.
 
 **You do not need to create another one.** Any app with Socket Mode enabled, an
-app-level token carrying `connections:write`, and a bot token works: put its three
-values in `.env` and the rest of this section applies unchanged. The manifest is
+app-level token carrying `connections:write`, and a bot token works: supply its
+two tokens the same way as any other secret (files on the recommended path, `.env`
+on the legacy one) with `SLACK_CHANNEL_ID` in `.env`, and the rest of this section
+applies unchanged. The manifest is
 the reproducible path for a *new* app, not a requirement for an existing one.
 
 Two things to know when reusing an older app. It probably carries the broader

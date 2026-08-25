@@ -268,8 +268,14 @@ if [ "$LOCAL_ONLY" = 1 ]; then
 else
   AUTHED="$(pcli_quiet --json whoami | python3 -c 'import json,sys; print(json.load(sys.stdin).get("authenticated"))' 2>/dev/null || echo False)"
   [ "$AUTHED" = "True" ] || die "Pretorin says not authenticated.
-  Put a valid PRETORIN_API_KEY in .env (a read-only key is sufficient), or run
-  with --local-only to bind resolvers without touching the platform."
+  Supply a valid Pretorin API key by whichever path this deployment uses:
+    recommended   a value in secrets/runtime/pretorin-api-key, with
+                  compose.secrets.yaml in COMPOSE_FILE (see docs/file-secrets.md)
+    legacy        PRETORIN_API_KEY=... in .env
+  Supplying it BOTH ways is refused, so pick one. A read-only key is sufficient
+  for onboarding; a write-enabled key also works, because the key's own scopes
+  decide what is permitted and nothing here filters on top of them.
+  Or run with --local-only to bind resolvers without touching the platform."
   log "authenticated"
 
   # --- 2. active context -------------------------------------------------

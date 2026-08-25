@@ -104,7 +104,34 @@ python3 "$PARSE" scope "$TARGETS_FILE" >/dev/null   # fail fast on a bad file
 IFS=$'\t' read -r SYSTEM_ID FRAMEWORK_ID < <(python3 "$PARSE" scope "$TARGETS_FILE")
 log "scope: system=${SYSTEM_ID} framework=${FRAMEWORK_ID}"
 
-# --- 2. .env ---------------------------------------------------------------
+# --- 2. credentials --------------------------------------------------------
+# TWO PATHS, AND THIS SCRIPT MUST NOT MIX THEM.
+#
+#   RECOMMENDED  file-backed secrets. Values live in secrets/runtime/*, mounted
+#                read-only, and .env holds NON-SECRETS ONLY. Selected by putting
+#                compose.secrets.yaml in COMPOSE_FILE — the same way the build
+#                overlay is selected further down, so there is one mechanism to
+#                learn rather than a bespoke flag.
+#
+#   LEGACY       secret values in .env. Still supported; still what an existing
+#                deployment uses. compose's env_file hands every value here to
+#                the container AND to `docker inspect`.
+#
+# Putting a gateway token in .env on the FILE-SECRET path is not a harmless
+# belt-and-braces: the entrypoint refuses when a secret is supplied twice
+# ("... and ..._FILE are both set") and the gateway exits before serving. So on
+# that path this script deliberately generates nothing secret into .env.
+FILE_SECRETS=0
+case "${COMPOSE_FILE:-}" in
+  *compose.secrets.yaml*) FILE_SECRETS=1 ;;
+esac
+if [ "$FILE_SECRETS" = 1 ]; then
+  log "credential path: FILE-BACKED (compose.secrets.yaml selected)"
+else
+  log "credential path: legacy .env values (recommended: compose.secrets.yaml, see docs/file-secrets.md)"
+fi
+
+# --- 2a. .env --------------------------------------------------------------
 # Before targets, not after: a private target's GitHub App configuration is read
 # from this file, so it has to exist first. On a genuinely fresh clone the
 # generated .env has an empty GITHUB_APP_ID, and a private target then fails with
@@ -126,10 +153,41 @@ if [ -e .env ]; then
     log "  .env mode was ${MODE}; tightening to 600 (contents untouched)"
     chmod 600 .env
   fi
-  grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env \
-    || warn ".env has no OPENCLAW_GATEWAY_TOKEN value; the gateway will exit 1."
+  if [ "$FILE_SECRETS" = 1 ]; then
+    # On this path a token in .env is the problem, not its absence: supplied both
+    # ways, the entrypoint refuses and the gateway never starts.
+    if grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env; then
+      warn ".env still carries a gateway token value, and compose.secrets.yaml also mounts one."
+      warn "  The entrypoint refuses a secret supplied twice, so the gateway will exit."
+      warn "  Blank the .env line (keep 'OPENCLAW_GATEWAY_TOKEN=') and keep the file under"
+      warn "  secrets/runtime/ as the single source."
+    fi
+    for legacy_secret in PRETORIN_API_KEY SLACK_APP_TOKEN SLACK_BOT_TOKEN; do
+      if grep -qE "^${legacy_secret}=.+" .env; then
+        warn ".env still carries a ${legacy_secret} value; on the file-secret path it belongs in"
+        warn "  secrets/runtime/. Both at once is refused by the entrypoint."
+      fi
+    done
+  else
+    grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env \
+      || warn ".env has no OPENCLAW_GATEWAY_TOKEN value; the gateway will exit 1."
+  fi
+elif [ "$FILE_SECRETS" = 1 ]; then
+  # NON-SECRETS ONLY. Copied verbatim from .env.example, which ships every secret
+  # line empty — so no substitution, and nothing here to leak into
+  # `docker inspect`. The gateway token is generated into its own file below.
+  log "writing .env (mode 600) with NON-SECRETS ONLY (file-secret path)"
+  ( umask 077 && cp .env.example .env )
+  chmod 600 .env
+  # Assert the shipped example really is value-free, rather than trusting it: a
+  # future edit that pastes a placeholder secret in here would silently create the
+  # dual-source conflict this branch exists to avoid.
+  if grep -qE '^(PRETORIN_API_KEY|OPENCLAW_GATEWAY_TOKEN|SLACK_APP_TOKEN|SLACK_BOT_TOKEN)=.+' .env; then
+    die "generated .env carries a secret value, which the file-secret path forbids —
+  .env.example must ship these lines empty. Fix .env.example, then re-run."
+  fi
 else
-  log "writing .env (mode 600) with a generated gateway token"
+  log "writing .env (mode 600) with a generated gateway token (legacy value path)"
   # Generated from .env.example so the documentation lives in exactly one file.
   # umask first: the file must never exist, even briefly, as world-readable.
   ( umask 077 && sed 's|^OPENCLAW_GATEWAY_TOKEN=.*|OPENCLAW_GATEWAY_TOKEN='"$(openssl rand -hex 32)"'|' \
@@ -140,7 +198,34 @@ else
   # as an exit 1 from a container.
   grep -qE '^OPENCLAW_GATEWAY_TOKEN=[0-9a-f]{64}$' .env \
     || die "generated .env has no valid OPENCLAW_GATEWAY_TOKEN — did .env.example change?"
-  log "  PRETORIN_API_KEY is empty. Add a read-only key to .env before onboarding."
+  log "  PRETORIN_API_KEY is empty. Add a key to .env before onboarding."
+fi
+
+# --- 2b. secret files (file-secret path only) ------------------------------
+# init-file-secrets.sh is write-if-absent and generates the gateway token when it
+# is empty, so running it here is what makes the documented Quickstart actually
+# complete: the operator is left with files to paste values into rather than a
+# deployment that exits 1 on the first `up`.
+if [ "$FILE_SECRETS" = 1 ]; then
+  log "preparing secret files (never overwrites an existing value)"
+  bash "${REPO_ROOT}/scripts/init-file-secrets.sh" 2>&1 | sed 's/^/  /' ||     die "init-file-secrets.sh failed; see the output above."
+
+  SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
+  # Report what still needs a value, by name. A silent empty file becomes a
+  # provider auth error three steps later, which is the worst place to learn it.
+  NEEDS_VALUE=()
+  for required in pretorin-api-key; do
+    [ -s "${SECRET_DIR}/${required}" ] || NEEDS_VALUE+=("${required}")
+  done
+  if [ ! -s "${SECRET_DIR}/openai-api-key" ] && [ ! -s "${SECRET_DIR}/anthropic-api-key" ]; then
+    NEEDS_VALUE+=("openai-api-key OR anthropic-api-key (exactly one)")
+  fi
+  if [ "${#NEEDS_VALUE[@]}" -gt 0 ]; then
+    log "  still empty, and needed before an agent turn:"
+    for n in "${NEEDS_VALUE[@]}"; do log "    ${SECRET_DIR}/${n}"; done
+  fi
+  grep -qE '^[0-9a-f]{64}$' "${SECRET_DIR}/openclaw-gateway-token" 2>/dev/null \
+    || warn "${SECRET_DIR}/openclaw-gateway-token has no usable token; the gateway will exit 1."
 fi
 
 # --- 3. targets ------------------------------------------------------------
@@ -333,6 +418,30 @@ IMAGE_ARCH="$(docker compose run --rm -T cli uname -m | tr -d '\r\n')"
   || die "image reports arch '${IMAGE_ARCH}', expected x86_64."
 log "image runs as ${IMAGE_ARCH}"
 
+SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
+if [ "$FILE_SECRETS" = 1 ]; then
+  NEXT_STEPS="  1. paste values into the secret files (nothing secret goes in .env):
+       ${SECRET_DIR}/pretorin-api-key
+       ${SECRET_DIR}/openai-api-key   OR   ${SECRET_DIR}/anthropic-api-key
+     The gateway token was generated for you. Checklist: docs/file-secrets.md
+  2. scripts/onboard-targets.sh                 # register targets with Pretorin
+  3. docker compose up -d                       # gateway on http://127.0.0.1:18789"
+  SLACK_HINT="in ${SECRET_DIR}/slack-app-token and slack-bot-token, plus SLACK_CHANNEL_ID in .env,"
+else
+  NEXT_STEPS="  1. put a PRETORIN_API_KEY in .env             (see .env.example)
+     A read-only key is sufficient for everything here; a write-enabled key is
+     also supported. The key's own scopes decide, not any setting in this repo.
+  2. scripts/onboard-targets.sh                 # register targets with Pretorin
+  3. docker compose up -d                       # gateway on http://127.0.0.1:18789
+
+  This is the LEGACY credential path: values in .env reach \`docker inspect\`. The
+  recommended path mounts them as files instead —
+    export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
+    scripts/init-file-secrets.sh    # migrates what is already in .env
+  See docs/file-secrets.md."
+  SLACK_HINT="and SLACK_CHANNEL_ID in .env,"
+fi
+
 cat <<EOF
 
 bootstrap: done.
@@ -341,12 +450,10 @@ bootstrap: done.
   image:     $([ "$DO_BUILD" = 1 ] && echo 'built locally (compose.build.yaml)' || echo "pulled ${IMAGE_REF:-}")
 
 Next:
-  1. put a read-only PRETORIN_API_KEY in .env   (see .env.example)
-  2. scripts/onboard-targets.sh                 # register targets with Pretorin
-  3. docker compose up -d                       # gateway on http://127.0.0.1:18789
+${NEXT_STEPS}
 
 Slack is optional. To have the agent answer in a Slack channel, import
-slack/app-manifest.json at api.slack.com/apps/new, then put SLACK_APP_TOKEN,
-SLACK_BOT_TOKEN and SLACK_CHANNEL_ID in .env BEFORE the first \`up\` — the config
-is seeded once and never overwritten. See README.md ('Slack').
+slack/app-manifest.json at api.slack.com/apps/new, then supply the two tokens
+${SLACK_HINT} BEFORE the first \`up\` — the
+config is seeded once and never overwritten. See README.md ('Slack').
 EOF
