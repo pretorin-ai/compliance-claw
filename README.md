@@ -512,9 +512,16 @@ repo-relative path and line range, so it is reviewable — but *who asked for it
 not recorded. Platform-side scope approval is a separate prerequisite: without it
 Pretorin answers `Scope is not approved with a confirmed scale yet`.
 
-`PRETORIN_KEY_MODE` (default `read-only`) is your declaration about the key —
-`pretorin whoami` reports authentication but not scopes, so it cannot be detected.
-`scripts/smoke.sh` reads it to decide whether attempting a write tool is safe.
+**The key's server-side scopes are the sole authorization boundary.** Compliance
+Claw does no local permission filtering and has no "mode" to configure — a
+read-only key gets platform rejections on write tools, a write-enabled key does
+not, and both are supported paths.
+
+`pretorin whoami` reports authentication but not scopes, so `scripts/smoke.sh`
+cannot discover which kind of key it is holding. It therefore takes the expected
+outcome as an argument — `--expect-read-only` or `--test-write-enabled` — and with
+neither flag it never attempts a write at all. Those are test declarations, not
+configuration.
 
 ## Updating the Pretorin CLI
 

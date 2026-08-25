@@ -100,4 +100,104 @@ if docker run --rm --platform linux/amd64 \
 fi
 grep -q 'both set' "$TMP/conflict.log"
 
-echo "file-secret-test: PASS — values loaded at runtime, absent from docker inspect, dual source refused"
+# ===========================================================================
+# DELIVERY MATRIX — each service sees exactly its allowed set, AND NOTHING MORE.
+# ===========================================================================
+#
+# One workflow, different reach. Over-delivery is the failure this catches: it is
+# invisible in normal operation (everything works, some container just holds a
+# credential it never needed) and it is exactly the kind of thing that drifts when
+# someone copies a service block.
+#
+# Read the EXPECTED sets from compose.secrets.yaml rather than restating them, so
+# the test cannot pass while the compose file says something else. `docker compose
+# config` is used only to read the wiring under test; no operator `.env` value
+# reaches the containers below, which are still plain `docker run`.
+echo "file-secret-test: checking the per-service delivery matrix"
+
+MATRIX="$(COMPOSE_FILE=compose.yaml:compose.secrets.yaml \
+          COMPOSE_PROJECT_NAME="${PROJECT}-matrix" \
+          docker compose --profile cli config --format json 2>/dev/null \
+  | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for name in ("openclaw", "cli"):
+    svc = d["services"][name]
+    got = sorted(x["source"] for x in svc.get("secrets", []))
+    print(name, ",".join(got))
+')"
+[ -n "$MATRIX" ] || { echo "file-secret-test: FAIL — could not render the compose secret matrix" >&2; exit 1; }
+printf '%s\n' "$MATRIX" | sed 's/^/  wiring: /'
+
+EXPECT_OPENCLAW="anthropic_api_key,openai_api_key,openclaw_gateway_token,pretorin_api_key,slack_app_token,slack_bot_token"
+EXPECT_CLI="pretorin_api_key,slack_app_token,slack_bot_token"
+GOT_OPENCLAW="$(printf '%s\n' "$MATRIX" | awk '$1=="openclaw"{print $2}')"
+GOT_CLI="$(printf '%s\n' "$MATRIX" | awk '$1=="cli"{print $2}')"
+
+[ "$GOT_OPENCLAW" = "$EXPECT_OPENCLAW" ] || {
+  echo "file-secret-test: FAIL — openclaw secret set changed" >&2
+  echo "  expected: ${EXPECT_OPENCLAW}" >&2
+  echo "  got     : ${GOT_OPENCLAW}" >&2
+  exit 1
+}
+# The one that matters. A model key or the gateway token appearing here is
+# over-delivery: `cli` runs no agent turns and starts no gateway.
+[ "$GOT_CLI" = "$EXPECT_CLI" ] || {
+  echo "file-secret-test: FAIL — cli secret set changed (over- or under-delivery)" >&2
+  echo "  expected: ${EXPECT_CLI}" >&2
+  echo "  got     : ${GOT_CLI}" >&2
+  exit 1
+}
+
+# And prove it at RUNTIME, not just in the wiring: give a container exactly the
+# `cli` set and assert the excluded credentials are genuinely absent from the
+# process environment the entrypoint builds. Distinct canaries per file, so a
+# leak names itself.
+CANARY_SLACK_APP="CANARY-SLACKAPP-FILE-5c1d77"
+CANARY_ANTHROPIC="CANARY-ANTHROPIC-FILE-9b3e02"
+printf '%s' "$CANARY_SLACK_APP" > "$TMP/secrets/slack-app-token"
+printf '%s' "$CANARY_ANTHROPIC" > "$TMP/secrets/anthropic-api-key"
+chmod 604 "$TMP/secrets"/*
+
+docker run --rm --platform linux/amd64 \
+  -e PRETORIN_API_KEY_FILE=/run/secrets/pretorin_api_key \
+  -e SLACK_APP_TOKEN_FILE=/run/secrets/slack_app_token \
+  --mount "type=bind,src=${TMP}/secrets/pretorin-api-key,dst=/run/secrets/pretorin_api_key,readonly" \
+  --mount "type=bind,src=${TMP}/secrets/slack-app-token,dst=/run/secrets/slack_app_token,readonly" \
+  "$IMAGE" bash -c '
+    set -e
+    # Allowed: present.
+    test "$PRETORIN_API_KEY" = "CANARY-PRETORIN-FILE-31f9a6"
+    test "$SLACK_APP_TOKEN"  = "CANARY-SLACKAPP-FILE-5c1d77"
+    # Excluded: must be unset AND their canaries must appear nowhere in the env.
+    test -z "${OPENAI_API_KEY:-}"
+    test -z "${ANTHROPIC_API_KEY:-}"
+    test -z "${OPENCLAW_GATEWAY_TOKEN:-}"
+    if env | grep -qE "CANARY-OPENAI|CANARY-ANTHROPIC|0123456789abcdef"; then
+      echo "a credential outside the allowed set reached the environment" >&2
+      exit 1
+    fi
+  ' >"$TMP/matrix-runtime.log" 2>&1 || {
+    echo "file-secret-test: FAIL — the cli-shaped container did not see exactly its allowed set" >&2
+    tail -5 "$TMP/matrix-runtime.log" >&2
+    exit 1
+  }
+
+# The adapter is derived, not configured: no key visible -> device-login value;
+# an OpenAI key visible -> the API-key value. Unset would make the whole config
+# invalid, so the entrypoint must never leave it empty.
+adapter_for() {
+  docker run --rm --platform linux/amd64 "$@" "$IMAGE" \
+    bash -c 'printf "%s" "${OPENAI_REQUEST_ADAPTER:-<unset>}"' 2>/dev/null | tail -1
+}
+A_NOKEY="$(adapter_for)"
+A_KEY="$(adapter_for -e OPENAI_API_KEY_FILE=/run/secrets/openai_api_key \
+  --mount "type=bind,src=${TMP}/secrets/openai-api-key,dst=/run/secrets/openai_api_key,readonly")"
+printf '  adapter: no model key -> %s | openai key -> %s\n' "$A_NOKEY" "$A_KEY"
+[ "$A_NOKEY" = "openai-chatgpt-responses" ] || {
+  echo "file-secret-test: FAIL — adapter without a key should be openai-chatgpt-responses, got '${A_NOKEY}'" >&2; exit 1; }
+[ "$A_KEY" = "openai-responses" ] || {
+  echo "file-secret-test: FAIL — adapter with an OpenAI key should be openai-responses, got '${A_KEY}'" >&2; exit 1; }
+
+echo "file-secret-test: PASS — values loaded at runtime, absent from docker inspect, dual source refused,"
+echo "                  delivery matrix holds per service, adapter derived per credential"

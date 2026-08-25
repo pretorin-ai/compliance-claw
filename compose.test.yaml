@@ -7,6 +7,12 @@
 #
 # WHAT IT OVERRIDES, AND WHAT IT DOES NOT.
 #
+# THE PORT, AND ONLY THE PORT. Env isolation lives in compose.test-env.yaml
+# because it applies to the LEGACY .env path alone: stacked on top of
+# compose.secrets.yaml it would re-add a .env gateway token beside the mounted
+# one and trip the entrypoint's dual-source refusal. Keeping them separate means
+# this file composes with either credential path.
+#
 # Only the published port. The project NAME needs no override here: Compose
 # resolves it as `-p` > COMPOSE_PROJECT_NAME > the top-level `name:` in
 # compose.yaml > the directory name, so exporting COMPOSE_PROJECT_NAME is enough
@@ -33,21 +39,8 @@
 # inherited unchanged on purpose. An overlay that diverges from the real
 # deployment proves things about the overlay.
 
-# A SHARED ANCHOR, because both services must be isolated identically.
-#
-# The base file's `env_file: .env` is the OPERATOR'S real environment, live Slack
-# tokens included. An isolated project that inherited it would connect a SECOND
-# bot to the operator's actual Slack channel with the same credentials — two bots
-# answering one channel. That is a change to the working deployment even though
-# none of its containers were touched, so the env file is REPLACED, not merged.
-x-test-env: &test-env
-  env_file: !override
-    - path: .env.test
-      required: true
-
 services:
   openclaw:
-    <<: *test-env
     # !override, not a bare list: Compose MERGES port lists, so without it the
     # inherited 127.0.0.1:18789 would still be published alongside this one and
     # the clash would come straight back. Requires Compose >= 2.24.0, the same
@@ -55,11 +48,15 @@ services:
     #
     # Still loopback-only. The base file's comment applies verbatim: a bare
     # "18889:18789" would publish on 0.0.0.0 and expose the gateway to the LAN.
+    #
+    # THE PORT IS A VARIABLE, not a constant. Hardcoding 18889 here only moved the
+    # collision: two isolated projects then clash with EACH OTHER, and the symptom
+    # is a container stuck in "Created" with no logs. Every isolated project picks
+    # its own:  CC_TEST_PORT=18991 docker compose up -d
     ports: !override
-      - "127.0.0.1:18889:18789"
+      - "127.0.0.1:${CC_TEST_PORT:-18889}:18789"
 
   cli:
-    <<: *test-env
-    # Restated because the anchor above replaces the merge key wholesale; the
-    # profile is what keeps `up` from starting a second gateway.
+    # Restated for readability; the profile is what keeps `up` from starting a
+    # second gateway.
     profiles: ["cli"]

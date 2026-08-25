@@ -155,6 +155,24 @@ COPY --from=pretorin-verify --chown=root:root \
 # empty, which is why every image-level probe names the seed instead.
 ENV PATH="/home/node/.pretorin/bin:${PATH}"
 
+# The OpenAI request adapter, as an IMAGE-LEVEL DEFAULT.
+#
+# The config template carries ${OPENAI_REQUEST_ADAPTER} and the entrypoint exports
+# the right value for the process it is about to exec. But `docker compose exec`
+# does not go through the entrypoint, so an exec'd `openclaw ...` would see the
+# variable unset — and an unset ${VAR} does not fall back to anything, it makes the
+# WHOLE CONFIG INVALID. That broke `docker compose exec openclaw openclaw agent`,
+# which README documents as the way to run a turn.
+#
+# So the image declares the device-login value here, which makes the config parse
+# for any process in the container, and the entrypoint overrides it to
+# openai-responses for PID 1 when an OpenAI key is actually present.
+#
+# Safe for exec'd clients specifically because `openclaw agent` talks to the
+# GATEWAY over loopback: inference happens in PID 1, which has the correct value.
+# The exec'd process only needs the config to parse.
+ENV OPENAI_REQUEST_ADAPTER="openai-chatgpt-responses"
+
 # /home/node/.openclaw already exists in the base image, owned by node — a fresh
 # named volume is seeded from it, so the state mount needs no ownership fixup.
 # The target mount point is created here rather than left to the daemon, which

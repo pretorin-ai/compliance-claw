@@ -112,6 +112,37 @@ do
 done
 unset secret_name
 
+# --- The OpenAI request adapter, resolved per process ----------------------
+#
+# Which adapter is correct depends on the credential: an API key needs
+# "openai-responses", device-code login needs "openai-chatgpt-responses". The
+# template carries ${OPENAI_REQUEST_ADAPTER} and OpenClaw substitutes it at config
+# load time, so this is a per-container decision made fresh on every start rather
+# than a value baked into the volume.
+#
+# WHY NOT DECIDE IT WHEN SEEDING. The documented order runs onboard-targets.sh
+# before `up`, which seeds the config from the `cli` service — and `cli` is
+# deliberately not given a model key. A seed-time choice was therefore made by a
+# container that could not see the credential, and never-clobber locked the wrong
+# answer in for good. Per-process resolution removes the dependency instead of
+# moving the secret.
+#
+# ALWAYS EXPORTED. An unset ${VAR} does not fall back to a default — it makes the
+# entire config invalid ("Run `openclaw doctor --fix`"). So there is no branch
+# here that leaves it empty. Runs after load_secret_file above, so a file-backed
+# key counts exactly like a direct one.
+#
+# The Dockerfile also sets an image-level default, for processes that never reach
+# this script: `docker compose exec` bypasses the entrypoint entirely, and without
+# a baked default an exec'd `openclaw ...` would find the marker unset and reject
+# the config. This line refines that default for the process actually being exec'd.
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  OPENAI_REQUEST_ADAPTER="openai-responses"
+else
+  OPENAI_REQUEST_ADAPTER="openai-chatgpt-responses"
+fi
+export OPENAI_REQUEST_ADAPTER
+
 # The gateway needs the token; `docker compose run --rm cli pretorin version`
 # does not, and must keep working on a fresh clone with no .env (compose marks
 # .env required:false). So the check is scoped to gateway invocations instead of
@@ -438,30 +469,6 @@ else
     echo "  All three of SLACK_BOT_TOKEN, SLACK_APP_TOKEN and SLACK_CHANNEL_ID are" >&2
     echo "  required together. See .env.example or docs/file-secrets.md." >&2
     echo "  Fix the selected secret source, then reset the config: docker compose down -v" >&2
-  fi
-
-  # THE OPENAI REQUEST ADAPTER, CHOSEN BY WHICH CREDENTIAL IS PRESENT.
-  #
-  # The template ships "openai-chatgpt-responses", which is correct for the
-  # device-code login path. An OpenAI API KEY needs "openai-responses" instead;
-  # with the wrong adapter the key authenticates and then every turn fails.
-  # Neither value is right for both, so shipping either unconditionally breaks
-  # the other deployment shape.
-  #
-  # A targeted sed rather than `openclaw config set`, for the same reason the
-  # Slack patch is a patch file: `config set` rewrites this JSON5 as strict JSON
-  # and deletes every comment in it, and this config is meant to be read.
-  if [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY_FILE:-}" ]; then
-    if sed -i 's|"openai-chatgpt-responses"|"openai-responses"|' "$CONFIG" 2>/dev/null \
-       && grep -q '"openai-responses"' "$CONFIG"; then
-      echo "compliance-claw: OpenAI API key detected; request adapter set to openai-responses" >&2
-    else
-      echo "compliance-claw: WARNING — could not select the openai-responses adapter." >&2
-      echo "  An OpenAI API key is configured, but ${CONFIG} still uses the device-login" >&2
-      echo "  adapter, so agent turns will fail. Fix it with:" >&2
-      echo "    docker compose run --rm cli openclaw config set \\" >&2
-      echo "      models.providers.openai.api openai-responses" >&2
-    fi
   fi
 
   # Written only on a fresh seed. An existing config with no marker keeps

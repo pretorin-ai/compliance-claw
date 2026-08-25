@@ -29,7 +29,47 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 NO_CREDS=0
-[ "${1:-}" = "--no-creds" ] && NO_CREDS=1
+# WRITE_POSTURE is a TEST DECLARATION, never a deployment setting.
+#
+# `pretorin whoami` reports authentication but not scopes, so this harness cannot
+# discover whether the key it holds can write. The probe further down is
+# irreversible when it succeeds — it creates a real platform record — so the
+# expected outcome has to be stated by whoever runs the suite.
+#
+# It used to be read from a key-mode variable in .env, which made a test argument
+# look like configuration and, worse, implied Compliance Claw enforces a local
+# read/write posture. It does not: the key's server-side scopes are the sole
+# authorization boundary. So this is a flag.
+#
+# DEFAULT IS "unstated", and unstated means no write is ever attempted. That
+# preserves the lesson from the incident this check was hardened after: an
+# undeclared, write-enabled key once reached the probe and created a risk record.
+WRITE_POSTURE=unstated
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-creds)           NO_CREDS=1 ;;
+    --expect-read-only)   WRITE_POSTURE=read-only ;;
+    --test-write-enabled) WRITE_POSTURE=write-enabled ;;
+    -h|--help)
+      cat <<'USAGE'
+usage: smoke.sh [--no-creds] [--expect-read-only | --test-write-enabled]
+
+  --no-creds             run Section A only (what CI runs)
+  --expect-read-only     attempt a platform write and REQUIRE the platform to
+                         reject it. Safe: nothing is created on success-to-reject.
+  --test-write-enabled   attempt the same write and REQUIRE it to SUCCEED. This
+                         CREATES A REAL PLATFORM RECORD. Opt-in only.
+
+With neither posture flag, no write is attempted at all and the write-posture
+rows report skipped-with-reason. These flags describe the KEY you are pointing at;
+they change nothing about the deployment, which applies no local permission
+filtering of its own.
+USAGE
+      exit 0 ;;
+    *) printf 'smoke: unknown argument %s (try --help)\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 PASS=0; FAIL=0; SKIP=0; WARN=0
 FAILED_CHECKS=()
@@ -201,6 +241,27 @@ if [ -n "$DW_DECLARED" ] && [ "$DW_DECLARED" = "$DW_GREPPED" ]; then
 else
   fail "every entrypoint drift warning has an update.sh branch, and vice versa" \
        "declared: $(printf '%s' "$DW_DECLARED" | tr '\n' '|') vs grepped: $(printf '%s' "$DW_GREPPED" | tr '\n' '|')"
+fi
+
+head2 "A3c. write-posture safety property (no credentials needed)"
+# ASSERTED WHERE IT ALWAYS RUNS. The property is "without an explicit posture
+# flag, no platform write is ever attempted" — true with or without credentials,
+# so it belongs in the section CI executes rather than behind a credential gate.
+# The probe itself still lives in B4, where a key exists to probe with.
+case "$WRITE_POSTURE" in
+  unstated)
+    pass "no posture flag -> no write probe will be attempted (WRITE_POSTURE=unstated)" ;;
+  read-only)
+    pass "--expect-read-only -> the probe will run and REQUIRE a server-side rejection" ;;
+  write-enabled)
+    note "--test-write-enabled -> the probe WILL CREATE A REAL PLATFORM RECORD" ;;
+esac
+# And prove the parser cannot be bypassed: an unknown argument must refuse rather
+# than fall through to a default posture.
+if bash "$0" --nonsense-argument >/dev/null 2>&1; then
+  fail "an unknown argument is refused" "it was accepted, so a typo could silently select a posture"
+else
+  pass "an unknown argument is refused rather than defaulting"
 fi
 
 head2 "A4. gateway starts, config and templates are seeded"
@@ -491,13 +552,28 @@ for name,svc in d.items():
     assert not svc.get("env_file"), f"{name} still has env_file"
     env=svc.get("environment",{})
     assert not (secret_names & set(env)), f"{name} has direct secret values"
-    common={n+"_FILE" for n in {"PRETORIN_API_KEY","OPENCLAW_GATEWAY_TOKEN","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"}}
-    assert common <= set(env), f"{name} lacks common *_FILE paths"
-    expected=6 if name=="openclaw" else 4
-    assert len(svc.get("secrets",[])) == expected, f"{name} mounts the wrong secret set"
-assert {"OPENAI_API_KEY_FILE","ANTHROPIC_API_KEY_FILE"} <= set(d["openclaw"].get("environment",{}))
-assert "OPENAI_API_KEY_FILE" not in d["cli"].get("environment",{})
-assert "ANTHROPIC_API_KEY_FILE" not in d["cli"].get("environment",{})
+    # Shared by both services: the Pretorin key and the Slack pair. Everything
+    # else is delivered per service, so it is asserted per service below.
+    common={n+"_FILE" for n in {"PRETORIN_API_KEY","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"}}
+    assert common <= set(env), f"{name} lacks the shared *_FILE paths"
+# THE DELIVERY MATRIX, ASSERTED AS AN EXACT SET IN BOTH DIRECTIONS.
+#
+# "<= set(env)" alone only catches under-delivery. Over-delivery is the failure
+# that hides: everything works, some container just holds a credential it never
+# needed, and nobody notices until it leaks. So each side is pinned exactly.
+want_openclaw={"pretorin_api_key","slack_app_token","slack_bot_token",
+               "openclaw_gateway_token","openai_api_key","anthropic_api_key"}
+want_cli={"pretorin_api_key","slack_app_token","slack_bot_token"}
+got_openclaw={x["source"] for x in d["openclaw"].get("secrets",[])}
+got_cli={x["source"] for x in d["cli"].get("secrets",[])}
+assert got_openclaw == want_openclaw, f"openclaw secrets {sorted(got_openclaw)} != {sorted(want_openclaw)}"
+assert got_cli == want_cli, f"cli secrets {sorted(got_cli)} != {sorted(want_cli)}"
+# Gateway-only, by env var too. A model key gives spend authority to a container
+# that runs no turns; the gateway token would let a one-off cli start a second
+# gateway against the same volumes.
+for gateway_only in ("OPENAI_API_KEY_FILE","ANTHROPIC_API_KEY_FILE","OPENCLAW_GATEWAY_TOKEN_FILE"):
+    assert gateway_only in d["openclaw"].get("environment",{}), f"openclaw lacks {gateway_only}"
+    assert gateway_only not in d["cli"].get("environment",{}), f"cli should not receive {gateway_only}"
 print("ok")
 ' 2>&1 || true)"
 if [ "$FILE_SECRET_CHECK" = ok ]; then
@@ -847,17 +923,7 @@ elif ! AUTH="$(val pretorin --json whoami)" \
      || ! printf '%s' "$AUTH" | grep -q '"authenticated": *true'; then
   skip "entire credentialed section" "PRETORIN_API_KEY is absent or does not authenticate"
 else
-  # FAIL SAFE ON AN ABSENT DECLARATION. This used to default to "read-only" when
-  # PRETORIN_KEY_MODE was missing, which is backwards: the probe below CREATES A
-  # REAL PLATFORM RECORD if the key turns out to be write-enabled, and a .env
-  # written before Phase 4 has no such line at all (never-clobber means it is
-  # never added retroactively). Observed exactly that — an undeclared,
-  # write-enabled key, and the probe succeeded and created a risk.
-  #
-  # Absence of a declaration now means "do not do the irreversible thing".
-  KEY_MODE="${PRETORIN_KEY_MODE:-$(grep -E '^PRETORIN_KEY_MODE=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')}"
-  KEY_MODE="${KEY_MODE:-undeclared}"
-  printf '  key authenticates; declared mode: %s\n' "$KEY_MODE"
+  printf '  key authenticates; write posture stated for this run: %s\n' "$WRITE_POSTURE"
 
   head2 "B1. real onboarding against the declared scope"
   if bash scripts/onboard-targets.sh >/tmp/smoke-real-onboard.log 2>&1; then
@@ -912,18 +978,26 @@ else
     pass "no local tools.deny is configured"
   fi
 
-  if [ "$KEY_MODE" = "undeclared" ]; then
-    skip "key-scope write probe" \
-      "PRETORIN_KEY_MODE is not set in .env. This probe CREATES A REAL RECORD if the
-        key has write scope, so an undeclared key is never probed. Set
-        PRETORIN_KEY_MODE=read-only or =write in .env to declare what you are running."
-  elif [ "$KEY_MODE" != "read-only" ]; then
-    WRITE_PROBE=1
-  else
-    WRITE_PROBE=0
-  fi
+  # ASSERTED POSITIVELY, not by the absence of output. "no flag means no write"
+  # is a safety property, so it gets a row that passes for a stated reason rather
+  # than a silence that could equally mean the block was skipped by accident.
+  case "$WRITE_POSTURE" in
+    unstated)
+      WRITE_PROBE=""
+      pass "no write posture stated -> no write probe executed (nothing was created)"
+      skip "key-scope write probe" \
+        "neither --expect-read-only nor --test-write-enabled was passed. This probe
+        CREATES A REAL RECORD when the key can write, so it is never run on an
+        unstated posture. Pass --expect-read-only for a read-only key." ;;
+    read-only)    WRITE_PROBE=0 ;;
+    write-enabled)
+      WRITE_PROBE=1
+      # Say it before doing it. The operator asked for this, but the record is
+      # real and the announcement is what makes an accidental flag obvious.
+      printf '  --test-write-enabled: about to attempt a REAL platform write (a risk record will be created)\n' ;;
+  esac
 
-  if [ "${WRITE_PROBE:-}" != "" ]; then
+  if [ -n "${WRITE_PROBE}" ]; then
     ARGS="$(python3 - "$SYSTEM_ID" "$FRAMEWORK_ID" <<'PY'
 import json, sys
 print(json.dumps({

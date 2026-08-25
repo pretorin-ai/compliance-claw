@@ -1,0 +1,34 @@
+# compose.test-env.yaml — env isolation for the LEGACY `.env` credential path.
+#
+# Stack this ONLY when validating the legacy path, and never together with
+# compose.secrets.yaml.
+#
+# WHY IT IS A SEPARATE FILE. The base `env_file: .env` is the operator's real
+# environment, live Slack tokens included, so an isolated project that inherited
+# it would connect a SECOND bot with the same credentials to their actual channel.
+# That is a change to the working deployment even though none of its containers
+# were touched. Replacing the env file fixes that.
+#
+# But the same override on top of compose.secrets.yaml is wrong: that overlay
+# deliberately resets env_file so secrets arrive as mounted files, and re-adding a
+# .env with a gateway token in it means the token is supplied twice. The entrypoint
+# refuses exactly that ("OPENCLAW_GATEWAY_TOKEN and OPENCLAW_GATEWAY_TOKEN_FILE are
+# both set") — correct behaviour, discovered by stacking the two files and watching
+# the gateway refuse to start. Hence two overlays instead of one.
+#
+# Usage (legacy path):
+#   export COMPOSE_PROJECT_NAME=cclegacy CC_TEST_PORT=18992
+#   export COMPOSE_FILE=compose.yaml:compose.build.yaml:compose.test.yaml:compose.test-env.yaml
+
+x-test-env: &test-env
+  env_file: !override
+    - path: .env.test
+      required: true
+
+services:
+  openclaw:
+    <<: *test-env
+
+  cli:
+    <<: *test-env
+    profiles: ["cli"]

@@ -44,11 +44,18 @@ in depth, **not** an authorization control.
 
 ### A write-enabled key is an explicit opt-in
 
-Nothing in this repository escalates on its own. Choosing a write-enabled key
-enables platform writes: evidence upload, control status, risks, vendors.
-`PRETORIN_KEY_MODE` in `.env` is your **declaration** about the key, not a check —
-`pretorin whoami` reports authentication but no scopes, so key mode cannot be
-detected. It only gates whether the smoke test attempts a write.
+Nothing in this repository escalates on its own, and nothing in it restricts
+either. **The key's server-side scopes are the sole authorization boundary.**
+Choosing a write-enabled key enables platform writes — evidence upload, control
+status, risks, vendors — and choosing a read-only key means the platform rejects
+them. Compliance Claw applies no local permission filtering, ships no local
+"mode", and does not default a deployment to a locally-restricted posture; a
+rejection you see is Pretorin's, not ours.
+
+`pretorin whoami` reports authentication but no scopes, so the smoke test cannot
+discover which kind of key it holds. It takes the expected outcome as an argument
+instead (`--expect-read-only` / `--test-write-enabled`), and attempts no write
+without one. That is a property of the harness, not of the deployment.
 
 ### Shared Slack channels: the attribution problem
 
