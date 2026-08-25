@@ -342,6 +342,6 @@ view (the preflight artifact carries a 3600s TTL and each session keeps its own
 pretorin mcp-serve child, reaped after mcp.sessionIdleTtlMs = 10 min):
   docker compose restart openclaw
 
-(Not `openclaw mcp reload` from the cli service: it only disposes the calling
+(Not \`openclaw mcp reload\` from the cli service: it only disposes the calling
 process's own cached runtimes, so it cannot touch the gateway's children.)
 EOF

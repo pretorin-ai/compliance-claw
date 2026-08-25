@@ -74,27 +74,70 @@ fi
 log "activating ${NEW_VERSION}: restarting the gateway so MCP picks it up"
 docker compose restart openclaw
 
-# Probe, rather than assume. The observable comes free from the atomic-rename
-# behaviour: a child still running the replaced binary has a /proc/<pid>/exe
-# that reads "(deleted)". After a restart there must be none.
-STALE="$(docker compose exec -T openclaw sh -c '
-  found=0
+# Probe, rather than assume. Two independent observables, because the obvious one
+# is not available on every platform this runs on:
+#
+#   1. exe-deleted. Atomic rename-into-place means a child still executing the
+#      replaced inode has a /proc/<pid>/exe that reads "(deleted)".
+#   2. start-time. A child that started BEFORE the active binary's mtime cannot
+#      be running the new bytes, whatever /proc says its exe is.
+#
+# (1) IS BLIND UNDER EMULATION, which is how this deployment runs on the
+# operator's Mac: the image is linux/amd64 on Apple Silicon, so /proc/<pid>/exe
+# resolves to /run/rosetta/rosetta — the translator — and can never contain
+# "(deleted)" no matter what happened to the target binary. The first version of
+# this probe therefore printed the reassuring "No MCP child is running a replaced
+# binary" on a platform where it had observed nothing at all. Found by the
+# credentialed acceptance run.
+#
+# So the probe now reports THREE outcomes and never claims a clean result it did
+# not establish. (2) is what actually carries the check under emulation.
+PROBE="$(docker compose exec -T openclaw sh -c '
+  BIN=/home/node/.pretorin/bin/pretorin
+  BIN_MTIME="$(stat -c %Y "$BIN" 2>/dev/null || echo 0)"
+  seen=0
   for d in /proc/[0-9]*; do
     [ -r "$d/cmdline" ] || continue
-    if tr "\0" " " < "$d/cmdline" 2>/dev/null | grep -q "pretorin mcp-serve"; then
-      exe="$(readlink "$d/exe" 2>/dev/null || true)"
-      case "$exe" in *"(deleted)"*) echo "$d $exe"; found=1 ;; esac
-    fi
+    tr "\0" " " < "$d/cmdline" 2>/dev/null | grep -q "pretorin mcp-serve" || continue
+    seen=$((seen + 1))
+    exe="$(readlink "$d/exe" 2>/dev/null || true)"
+    case "$exe" in
+      *"(deleted)"*) echo "STALE $d exe=$exe" ;;
+      *pretorin*)    echo "FRESH $d exe-attributable" ;;
+      *)
+        # exe is not the target binary (emulation shim, or unreadable). Fall back
+        # to start time: /proc/<pid> mtime is when the process started.
+        started="$(stat -c %Y "$d" 2>/dev/null || echo 0)"
+        if [ "$started" -lt "$BIN_MTIME" ]; then
+          echo "STALE $d started-before-binary(${started}<${BIN_MTIME})"
+        else
+          echo "FRESH $d started-after-binary(${started}>=${BIN_MTIME})"
+        fi ;;
+    esac
   done
+  [ "$seen" = 0 ] && echo "NONE no mcp-serve child running"
   exit 0
 ' 2>/dev/null || true)"
 
-if [ -n "$STALE" ]; then
+if printf '%s' "$PROBE" | grep -q '^STALE'; then
   warn "an MCP child is still running the replaced binary after the restart:"
-  printf '%s\n' "$STALE" >&2
+  printf '%s\n' "$PROBE" | grep '^STALE' >&2
   warn "run 'docker compose restart openclaw' again, or check 'docker compose logs openclaw'."
   exit 1
 fi
 
-log "active: ${NEW_VERSION}. No MCP child is running a replaced binary."
+if [ -z "$PROBE" ]; then
+  # Neither a child nor the NONE marker: the exec itself failed. Say so instead
+  # of reading silence as success.
+  warn "could not inspect the gateway's MCP children, so activation is UNVERIFIED."
+  warn "check with: docker compose exec openclaw pgrep -af mcp-serve"
+elif printf '%s' "$PROBE" | grep -q '^NONE'; then
+  # The normal state after a restart: children are spawned per session and reaped
+  # after idle, so there is usually nothing running yet. The next session gets the
+  # new binary because the config points at a fixed path.
+  log "active: ${NEW_VERSION}. No MCP child running yet; the next session starts on it."
+else
+  log "active: ${NEW_VERSION}. Every running MCP child is on the new binary:"
+  printf '%s\n' "$PROBE" | sed 's/^/  /' >&2
+fi
 log "the image was NOT changed. To move the image, use scripts/update.sh."

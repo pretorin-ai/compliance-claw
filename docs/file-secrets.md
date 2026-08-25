@@ -113,6 +113,46 @@ widening the credential's reach.
 An unset marker does not fall back to a default; it makes the whole config
 invalid. The export is unconditional for that reason.
 
+## `docker compose exec` does not see these secrets
+
+The entrypoint reads `/run/secrets/*` and exports them, so **PID 1** — the
+gateway — has them. An `exec`'d process is a child of the Docker daemon, not of
+PID 1, so it starts with none of those exports. This is the file-secret design
+working as intended, and it is also a footgun worth knowing before you hit it.
+
+It matters for any `exec` that loads the config, because
+`gateway.auth.token` is a `${OPENCLAW_GATEWAY_TOKEN}` reference resolved at load
+time. With the variable unset you get:
+
+```
+GatewaySecretRefUnavailableError: gateway.auth.token is configured as a secret
+reference but is unavailable in this command path.
+```
+
+That is not a missing model key and not a broken token — it is an unset
+variable. Re-read it from the mounted file **inside** the container, so the value
+never crosses the `docker` CLI boundary:
+
+```sh
+docker compose exec -T openclaw sh -c '
+  export OPENCLAW_GATEWAY_TOKEN="$(cat /run/secrets/openclaw_gateway_token)"
+  openclaw agent --agent main -m "your prompt"'
+```
+
+Do **not** use `docker compose exec -e OPENCLAW_GATEWAY_TOKEN="$(cat ...)"`: that
+reads the secret on the host and puts it in an argument list, which is visible to
+`ps` for the life of the call.
+
+Checking what the gateway actually resolved is a different question, and
+`exec env` cannot answer it — read PID 1's own environment:
+
+```sh
+docker compose exec -T openclaw sh -c 'tr "\0" "\n" < /proc/1/environ | grep OPENAI_REQUEST_ADAPTER'
+```
+
+Reading it any other way is how an earlier round of this work "observed" an empty
+adapter and went looking for a bug that was not there.
+
 ## Azure mapping
 
 On the Azure VM, a root-owned startup service will authenticate to Key Vault

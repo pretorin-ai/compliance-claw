@@ -264,6 +264,32 @@ else
   pass "an unknown argument is refused rather than defaulting"
 fi
 
+head2 "A3d. no operator message is executed instead of printed"
+# An UNQUOTED heredoc runs command substitution on its body, so a command name
+# written in backticks for a human to read gets EXECUTED on the host. This is not
+# hypothetical: the credentialed acceptance run caught onboard-targets.sh doing
+# it, and the failure DELETED the command name from the very sentence whose job
+# was to name it. Static check, so CI runs it with no credentials.
+if HD_OUT="$(python3 scripts/lint-heredocs.py scripts/*.sh 2>&1)"; then
+  pass "no unescaped backtick inside an expanding heredoc"
+else
+  fail "no unescaped backtick inside an expanding heredoc" \
+       "$(printf '%s' "$HD_OUT" | tr '\n' ' ')"
+fi
+# And prove the checker is live rather than vacuously green: re-introduce the
+# exact defect in a COPY and require a non-zero exit. A linter nothing has ever
+# seen fail is not a gate.
+HD_TMP="$(mktemp -d)"
+sed 's/(Not \\`openclaw mcp reload\\`/(Not `openclaw mcp reload`/' \
+  scripts/onboard-targets.sh > "${HD_TMP}/regressed.sh"
+if python3 scripts/lint-heredocs.py "${HD_TMP}/regressed.sh" >/dev/null 2>&1; then
+  fail "the heredoc checker detects the defect it was written for" \
+       "the reintroduced backtick was not flagged, so the check proves nothing"
+else
+  pass "the heredoc checker detects the defect it was written for"
+fi
+rm -rf "$HD_TMP"
+
 head2 "A4. gateway starts, config and templates are seeded"
 if docker compose ps --status running --services 2>/dev/null | grep -qx openclaw; then
   note "gateway already running; leaving it up at the end"
@@ -338,6 +364,16 @@ fi
 # Read once, up front: the expected plugin profile below is decided by what is
 # actually in the config, and several later checks assert on the same text.
 CFG="$(val cat /home/node/.openclaw/openclaw.json)"
+# COMMENT-STRIPPED VIEW. The template is JSON5 and deliberately DOCUMENTS options
+# it does not set — `// toolFilter: {` is the live example. A bare grep for a key
+# name therefore finds the COMMENT and reports a setting that is not there. Same
+# defect class as the absolute-path invariant check, which once matched its own
+# explanatory comment. Found by the credentialed acceptance run, where "no local
+# tool filter is configured" failed against a config that configures no filter.
+#
+# WHOLE-LINE COMMENTS ONLY: "http://127.0.0.1:18789" also contains //, so
+# stripping from the first // anywhere would eat real values.
+CFG_LIVE="$(printf '%s\n' "$CFG" | sed 's|^[[:space:]]*//.*$||')"
 CFG_RAW="$CFG"
 if printf '%s' "$CFG" | grep -q '/opt/compliance-claw/plugins/slack'; then
   SLACK_PROFILE=1
@@ -604,12 +640,40 @@ hasnt "config holds no Slack app token value"   "xapp-" "$CFG"
 hasnt "config holds no Slack token substitution" '${SLACK_BOT_TOKEN}' "$CFG"
 hasnt "config holds no Slack app-token substitution" '${SLACK_APP_TOKEN}' "$CFG"
 
-# The whole state volume, with canary values actually present in the environment.
-CANARY_HITS="$(SLACK_BOT_TOKEN="$SLACK_CANARY_BOT" SLACK_APP_TOKEN="$SLACK_CANARY_APP" \
-  docker compose run --rm -T \
+# The whole state volume, with canary values actually present as credentials.
+#
+# INJECTED THE WAY THE DEPLOYMENT SUPPLIES THEM, which differs by path. Passing
+# `-e SLACK_BOT_TOKEN=...` while compose also mounts SLACK_BOT_TOKEN_FILE is a
+# DUAL SOURCE, and the entrypoint refuses it by design — so on the file-secret
+# path the old env-var injection made the container exit before the grep ever ran.
+# The probe then reported "N file(s) contain a canary token" about a probe that
+# had not executed. Correct refusal, wrong injection, and a failure message that
+# described the opposite of what happened. Found by the credentialed acceptance
+# run; this is the property most worth proving on the path the README recommends.
+CANARY_RC=0
+if printf '%s' "${COMPOSE_FILE:-}" | grep -q 'compose\.secrets\.yaml'; then
+  # Canaries go in FILES, in a throwaway secret dir compose resolves at run time.
+  CANARY_DIR="$(mktemp -d)"
+  cp "${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"/* "$CANARY_DIR"/ 2>/dev/null || true
+  printf '%s' "$SLACK_CANARY_BOT" > "${CANARY_DIR}/slack-bot-token"
+  printf '%s' "$SLACK_CANARY_APP" > "${CANARY_DIR}/slack-app-token"
+  chmod 600 "$CANARY_DIR"/* 2>/dev/null || true
+  CANARY_HITS="$(COMPLIANCE_CLAW_SECRET_DIR="$CANARY_DIR" docker compose run --rm -T \
+    cli bash -c 'grep -rl "CANARY-SLACK-" /home/node/.openclaw /home/node/.pretorin 2>/dev/null | wc -l' \
+    2>/dev/null | tr -d ' \r\n')" || CANARY_RC=$?
+  rm -rf "$CANARY_DIR"
+else
+  CANARY_HITS="$(docker compose run --rm -T \
     -e SLACK_BOT_TOKEN="$SLACK_CANARY_BOT" -e SLACK_APP_TOKEN="$SLACK_CANARY_APP" \
-    cli bash -c 'grep -rl "CANARY-SLACK-" /home/node/.openclaw /home/node/.pretorin 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r\n')"
-if [ "${CANARY_HITS:-x}" = 0 ]; then
+    cli bash -c 'grep -rl "CANARY-SLACK-" /home/node/.openclaw /home/node/.pretorin 2>/dev/null | wc -l' \
+    2>/dev/null | tr -d ' \r\n')" || CANARY_RC=$?
+fi
+# THREE OUTCOMES, NOT TWO. "the probe did not run" is not "the volume is clean",
+# and it is not "the volume is dirty" either — it has to say so itself.
+if [ "$CANARY_RC" != 0 ] || [ -z "${CANARY_HITS:-}" ]; then
+  fail "no Slack token value anywhere in either state volume" \
+       "the probe did not run (container exit ${CANARY_RC}); this proves nothing either way"
+elif [ "$CANARY_HITS" = 0 ]; then
   pass "no Slack token value anywhere in either state volume"
 else
   fail "no Slack token value anywhere in either state volume" "${CANARY_HITS} file(s) contain a canary token"
@@ -776,8 +840,30 @@ else
   digest() { echo "no-md5-tool"; }
 fi
 if [ -e .env ]; then
-  grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env && pass ".env carries a gateway token" \
-    || fail ".env carries a gateway token"
+  # PATH-AWARE, because the two credential paths want OPPOSITE things here and a
+  # single assertion cannot be right for both. On the recommended file-secret path
+  # a token VALUE in .env is a defect — the entrypoint refuses a dual source — and
+  # bootstrap deliberately writes the key with an empty value. On the legacy path
+  # the value in .env is the whole mechanism. Asserting "a token is present"
+  # unconditionally is what made the acceptance run fail on the path the README
+  # now recommends.
+  if printf '%s' "${COMPOSE_FILE:-}" | grep -q 'compose\.secrets\.yaml'; then
+    if grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env; then
+      fail ".env carries NO gateway token value (file-secret path)" \
+           "a value is in .env AND a file is mounted; the entrypoint refuses that dual source"
+    else
+      pass ".env carries NO gateway token value (file-secret path)"
+    fi
+    if [ -s "${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}/openclaw-gateway-token" ]; then
+      pass "the gateway token lives in the mounted secret file instead"
+    else
+      fail "the gateway token lives in the mounted secret file instead" \
+           "neither .env nor the secret file carries a token; the gateway would exit 1"
+    fi
+  else
+    grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env && pass ".env carries a gateway token (legacy path)" \
+      || fail ".env carries a gateway token (legacy path)"
+  fi
   ENV_BEFORE="$(digest .env)"
   HEAD_BEFORE="$(git -C "workspace/targets/${FIRST_TARGET}" rev-parse HEAD)"
   if OUT="$(bash scripts/bootstrap.sh 2>&1)"; then
@@ -967,12 +1053,12 @@ else
   # would look identical to a server-side one.
   #
   # So first prove nothing local is in the way, whatever the key is.
-  if printf '%s' "$CFG" | grep -q 'toolFilter'; then
+  if printf '%s' "$CFG_LIVE" | grep -q 'toolFilter'; then
     fail "no local tool filter is configured" "mcp.servers.pretorin.toolFilter is set; a rejection would be ambiguous"
   else
     pass "no local tool filter is configured"
   fi
-  if printf '%s' "$CFG" | grep -qE '"?deny"?[[:space:]]*:'; then
+  if printf '%s' "$CFG_LIVE" | grep -qE '"?deny"?[[:space:]]*:'; then
     fail "no local tools.deny is configured" "a deny list is set; a rejection would be ambiguous"
   else
     pass "no local tools.deny is configured"
@@ -1069,11 +1155,37 @@ PY
   # dead path stayed invisible, exactly like the plugin-banner grep did.
   REAL_SHA="$(git -C "workspace/targets/${FIRST_TARGET}" rev-parse HEAD)"
   REAL_URL="$(git -C "workspace/targets/${FIRST_TARGET}" remote get-url origin)"
-  TURN="$(docker compose exec -T openclaw openclaw agent --agent main -m \
-    "Select the ${FIRST_TARGET} target under /workspace/targets. Report its repository URL, its HEAD commit SHA, and one repository-relative file path you read. Do not call any Pretorin write tool." 2>&1)"
+  # `docker compose exec` DOES NOT INHERIT THE ENTRYPOINT'S EXPORTS. PID 1 reads
+  # /run/secrets/* and exports them; an exec'd process is a new child of the
+  # daemon, not of PID 1, so on the file-secret path OPENCLAW_GATEWAY_TOKEN is
+  # simply unset here. The config resolves gateway.auth.token from ${VAR} at load
+  # time, so `openclaw agent` then dies with
+  #   GatewaySecretRefUnavailableError: gateway.auth.token is configured as a
+  #   secret reference but is unavailable in this command path
+  # BEFORE it ever reaches model resolution — which is why this looked like a
+  # missing model key and was not one. Same defect class as the adapter marker,
+  # and the reason docs/file-secrets.md now documents the exec footgun.
+  #
+  # Re-read the token from the mounted file INSIDE the container: the value never
+  # crosses the docker CLI boundary and never lands in an exec environment on the
+  # host. Falls through untouched on the legacy path, where env_file already
+  # supplied it.
+  CC_PROMPT="Select the ${FIRST_TARGET} target under /workspace/targets. Report its repository URL, its HEAD commit SHA, and one repository-relative file path you read. Do not call any Pretorin write tool."
+  TURN="$(docker compose exec -T -e CC_PROMPT="$CC_PROMPT" openclaw sh -c '
+    if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ] && [ -r /run/secrets/openclaw_gateway_token ]; then
+      OPENCLAW_GATEWAY_TOKEN="$(cat /run/secrets/openclaw_gateway_token)"
+      export OPENCLAW_GATEWAY_TOKEN
+    fi
+    openclaw agent --agent main -m "$CC_PROMPT"' 2>&1)"
   LOWT="$(printf '%s' "$TURN" | tr 'A-Z' 'a-z')"
   case "$LOWT" in
-    *providerautherror*|*failovererror*|*"missing-provider-auth"*|*"no api key"*|*"auth store"*|*"embedded fallback"*)
+    *gatewaysecretrefunavailable*|*"secret reference but is unavailable"*)
+      # NOT a credential problem: the turn could not even authenticate to the
+      # gateway. Kept as its own branch so it can never be mistaken for "no model
+      # key" again, which is exactly how it presented the first time.
+      fail "agent turn reaches the gateway" \
+           "gateway.auth.token did not resolve in the exec path; the token was not re-read from /run/secrets" ;;
+    *providerautherror*|*failovererror*|*"missing-provider-auth"*|*"no api key"*|*"auth store"*|*"embedded fallback"*|*"no model"*|*"unknown model"*)
       skip "agent turn provenance check" \
            "no usable model credentials in this deployment (the turn never reached a model)" ;;
     *)

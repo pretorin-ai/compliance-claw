@@ -417,3 +417,228 @@ then a **real agent turn with no device-code login and no manual config patching
 Slack round trip, provider actually serving, and both key postures via the new flags —
 `--expect-read-only` with a read-only key, `--test-write-enabled` with a write key. When
 recorded, redact every value and identifier.
+
+# Addendum — credentialed local acceptance run
+
+Run on 2026-08-25 against branch `chore/cli-self-update` at `217b9fe`, in an
+isolated Compose project. **All secret values, key fragments, tokens, record ids
+and org-internal identifiers are redacted.** Nothing was merged, tagged,
+published or deployed.
+
+## Isolation, and the one deliberate omission
+
+| | |
+| --- | --- |
+| project | `ccacc` (own `COMPOSE_PROJECT_NAME`, fresh volumes) |
+| port | `127.0.0.1:18991`, derived — never 18789 |
+| repo | a scratch copy of `HEAD`, because `bootstrap.sh` writes `.env` and the operator's `.env` carries live legacy credentials |
+| secrets | a throwaway dir; real Pretorin key, **freshly generated** gateway token |
+| image | built locally (`compose.build.yaml`), since the branch is unreleased |
+| Slack tokens | **left empty on purpose** — see below |
+
+The Slack tokens were left empty as the isolation lever. The entrypoint gates the
+Slack patch on all three of `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` and
+`SLACK_CHANNEL_ID`, so empty files mean no socket-mode client is ever started and
+the shared Slack app is untouched. This was necessary, not convenient: see
+"What could not be run".
+
+Live deployment verified before, during and after — `Up 12 days (healthy)` on
+18789, shared target clone unchanged at `276b5fd`, operator `.env` digest and all
+six `secrets/runtime/` files unchanged.
+
+## What the run proved
+
+Fresh flow, in the documented order, with no manual config editing and no
+device-code login:
+
+```
+bootstrap.sh --build  ->  onboard-targets.sh  ->  up -d
+```
+
+| Property | Observed |
+| --- | --- |
+| `.env` holds no secret on the file-secret path | 0 non-empty secret assignments |
+| bootstrap names only what is *actually* empty | named `openai-api-key OR anthropic-api-key`, correctly silent about the populated Pretorin key |
+| seed is off PATH and root-owned | `/opt/compliance-claw/pretorin-seed/pretorin`, `root:root` |
+| active binary is first on PATH | `command -v pretorin` -> `/home/node/.pretorin/bin/pretorin`, `node:node` |
+| seed copy is byte-identical to the pin | both `sha256` = `f7ae0bb5…dea711` = `PRETORIN_SHA256` |
+| MCP command points at the persistent path | `mcp.servers.pretorin.command: /home/node/.pretorin/bin/pretorin` |
+| adapter resolves per process | PID 1: `OPENAI_REQUEST_ADAPTER=openai-chatgpt-responses` (no OpenAI key present — the correct branch) |
+| onboarding against the real platform | 0 failures, 0 warnings; 13 recipes; `code_repository` degraded as expected |
+| a read tool through MCP | `list_frameworks` returned 26 frameworks through `pretorin mcp-serve` |
+| updater plugin activates | gateway banner: 9 plugins including `pretorin-update`; `plugins inspect --runtime` -> `Tools: pretorin_update`, `Commands: pretorin-update` |
+| gateway restarts and MCP survives | healthy after restart; `list_frameworks` still returned 26 |
+| `smoke.sh --test-write-enabled` | **137 pass, 0 fail, 2 skip, 2 note** |
+| `smoke.sh --no-creds`, legacy path, separate project | **123 pass, 0 fail, 1 skip, 1 note** |
+
+Key posture: the operator's key is **write-enabled**. `whoami` reports
+authentication but not scopes, so posture is only discoverable by attempting a
+write. Three probe risk records were created and are safe to delete; they are
+titled `compliance-claw smoke probe - key scope regression` and
+`compliance-claw acceptance probe - key posture discovery`. A fourth, older
+record titled `compliance-claw smoke probe - read-only key must be rejected`
+dates from 2026-08-06 and is a stale artifact of an earlier session.
+
+## Updater behaviour, including the paths that are meant to fail
+
+`0.28.7` is simultaneously the latest upstream release **and** the floor for
+self-update, so there is currently no legal `(from, to)` pair. Attempting
+`0.28.6` surfaced why, and the wrapper handled it exactly as designed:
+
+```
+✗ Update refused (manifest-cutoff): release v0.28.6 predates self-update
+  metadata (its signed manifest has no RELEASE-TAG entry)
+pretorin-update: the update did not take effect.
+  requested 0.28.6   previous 0.28.7   now 0.28.7
+pretorin-update: restored the previous binary from backup (verification failed).
+v=1 … outcome=rolled_back requester=unavailable route=unknown
+```
+
+That answers the open §A question: **the verify flow does consume `RELEASE-TAG`**,
+and pre-0.28.7 releases are not installable targets at all — a stronger statement
+than the "cannot self-update" floor already recorded in `versions.env`.
+
+Three things this confirms, none of which needed a newer release:
+
+- the CLI **exits 0 on refusal**, and the wrapper caught it anyway by re-reading
+  the version rather than trusting the exit code
+- rollback restored the previous binary, digest-verified
+- the audit line carries `requester=unavailable` — correct for a host CLI
+  invocation, which has no authenticated metadata — and no secret value
+
+The already-current path is classified separately and does **not** produce a
+spurious rollback:
+
+```
+✓ Pretorin CLI is already up to date (0.28.7).
+v=1 … outcome=already_current requester=unavailable route=unknown
+pretorin-update: activating 0.28.7: restarting the gateway so MCP picks it up
+```
+
+`--self-test` passed all 22 input cases offline, including the multiline
+`0.28.7\n0.28.8` case and the shell-metacharacter set.
+
+## Five defects found and fixed
+
+The run existed to find these; all five are fixed on the branch.
+
+**1. An operator message was being executed instead of printed.**
+`onboard-targets.sh`'s completion text named the command you must *not* run,
+in backticks, inside an unquoted `cat <<EOF`. The shell ran it:
+
+```
+scripts/onboard-targets.sh: line 334: openclaw: command not found
+```
+
+and the sentence came out as `(Not  from the cli service:` — the one word it
+existed to say had been deleted by the shell. Two conventions broken at once:
+name-the-fix, and never execute what you mean to display. Fixed by escaping;
+gated by the new `scripts/lint-heredocs.py` and smoke row **A3d**, which also
+re-introduces the defect in a copy each run so the checker cannot go vacuously
+green.
+
+**2. `toolFilter` false positive.** B4's "no local tool filter is configured"
+failed against a config that configures none: the template *documents* the option
+as `// toolFilter: {`, and the check grepped the raw JSON5. Same defect class as
+the absolute-path invariant that once matched its own comment. Fixed with a
+comment-stripped `CFG_LIVE` view (whole-line comments only — `http://` contains
+`//` too).
+
+**3. The `.env` gateway-token assertion contradicted the recommended path.**
+A10 required `^OPENCLAW_GATEWAY_TOKEN=.+` unconditionally, but on the file-secret
+path a value in `.env` is a *defect* and bootstrap deliberately writes the key
+empty. The assertion is now path-aware, and both arms were verified non-vacuous
+(legacy `.env`: 1 matching line; file-secret `.env`: 0).
+
+**4. The Slack canary probe never ran on the file-secret path.** It injected
+canaries as `-e SLACK_BOT_TOKEN=…` while compose also mounted
+`SLACK_BOT_TOKEN_FILE`. The entrypoint correctly refused the dual source, the
+container exited before the grep, and the check then reported
+`N file(s) contain a canary token` about a probe that had not executed. Correct
+refusal, wrong injection, and a message describing the opposite of what happened.
+Canaries now go into files on that path, and the outcome is three-way:
+hits / clean / **probe did not run**.
+
+**5. `docker compose exec` cannot resolve the gateway token.** The entrypoint
+exports secrets in PID 1; an `exec`'d process is a child of the daemon, so on the
+file-secret path `OPENCLAW_GATEWAY_TOKEN` is unset and `openclaw agent` dies with
+`GatewaySecretRefUnavailableError` **before** model resolution. This read as "no
+model key" and was not — same defect class as the adapter marker. B6 now re-reads
+the token from `/run/secrets` *inside* the container (never through the docker CLI
+argument list, which `ps` can see), the secret-ref failure has its own branch so
+it can never masquerade as a credential problem again, and the footgun is
+documented in `docs/file-secrets.md`.
+
+## A sixth: the activation probe was blind on this platform
+
+Not in the original list because it only appears under emulation. The probe
+looked for `(deleted)` in `/proc/<pid>/exe`, which works on the amd64 deployment
+target — but this image runs linux/amd64 on Apple Silicon, where `exe` resolves
+to `/run/rosetta/rosetta` and can never contain `(deleted)`. So the probe printed
+the reassuring `No MCP child is running a replaced binary` having observed
+nothing at all: assert-by-absence, the exact trap this repo keeps re-learning.
+
+It now uses a second, platform-independent observable — a child that started
+before the active binary's mtime cannot be running the new bytes — and reports
+three outcomes rather than two, including an explicit **UNVERIFIED** when the
+inspection itself fails. All three branches were driven:
+
+```
+FRESH  /proc/9   started-after-binary(1787686140>=1787685976)
+STALE  /proc/131 started-before-binary(1787686188<1787686193)
+NONE   no mcp-serve child running
+```
+
+The STALE case was produced by advancing the binary's mtime with `touch` while a
+child was held open; `sha256` was confirmed unchanged either side, so this
+exercised the detector without touching the signed-update path.
+
+## What could not be run, and why
+
+**A real agent turn — blocked, no OpenAI API key exists on this machine.**
+`secrets/runtime/openai-api-key` and `anthropic-api-key` are both 0 bytes, and
+neither key is in `.env` or the environment. The only OpenAI credential present
+is `~/.codex/auth.json`, which is the device-login path the brief excludes. The
+tooling diagnosed this itself — bootstrap printed *"still empty, and needed before
+an agent turn"* — and B6 correctly skips rather than passing. Everything the turn
+would depend on is proven: the adapter resolves per process, the persistent CLI
+serves MCP, and the gateway-token path is fixed. Only "a real key serves a turn"
+is unobserved.
+
+**Slack message/reply and both Slack update routes — blocked, and this one is a
+safety decision rather than a missing credential.** The live gateway logs:
+
+> socket mode reports **10 active connections for this Slack app**; Slack may
+> deliver each event to any one connection
+
+Slack delivers each event to exactly one of the connections on an app. A second
+gateway on the same tokens would therefore (a) receive events intended for the
+operator's live deployment and answer them in the real channel, and (b) hand my
+test messages to whichever gateway won the race. That is a change to the working
+deployment's behaviour even though none of its containers are touched, so I did
+not connect. It needs **a separate Slack app** (its own app/bot tokens) — the
+same remedy the upstream warning names.
+
+Route 1 is *registered and loaded* — `plugins inspect --runtime` reports
+`Commands: pretorin-update` — but it is dispatchable only from a channel
+provider. There is no local or HTTP dispatch path in 2026.7.1: `openclaw message`
+has no command verb, and `/commands` on the gateway is the control-UI SPA
+catch-all, not an API. So both routes wait on the Slack app.
+
+**`smoke.sh --expect-read-only` — blocked, no read-only key.** The operator's key
+is write-enabled, so this invocation would fail by design and prove nothing. The
+write half passed. Covering the read-only half needs a second, read-scoped key;
+until then the read-only branch of B4 has never executed.
+
+## Still outstanding
+
+1. A second Slack app, then: Slack round trip, route 1 (command, LLM-bypass) and
+   route 2 (agent tool, needs a model key). Route 1 will also settle which of
+   `dmPolicy`/`groupPolicy` a slash command bypasses.
+2. An OpenAI API key, then a real agent turn with provenance.
+3. A read-only Pretorin key, then `--expect-read-only`.
+4. `0.28.8`, then the update **success** path: bytes actually change, MCP recycles
+   onto the new binary, `outcome=updated`.
+5. Exec hardening (SECURITY.md ledger item 4) before production.
+6. Housekeeping: three probe risk records from this run, one stale record from
+   2026-08-06, and orphaned `ccaccept_*` volumes from an earlier session.
