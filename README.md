@@ -5,8 +5,8 @@ you mount and do compliance work against your Pretorin system — from a termina
 from a Slack channel.
 
 Compliance Claw is deliberately thin. Pretorin already provides the compliance
-intelligence: the skill, the MCP tool surface, workflows, recipes, source
-preflight, active recipe sets, plans. This repository supplies the runtime that
+intelligence: the MCP tool surface and its own routing instructions, workflows,
+recipes, source preflight, active recipe sets, plans. This repository supplies the runtime that
 joins those to your code — a supply-chain-verified Pretorin binary, a configured
 OpenClaw gateway, a pinned Slack channel, and the wiring that tells Pretorin which
 repositories this deployment is about.
@@ -104,7 +104,14 @@ Two ordering rules, both of which bite silently if ignored:
   onboard while the gateway is running:
 
   ```sh
-  docker compose run --rm cli openclaw mcp reload    # or restart the gateway
+  docker compose restart openclaw
+```
+
+  Not `openclaw mcp reload` from the `cli` service: that disposes cached MCP
+  runtimes in the *calling* process only, so a one-off container disposes its own
+  empty cache and exits, leaving the gateway's children untouched.
+
+  ```sh
   ```
 
 Check what you bound at any time, read-only:
@@ -509,6 +516,91 @@ Pretorin answers `Scope is not approved with a confirmed scale yet`.
 `pretorin whoami` reports authentication but not scopes, so it cannot be detected.
 `scripts/smoke.sh` reads it to decide whether attempting a write tool is safe.
 
+## Updating the Pretorin CLI
+
+The image ships an **immutable seed**. On first start it is copied to
+`/home/node/.pretorin/bin/pretorin` inside the `pretorin-state` volume, and that
+copy is the CLI this deployment runs: it is first on `PATH`, it is what
+`mcp.servers.pretorin.command` points at, and an image upgrade never replaces it.
+So `pretorin version` has one meaning everywhere, and moving the CLI does not
+require a Compliance Claw release.
+
+```sh
+scripts/pretorin-update.sh              # status: active vs seed, and the last update
+scripts/pretorin-update.sh latest       # the latest stable release
+scripts/pretorin-update.sh 0.28.7       # exactly that version
+scripts/pretorin-update.sh --dry-run    # say what would happen; change nothing
+```
+
+From Slack, either route works and both run the same implementation:
+
+```
+/claw /pretorin-update latest           deterministic; bypasses the model entirely
+/claw /pretorin-update status
+@Compliance Claw update Pretorin        conversational; goes through the model
+```
+
+**Any authorized Slack user can do this, deliberately, with no approval step.**
+The compensating control is the audit record below, not a confirmation prompt.
+
+`latest` is passed to the CLI as *no argument at all*, which is how
+`pretorin update` already means "install the latest stable release" — so release
+selection, signature verification, downgrade refusal and prerelease exclusion are
+all the CLI's own, not reimplemented here. Explicit prereleases (`0.29.0-rc2`) are
+refused: an unattended, Slack-triggered update on a shared instance is the wrong
+place for a release candidate.
+
+**An update changes the CLI for every user of the instance.** Deployments are
+independent of each other, but users of one deployment are not. The Slack
+acknowledgement says so before the work starts.
+
+**Activation is part of the update.** The CLI replaces its own binary by rename,
+so a running `pretorin mcp-serve` child keeps the old one until it restarts —
+which means "the file was replaced" is not "the update is live". After a
+successful update the gateway is restarted (from Slack, through OpenClaw's own
+restart path; from the host, with `docker compose restart openclaw`) and the
+result is confirmed. If a restart is not possible, the update is reported as
+**installed but not yet active**, naming the manual step. It is never reported as
+complete when it is not.
+
+### The update audit record
+
+Every invocation appends one line to `/home/node/.pretorin/update-audit.log`
+(mode `0600`) **and** writes the same line to the container log:
+
+```
+v=1 ts=2026-08-24T14:05:02Z requested=latest normalized= previous=0.28.7 \
+    resulting=0.29.0 outcome=installed requester=slack:U024BE7LH route=command
+```
+
+| Field | Meaning |
+| --- | --- |
+| `v` | record format version, so a parser can tell when this changes |
+| `requested` / `normalized` | what was asked for, verbatim, and after normalizing (`v0.28.7` → `0.28.7`) |
+| `previous` / `resulting` | the version before and after |
+| `outcome` | `installed`, `already_current`, `refused_input`, `rolled_back`, `timeout`, `backup_failed`, `backup_mismatch`, `interrupted` |
+| `requester` | `<channel>:<user-id>`, from the **authenticated** invocation, or `unavailable` |
+| `route` | `command`, `tool`, or `repair` |
+
+Read it with `scripts/pretorin-update.sh --status`, or in full:
+
+```sh
+docker compose run --rm cli cat /home/node/.pretorin/update-audit.log
+docker compose logs openclaw | grep 'outcome='
+```
+
+**Requester identity is never taken from a model or an argument.** The command
+route reads it from the authenticated Slack message; the tool route reads it from
+the runtime's trusted inbound sender. When neither is available the field is
+literally `unavailable` rather than a value someone could have chosen.
+
+**What this record is, and is not.** It is the compensating control for having no
+approval workflow: it tells you who moved the CLI, when, and to what. It is not
+tamper-evident storage. The agent runs as the same user, tool execution in this
+container is unsandboxed (see SECURITY.md), and `down -v` deletes the volume the
+file lives in. The copy in the container log is outside the volume and outside the
+agent's write path, which is why the record is written twice.
+
 ## Testing
 
 ```sh
@@ -555,13 +647,23 @@ overlay (that is a rebuild, not an update).
 | | Survives `update.sh` | Survives `down -v` |
 | --- | --- | --- |
 | The image | replaced — that is the point | n/a |
+| **The Pretorin CLI** (`pretorin-state`) | **yes — `update.sh` no longer moves it** | **no — reverts to the image seed** |
 | Model login (`openclaw-state`) | **yes** | **no** |
 | Seeded config, sessions, `AGENTS.md` | **yes** | **no** |
 | Pretorin context, resolvers, recipes (`pretorin-state`) | **yes** | **no** |
 | `.env` | **yes** | **yes** — never touched by either |
 | `workspace/targets` clones | **yes** | **yes** — bind-mounted, not a volume |
 
-So an update never costs you a re-login or a re-onboard. Re-run
+So an update never costs you a re-login or a re-onboard.
+
+**Two things about the CLI row, because both surprise people.** `down -v` deletes
+`pretorin-state`, so the next start re-seeds the CLI from the image and every
+update you had applied is gone — worth knowing, because `down -v` is the remedy
+this README recommends in three other places. And rolling the *image* backwards
+does **not** roll the CLI backwards: the volume keeps whatever version it has.
+The CLI moves in exactly one way, `scripts/pretorin-update.sh`.
+
+Re-run
 `scripts/onboard-targets.sh` only after `down -v`, or when `targets.yaml` changes;
 it is idempotent either way.
 
@@ -575,8 +677,19 @@ NOTE  deployment is behind the repo pin: run scripts/update.sh
 
 A warning, not a failure — being mid-update is not being broken.
 
-**Known state:** a deployment still on **v0.1.x** is running Pretorin CLI 0.26.14.
-Updating to v0.2.0 is what moves it to **0.28.2**.
+**The image no longer decides which Pretorin CLI you run.** It ships a *seed*;
+the CLI a deployment actually uses lives in the `pretorin-state` volume, and
+`update.sh` does not touch volumes. So pulling a newer image gives you a newer
+seed and the same CLI. Move the CLI with:
+
+```sh
+scripts/pretorin-update.sh --status     # what is installed, and what the image seeds
+scripts/pretorin-update.sh latest       # update to the latest stable release
+```
+
+**Historical note:** on v0.2.x and earlier the CLI *was* welded to the image, so
+an image upgrade did move it — that is how a v0.1.x deployment went from 0.26.14
+to 0.28.2. From this release on, the two are independent.
 
 **A newer image does not update an existing volume's config.** Templates are
 seeded write-if-absent and never overwritten, so a tightened template has no
@@ -596,7 +709,7 @@ There is a second, Slack-specific version of this warning, because the
 template-version message says nothing about Slack:
 
 ```
-compliance-claw: WARNING — Slack is configured in .env but NOT in this volume's config.
+compliance-claw: WARNING — Slack credentials are supplied but NOT in this volume's config.
 ```
 
 That means all three Slack variables are set and the existing config predates
@@ -637,7 +750,11 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | `Missing required scopes: write` | Read-only key, write tool | Correct behaviour — see "Read-only vs write-enabled" |
 | `Scope is not approved with a confirmed scale yet` | Platform prerequisite | Approve scope setup on platform.pretorin.com |
 | Agent answers with no sources bound | Framework switched in chat | One scope per deployment; re-run onboarding for another |
-| `plugins list` shows 8 plugins, not 1 | Slack not configured | Expected; the two profiles are documented above |
+| `plugins list` shows 9 plugins, not 2 | Slack not configured | Expected; the two profiles are documented above |
+| `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
+| An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
+| Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`. `--status` confirms which binary is active |
+| `/claw /pretorin-update` does nothing in Slack | `channels.slack.slashCommand` missing from an existing config | Never-clobber: the container warns. Re-seed, or set it by hand |
 
 Logs and state:
 

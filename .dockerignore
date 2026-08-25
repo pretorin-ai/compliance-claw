@@ -5,3 +5,4 @@
 !versions.env
 !vendor/
 !scripts/
+!plugins/

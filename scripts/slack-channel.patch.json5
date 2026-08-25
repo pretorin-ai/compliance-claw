@@ -50,15 +50,34 @@
     // allowlist keeps the seven bundled plugins off with no Slack to show for
     // it, and nothing in the logs explains why. scripts/smoke.sh asserts the two
     // move together.
-    allow: ["slack"],
+    //
+    // pretorin-update IS NOT OPTIONAL HERE. Because this list is exclusive, an
+    // entry omitted is a plugin disabled — so leaving it out would silently
+    // remove both CLI-update routes on exactly the deployments that have Slack.
+    // The banner therefore reads (2 plugins: pretorin-update, slack).
+    allow: ["slack", "pretorin-update"],
 
     entries: { slack: { enabled: true } },
 
-    // The image copy, outside the state volume. Baked by the Dockerfile's
-    // slack-plugin stage after an integrity check against SLACK_PLUGIN_INTEGRITY
-    // in versions.env, and node-owned because OpenClaw blocks plugin files owned
-    // by another uid.
-    load: { paths: ["/opt/compliance-claw/plugins/slack"] },
+    // The image copies, outside the state volume. The Slack plugin is baked by
+    // the Dockerfile's slack-plugin stage after an integrity check against
+    // SLACK_PLUGIN_INTEGRITY in versions.env, and both are node-owned because
+    // OpenClaw blocks plugin files owned by another uid.
+    //
+    // THE UPDATER PATH IS RE-LISTED ON PURPOSE, NOT DUPLICATED BY MISTAKE.
+    // `openclaw config patch` uses JSON merge-patch semantics, so an array in a
+    // patch REPLACES the array in the target rather than merging with it —
+    // verified: a base of [a, b] patched with [c] yields [c] alone. The base
+    // template already lists the updater; if this patch named only the Slack
+    // path, applying it on a fresh Slack seed would silently delete the updater
+    // and both /pretorin-update and the pretorin_update tool would simply not
+    // exist. Any future entry added to the base template must be added here too.
+    load: {
+      paths: [
+        "/opt/compliance-claw/plugins/slack",
+        "/opt/compliance-claw/plugins/pretorin-update",
+      ],
+    },
   },
 
   channels: {
@@ -85,7 +104,35 @@
       dmPolicy: "disabled",
 
       // Slack traffic may not rewrite the gateway's own configuration.
+      //
+      // This is why the CLI updater never touches config to force MCP to pick up
+      // a new binary: it restarts the gateway through the supported restart RPC
+      // instead. A config write from a Slack-triggered path would contradict
+      // this line, and on a non-Slack deployment `openclaw config set` would
+      // also rewrite the JSON5 template as strict JSON and delete every comment.
       configWrites: false,
+
+      // HOW A SLACK USER REACHES A GATEWAY COMMAND.
+      //
+      // Native Slack slash commands are off by default (`commands.native: auto`
+      // does not enable them for Slack), and Slack rejects an unregistered
+      // `/foo` before it ever reaches us. This single registered command wraps
+      // the rest, so the deterministic route is:
+      //
+      //     /claw /pretorin-update latest
+      //     /claw /pretorin-update 0.28.7
+      //     /claw /pretorin-update status
+      //
+      // NO SLACK APP RE-IMPORT IS NEEDED. slack/app-manifest.json already
+      // declares /claw and already grants the `commands` bot scope; it was inert
+      // only because nothing enabled it. `ephemeral` keeps its default (true),
+      // so the acknowledgement is visible just to the invoker while the outcome
+      // — which changes the CLI for everyone — is delivered as a normal channel
+      // message.
+      slashCommand: {
+        enabled: true,
+        name: "claw",
+      },
 
       // Only the channels listed below are served, and only on an explicit
       // @mention. Keys MUST be Slack channel IDs (C...): a name-based key such

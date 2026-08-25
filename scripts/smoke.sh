@@ -111,14 +111,53 @@ head1 "SECTION A — no credentials (this is what CI runs)"
 # ===========================================================================
 
 head2 "A1. versions and supply chain"
-V="$(val pretorin version)"
+# The seed and the active CLI are different files on purpose, so asking "what
+# version is this?" has two correct answers. `val pretorin version` resolves
+# PATH, which puts the ACTIVE binary first — right for an operator, wrong for a
+# pin assertion, because a deployment that has updated its CLI is SUPPOSED to be
+# ahead of versions.env. So the pin is asserted against the seed by its explicit
+# path, and the active binary is reported as a NOTE.
+# Just the version token. `pretorin version` prints three lines and the third is
+# `path:`, which differs between the seed and the active copy BY DEFINITION — so
+# comparing whole outputs made the "unmodified" branch unreachable and every run
+# emitted a spurious "expected after a CLI update" note.
+pver() { val "$1" version | awk 'NR==1 && $2=="version" {print $3; exit}'; }
+V_SEED="$(pver /opt/compliance-claw/pretorin-seed/pretorin)"
+V_ACTIVE="$(pver pretorin)"
 # Read from versions.env rather than hardcoded here. Two literals in a test are
 # two more places to forget on a bump — and a pin nothing reads is decoration, not
 # a source of truth. OPENCLAW_VERSION in particular had no consumer at all until
 # this line; the Dockerfile FROM carries the tag as a literal beside its digest.
 # shellcheck disable=SC1091
 . ./versions.env
-has "pretorin matches versions.env (${PRETORIN_VERSION})" "$PRETORIN_VERSION" "$V"
+has "pretorin SEED matches versions.env (${PRETORIN_VERSION})" "$PRETORIN_VERSION" "$V_SEED"
+
+# The active CLI. A NOTE, never a FAIL: being ahead of the seed is the whole
+# point of the feature, and CI runs this on a fresh volume where the two agree.
+# sha256 as well as version, because a same-version swap is invisible to a
+# version comparison and is exactly what an agent with exec could do.
+SEED_SHA="$(val sha256sum /opt/compliance-claw/pretorin-seed/pretorin | awk '{print $1}')"
+ACTIVE_SHA="$(val sha256sum /home/node/.pretorin/bin/pretorin | awk '{print $1}')"
+if [ -z "$V_ACTIVE" ]; then
+  fail "the active Pretorin CLI runs" "nothing at /home/node/.pretorin/bin/pretorin reported a version"
+elif [ "$V_ACTIVE" = "$V_SEED" ] && [ "$ACTIVE_SHA" = "$SEED_SHA" ]; then
+  pass "active Pretorin CLI is the image seed, unmodified (${V_ACTIVE})"
+elif [ "$V_ACTIVE" = "$V_SEED" ]; then
+  note "active CLI reports ${V_ACTIVE} like the seed but the BYTES DIFFER — investigate"
+  printf '        active %s\n        seed   %s\n' "$ACTIVE_SHA" "$SEED_SHA"
+else
+  note "active CLI is ${V_ACTIVE}; the image seeds ${V_SEED} (expected after a CLI update)"
+fi
+
+# The config must point MCP at the SAME file PATH resolves, or an update lands
+# somewhere the agent never runs. This is the assertion the "two meanings of
+# pretorin version" hazard used to require prose to explain.
+CFG_CMD="$(val openclaw config get mcp.servers.pretorin.command | tr -d '"[:space:]')"
+if [ "$CFG_CMD" = "/home/node/.pretorin/bin/pretorin" ]; then
+  pass "mcp.servers.pretorin.command is the active binary"
+else
+  fail "mcp.servers.pretorin.command is the active binary" "config says: ${CFG_CMD:-<unset>}"
+fi
 has "openclaw matches versions.env (${OPENCLAW_VERSION})" "$OPENCLAW_VERSION" "$(val openclaw --version)"
 # The FROM line restates the tag next to its digest, because FROM cannot source a
 # file. If they drift, the image is not the version versions.env claims it is.
@@ -136,6 +175,33 @@ has "mcp-smoke-test passes" "PASSED" "$S"
 
 head2 "A3. targets.yaml parser"
 ok "parse-targets.py --self-test" python3 scripts/parse-targets.py --self-test
+
+head2 "A3b. CLI updater — offline input rules and the drift contract"
+# The input rules are pure: no network, no credentials, no volume. They are also
+# the whole authorization surface of the model-visible route, so they get a gate
+# that runs on every push rather than a hand-check once.
+ok "pretorin-update --self-test (offline)" \
+   docker compose run --rm -T cli /opt/compliance-claw/pretorin-update.sh --self-test
+
+# The updater must never be reachable as a bare name: PATH puts the active CLI
+# first, and a bare `pretorin` inside the wrapper would silently operate on
+# whichever file PATH found. --self-test asserts this internally; assert here
+# that the wrapper is actually present in the image at the documented path.
+ok "the updater wrapper ships at the documented path" \
+   docker compose run --rm -T cli test -x /opt/compliance-claw/pretorin-update.sh
+
+# BOTH DIRECTIONS. A drift warning with no update.sh branch is invisible to an
+# operator running update.sh; an update.sh branch with no warning is a dead grep
+# that reports "config is current" forever. Both have shipped in this repo, which
+# is why this is a gate and not a convention.
+DW_DECLARED="$(grep -oE '# DRIFT-WARNING: .+' scripts/entrypoint.sh | sed 's/# DRIFT-WARNING: //' | sort)"
+DW_GREPPED="$(grep -oE "grep -q '[^']+'" scripts/update.sh | sed "s/grep -q '//;s/'\$//" | sort)"
+if [ -n "$DW_DECLARED" ] && [ "$DW_DECLARED" = "$DW_GREPPED" ]; then
+  pass "every entrypoint drift warning has an update.sh branch, and vice versa"
+else
+  fail "every entrypoint drift warning has an update.sh branch, and vice versa" \
+       "declared: $(printf '%s' "$DW_DECLARED" | tr '\n' '|') vs grepped: $(printf '%s' "$DW_GREPPED" | tr '\n' '|')"
+fi
 
 head2 "A4. gateway starts, config and templates are seeded"
 if docker compose ps --status running --services 2>/dev/null | grep -qx openclaw; then
@@ -190,9 +256,19 @@ fi
 # gateway would be a pass that means nothing, which is the bug this block exists
 # to prevent, reintroduced two lines lower down.
 if [ "$READY" = 1 ]; then
-  curl -fsS -m 5 http://127.0.0.1:18789/healthz >/dev/null 2>&1 \
-    && pass "gateway answers /healthz on the published port" \
-    || fail "gateway answers /healthz on the published port" "container healthy but the published port did not answer"
+  # Ask compose which port THIS project published, rather than assuming 18789.
+  # An isolated test project runs on a different port, and a hardcoded one sends
+  # the probe to whatever else is listening — most likely the real deployment.
+  HPORT="$(docker compose port openclaw 18789 2>/dev/null | sed 's/.*://' | tr -d '\r\n')"
+  if [ -z "$HPORT" ]; then
+    skip "gateway answers /healthz on the published port" \
+         "docker compose port did not report a published port for openclaw"
+  elif curl -fsS -m 5 "http://127.0.0.1:${HPORT}/healthz" >/dev/null 2>&1; then
+    pass "gateway answers /healthz on the published port (${HPORT})"
+  else
+    fail "gateway answers /healthz on the published port (${HPORT})" \
+         "container healthy but the published port did not answer"
+  fi
 else
   skip "gateway answers /healthz on the published port" \
        "our container is not up; any reply on that port would come from another deployment"
@@ -234,14 +310,23 @@ else
   # therefore also trims the bundled set. Asserting a single expected number would
   # mean one of the two profiles is always failing.
   if [ "$SLACK_PROFILE" = 1 ]; then
-    has "runtime plugin set is exactly 'slack' (Slack profile)" "slack" "$PLUGIN_NAMES"
-    if [ "$PLUGIN_NAMES" = "slack" ]; then
+    has "runtime plugin set includes slack (Slack profile)" "slack" "$PLUGIN_NAMES"
+    has "runtime plugin set includes pretorin-update (Slack profile)" "pretorin-update" "$PLUGIN_NAMES"
+    # The allowlist is exclusive, so it must name BOTH ids and nothing else: an
+    # id left out is a plugin silently disabled, and a bundled id creeping in
+    # would mean the trim stopped working.
+    if [ "$PLUGIN_NAMES" = "pretorin-update, slack" ] || [ "$PLUGIN_NAMES" = "slack, pretorin-update" ]; then
       pass "no bundled plugin activates under the exclusive allowlist"
     else
       fail "no bundled plugin activates under the exclusive allowlist" "got: ${PLUGIN_NAMES}"
     fi
   else
-    has "runtime plugin set is the 8 bundled (no-Slack profile)" "8 plugins" "$PLUGIN_LINE"
+    # 9, not 8: the base template adds the updater's load path and deliberately
+    # sets NO plugins.allow, so the bundled eight still load and the updater joins
+    # them. That is what keeps this profile — the one CI runs — able to exercise
+    # both update routes.
+    has "runtime plugin set is the 8 bundled + updater (no-Slack profile)" "9 plugins" "$PLUGIN_LINE"
+    has "  updater plugin present: pretorin-update" "pretorin-update" "$PLUGIN_NAMES"
     for p in browser canvas device-pair file-transfer memory-core ollama phone-control talk-voice; do
       has "  bundled plugin present: ${p}" "$p" "$PLUGIN_NAMES"
     done
@@ -257,7 +342,32 @@ fi
 # dropped), so matching JSON5 syntax makes this check fail on a healthy
 # deployment. These three survive any reformat.
 has "config seeded into the state volume" '18789' "$CFG"
-has "config registers the Pretorin MCP server" '/usr/local/bin/pretorin' "$CFG"
+has "config registers the Pretorin MCP server" '/home/node/.pretorin/bin/pretorin' "$CFG"
+# The seed path must NOT appear: if it does, this config predates the re-point
+# and CLI updates would land somewhere MCP never runs.
+hasnt "config does not still point MCP at the image seed" '/usr/local/bin/pretorin' "$CFG"
+has "config carries the updater plugin load path" '/opt/compliance-claw/plugins/pretorin-update' "$CFG"
+hasnt "config no longer loads a skill directory" 'extraDirs' "$CFG"
+
+# The updater plugin, checked through OpenClaw's own diagnostics rather than by
+# reading the startup banner. `plugins doctor` is what surfaces a rejected
+# manifest, suspicious file ownership or an undeclared tool contract — every one
+# of which otherwise presents to an operator as "the command just does not
+# exist".
+#
+# NOT `plugins validate`: that command only understands defineToolPlugin metadata
+# and always fails on a mixed command+tool plugin like this one.
+PDOCTOR="$(val openclaw plugins doctor 2>&1 || true)"
+if printf '%s' "$PDOCTOR" | grep -q 'No plugin issues detected'; then
+  pass "openclaw plugins doctor reports no issues"
+else
+  fail "openclaw plugins doctor reports no issues" "$(printf '%s' "$PDOCTOR" | head -4)"
+fi
+
+PINSPECT="$(val openclaw plugins inspect pretorin-update --runtime --json 2>&1 || true)"
+has "updater plugin loads at runtime" 'pretorin-update' "$PINSPECT"
+has "updater registers its agent tool" 'pretorin_update' "$PINSPECT"
+hasnt "updater plugin passes OpenClaw file-safety checks" 'blocked plugin candidate' "$PINSPECT"
 has "config keeps the key as a substitution, not a value" '${PRETORIN_API_KEY}' "$CFG"
 has "config carries the MCP cwd fix" '/opt/compliance-claw/no-repo' "$CFG"
 
@@ -464,7 +574,7 @@ for _ in $(seq 1 60); do
     # match itself, which is how the first version of this check lied.
     # (No apostrophes in this heredoc: bash 3.2 scans quotes inside a heredoc
     #  nested in $( ), so a contraction here breaks the enclosing parse.)
-    if [ "$cl" = "/usr/local/bin/pretorin mcp-serve" ]; then
+    if [ "$cl" = "/home/node/.pretorin/bin/pretorin mcp-serve" ]; then
       echo "CHILD_CWD=$(readlink "$d/cwd")"
       exit 0
     fi
@@ -781,39 +891,82 @@ else
     fail "list_frameworks returns through pretorin mcp-serve" "$(printf '%s' "$OUT" | tail -3)"
   fi
 
-  head2 "B4. a write tool is rejected server-side"
-  if [ "$KEY_MODE" = "undeclared" ]; then
-    skip "write-tool rejection probe" \
-      "PRETORIN_KEY_MODE is not set in .env. This probe CREATES A REAL RECORD if the
-        key has write scope, so an undeclared key is never probed. Add
-        PRETORIN_KEY_MODE=read-only to .env if that is what you are running."
-  elif [ "$KEY_MODE" != "read-only" ]; then
-    skip "write-tool rejection probe" "PRETORIN_KEY_MODE=${KEY_MODE}: a write-enabled key would CREATE a real record"
+  head2 "B4. key scope decides write access — and nothing local does"
+  # WHY THIS IS ASSERTED FROM BOTH SIDES.
+  #
+  # The design commitment is that Pretorin permissions are determined ENTIRELY by
+  # the operator-supplied API key: Compliance Claw does not block writes and does
+  # not filter tools by any local mode. A rejection is only evidence of that if
+  # the same call SUCCEEDS with a write-enabled key — otherwise a local block
+  # would look identical to a server-side one.
+  #
+  # So first prove nothing local is in the way, whatever the key is.
+  if printf '%s' "$CFG" | grep -q 'toolFilter'; then
+    fail "no local tool filter is configured" "mcp.servers.pretorin.toolFilter is set; a rejection would be ambiguous"
   else
+    pass "no local tool filter is configured"
+  fi
+  if printf '%s' "$CFG" | grep -qE '"?deny"?[[:space:]]*:'; then
+    fail "no local tools.deny is configured" "a deny list is set; a rejection would be ambiguous"
+  else
+    pass "no local tools.deny is configured"
+  fi
+
+  if [ "$KEY_MODE" = "undeclared" ]; then
+    skip "key-scope write probe" \
+      "PRETORIN_KEY_MODE is not set in .env. This probe CREATES A REAL RECORD if the
+        key has write scope, so an undeclared key is never probed. Set
+        PRETORIN_KEY_MODE=read-only or =write in .env to declare what you are running."
+  elif [ "$KEY_MODE" != "read-only" ]; then
+    WRITE_PROBE=1
+  else
+    WRITE_PROBE=0
+  fi
+
+  if [ "${WRITE_PROBE:-}" != "" ]; then
     ARGS="$(python3 - "$SYSTEM_ID" "$FRAMEWORK_ID" <<'PY'
 import json, sys
 print(json.dumps({
     "system_id": sys.argv[1],
     "framework_id": sys.argv[2],
-    "title": "compliance-claw smoke probe - read-only key must be rejected",
+    "title": "compliance-claw smoke probe - key scope regression",
     "category": "operational",
 }))
 PY
 )"
     OUT="$(cli python3 /opt/compliance-claw/mcp-call.py create_risk "$ARGS" 2>&1)"; RC=$?
-    if [ "$RC" = 0 ]; then
-      fail "create_risk is rejected" "IT SUCCEEDED — this key has write scope, or the platform did not enforce"
-    elif [ "$RC" = 3 ]; then
-      LOW="$(printf '%s' "$OUT" | tr 'A-Z' 'a-z')"
-      case "$LOW" in
-        *permission*|*forbidden*|*unauthor*|*scope*|*403*|*not\ allowed*|*read-only*)
-          pass "create_risk rejected server-side on authorization" ;;
-        *)
-          note "create_risk was rejected but not visibly on authorization — INCONCLUSIVE"
-          printf '        %s\n' "$(printf '%s' "$OUT" | head -2)" ;;
-      esac
+    if [ "$WRITE_PROBE" = 0 ]; then
+      # READ-ONLY KEY: the write must be refused, and refused BY PRETORIN.
+      if [ "$RC" = 0 ]; then
+        fail "read-only key: create_risk is rejected" \
+             "IT SUCCEEDED — either the key is not read-only, or the platform did not enforce"
+      elif [ "$RC" = 3 ]; then
+        LOW="$(printf '%s' "$OUT" | tr 'A-Z' 'a-z')"
+        case "$LOW" in
+          *permission*|*forbidden*|*unauthor*|*scope*|*403*|*not\ allowed*|*read-only*)
+            pass "read-only key: create_risk rejected server-side on authorization" ;;
+          *)
+            note "create_risk was rejected but not visibly on authorization — INCONCLUSIVE"
+            printf '        %s\n' "$(printf '%s' "$OUT" | head -2)" ;;
+        esac
+      else
+        fail "read-only key: create_risk is rejected" \
+             "transport failure (rc=${RC}), not a server verdict: $(printf '%s' "$OUT" | tail -2)"
+      fi
     else
-      fail "create_risk is rejected" "transport failure (rc=${RC}), not a server verdict: $(printf '%s' "$OUT" | tail -2)"
+      # WRITE-ENABLED KEY: the SAME call must SUCCEED. This is the half that
+      # proves the refusal above came from key scope and not from anything this
+      # repo configures. It creates a real record, which is why it only runs on
+      # an explicitly declared write key and never in CI.
+      if [ "$RC" = 0 ]; then
+        pass "write-enabled key: the same create_risk succeeds (a real record was created)"
+      elif [ "$RC" = 3 ]; then
+        fail "write-enabled key: the same create_risk succeeds" \
+             "the platform REFUSED a declared write key: $(printf '%s' "$OUT" | head -2)"
+      else
+        fail "write-enabled key: the same create_risk succeeds" \
+             "transport failure (rc=${RC}): $(printf '%s' "$OUT" | tail -2)"
+      fi
     fi
   fi
 

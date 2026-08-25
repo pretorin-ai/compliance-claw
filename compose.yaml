@@ -21,7 +21,11 @@
 # gateway keeps a per-session `pretorin mcp-serve` child alive that can serve the
 # older view (the preflight artifact carries a 3600s TTL). If you must onboard
 # while the gateway is up, follow it with:
-#   docker compose run --rm cli openclaw mcp reload   # or restart the gateway
+#   docker compose restart openclaw
+#
+# NOT `openclaw mcp reload` from the cli service: that command disposes cached
+# MCP runtimes IN THE CALLING PROCESS ONLY, so a one-off cli container disposes
+# its own empty cache and exits, leaving the gateway's children untouched.
 #
 # The gateway generates ~/.openclaw/openclaw.json into the state volume on first
 # start and never overwrites it. `.env` must supply OPENCLAW_GATEWAY_TOKEN or the

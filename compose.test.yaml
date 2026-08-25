@@ -1,0 +1,65 @@
+# compose.test.yaml — validation overlay for an ISOLATED deployment.
+#
+# WHY THIS FILE EXISTS AT ALL. Validating a change to the seeding, config and
+# plugin wiring means running a real deployment on fresh volumes. Doing that in
+# the default project would replace the operator's working deployment's config
+# and volumes, which is the one outcome that must not happen.
+#
+# WHAT IT OVERRIDES, AND WHAT IT DOES NOT.
+#
+# Only the published port. The project NAME needs no override here: Compose
+# resolves it as `-p` > COMPOSE_PROJECT_NAME > the top-level `name:` in
+# compose.yaml > the directory name, so exporting COMPOSE_PROJECT_NAME is enough
+# to move the containers AND the named volumes into their own namespace.
+#
+# The port, on the other hand, is a literal in compose.yaml and cannot be
+# overridden by an environment variable, so it lives here. It is load-bearing:
+# two projects publishing 18789 on loopback collide, and the failure mode is
+# worse than an error — the second project's health probe gets answered by the
+# FIRST project's gateway and reports a cheerful pass. scripts/smoke.sh now asks
+# `docker compose port` for the real port instead of assuming one, which is what
+# makes this overlay safe rather than merely quiet.
+#
+# Usage:
+#   export COMPOSE_PROJECT_NAME=ccupd
+#   export COMPOSE_FILE=compose.yaml:compose.build.yaml:compose.test.yaml
+#   docker compose build && docker compose up -d
+#   bash scripts/smoke.sh
+#
+# Teardown destroys only this project's volumes:
+#   docker compose down -v
+#
+# Everything else — the image, the mounts, the entrypoint, the secret wiring — is
+# inherited unchanged on purpose. An overlay that diverges from the real
+# deployment proves things about the overlay.
+
+# A SHARED ANCHOR, because both services must be isolated identically.
+#
+# The base file's `env_file: .env` is the OPERATOR'S real environment, live Slack
+# tokens included. An isolated project that inherited it would connect a SECOND
+# bot to the operator's actual Slack channel with the same credentials — two bots
+# answering one channel. That is a change to the working deployment even though
+# none of its containers were touched, so the env file is REPLACED, not merged.
+x-test-env: &test-env
+  env_file: !override
+    - path: .env.test
+      required: true
+
+services:
+  openclaw:
+    <<: *test-env
+    # !override, not a bare list: Compose MERGES port lists, so without it the
+    # inherited 127.0.0.1:18789 would still be published alongside this one and
+    # the clash would come straight back. Requires Compose >= 2.24.0, the same
+    # floor compose.secrets.yaml already needs.
+    #
+    # Still loopback-only. The base file's comment applies verbatim: a bare
+    # "18889:18789" would publish on 0.0.0.0 and expose the gateway to the LAN.
+    ports: !override
+      - "127.0.0.1:18889:18789"
+
+  cli:
+    <<: *test-env
+    # Restated because the anchor above replaces the merge key wholesale; the
+    # profile is what keeps `up` from starting a second gateway.
+    profiles: ["cli"]

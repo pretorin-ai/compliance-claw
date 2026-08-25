@@ -2,7 +2,8 @@
 
 Compliance Claw is a **proof of concept**. This document states what it does
 protect, what it deliberately does not, and everything known to be outstanding.
-The hardening ledger at the end is complete as of Phase 5 — if something is not in
+The hardening ledger at the end is complete as of the CLI self-update release — if
+something is not in
 it, it was not considered, and that is worth telling us about.
 
 Report a vulnerability to security@pretorin.com rather than opening an issue.
@@ -112,6 +113,49 @@ it out of both the URL and the process table, deletes it on exit, and asserts th
 no clone's `.git/config` retained it. The container sees only the resulting
 working tree, read-only.
 
+## The Pretorin CLI trust root, and how this release changes it
+
+Until this release the Pretorin CLI was part of the image, so its bytes were
+covered by `PRETORIN_SHA256` in `versions.env` — a fail-closed pin, checked at
+build time against the cosign-signed `SHA256SUMS`, that would refuse the build
+even if the upstream signing key were compromised and used to sign different
+bytes.
+
+**That pin now governs the SEED only.** The CLI a deployment runs lives in the
+`pretorin-state` volume and is updated in place by `scripts/pretorin-update.sh`,
+which delegates to the CLI's own signed `pretorin update`. After the first
+update, what stands behind those bytes is upstream's signature verification, not
+a pin in this repository.
+
+**State the cost plainly.** Before, a compromised Pretorin signing key could only
+reach deployments if someone cut a Compliance Claw release, and the local pin
+would have refused it. Now it reaches a deployment on the next update, with no
+repo-side check that fails closed. That is a real reduction in defence-in-depth,
+accepted here because the alternative — a release cycle for every upstream
+dependency bump — produced deployments that stayed months behind, and because the
+component in question holds the Pretorin API key and runs with unsandboxed tool
+execution either way. It is ledger item 3.
+
+What did **not** change: the seed is still pinned and still fails closed at build
+time, the anchor is still vendored and reviewed in a diff (`vendor/README.md`),
+and the image is still unsigned with its digest as the integrity control.
+
+### The updater is an audited path, not a security boundary
+
+The CLI updater exposes exactly one fixed action by two routes. The command route
+(`/claw /pretorin-update`) bypasses the model entirely and cannot be reached by a
+prompt-injected agent. The tool route can be, deliberately, in this
+trusted-repository pilot; its blast radius is bounded to *which signed Pretorin
+version installs* — no command, path or URL is expressible through it.
+
+**Neither route is a boundary, and the docs must not imply otherwise.** Tool
+execution in this container is unsandboxed (see below), so an agent can already
+run the wrapper directly, replace the binary in the volume without it, and
+rewrite the audit file afterwards. What the updater provides is a *narrow,
+identity-bearing, audited path for the supported routes* — and it adds no
+LLM-reachable capability that `exec` did not already provide. Closing that gap is
+ledger item 4.
+
 ## What the POC does NOT protect against
 
 - **Legacy `.env` deployments.** The base Compose file still uses `env_file` for
@@ -169,13 +213,29 @@ Ordered roughly by how much it matters, not by effort.
 2. **RBAC and user-level attribution before any shared channel with a
    write-enabled key.** The prerequisite for treating Slack as more than a
    read-only surface. Until it exists, the read-only posture above is the control.
-3. **Fail-closed runtime-pin validation.** The `models.providers.openai.
+3. **Restore a fail-closed check over the ACTIVE Pretorin CLI.** `PRETORIN_SHA256`
+   now covers the seed only (see the trust-root section above), so a deployment
+   that has updated its CLI has no repo-side pin behind its bytes. Options worth
+   evaluating: recording the expected digest in the audit record and asserting it
+   on start, or having the updater verify the signed `SHA256SUMS` itself with a
+   vendored anchor — which would mean adding cosign to the runtime image and
+   maintaining a second verification path alongside the CLI's own.
+4. **Trim agent tool execution, or sandbox it.** Tool execution is unsandboxed and
+   the config sets no `tools.profile`, so `exec` is available to every agent turn.
+   That predates this release, but the CLI moving into a writable volume widens
+   what `exec` can reach: an agent can replace the active binary directly and
+   rewrite the update audit file. The wrapper's audit therefore covers the
+   supported routes only. `tools.exec.security: "allowlist"` with a host approvals
+   file is the narrow fix; enabling the sandbox is the broad one. **Required
+   before production** — the provenance workflow in `AGENTS.md` currently depends
+   on `git`, so neither can simply be switched on without replacing that path.
+5. **Fail-closed runtime-pin validation.** The `models.providers.openai.
    agentRuntime` pin is currently observable only as a log line the smoke test
    greps. If it silently regressed, agent turns would route through the Codex
    app-server plugin, which does not receive `tools.toolSearch` and bypasses
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
-4. **The base image ships five fixable CRITICAL vulnerabilities.** Measured, not
+6. **The base image ships five fixable CRITICAL vulnerabilities.** Measured, not
    estimated: two `libgnutls30` (Debian has `3.7.9-2+deb12u7`), one
    `@vitest/browser` — a test framework upstream ships inside a runtime image —
    and two vendored copies of `node-tar`, one inside npm and one inside
@@ -188,7 +248,7 @@ Ordered roughly by how much it matters, not by effort.
    once upstream rebuilds. The `libgnutls30` pair is the one to watch: unlike the
    others it sits on a live TLS path, and the reason for deferring it is
    inability to patch, not a claim that it is unreachable.
-5. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
+7. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
    publishes and verifies an immutable digest, which is integrity but not
    authenticity: nothing attests *who* built a given digest. **The image is
    unsigned today**, and there is no signature for an operator to verify.
@@ -205,11 +265,11 @@ Ordered roughly by how much it matters, not by effort.
    Until it ships, the digest pin in `compose.yaml` is the image-integrity
    control. Nothing in this repository should tell an operator to run
    `cosign verify` against the Compliance Claw image.
-6. **OpenClaw base-image attestation.** Phase 1's chain guarantees the *Pretorin
+8. **OpenClaw base-image attestation.** Phase 1's chain guarantees the *Pretorin
    binary* and Phase 5's gate guarantees the *Slack plugin*; the OpenClaw base
    image is trusted on its digest pin alone. Verifying upstream's own GHCR
    attestation would close the last unverified link in the image.
-7. **RESOLVED — the release workflow can now be rehearsed.** It previously could
+9. **RESOLVED — the release workflow can now be rehearsed.** It previously could
    not: GitHub only exposes `workflow_dispatch` for workflows on the **default
    branch**, and `release.yml` lived on a feature branch, so its first execution
    was the v0.1.0 tag push. It is now on `master` and carries a `dry_run` input
@@ -222,33 +282,33 @@ Ordered roughly by how much it matters, not by effort.
 
    Kept in the ledger as history, because the reasoning still applies to any new
    workflow: a pipeline whose first run is a real release has never been tested.
-8. **Connected Sources (`source_admin`) as the eventual binding source.** Local
+10. **Connected Sources (`source_admin`) as the eventual binding source.** Local
    `preflight` resolvers are a host-local approximation. Connected Sources is also
    the **only** path to `branch_protection`, `code_review_records` and
    `pull_request_records` — i.e. the thing that resolves `code_repository`
    reporting `degraded`, which is expected today and cannot be fixed from a local
    checkout. Requires a scope this POC deliberately does not use.
-9. **Config reconciliation instead of warn-and-`down -v`.** Templates are seeded
+11. **Config reconciliation instead of warn-and-`down -v`.** Templates are seeded
    write-if-absent and never overwritten, so a newer image cannot tighten an
    existing deployment's config. Today the entrypoint warns — including a specific
    warning when Slack is configured in `.env` but absent from an existing
    config — and `down -v` is the only reset.
-10. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
+12. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
    observed working (`cataloged 223 tools behind compact directory surface`) but
    upstream marks all Tool Search modes experimental. If it regresses, the prompt
    returns to roughly 40k tokens per turn and the commented `toolFilter` block is
    the lever.
-11. **Per-repository authorization.** Every target shares one Pretorin key and one
+13. **Per-repository authorization.** Every target shares one Pretorin key and one
    scope. A reviewer who should see one repository sees all of them.
-12. **`mcp.sessionIdleTtlMs` is untuned.** Default 600000 ms — ten minutes of
+14. **`mcp.sessionIdleTtlMs` is untuned.** Default 600000 ms — ten minutes of
    idleness before a session's `pretorin mcp-serve` child (a 23 MB binary) is
    reaped; `0` disables idle cleanup. Fine for one operator, unmeasured for a
    shared channel where each session spawns its own child.
-13. **Multi-arch is blocked upstream.** `SHA256SUMS` publishes only
+15. **Multi-arch is blocked upstream.** `SHA256SUMS` publishes only
     `linux-x86_64` and `macos-arm64`, so there is no linux/arm64 Pretorin binary
     to build against. Not deferred by choice — blocked. Apple Silicon runs amd64
     under emulation.
-14. **Upstream feedback: `pretorin preflight unbind --id <resolver-id>`.**
+16. **Upstream feedback: `pretorin preflight unbind --id <resolver-id>`.**
     `unbind --name` removes *every* resolver with that name, and names derive from
     directory basenames, so two targets that both own `docs/` collide. The
     sweep-then-bind ordering makes this safe rather than merely tolerable; an
@@ -278,4 +338,4 @@ Ordered roughly by how much it matters, not by effort.
   proves which digest came from this repository's workflow, so anyone who can push
   to the registry can publish another. The SBOM is retained as a workflow artifact,
   not attached to the image and not signed. Azure Key Vault–backed signing is
-  ledger item 5 above — recorded as planned work, not quietly omitted.
+  ledger item 7 above — recorded as planned work, not quietly omitted.
