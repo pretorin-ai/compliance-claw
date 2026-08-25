@@ -1,0 +1,41 @@
+{
+  "id": "pretorin-update",
+  "name": "Pretorin CLI Updater",
+  "description": "Update this deployment's Pretorin CLI in place, from Slack or a conversation.",
+  "version": "1.0.0",
+  // TRUE, and it matters. With false the gateway reads this manifest and then
+  // leaves the plugin inactive: `plugins inspect --runtime` still says "loaded"
+  // (inspect loads it on purpose), while the startup banner omits it and neither
+  // route exists. The config also enables it explicitly, the same way the Slack
+  // plugin does; this is the half that works when no config entry is present.
+  "enabledByDefault": true,
+
+  // onStartup is REQUIRED: omitting it no longer startup-loads the plugin, and a
+  // command that is not registered at startup silently does not exist.
+  "activation": {
+    "onStartup": true,
+    "onCommands": ["pretorin-update"]
+  },
+
+  // Ownership/diagnostics only. "runtime-slash" is the one kind the manifest
+  // normalizer keeps; anything else is silently dropped.
+  "commandAliases": [
+    { "name": "pretorin-update", "kind": "runtime-slash" }
+  ],
+
+  // MANDATORY for registerTool. Without a matching contracts.tools entry the
+  // runtime rejects the registration outright:
+  // "plugin must declare contracts.tools before registering agent tools".
+  "contracts": {
+    "tools": ["pretorin_update"]
+  },
+
+  // Required field. Empty and closed: this plugin takes no configuration, and
+  // additionalProperties:false means a stray plugins.entries key is rejected at
+  // config-read time rather than ignored at runtime.
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -41,7 +41,36 @@
   // a different auth store and a different billing path, and it does not
   // receive tools.toolSearch below. Drift alarm: with this pin the gateway logs
   // "8 plugins" with no `codex`; without it, 9 plugins including `codex`.
-  models: { providers: { openai: { agentRuntime: { id: "openclaw" } } } },
+  //
+  // `api` is the REQUEST ADAPTER, and the right value depends on which credential
+  // the deployment supplies: "openai-chatgpt-responses" for the device-code login
+  // path, "openai-responses" for an OpenAI API key. With the wrong one the key
+  // authenticates and then every turn fails.
+  //
+  // A ${VAR} MARKER, NOT A BAKED VALUE — and not something the entrypoint edits
+  // either. OpenClaw resolves ${VAR} at config LOAD time, per process, which is
+  // already how PRETORIN_API_KEY and the gateway token reach this file without
+  // their values ever being written to the volume. The entrypoint exports a
+  // concrete value on every start, computed from the credential THAT container
+  // can actually see.
+  //
+  // Deciding it at seed time was the earlier bug: the documented order runs
+  // `onboard-targets.sh` first, which seeds from the `cli` service, and `cli`
+  // deliberately gets no model key — so the adapter was chosen by a container
+  // that could not see the credential, and never-clobber then locked it in.
+  // Resolving per process means the gateway gets the right answer whether or not
+  // it was the container that seeded.
+  //
+  // Empty is NOT a safe default: an unset variable makes the whole config invalid
+  // ("Run `openclaw doctor --fix`"), which is why the export is unconditional.
+  models: {
+    providers: {
+      openai: {
+        agentRuntime: { id: "openclaw" },
+        api: "${OPENAI_REQUEST_ADAPTER}",
+      },
+    },
+  },
 
   agents: {
     defaults: {
@@ -72,7 +101,13 @@
   mcp: {
     servers: {
       pretorin: {
-        command: "/usr/local/bin/pretorin",
+        // THE ACTIVE CLI, NOT THE IMAGE SEED. The image ships a seed at
+        // /opt/compliance-claw/pretorin-seed/pretorin and the entrypoint copies
+        // it here once; from then on this path is authoritative and survives
+        // image upgrades. It is also first on PATH, so a bare `pretorin` in a
+        // shell resolves to this same file — one binary, one version, one
+        // answer. Updating it is scripts/pretorin-update.sh, never a new image.
+        command: "/home/node/.pretorin/bin/pretorin",
         args: ["mcp-serve"],
 
         // THE CWD FIX. Without this the child inherits the image's WorkingDir
@@ -107,14 +142,27 @@
     },
   },
 
-  // Lowest-precedence skill root, so a same-named skill in the workspace or the
-  // state volume would silently win. `openclaw skills info pretorin` must
-  // report Source: openclaw-extra to prove ours is the one that loaded.
-  skills: {
-    load: {
-      extraDirs: ["/opt/compliance-claw/skills"],
-      // The skill tree is baked into the image and never changes at runtime.
-      watch: false,
-    },
+  // The CLI updater plugin: one command (/pretorin-update, which bypasses the
+  // LLM) and one narrowly typed agent tool.
+  //
+  // NOTE WHAT IS DELIBERATELY ABSENT HERE: `plugins.allow`. It is an EXCLUSIVE
+  // allowlist, so naming anything trims the enabled set to exactly that list.
+  // Leaving it unset keeps the bundled plugins loading AND still enables this
+  // one, because a plugins.load.paths entry is config-origin and config-origin
+  // plugins are enabled by default when no allowlist exists. The Slack patch is
+  // where an allowlist appears, and it lists BOTH ids for that reason.
+  //
+  // The Slack patch also RE-LISTS this path. `openclaw config patch` uses JSON
+  // merge-patch semantics, so arrays are REPLACED, not merged: a patch that set
+  // only the Slack path would silently drop the updater on every Slack
+  // deployment.
+  plugins: {
+    load: { paths: ["/opt/compliance-claw/plugins/pretorin-update"] },
+    // Explicit, not inherited from the manifest's enabledByDefault. A load path
+    // alone is not activation: the gateway will happily read a plugin's manifest
+    // and leave it inactive, and the only symptom is a startup banner that does
+    // not list it — `plugins inspect --runtime` still reports "loaded", because
+    // inspect loads it deliberately. Same shape as entries.slack in the Slack patch.
+    entries: { "pretorin-update": { enabled: true } },
   },
 }

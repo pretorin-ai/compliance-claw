@@ -120,7 +120,7 @@ RUN P=/build/node_modules/@openclaw/slack \
  && echo "slack plugin tree resolves"
 
 
-# Runtime: OpenClaw, with the verified Pretorin binary and its skill added.
+# Runtime: OpenClaw, with the verified Pretorin binary added as an immutable seed.
 #
 # The digest is the OCI index, not the amd64 manifest — same as the debian pin
 # above. An index digest still resolves per-platform, so the multi-arch work
@@ -133,16 +133,45 @@ FROM ghcr.io/openclaw/openclaw:2026.7.1@sha256:6a31d44b2944e7adcd2b582bf6fb46311
 # The image already runs as `node`; switch back at the end of the stage.
 USER root
 
-COPY --from=pretorin-verify /usr/local/bin/pretorin /usr/local/bin/
+# THE SEED, AND WHY IT IS NOT ON PATH.
+#
+# This is the verified binary, and it is a seed: the entrypoint copies it once
+# into the pretorin-state volume and everything afterwards runs the copy. Keeping
+# it off PATH is what makes `pretorin` mean exactly one thing. If a seed sat at
+# /usr/local/bin/pretorin, then `docker compose run --rm cli pretorin version`
+# would answer with the image's version while MCP ran a different, updated
+# binary — two correct answers to one question, which is how an operator ends up
+# debugging the wrong file.
+#
+# Anything that deliberately wants the seed names this path explicitly:
+# .github/workflows/release.yml probes the image with `--entrypoint bash`, which
+# skips seeding, so it has no active binary to ask.
+COPY --from=pretorin-verify --chown=root:root \
+     /usr/local/bin/pretorin /opt/compliance-claw/pretorin-seed/pretorin
 
-# --path, not --agent: the built-in agent registry knows only claude and codex
-# and roots both under /root, which this image's non-root user cannot read.
-# Installing to an explicit directory instead keeps the skill outside both the
-# state volume and the read-only target mount, so neither can shadow or hide it.
-# Making OpenClaw actually load this directory is Phase 3 (skills.load.extraDirs).
-RUN install -d /opt/compliance-claw/skills \
- && pretorin skill install --path /opt/compliance-claw/skills \
- && chown -R node:node /opt/compliance-claw
+# The active CLI lives in the pretorin-state volume and is first on PATH, so MCP,
+# onboarding, smoke and every operator command resolve the same binary. The
+# directory is created (node-owned) below; until the entrypoint seeds it, it is
+# empty, which is why every image-level probe names the seed instead.
+ENV PATH="/home/node/.pretorin/bin:${PATH}"
+
+# The OpenAI request adapter, as an IMAGE-LEVEL DEFAULT.
+#
+# The config template carries ${OPENAI_REQUEST_ADAPTER} and the entrypoint exports
+# the right value for the process it is about to exec. But `docker compose exec`
+# does not go through the entrypoint, so an exec'd `openclaw ...` would see the
+# variable unset — and an unset ${VAR} does not fall back to anything, it makes the
+# WHOLE CONFIG INVALID. That broke `docker compose exec openclaw openclaw agent`,
+# which README documents as the way to run a turn.
+#
+# So the image declares the device-login value here, which makes the config parse
+# for any process in the container, and the entrypoint overrides it to
+# openai-responses for PID 1 when an OpenAI key is actually present.
+#
+# Safe for exec'd clients specifically because `openclaw agent` talks to the
+# GATEWAY over loopback: inference happens in PID 1, which has the correct value.
+# The exec'd process only needs the config to parse.
+ENV OPENAI_REQUEST_ADAPTER="openai-chatgpt-responses"
 
 # /home/node/.openclaw already exists in the base image, owned by node — a fresh
 # named volume is seeded from it, so the state mount needs no ownership fixup.
@@ -155,7 +184,8 @@ RUN install -d /opt/compliance-claw/skills \
 # volume over it. Without this line the daemon creates that mount point as root
 # and onboarding fails with a permission error on the first write.
 RUN install -d -o node -g node /workspace/targets \
- && install -d -m 0700 -o node -g node /home/node/.pretorin
+ && install -d -m 0700 -o node -g node /home/node/.pretorin \
+ && install -d -m 0700 -o node -g node /home/node/.pretorin/bin
 
 # The working directory for the `pretorin mcp-serve` child, referenced as
 # mcp.servers.pretorin.cwd in the config template. A sentinel, not a workspace:
@@ -201,6 +231,20 @@ COPY --from=slack-plugin --chown=node:node \
 COPY scripts/openclaw-config.template.json scripts/agents-md.template \
      scripts/slack-channel.patch.json5 /opt/compliance-claw/
 COPY scripts/entrypoint.sh /usr/local/bin/compliance-claw-entrypoint
+
+# The CLI updater. One implementation; the Slack plugin, the model-visible tool
+# and scripts/pretorin-update.sh on the host all call this same file, so the
+# locking, backup, verification, rollback, sanitized environment and audit logic
+# exist once.
+COPY scripts/pretorin-update.in-image.sh /opt/compliance-claw/pretorin-update.sh
+
+# The updater plugin: one command (/pretorin-update, which bypasses the LLM) and
+# one narrowly typed agent tool, both calling the wrapper above.
+#
+# Plain COPY, never --link: OpenClaw rejects a plugin candidate whose files are
+# hardlinked (nlink > 1) for any non-bundled origin, and --link produces exactly
+# that. node-owned for the same reason as the Slack plugin above.
+COPY --chown=node:node plugins/pretorin-update /opt/compliance-claw/plugins/pretorin-update
 
 # The MCP stdio client used by scripts/smoke.sh to prove key posture — a read
 # tool succeeds, a write tool is rejected server-side — through the same
@@ -252,7 +296,10 @@ RUN . /opt/compliance-claw/versions.env \
  && grep -qx "IMAGE_VERSION=${IMAGE_SELF_VERSION}" /opt/compliance-claw/versions.env \
  && test -x /usr/bin/tini \
  && chmod 0755 /usr/local/bin/compliance-claw-entrypoint \
- && chown -R node:node /opt/compliance-claw
+ && chown -R node:node /opt/compliance-claw \
+ && chown -R root:root /opt/compliance-claw/pretorin-seed \
+ && chmod 0755 /opt/compliance-claw/pretorin-seed/pretorin \
+ && chmod 0755 /opt/compliance-claw/pretorin-update.sh
 
 USER node
 

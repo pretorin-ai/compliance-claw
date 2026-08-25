@@ -47,7 +47,7 @@ SLUGS=("$@")
 
 # Prefer the process environment, fall back to .env. Deliberately NOT `source
 # .env`: that file is operator-editable and sourcing it would execute whatever it
-# contains. Same key-extraction shape scripts/smoke.sh uses for PRETORIN_KEY_MODE.
+# contains.
 env_val() {
   local name="$1" val
   eval "val=\${${name}:-}"

@@ -101,6 +101,12 @@ jobs:
           [ "$fail" = 0 ] || exit 1
           echo "No Pretorin, Slack, model or GitHub App credentials are configured."
 
+      # Ahead of the full suite on purpose: it needs no credentials, no gateway
+      # and no network, so when the CLI updater's input rules break, that is the
+      # first thing the log says rather than the fortieth.
+      - name: CLI updater input rules (offline, no credentials)
+        run: bash scripts/pretorin-update.sh --self-test
+
       - name: Smoke test (no-credential section only)
         run: bash scripts/smoke.sh --no-creds
 

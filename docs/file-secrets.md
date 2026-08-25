@@ -49,7 +49,6 @@ remain trusted, as they are with every bind mount.
 
 Only non-secret deployment settings are interpolated from `.env` in this mode:
 
-- `PRETORIN_KEY_MODE`
 - `SLACK_CHANNEL_ID`
 - target and model selection performed by their existing configuration flows
 
@@ -57,24 +56,102 @@ Host-side GitHub App identifiers and its private-key path may remain in `.env`
 for `scripts/bootstrap.sh`; the overlay does not forward them into either
 container.
 
-The six runtime secret files are:
+## The checklist — every secret file, in one place
 
-| Host filename | Runtime variable |
+This table is the single source of truth for what to populate. `.env.example`
+points here rather than restating it, so the two cannot drift.
+
+| Host file under `secrets/runtime/` | Runtime variable | Required? | Delivered to |
+| --- | --- | --- | --- |
+| `pretorin-api-key` | `PRETORIN_API_KEY` | for any platform access | `openclaw`, `cli` |
+| `openclaw-gateway-token` | `OPENCLAW_GATEWAY_TOKEN` | **yes** — the gateway exits 1 without it | `openclaw` only |
+| `slack-app-token` | `SLACK_APP_TOKEN` | only for Slack (all three together) | `openclaw`, `cli` |
+| `slack-bot-token` | `SLACK_BOT_TOKEN` | only for Slack | `openclaw`, `cli` |
+| `openai-api-key` | `OPENAI_API_KEY` | **exactly one** model key | `openclaw` only |
+| `anthropic-api-key` | `ANTHROPIC_API_KEY` | **exactly one** model key | `openclaw` only |
+
+`SLACK_CHANNEL_ID` is the third Slack value and is **not** a secret — it stays in
+`.env`, along with the host-side GitHub App identifiers and private-key path,
+which the overlay does not forward into either container.
+
+An empty optional file means that provider is simply not configured. The gateway
+token is the one that fails closed.
+
+### Delivery is least privilege, not convenience
+
+One workflow, different reach. A service receives a credential only if it needs
+it, and the two exclusions are the interesting part:
+
+| Excluded from `cli` | Why |
 | --- | --- |
-| `pretorin-api-key` | `PRETORIN_API_KEY` |
-| `openclaw-gateway-token` | `OPENCLAW_GATEWAY_TOKEN` |
-| `slack-app-token` | `SLACK_APP_TOKEN` |
-| `slack-bot-token` | `SLACK_BOT_TOKEN` |
-| `openai-api-key` | `OPENAI_API_KEY` |
-| `anthropic-api-key` | `ANTHROPIC_API_KEY` |
+| model API keys | agent turns run only in the gateway. Handing a one-off container a provider credential gives it spend authority it has no use for. |
+| `openclaw-gateway-token` | the entrypoint requires it only for gateway invocations, and `cli` is one-off by Compose profile. Without it, `cli` cannot start a second gateway against the same volumes. |
 
-Provider API keys are mounted only into the long-running gateway service. The
-CLI service receives Pretorin, gateway and optional Slack credentials because
-its diagnostics and configuration commands use them, but it does not receive
-model API keys.
+If a `cli` invocation ever genuinely needs the gateway token, the entrypoint
+refuses with a message naming the file to mount, rather than failing somewhere
+deeper. `scripts/test-file-secrets.sh` asserts this matrix directly: it plants a
+distinct canary in every secret file and checks that each container sees exactly
+its allowed set **and nothing more**, so over-delivery fails the gate rather than
+going unnoticed.
 
-Empty optional files mean that provider is not configured. The gateway token is
-required when starting the gateway; an empty file fails closed.
+### The model credential needs no variable
+
+Populate exactly one of `openai-api-key` or `anthropic-api-key`. Nothing else is
+required: the entrypoint derives the OpenAI request adapter
+(`models.providers.openai.api`) from whether an OpenAI key is visible, and exports
+it on every start, so the config carries a `${OPENAI_REQUEST_ADAPTER}` marker
+rather than a baked value.
+
+That indirection is load-bearing. Deciding the adapter when the config is *seeded*
+does not work: the documented order runs `scripts/onboard-targets.sh` before
+`docker compose up`, which seeds from the `cli` service — and `cli` deliberately
+has no model key. A seed-time choice was therefore made by a container that could
+not see the credential, and never-clobber then locked the wrong value in for the
+life of the volume. Resolving per process removes the dependency instead of
+widening the credential's reach.
+
+An unset marker does not fall back to a default; it makes the whole config
+invalid. The export is unconditional for that reason.
+
+## `docker compose exec` does not see these secrets
+
+The entrypoint reads `/run/secrets/*` and exports them, so **PID 1** — the
+gateway — has them. An `exec`'d process is a child of the Docker daemon, not of
+PID 1, so it starts with none of those exports. This is the file-secret design
+working as intended, and it is also a footgun worth knowing before you hit it.
+
+It matters for any `exec` that loads the config, because
+`gateway.auth.token` is a `${OPENCLAW_GATEWAY_TOKEN}` reference resolved at load
+time. With the variable unset you get:
+
+```
+GatewaySecretRefUnavailableError: gateway.auth.token is configured as a secret
+reference but is unavailable in this command path.
+```
+
+That is not a missing model key and not a broken token — it is an unset
+variable. Re-read it from the mounted file **inside** the container, so the value
+never crosses the `docker` CLI boundary:
+
+```sh
+docker compose exec -T openclaw sh -c '
+  export OPENCLAW_GATEWAY_TOKEN="$(cat /run/secrets/openclaw_gateway_token)"
+  openclaw agent --agent main -m "your prompt"'
+```
+
+Do **not** use `docker compose exec -e OPENCLAW_GATEWAY_TOKEN="$(cat ...)"`: that
+reads the secret on the host and puts it in an argument list, which is visible to
+`ps` for the life of the call.
+
+Checking what the gateway actually resolved is a different question, and
+`exec env` cannot answer it — read PID 1's own environment:
+
+```sh
+docker compose exec -T openclaw sh -c 'tr "\0" "\n" < /proc/1/environ | grep OPENAI_REQUEST_ADAPTER'
+```
+
+Reading it any other way is how an earlier round of this work "observed" an empty
+adapter and went looking for a bug that was not there.
 
 ## Azure mapping
 

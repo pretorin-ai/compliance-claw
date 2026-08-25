@@ -268,8 +268,14 @@ if [ "$LOCAL_ONLY" = 1 ]; then
 else
   AUTHED="$(pcli_quiet --json whoami | python3 -c 'import json,sys; print(json.load(sys.stdin).get("authenticated"))' 2>/dev/null || echo False)"
   [ "$AUTHED" = "True" ] || die "Pretorin says not authenticated.
-  Put a valid PRETORIN_API_KEY in .env (a read-only key is sufficient), or run
-  with --local-only to bind resolvers without touching the platform."
+  Supply a valid Pretorin API key by whichever path this deployment uses:
+    recommended   a value in secrets/runtime/pretorin-api-key, with
+                  compose.secrets.yaml in COMPOSE_FILE (see docs/file-secrets.md)
+    legacy        PRETORIN_API_KEY=... in .env
+  Supplying it BOTH ways is refused, so pick one. A read-only key is sufficient
+  for onboarding; a write-enabled key also works, because the key's own scopes
+  decide what is permitted and nothing here filters on top of them.
+  Or run with --local-only to bind resolvers without touching the platform."
   log "authenticated"
 
   # --- 2. active context -------------------------------------------------
@@ -334,5 +340,8 @@ onboard: done.
 If the gateway is already running, its live sessions may still hold the previous
 view (the preflight artifact carries a 3600s TTL and each session keeps its own
 pretorin mcp-serve child, reaped after mcp.sessionIdleTtlMs = 10 min):
-  docker compose run --rm cli openclaw mcp reload    # or restart the gateway
+  docker compose restart openclaw
+
+(Not \`openclaw mcp reload\` from the cli service: it only disposes the calling
+process's own cached runtimes, so it cannot touch the gateway's children.)
 EOF

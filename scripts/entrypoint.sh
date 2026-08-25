@@ -36,6 +36,30 @@ SLACK_PATCH="${TEMPLATES}/slack-channel.patch.json5"
 # invocation too, of which scripts/smoke.sh makes dozens.
 SLACK_MARKER="/opt/compliance-claw/plugins/slack"
 
+# --- The Pretorin CLI: an immutable seed, and the one active copy ----------
+#
+# The image ships a SEED, deliberately off PATH. The active CLI lives in the
+# pretorin-state volume, is first on PATH, and is what mcp.servers.pretorin.command
+# points at — so `pretorin` means exactly one thing everywhere, and an image
+# upgrade never silently changes the CLI a deployment runs.
+#
+# EVERY path below is warn-only. This script runs for every `cli` invocation, so
+# a fatal seed failure would take down `docker compose run --rm cli pretorin
+# version` — the one command an operator has left to diagnose the problem. The
+# precedent is the template-marker sanitization further down, which exists for
+# the same reason.
+PRETORIN_SEED="/opt/compliance-claw/pretorin-seed/pretorin"
+PRETORIN_STATE="/home/node/.pretorin"
+PRETORIN_BIN_DIR="${PRETORIN_STATE}/bin"
+PRETORIN_ACTIVE="${PRETORIN_BIN_DIR}/pretorin"
+PRETORIN_BACKUP="${PRETORIN_BIN_DIR}/pretorin.backup"
+PRETORIN_LOCK="${PRETORIN_STATE}/.update.lock"
+PRETORIN_MARKER="${PRETORIN_STATE}/.update-in-progress"
+PRETORIN_AUDIT="${PRETORIN_STATE}/update-audit.log"
+# The path a pre-0.28.7-era config points at. Used only to recognise a volume
+# whose config predates the re-point, so the warning can name the exact remedy.
+PRETORIN_LEGACY_CMD="/usr/local/bin/pretorin"
+
 # --- File-backed runtime secrets -------------------------------------------
 #
 # Docker Compose and cloud secret stores deliver secrets as files. OpenClaw and
@@ -88,12 +112,48 @@ do
 done
 unset secret_name
 
+# --- The OpenAI request adapter, resolved per process ----------------------
+#
+# Which adapter is correct depends on the credential: an API key needs
+# "openai-responses", device-code login needs "openai-chatgpt-responses". The
+# template carries ${OPENAI_REQUEST_ADAPTER} and OpenClaw substitutes it at config
+# load time, so this is a per-container decision made fresh on every start rather
+# than a value baked into the volume.
+#
+# WHY NOT DECIDE IT WHEN SEEDING. The documented order runs onboard-targets.sh
+# before `up`, which seeds the config from the `cli` service — and `cli` is
+# deliberately not given a model key. A seed-time choice was therefore made by a
+# container that could not see the credential, and never-clobber locked the wrong
+# answer in for good. Per-process resolution removes the dependency instead of
+# moving the secret.
+#
+# ALWAYS EXPORTED. An unset ${VAR} does not fall back to a default — it makes the
+# entire config invalid ("Run `openclaw doctor --fix`"). So there is no branch
+# here that leaves it empty. Runs after load_secret_file above, so a file-backed
+# key counts exactly like a direct one.
+#
+# The Dockerfile also sets an image-level default, for processes that never reach
+# this script: `docker compose exec` bypasses the entrypoint entirely, and without
+# a baked default an exec'd `openclaw ...` would find the marker unset and reject
+# the config. This line refines that default for the process actually being exec'd.
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  OPENAI_REQUEST_ADAPTER="openai-responses"
+else
+  OPENAI_REQUEST_ADAPTER="openai-chatgpt-responses"
+fi
+export OPENAI_REQUEST_ADAPTER
+
 # The gateway needs the token; `docker compose run --rm cli pretorin version`
 # does not, and must keep working on a fresh clone with no .env (compose marks
 # .env required:false). So the check is scoped to gateway invocations instead of
 # being global. OpenClaw would fail closed on its own anyway; this only replaces
 # a SecretRefResolutionError pointing at `openclaw gateway status --deep` with a
 # message naming the file the operator actually has to edit.
+IS_GATEWAY=0
+case " $* " in
+  *" gateway "*) IS_GATEWAY=1 ;;
+esac
+
 case " $* " in
   *" gateway "*)
     if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
@@ -105,6 +165,87 @@ case " $* " in
     fi
     ;;
 esac
+
+# --- Seed the active Pretorin CLI, and repair an interrupted update -------
+#
+# Always returns 0. Callers must not be able to fail because of this.
+seed_pretorin_cli() {
+  if [ ! -d "$PRETORIN_STATE" ]; then
+    echo "compliance-claw: WARNING — ${PRETORIN_STATE} is missing; the Pretorin CLI cannot be seeded." >&2
+    return 0
+  fi
+
+  install -d -m 0700 "$PRETORIN_BIN_DIR" 2>/dev/null || {
+    echo "compliance-claw: WARNING — could not create ${PRETORIN_BIN_DIR}." >&2
+    echo "  The MCP server will not start. Check volume ownership and free space." >&2
+    return 0
+  }
+
+  # REPAIR, AND WHY IT MUST TAKE THE LOCK.
+  #
+  # A marker means an update was interrupted — OR that one is running right now.
+  # This script runs on every `cli` invocation (scripts/smoke.sh makes dozens,
+  # onboard-targets.sh one per command, update.sh one per run), so an unguarded
+  # repair would fire in the middle of a legitimate in-flight update and restore
+  # the backup over a download that is still going. Taking the updater's own lock
+  # non-blockingly is what distinguishes "nobody is home" from "work in
+  # progress"; when it is held, this stays silent and does nothing.
+  if [ -e "$PRETORIN_MARKER" ] && command -v flock >/dev/null 2>&1; then
+    if flock -n "$PRETORIN_LOCK" true 2>/dev/null; then
+      echo "compliance-claw: WARNING — a Pretorin CLI update was interrupted." >&2
+      echo "  $(cat "$PRETORIN_MARKER" 2>/dev/null || echo 'marker unreadable')" >&2
+      if [ -s "$PRETORIN_BACKUP" ] && install -m 0755 "$PRETORIN_BACKUP" "$PRETORIN_ACTIVE" 2>/dev/null; then
+        echo "  Restored the previous binary from backup." >&2
+      elif install -m 0755 "$PRETORIN_SEED" "$PRETORIN_ACTIVE" 2>/dev/null; then
+        echo "  The backup was unusable; restored the image seed instead." >&2
+      else
+        echo "  Neither the backup nor the seed could be restored. Run: docker compose down && docker compose up -d" >&2
+      fi
+      rm -f "$PRETORIN_MARKER" 2>/dev/null || true
+      { umask 077; printf 'v=1 ts=%s requested=- normalized=- previous=- resulting=%s outcome=interrupted requester=entrypoint route=repair\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$("$PRETORIN_ACTIVE" version 2>/dev/null | awk 'NR==1{print $3}')" \
+        >> "$PRETORIN_AUDIT"; } 2>/dev/null || true
+    fi
+  fi
+
+  # PRESENCE IS NOT ENOUGH. A plain `! -e` test treats a 0-byte or half-written
+  # file as "already seeded" and keeps it forever, leaving MCP permanently broken
+  # with no way back. So: non-empty and executable, always; and the version exec
+  # only on gateway starts, because execing a 25 MB binary on every one-off `cli`
+  # command is the cost the SLACK_MARKER comment above exists to avoid.
+  local why=""
+  if [ ! -e "$PRETORIN_ACTIVE" ]; then
+    why="absent"
+  elif [ ! -s "$PRETORIN_ACTIVE" ] || [ ! -x "$PRETORIN_ACTIVE" ]; then
+    why="present but empty or not executable"
+  elif [ "$IS_GATEWAY" = 1 ] && ! "$PRETORIN_ACTIVE" version >/dev/null 2>&1; then
+    why="present but will not run"
+  fi
+
+  if [ -z "$why" ]; then
+    return 0
+  fi
+
+  if [ "$why" = absent ]; then
+    echo "compliance-claw: seeding ${PRETORIN_ACTIVE}" >&2
+  else
+    echo "compliance-claw: WARNING — ${PRETORIN_ACTIVE} is ${why}; re-seeding from the image." >&2
+  fi
+
+  if ! install -D -m 0755 "$PRETORIN_SEED" "$PRETORIN_ACTIVE" 2>/dev/null; then
+    echo "compliance-claw: WARNING — could not seed ${PRETORIN_ACTIVE} from ${PRETORIN_SEED}." >&2
+    echo "  The MCP server will not start. Check free space and ownership on the" >&2
+    echo "  pretorin-state volume, then recreate: docker compose up -d --force-recreate" >&2
+    return 0
+  fi
+
+  if [ "$IS_GATEWAY" = 1 ]; then
+    echo "compliance-claw: active Pretorin CLI $("$PRETORIN_ACTIVE" version 2>/dev/null | awk 'NR==1{print $3}')" >&2
+  fi
+  return 0
+}
+
+seed_pretorin_cli
 
 # The shipped template revision, baked at build time from versions.env.
 SHIPPED=0
@@ -233,6 +374,7 @@ if [ -e "$CONFIG" ]; then
   esac
 
   if [ "$HAVE" -lt "$SHIPPED" ]; then
+    # DRIFT-WARNING: predates the image
     echo "compliance-claw: WARNING — this volume's config predates the image." >&2
     echo "  volume template version ${HAVE}, image ships ${SHIPPED}." >&2
     echo "  Nothing was overwritten. The config in the volume stays authoritative," >&2
@@ -258,6 +400,7 @@ if [ -e "$CONFIG" ]; then
   # template versions and says nothing about Slack. That silence is the single
   # worst failure mode in this phase, so it gets its own warning naming both fixes.
   if [ "$SLACK_SET" = 1 ] && ! grep -q "$SLACK_MARKER" "$CONFIG"; then
+    # DRIFT-WARNING: Slack credentials are supplied but NOT
     echo "compliance-claw: WARNING — Slack credentials are supplied but NOT in this volume's config." >&2
     echo "  All three Slack variables are set, yet ${CONFIG} has no channels.slack" >&2
     echo "  and does not load the Slack plugin, so the agent will never appear in Slack." >&2
@@ -269,6 +412,39 @@ if [ -e "$CONFIG" ]; then
     echo "           'sed \"s|@SLACK_CHANNEL_ID@|\$SLACK_CHANNEL_ID|\" ${SLACK_PATCH} > /tmp/p.json5 \\" >&2
     echo "            && openclaw config patch --file /tmp/p.json5'" >&2
     echo "       then restart the gateway: docker compose restart openclaw" >&2
+  fi
+
+  # A third drift case, and the worst-behaved of the three: an existing config
+  # still points MCP at the seed path. Everything keeps WORKING, which is the
+  # problem — CLI updates land in the volume and the MCP server keeps running
+  # the image's binary, so the update appears to succeed and changes nothing an
+  # agent turn can see. Warn only; name the one-line remedy.
+  if grep -q "$PRETORIN_LEGACY_CMD" "$CONFIG" 2>/dev/null; then
+    # DRIFT-WARNING: runs MCP from the image seed
+    echo "compliance-claw: WARNING — this volume's config runs MCP from the image seed." >&2
+    echo "  ${CONFIG} still has mcp.servers.pretorin.command = ${PRETORIN_LEGACY_CMD}," >&2
+    echo "  which is the immutable seed. CLI updates go to ${PRETORIN_ACTIVE} and" >&2
+    echo "  will have NO EFFECT on what the agent actually runs until you re-point it." >&2
+    echo "  Nothing was overwritten. One line fixes it:" >&2
+    echo "    docker compose run --rm cli openclaw config set \\" >&2
+    echo "      mcp.servers.pretorin.command ${PRETORIN_ACTIVE}" >&2
+    echo "  then restart the gateway: docker compose restart openclaw" >&2
+  fi
+
+  # A fourth: the skill is gone from the image, but never-clobber leaves an
+  # existing config pointing at the deleted directory AND an existing AGENTS.md
+  # telling the agent to load it on every session. An instruction to load a
+  # capability that no longer exists is worse than a stale path, because the
+  # agent obeys it.
+  if grep -q 'extraDirs' "$CONFIG" 2>/dev/null; then
+    # DRIFT-WARNING: still loads the Pretorin skill
+    echo "compliance-claw: WARNING — this volume's config still loads the Pretorin skill." >&2
+    echo "  skills.load.extraDirs in ${CONFIG} points at /opt/compliance-claw/skills," >&2
+    echo "  which this image no longer ships: routing now comes from the MCP server's own" >&2
+    echo "  instructions (check_context then start_task). Nothing was overwritten." >&2
+    echo "    docker compose run --rm cli openclaw config unset skills.load.extraDirs" >&2
+    echo "  Then remove the 'load and follow the Pretorin skill' line from" >&2
+    echo "  ${WORKSPACE}/AGENTS.md — it is yours to edit and the entrypoint never rewrites it." >&2
   fi
 else
   echo "compliance-claw: seeding ${CONFIG}" >&2

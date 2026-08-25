@@ -18,6 +18,16 @@
 # resolvers — survive untouched. That is also why a template fix in a new image
 # does NOT reach a volume that already has a config: see the drift report below.
 #
+# AND IT NO LONGER MOVES THE PRETORIN CLI. The image ships a SEED; the CLI a
+# deployment actually runs lives in the pretorin-state volume, which this script
+# deliberately does not touch. So pulling a newer image gives you a newer seed
+# and the same CLI. To move the CLI:
+#
+#     scripts/pretorin-update.sh latest
+#
+# The two are separate on purpose: the CLI is an upstream dependency and should
+# not need a Compliance Claw release to move.
+#
 # It refuses rather than guesses. A dirty tree, a diverged branch or a checkout
 # with no upstream are all states where "update" means something the script
 # cannot decide for you, so it names the problem and the exact command.
@@ -156,7 +166,10 @@ docker compose up -d
 STARTUP="$(docker compose run --rm -T cli true 2>&1 || true)"
 
 printf '\n'
+DRIFT_FOUND=0
+
 if printf '%s' "$STARTUP" | grep -q 'predates the image'; then
+  DRIFT_FOUND=1
   warn "this volume's config predates the image you just pulled."
   printf '%s\n' "$STARTUP" | grep -A15 'predates the image' | sed 's/^/  /'
   cat >&2 <<'DRIFT'
@@ -175,10 +188,27 @@ if printf '%s' "$STARTUP" | grep -q 'predates the image'; then
     or reset — DESTROYS both volumes, including your model login:
       docker compose down -v && scripts/bootstrap.sh && scripts/onboard-targets.sh
 DRIFT
-elif printf '%s' "$STARTUP" | grep -q 'Slack is configured in .env but NOT'; then
-  warn "Slack is configured in .env but absent from this volume's config."
-  printf '%s\n' "$STARTUP" | grep -A10 'Slack is configured in .env but NOT' | sed 's/^/  /'
-else
+fi
+
+if printf '%s' "$STARTUP" | grep -q 'Slack credentials are supplied but NOT'; then
+  DRIFT_FOUND=1
+  warn "Slack credentials are supplied but absent from this volume's config."
+  printf '%s\n' "$STARTUP" | grep -A10 'Slack credentials are supplied but NOT' | sed 's/^/  /'
+fi
+
+if printf '%s' "$STARTUP" | grep -q 'runs MCP from the image seed'; then
+  DRIFT_FOUND=1
+  warn "this volume runs MCP from the image seed, so CLI updates have no effect."
+  printf '%s\n' "$STARTUP" | grep -A8 'runs MCP from the image seed' | sed 's/^/  /'
+fi
+
+if printf '%s' "$STARTUP" | grep -q 'still loads the Pretorin skill'; then
+  DRIFT_FOUND=1
+  warn "this volume's config still loads a skill this image no longer ships."
+  printf '%s\n' "$STARTUP" | grep -A8 'still loads the Pretorin skill' | sed 's/^/  /'
+fi
+
+if [ "$DRIFT_FOUND" = 0 ]; then
   log "the volume's config is current with this image."
 fi
 
@@ -189,5 +219,6 @@ log "Re-run scripts/onboard-targets.sh only after 'down -v', or when targets.yam
 log "changes — it is idempotent either way."
 printf '\n'
 log "done. Check it came up:  docker compose ps"
-log "and that the version is what you expect:"
+log "and that the versions are what you expect — they are now two answers, not one:"
 log "  docker compose run --rm cli cat /opt/compliance-claw/versions.env | grep IMAGE_VERSION"
+log "  scripts/pretorin-update.sh --status     # the CLI, which this script does NOT move"

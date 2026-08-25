@@ -204,12 +204,47 @@ jobs:
           run() { docker run --rm --entrypoint bash "$BUILD_REF" -lc "$1"; }
           ARCH="$(run 'uname -m')"
           [ "$ARCH" = x86_64 ] || { echo "::error::image arch is ${ARCH}"; exit 1; }
-          run 'pretorin version'
+          # THE SEED, BY ITS EXPLICIT PATH. These probes use --entrypoint bash,
+          # which skips the entrypoint and therefore skips seeding, so there is
+          # no active CLI in /home/node/.pretorin/bin to ask. Naming the seed is
+          # also the honest thing: this step is asserting what the IMAGE
+          # contains, not what a deployment would run.
+          run '/opt/compliance-claw/pretorin-seed/pretorin version'
           run 'openclaw --version'
+          # The seed must NOT be reachable as a bare name. Asserted against the
+          # standard bin directories, NOT with `command -v`: run() uses `bash -lc`
+          # and a login shell rebuilds PATH from /etc/profile, so `command -v`
+          # would report "not found" no matter where the seed lived — a check that
+          # cannot fail. Verified: the image's declared PATH does start with
+          # /home/node/.pretorin/bin, and a login shell drops it.
+          # Explicit -e tests, NOT `! ls a b c`: ls exits non-zero when ANY of its
+          # arguments is missing, so `! ls` would be true as soon as one of the
+          # three was absent — it reported success even with a pretorin sitting in
+          # /usr/local/bin. Caught by actually planting one and watching the check
+          # pass.
+          run '! { [ -e /usr/local/bin/pretorin ] || [ -e /usr/bin/pretorin ] || [ -e /bin/pretorin ]; }'
+          # And the active directory really is first on the image's PATH, which is
+          # what makes `pretorin` mean one thing at runtime.
+          IMG_PATH="$(docker image inspect "$BUILD_REF" \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^PATH=')"
+          case "$IMG_PATH" in
+            PATH=/home/node/.pretorin/bin:*) ;;
+            *) echo "::error::image PATH does not start with the active CLI dir: ${IMG_PATH}"; exit 1 ;;
+          esac
           # The Slack plugin has to be present in the image, not merely referenced
           # by the config template — this is the check a broken COPY would fail.
           run 'test -f /opt/compliance-claw/plugins/slack/dist/index.js'
           run 'test -f /opt/compliance-claw/slack-channel.patch.json5'
+          # The CLI updater, for the same reason: a broken COPY would otherwise
+          # publish an image where /pretorin-update and the pretorin_update tool
+          # simply do not exist, and nothing between the merge and the VM would
+          # notice.
+          run 'test -x /opt/compliance-claw/pretorin-update.sh'
+          run 'test -f /opt/compliance-claw/plugins/pretorin-update/index.js'
+          run 'test -f /opt/compliance-claw/plugins/pretorin-update/openclaw.plugin.json'
+          # The input rules, offline and credential-free, against the bytes being
+          # published rather than against a PR build.
+          run '/opt/compliance-claw/pretorin-update.sh --self-test'
           echo "image smoke passed (${ARCH})"
 
       # File-backed secrets are a DEPLOYMENT INTERFACE, so the gate belongs on the

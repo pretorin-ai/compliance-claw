@@ -1,5 +1,7 @@
 # Local secrets — never commit. See .env.example.
 .env
+# Validation-only environment for the isolated compose project (compose.test.yaml).
+.env.test
 
 # The GitHub App private key used to clone private targets. HOST ONLY — it is
 # never mounted into a container and never referenced by compose. .env names its

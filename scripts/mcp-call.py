@@ -28,7 +28,13 @@ import signal
 import subprocess
 import sys
 
-PRETORIN = "/usr/local/bin/pretorin"
+# Resolved through PATH, not hardcoded. The image puts the ACTIVE CLI
+# (/home/node/.pretorin/bin/pretorin, in the pretorin-state volume) first on
+# PATH, so a bare name reaches the same binary MCP runs and the same one an
+# operator gets in a shell. Hardcoding an absolute path here is what made this
+# probe test the image's seed instead of the deployment's CLI — and after the
+# seed moved off PATH, that path stopped existing at all.
+PRETORIN = "pretorin"
 CWD = "/opt/compliance-claw/no-repo"
 TIMEOUT_SECONDS = int(os.environ.get("MCP_CALL_TIMEOUT", "120"))
 

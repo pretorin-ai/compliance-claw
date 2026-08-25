@@ -6,10 +6,10 @@ yours to edit afterwards; the entrypoint never overwrites it.
 
 ## Pretorin
 
-For every Pretorin or compliance-related task, load and follow the Pretorin skill
-before selecting MCP tools. Use start_task for compliance work involving a system,
-framework, control, questionnaire or campaign. Follow the returned workflow and
-prefer Pretorin recipes when available.
+For every Pretorin or compliance-related task, start with check_context, then
+start_task for work involving a system, framework, control, questionnaire or
+campaign. The MCP server's own tool instructions carry the routing from there:
+follow the workflow it returns and prefer Pretorin recipes when it offers them.
 
 Do not switch the active system or framework in conversation. This deployment is
 onboarded to one scope, and only that scope has repositories bound to it — asking
