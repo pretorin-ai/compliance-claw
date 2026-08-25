@@ -290,3 +290,130 @@ Both are gate rows awaiting the credentialed run.
   `AGENTS.md` depends on `git`, so neither an exec allowlist nor the sandbox can
   simply be switched on without replacing that path.
 - The optional skill install, as a separate restricted feature.
+
+---
+
+# Addendum — correction pass (PR #12 follow-up)
+
+Goal: enforce one principle that the first pass muddled. **The Pretorin API key's
+server-side scopes are the sole authorization boundary.** Compliance Claw applies no
+local permission filtering, ships no local "mode", and must not have a setting that
+reads like one. Two adjacent problems came with it: the secret story was inconsistent,
+and the documented fresh-deployment order did not actually work.
+
+**Status: IMPLEMENTED and validated locally. Not released.** The credentialed
+acceptance run is operator-coordinated and is recorded as outstanding below, not as
+a pass.
+
+## 1. `PRETORIN_KEY_MODE` was never configuration
+
+It existed because `pretorin whoami` reports authentication but not scopes, so the
+harness cannot discover whether the key it holds can write — and the probe is
+irreversible when it succeeds. Putting that in `.env`, `compose.secrets.yaml` and the
+operator docs turned a test declaration into something that reads like a deployment
+setting, and one that *defaulted to `read-only`*, implying an enforcement this
+repository does not perform.
+
+Removed from every runtime and operator surface. `docs/plans/*` keeps the old name so
+this history stays traceable; nothing current mentions it, which makes the gate a plain
+`git grep` with no exceptions to remember.
+
+Replaced by explicit harness flags:
+
+| Invocation | Write probe |
+| --- | --- |
+| *(neither flag)* | **not attempted** |
+| `--expect-read-only` | runs it, requires a server-side rejection |
+| `--test-write-enabled` | runs it, requires success, announces that it creates a real record |
+
+**The safety property moved to where CI runs.** Asserting "no flag means no write"
+only inside the credentialed section meant the run most likely to catch a regression
+never checked it. It is now a Section A row, plus one proving an unknown argument is
+refused rather than silently selecting a posture.
+
+## 2. Delivery is least privilege, asserted as an exact set
+
+Two over-deliveries to the `cli` service removed: the model keys (it runs no agent
+turns) and the gateway token (the entrypoint needs it only for gateway invocations, and
+`cli` is one-off by profile — without it, `cli` cannot start a second gateway against
+the same volumes).
+
+The old assertion used a subset test, which catches under-delivery and is **blind to
+over-delivery** — the exact failure being fixed. Both `smoke.sh` A4d and
+`test-file-secrets.sh` now pin each service's secret set in both directions, and the
+canary harness proves at runtime that a `cli`-shaped container sees its allowed set
+and nothing more.
+
+## 3. The adapter defect, and the regression the fix introduced
+
+```
+BEFORE
+  onboard-targets.sh (documented, runs before `up`)
+        └─► docker compose run --rm cli …   ← FIRST container start; seeds the config
+                └─► cli has NO model key ──► adapter = device-login value
+                        └─► never-clobber ──► frozen wrong, for the life of the volume
+                                └─► gateway later: key authenticates, every turn fails
+
+AFTER
+  config on disk holds a MARKER:  api: "${OPENAI_REQUEST_ADAPTER}"
+        ├─► gateway (has the key)   ──► exports openai-responses        ──► correct
+        └─► cli     (has no key)    ──► exports the device-login value  ──► harmless
+```
+
+Observed on the secrets path, following the documented order exactly: the on-disk
+`api:` line holds the marker, the gateway process resolves `openai-responses`, and the
+`cli` service resolves the device-login value from the same file.
+
+**The fix broke something, and the gate caught it.** `docker compose exec` does not go
+through the entrypoint, so an exec'd `openclaw …` found the marker unset — and an unset
+`${VAR}` does not fall back to a default, it makes the whole config invalid. That broke
+`docker compose exec openclaw openclaw agent`, which the README documents as the way to
+run a turn. The Dockerfile now declares the device-login value as an image-level default
+so any process in the container can parse the config, and the entrypoint refines it for
+PID 1. This is safe for exec'd clients specifically because `openclaw agent` talks to
+the gateway over loopback: inference happens in PID 1, which holds the right value.
+
+A measurement error worth recording, because it looked identical to a bug: reading the
+adapter with `docker compose exec` showed it empty. That is the file-secret design
+working — the entrypoint exports into PID 1's tree and deliberately not into the
+container's configured environment. The correct observation is `/proc/1/environ`.
+
+## 4. One overlay could not serve both credential paths
+
+- `compose.test.yaml` is port-only, and the port is a **variable**. Hardcoding it just
+  moved the collision from the live deployment to the next isolated project; the symptom
+  was a container stuck in `Created` with no logs.
+- `compose.test-env.yaml` carries the `.env` isolation, which belongs to the legacy path
+  alone. Stacked on `compose.secrets.yaml` it re-added a `.env` gateway token beside the
+  mounted one and tripped the entrypoint's dual-source refusal — correct refusal, wrong
+  overlay, found by stacking them and watching the gateway decline to start.
+
+## Validation — observed results
+
+Isolated projects on derived ports (legacy path 18889, file-secret path 18991), canary
+values only. **All secret values, tokens and identifiers are redacted here by
+construction: every credential used was a fake canary, and no real key, token, channel
+id or org-internal URL appears in this record.**
+
+| Check | Result | Observed |
+| --- | --- | --- |
+| the variable is absent from all current files | **pass** | `git grep` clean outside `docs/plans/` |
+| no posture flag → no write probe | **pass** | asserted positively in the section CI runs |
+| unknown argument refused | **pass** | does not fall through to a default posture |
+| `--expect-read-only` / `--test-write-enabled` select correctly | **pass** | all three postures exercised without credentials |
+| delivery matrix, exact set per service | **pass** | `openclaw` 6, `cli` 3; gateway token and model keys absent from `cli` |
+| runtime containment | **pass** | a `cli`-shaped container sees its allowed canaries and none of the excluded ones |
+| adapter derives from the credential | **pass** | no model key → device value; OpenAI key → `openai-responses` |
+| documented order produces the right adapter | **pass** | seeded by `cli`, resolved correctly by the gateway |
+| exec'd commands parse the config | **pass** | regression found and fixed via the image-level default |
+| suite | **pass** | `smoke --no-creds`: 121 pass, 0 fail, 1 skip, 2 notes; file-secret contract pass |
+| live deployment untouched | **pass** | healthy on its own port throughout; shared target clone unchanged |
+| credentialed acceptance (§4 end to end, both key postures) | **not run** | operator-coordinated |
+
+## Still outstanding
+
+The credentialed sequence: populate one model key and the Pretorin key, onboard, start,
+then a **real agent turn with no device-code login and no manual config patching**,
+Slack round trip, provider actually serving, and both key postures via the new flags —
+`--expect-read-only` with a read-only key, `--test-write-enabled` with a write key. When
+recorded, redact every value and identifier.
