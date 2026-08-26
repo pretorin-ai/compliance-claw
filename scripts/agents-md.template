@@ -31,6 +31,23 @@ operator (scripts/onboard-targets.sh). Do not bind resolvers or run
 `preflight init` yourself: those write host-local state that the operator owns,
 and discovery run from the wrong directory registers the wrong repository.
 
+## Bringing a target up to date
+
+Targets do not move on their own. If a review needs the latest commit, use the
+`target_sync` tool: `all`, or one target name. It fast-forwards only, and it
+refuses rather than resolve anything — a target with local changes, a detached
+HEAD, or history that has diverged is reported and left alone. Report the outcome
+and the commit SHAs it returns; do not describe a target as updated unless the
+tool said `updated`.
+
+Only repositories already declared in targets.yaml can be synchronized. Adding,
+removing or re-pointing a target is an operator action on the host — if one is
+missing, say so and stop.
+
+Never write to a target yourself, through any path. /workspace/targets is
+read-only because reviews must not mutate the code they cite; the synchronizer
+has its own writable path and it is not yours to use.
+
 Every piece of evidence carries its provenance, gathered from the target itself:
 
 - repository URL — `git -C /workspace/targets/<name> remote get-url origin`

@@ -28,8 +28,10 @@ Verified against the published image, pulled by digest, on a fresh clone:
 | Write-enabled Pretorin key, through the recipe workflow | **passed** |
 | Published image pulled by immutable digest | **passed** |
 | Private GitHub repository support | **implemented; live validation deferred** |
+| Target synchronization from the host | **passed** |
+| Target synchronization from Slack | **implemented; live validation deferred** |
 
-Two honest caveats, not passes:
+Three honest caveats, not passes:
 
 - **Private repositories:** the path is complete and its refusal paths, parser
   contract and credential hygiene are verified, but the live happy path needs
@@ -39,6 +41,11 @@ Two honest caveats, not passes:
 - **Slack:** validated with an existing, manually created app. The committed
   `slack/app-manifest.json` is the reproducible setup path for a *new* app and is
   reviewed, but importing it from scratch was not separately tested.
+- **Target synchronization:** the engine, its refusals, the global lock and the
+  credential hygiene are gated offline against real local repositories, and the
+  wrapper was driven end to end inside the running gateway container. What is not
+  yet observed is a Slack round trip and a private clone over HTTPS with a
+  fine-grained PAT. Details and evidence: [docs/plans/target-sync.md](docs/plans/target-sync.md).
 
 The image is **unsigned**. Its integrity controls are the digest pin, the
 per-release SBOM, the release-time vulnerability scan, and documented release
@@ -267,6 +274,14 @@ One system and framework for the whole file; one or many targets. `bootstrap.sh`
 clones each into `workspace/targets/<name>`, which compose bind-mounts
 **read-only** at `/workspace/targets`.
 
+`ref` is a **branch name** — not a tag and not a SHA. Synchronization
+fast-forwards a branch to its upstream, and a detached checkout at a tag has no
+upstream to fast-forward to. Without `ref`, a target follows whatever branch the
+clone is on, which after a fresh clone is the remote's default.
+
+Once cloned, targets are brought up to date with **[Keeping targets up to
+date](#keeping-targets-up-to-date)** — from the host or from Slack.
+
 The private example ships **commented out**, and deliberately: the committed file
 has to work for a fresh clone that has nothing but a Pretorin key, and for CI,
 which holds zero credentials. A private target with no GitHub App is a hard
@@ -384,15 +399,136 @@ grep -c x-access-token workspace/targets/<name>/.git/config   # must print 0
 | `the GitHub App installation does not include:` | Step 4 missed that repository; the message links the installation page |
 | `needs Repository -> Contents -> Read-only` | Step 2 permission missing, or the org owner has not accepted a permission change |
 
-**The container never holds a git credential.** The token is used on the host, is
-passed to git through a credential helper rather than in the URL or in `argv`, is
-never written into any clone's `.git/config` (asserted after every clone, and
-independently by `scripts/smoke.sh`), and the container only ever sees the
-resulting working tree over its read-only mount.
+**The GitHub App credential never leaves this host.** The private key is
+host-only, the installation token it mints lives in a 0600 temp file for one
+`bootstrap.sh` run, both reach git through a credential helper rather than the
+URL or `argv`, neither is ever written into a clone's `.git/config` (asserted
+after every clone, and independently by `scripts/smoke.sh`), and neither is ever
+mounted into a container.
 
-A **fine-grained PAT is a development fallback only** and is not recommended: it
-carries a person's identity, expires on a human's schedule, and is much harder to
-scope down to one repository and one permission.
+#### The PAT fallback, and the invariant it relaxes
+
+Earlier releases said the container never holds a git credential at all. **That
+is no longer true**, and this section says so rather than leaving the old
+sentence standing.
+
+Synchronizing a private target from Slack happens *inside* the container, and the
+App private key deliberately never goes there — so that path uses a
+**fine-grained PAT** instead, delivered as a mounted file:
+
+```sh
+scripts/init-file-secrets.sh                     # creates it empty if absent
+$EDITOR secrets/runtime/github-readonly-pat      # paste the token, no newline needed
+```
+
+The token must be:
+
+- **fine-grained** (not classic),
+- limited to **only the selected repositories** you review,
+- with **Repository permissions → Contents: Read-only** and nothing else.
+
+Then `export COMPOSE_FILE=compose.yaml:compose.secrets.yaml` and restart. The PAT
+is only available on the file-secret path; the legacy `.env` path has no PAT and
+a private target there reports `auth_failed` naming the fix.
+
+**Status: internal-pilot acceptable, not recommended.** The GitHub App is the
+recommended mechanism for any customer or production deployment. A PAT carries a
+person's identity, expires on a human's schedule, is harder to scope, and —
+unlike the App — is a git credential that lives inside the container. It is never
+an environment variable, never in a URL, `.git/config`, a log, an audit line or a
+Slack message; but tool execution in that container is unsandboxed, so a
+prompt-injected agent can read the file. Read
+[SECURITY.md](SECURITY.md#the-pat-is-a-deliberately-relaxed-invariant-not-an-oversight)
+before enabling it.
+
+`bootstrap.sh` prefers the App whenever `GITHUB_APP_ID` is set, and **will not
+fall back to the PAT if minting fails** — a broken App stops the run rather than
+silently substituting a longer-lived credential.
+
+## Keeping targets up to date
+
+Targets do not move on their own. Three ways to advance them, all running the
+**same implementation** (`scripts/sync-targets.sh`) so they cannot disagree:
+
+```sh
+scripts/bootstrap.sh                  # host: clone what is missing, update the rest
+scripts/sync-targets.sh all           # host: update only, never clone
+scripts/sync-targets.sh simple-crm    # host: one target
+```
+
+and from Slack, once the gateway is running:
+
+```
+/claw /target-sync all                # deterministic; bypasses the model
+/claw /target-sync simple-crm
+@claw update the simple-crm target    # the target_sync tool, same wrapper
+```
+
+The reply names every target it touched:
+
+```
+simple-crm updated: 276b5fd → 918ac42
+```
+
+**Fast-forward only.** It never resets, force-checks-out, stashes, discards local
+changes, switches branches, rewrites history, deletes anything, or creates a
+merge commit. A target it cannot move safely is reported and left exactly as it
+is, with a message naming the remedy:
+
+| Outcome | What it means |
+| --- | --- |
+| `updated` | fast-forwarded; both SHAs reported |
+| `already_current` | nothing to do |
+| `dirty_refused` | the working tree has local changes |
+| `detached_refused` | HEAD is not on a branch |
+| `no_upstream_refused` | the branch does not track `origin/<branch>` |
+| `branch_mismatch_refused` | checked out on a branch other than `ref` |
+| `origin_mismatch_refused` | the clone tracks a different remote than `targets.yaml` |
+| `diverged_refused` | local commits the remote lacks, or upstream rewrote history |
+| `missing_clone` | not cloned yet — run `scripts/bootstrap.sh` |
+| `auth_failed` | the remote refused the credential |
+| `invalid_target` | not declared in `targets.yaml`, or a malformed request |
+| `sync_already_running` | another sync holds the global lock |
+
+`all` processes targets one at a time, keeps going after a failure, reports every
+target, and exits non-zero if any failed.
+
+**What it cannot do.** Only `all` or the name of a target already declared in
+`targets.yaml` is accepted — no URL, ref, path, flag or shell fragment is
+expressible on any route. Adding, removing, re-pointing or onboarding a target
+stays an operator action on the host: edit `targets.yaml`, then run
+`scripts/bootstrap.sh` and `scripts/onboard-targets.sh`.
+
+Ordinary synchronization does **not** re-run onboarding and does **not** restart
+the gateway. Source resolvers bind paths rather than commits, and
+`/workspace/targets` is a live bind mount, so the new bytes are visible
+immediately.
+
+### Where the writable mount is, and what it is not
+
+Assessment reads `/workspace/targets`, **read-only on both services**. The
+synchronizer writes through a second mount of the same host directory,
+`/var/lib/compliance-claw/targets`, on the **gateway service only**.
+
+That is process-level separation inside one container, **not a security
+boundary**: the wrapper and the agent's unsandboxed tool execution run as the
+same uid, so an agent can reach the writable path directly. What it buys is that
+the assessment path — the one every evidence citation comes from — stays
+read-only, so an accidental write fails instead of silently succeeding. See
+[SECURITY.md](SECURITY.md#the-sandbox-boundary--say-it-plainly).
+
+### The sync audit record
+
+One line per target, to `docker compose logs openclaw` **and** to
+`/home/node/.pretorin/target-sync-audit.log`:
+
+```
+v=1 ts=2026-08-26T00:01:53Z op=target-sync target=simple-crm outcome=already_current previous=276b5fd8… resulting=276b5fd8… credential=none requester=slack:U123 route=command
+```
+
+`credential` records the *source* (`none`, `github-app`, `pat`) and never a
+value. The log copy is the one that matters: the agent can rewrite anything in
+the state volume, so a file it can edit is not evidence on its own.
 
 ## Slack
 
@@ -656,10 +792,18 @@ agent's write path, which is why the record is written twice.
 scripts/smoke.sh              # Section A always; Section B if a key authenticates
 scripts/smoke.sh --no-creds   # Section A only — exactly what CI runs
 python3 scripts/parse-targets.py --self-test
+bash scripts/sync-targets.sh --self-test   # target sync: rules, outcomes, lock, leak canary
+scripts/pretorin-update.sh --self-test     # CLI updater input rules
 ```
 
+The two `--self-test` gates need no network, no credentials and no containers.
+`sync-targets.sh --self-test` builds throwaway local repositories and drives the
+**production** sync functions against them — the same ones `bootstrap.sh` and both
+Slack routes call — so it is evidence about the code that actually runs.
+
 Section A needs no credentials at all: versions, the Pretorin MCP surface, the
-`targets.yaml` parser, gateway startup and the plugin profile, config and
+`targets.yaml` parser, the target-sync rules and mount matrix, gateway startup
+and the plugin profile, config and
 `AGENTS.md` seeding, mount posture, the stale-template warning, the CWD fix,
 secret containment for every secret class, the private-target refusals, and proof
 that a **fresh volume** comes up Slack-configured with no manual JSON. Section B
@@ -792,6 +936,11 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | `Slack is only partially configured` | 1 or 2 of the 3 variables set | All three are required together |
 | `SLACK_CHANNEL_ID is not a Slack channel id` | A name or a URL was used | Right-click channel → Copy link → the `C...` value |
 | `GITHUB_APP_ID is not set` on a private target | No App configured | Follow "Private repositories", or drop `private: true` |
+| `/target-sync` says `missing_clone` | The target was added to `targets.yaml` but never cloned | `scripts/bootstrap.sh` on the host — sync never clones |
+| `/target-sync` says `dirty_refused` | Something wrote into the clone | `git -C workspace/targets/<name> status`; resolve it yourself, sync will not |
+| `/target-sync` says `diverged_refused` | Upstream force-pushed, or the clone has local commits | `git -C workspace/targets/<name> log --oneline <branch> ^origin/<branch>` |
+| `/target-sync` says `auth_failed` on a private target | No usable credential in the container | Put a fine-grained PAT in `secrets/runtime/github-readonly-pat` and use `compose.secrets.yaml` |
+| `up` fails with `bind source path does not exist: …/github-readonly-pat` | Upgraded without creating the new secret file | `scripts/init-file-secrets.sh` — or use `scripts/update.sh`, which does it before stopping anything |
 | `the GitHub App installation does not include:` | App not installed on that repo | Add it on the linked installation page |
 | `exists but is not the root of a git repository` | Interrupted clone | Inspect, then `rm -rf` that directory yourself and re-run |
 | `tracks a different remote` | `targets.yaml` URL changed | Fix the URL, or move the directory aside |

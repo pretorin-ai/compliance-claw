@@ -87,6 +87,12 @@ direct=("PRETORIN_API_KEY=","OPENCLAW_GATEWAY_TOKEN=","SLACK_APP_TOKEN=","SLACK_
 assert not any(item.startswith(direct) for item in env)
 assert "PRETORIN_API_KEY_FILE=/run/secrets/pretorin_api_key" in env
 assert "OPENCLAW_GATEWAY_TOKEN_FILE=/run/secrets/openclaw_gateway_token" in env
+# The PAT is delivered as a MOUNT ONLY. Every other secret here is exported into
+# PID 1 by the entrypoint, which unsandboxed tool execution then inherits; the
+# git credential helper reads this one from its path instead. A *_FILE variable
+# appearing here would mean somebody wired it into load_secret_file.
+assert not any(item.startswith("GITHUB_READONLY_PAT") for item in env), \
+    "the PAT must never be an environment variable, not even as a _FILE path"
 '
 
 # Ambiguous dual-source configuration must fail closed.
@@ -129,7 +135,7 @@ for name in ("openclaw", "cli"):
 [ -n "$MATRIX" ] || { echo "file-secret-test: FAIL — could not render the compose secret matrix" >&2; exit 1; }
 printf '%s\n' "$MATRIX" | sed 's/^/  wiring: /'
 
-EXPECT_OPENCLAW="anthropic_api_key,openai_api_key,openclaw_gateway_token,pretorin_api_key,slack_app_token,slack_bot_token"
+EXPECT_OPENCLAW="anthropic_api_key,github_readonly_pat,openai_api_key,openclaw_gateway_token,pretorin_api_key,slack_app_token,slack_bot_token"
 EXPECT_CLI="pretorin_api_key,slack_app_token,slack_bot_token"
 GOT_OPENCLAW="$(printf '%s\n' "$MATRIX" | awk '$1=="openclaw"{print $2}')"
 GOT_CLI="$(printf '%s\n' "$MATRIX" | awk '$1=="cli"{print $2}')"

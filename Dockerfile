@@ -183,7 +183,19 @@ ENV OPENAI_REQUEST_ADAPTER="openai-chatgpt-responses"
 # active recipe set there, outside ~/.openclaw, so compose mounts a second named
 # volume over it. Without this line the daemon creates that mount point as root
 # and onboarding fails with a permission error on the first write.
+#
+# The target-sync mount points get the same treatment, and for the same reason:
+#   /var/lib/compliance-claw/targets   the WRITABLE maintenance alias of the same
+#                                      host directory /workspace/targets exposes
+#                                      read-only. Gateway service only.
+#   /etc/compliance-claw               where targets.yaml is mounted read-only.
+#                                      NOT under /opt/compliance-claw, because the
+#                                      `pretorin mcp-serve` child's cwd sentinel
+#                                      lives there and Pretorin derives host-local
+#                                      source resolvers from the current directory.
 RUN install -d -o node -g node /workspace/targets \
+ && install -d -o node -g node /var/lib/compliance-claw/targets \
+ && install -d -o node -g node /etc/compliance-claw \
  && install -d -m 0700 -o node -g node /home/node/.pretorin \
  && install -d -m 0700 -o node -g node /home/node/.pretorin/bin
 
@@ -246,6 +258,28 @@ COPY scripts/pretorin-update.in-image.sh /opt/compliance-claw/pretorin-update.sh
 # that. node-owned for the same reason as the Slack plugin above.
 COPY --chown=node:node plugins/pretorin-update /opt/compliance-claw/plugins/pretorin-update
 
+# Target synchronization. Same three-part shape as the updater above, and the
+# same reason for each part:
+#
+#   sync-targets.sh      THE implementation. scripts/bootstrap.sh runs this exact
+#                        file on the host, so the fast-forward-only semantics, the
+#                        input rules, the global lock, the credential handling and
+#                        the audit trail exist once rather than twice.
+#   parse-targets.py     the wrapper validates a requested name against the
+#                        MOUNTED targets.yaml rather than re-parsing YAML in bash,
+#                        so this is needed in the image too. Same parser, same
+#                        rules, same self-test as the host uses.
+#   plugins/target-sync  one command (/target-sync, which bypasses the LLM) and
+#                        one narrowly typed agent tool, both calling the wrapper.
+#
+# git is NOT installed here: the OpenClaw base image already carries it (2.39.5,
+# with git-remote-https), which was measured against this pinned digest rather
+# than assumed. Nothing new is added to the runtime attack surface by this
+# feature — see SECURITY.md.
+COPY scripts/sync-targets.sh /opt/compliance-claw/sync-targets.sh
+COPY scripts/parse-targets.py /opt/compliance-claw/parse-targets.py
+COPY --chown=node:node plugins/target-sync /opt/compliance-claw/plugins/target-sync
+
 # The MCP stdio client used by scripts/smoke.sh to prove key posture — a read
 # tool succeeds, a write tool is rejected server-side — through the same
 # transport the agent uses. In the image rather than on the host because it
@@ -299,7 +333,9 @@ RUN . /opt/compliance-claw/versions.env \
  && chown -R node:node /opt/compliance-claw \
  && chown -R root:root /opt/compliance-claw/pretorin-seed \
  && chmod 0755 /opt/compliance-claw/pretorin-seed/pretorin \
- && chmod 0755 /opt/compliance-claw/pretorin-update.sh
+ && chmod 0755 /opt/compliance-claw/pretorin-update.sh \
+ && chmod 0755 /opt/compliance-claw/sync-targets.sh \
+ && chmod 0755 /opt/compliance-claw/parse-targets.py
 
 USER node
 

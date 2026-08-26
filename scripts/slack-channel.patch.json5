@@ -26,10 +26,10 @@
 // to the base template's comments after observing OpenClaw reformat the file.
 {
   plugins: {
-    // TRUST PIN for the one non-bundled plugin in this image. Upstream asks for
+    // TRUST PIN for the non-bundled plugins in this image. Upstream asks for
     // this: a plugin loaded from an explicit path with no install provenance is
     // reported as such in diagnostics, and plugins.allow is the documented way
-    // to say "yes, this one, deliberately".
+    // to say "yes, these, deliberately".
     //
     // ESCAPE HATCH — READ BEFORE EDITING. plugins.allow is an EXCLUSIVE
     // allowlist, not an addition. Naming slack here is therefore also a
@@ -51,11 +51,15 @@
     // it, and nothing in the logs explains why. scripts/smoke.sh asserts the two
     // move together.
     //
-    // pretorin-update IS NOT OPTIONAL HERE. Because this list is exclusive, an
-    // entry omitted is a plugin disabled — so leaving it out would silently
-    // remove both CLI-update routes on exactly the deployments that have Slack.
-    // The banner therefore reads (2 plugins: pretorin-update, slack).
-    allow: ["slack", "pretorin-update"],
+    // THE LOCAL PLUGINS ARE NOT OPTIONAL HERE. Because this list is exclusive,
+    // an entry omitted is a plugin disabled — so leaving one out would silently
+    // remove both of its routes on exactly the deployments that have Slack,
+    // which are the deployments those routes exist for. The banner therefore
+    // reads (3 plugins: pretorin-update, slack, target-sync).
+    //
+    // EVERY plugin added to the base template must be added to BOTH arrays in
+    // this file: this one, and load.paths below.
+    allow: ["slack", "pretorin-update", "target-sync"],
 
     entries: { slack: { enabled: true } },
 
@@ -64,18 +68,19 @@
     // SLACK_PLUGIN_INTEGRITY in versions.env, and both are node-owned because
     // OpenClaw blocks plugin files owned by another uid.
     //
-    // THE UPDATER PATH IS RE-LISTED ON PURPOSE, NOT DUPLICATED BY MISTAKE.
+    // THE LOCAL PLUGIN PATHS ARE RE-LISTED ON PURPOSE, NOT DUPLICATED BY MISTAKE.
     // `openclaw config patch` uses JSON merge-patch semantics, so an array in a
     // patch REPLACES the array in the target rather than merging with it —
     // verified: a base of [a, b] patched with [c] yields [c] alone. The base
-    // template already lists the updater; if this patch named only the Slack
-    // path, applying it on a fresh Slack seed would silently delete the updater
-    // and both /pretorin-update and the pretorin_update tool would simply not
+    // template already lists both local plugins; if this patch named only the
+    // Slack path, applying it on a fresh Slack seed would silently delete them
+    // and /pretorin-update, /target-sync and both agent tools would simply not
     // exist. Any future entry added to the base template must be added here too.
     load: {
       paths: [
         "/opt/compliance-claw/plugins/slack",
         "/opt/compliance-claw/plugins/pretorin-update",
+        "/opt/compliance-claw/plugins/target-sync",
       ],
     },
   },
@@ -121,7 +126,8 @@
       //
       //     /claw /pretorin-update latest
       //     /claw /pretorin-update 0.28.7
-      //     /claw /pretorin-update status
+      //     /claw /target-sync all
+      //     /claw /target-sync simple-crm
       //
       // NO SLACK APP RE-IMPORT IS NEEDED. slack/app-manifest.json already
       // declares /claw and already grants the `commands` bot scope; it was inert

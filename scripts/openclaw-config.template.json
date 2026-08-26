@@ -142,8 +142,11 @@
     },
   },
 
-  // The CLI updater plugin: one command (/pretorin-update, which bypasses the
-  // LLM) and one narrowly typed agent tool.
+  // Two local plugins, each with one command that bypasses the LLM and one
+  // narrowly typed agent tool:
+  //
+  //   pretorin-update   move this deployment's Pretorin CLI
+  //   target-sync       fast-forward the review targets declared in targets.yaml
   //
   // NOTE WHAT IS DELIBERATELY ABSENT HERE: `plugins.allow`. It is an EXCLUSIVE
   // allowlist, so naming anything trims the enabled set to exactly that list.
@@ -157,12 +160,20 @@
   // only the Slack path would silently drop the updater on every Slack
   // deployment.
   plugins: {
-    load: { paths: ["/opt/compliance-claw/plugins/pretorin-update"] },
+    load: {
+      paths: [
+        "/opt/compliance-claw/plugins/pretorin-update",
+        "/opt/compliance-claw/plugins/target-sync",
+      ],
+    },
     // Explicit, not inherited from the manifest's enabledByDefault. A load path
     // alone is not activation: the gateway will happily read a plugin's manifest
     // and leave it inactive, and the only symptom is a startup banner that does
     // not list it — `plugins inspect --runtime` still reports "loaded", because
     // inspect loads it deliberately. Same shape as entries.slack in the Slack patch.
-    entries: { "pretorin-update": { enabled: true } },
+    entries: {
+      "pretorin-update": { enabled: true },
+      "target-sync": { enabled: true },
+    },
   },
 }
