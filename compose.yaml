@@ -116,6 +116,15 @@ services:
   openclaw:
     <<: *compliance-claw
 
+    # The long-running gateway: Docker restarts it after a daemon restart or a
+    # host reboot, and leaves it down after a deliberate `stop` or `down`. This
+    # depends on Docker itself being enabled to start on boot.
+    #
+    # ON THE SERVICE, NOT THE ANCHOR. `cli` merges the same anchor, and a
+    # one-off command runner exiting is the expected outcome, not a failure to
+    # recover from.
+    restart: unless-stopped
+
     # RESTATED, NOT MERGED — and that is a property of YAML, not a style choice.
     # A `volumes:` key on the service REPLACES the one the merge key brought in;
     # it does not append to it. Writing only the two extra mounts here silently

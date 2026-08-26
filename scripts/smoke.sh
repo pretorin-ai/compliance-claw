@@ -629,6 +629,18 @@ if grep -qE '^[[:space:]]*build:' compose.yaml; then
 else
   pass "compose.yaml has no build section (pull-only by default)"
 fi
+# VM READINESS. The gateway is long-running and must come back by itself after a
+# host reboot; `cli` is a one-off runner and must not. Read from the RENDERED
+# config, so putting the policy on the shared anchor — which would hand it to
+# `cli` too — fails here rather than in production.
+ok "the gateway restarts unless-stopped, and 'cli' has no restart policy" \
+   bash -c 'docker compose --profile cli config --format json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)[\"services\"]
+got=d[\"openclaw\"].get(\"restart\")
+assert got == \"unless-stopped\", f\"openclaw restart is {got!r}\"
+assert not d[\"cli\"].get(\"restart\"), \"cli has a restart policy\"
+"'
 # Is the RUNNING deployment actually on the image this checkout pins? An
 # operator who pulled the repo but never restarted is running last release's
 # bytes while every file here describes the new one — invisible, and exactly the

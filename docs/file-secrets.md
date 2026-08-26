@@ -220,10 +220,12 @@ A production deployment may later use the VM's managed identity and Azure Key
 Vault to recreate the same filenames under `/run/compliance-claw-secrets/` before
 Compose starts. That automation is planned, not shipped by this repository.
 
-This repository also does not yet install a system service that restarts Compose
-after a VM reboot. For the pilot, re-export the two variables above and run
-`docker compose up -d` after reboot. Automatic boot recovery belongs in the
-deployment-hardening work, alongside Key Vault integration.
+Enable Docker itself to start on boot. The gateway declares
+`restart: unless-stopped`, so once Docker is up Compose restores the container
+with the secret mounts it already had — no repeat of the two exports. Nothing is
+restored if the container was stopped deliberately, or if `docker compose down`
+removed it; in that case re-export the two variables above and run
+`docker compose up -d`.
 
 The GitHub App private key is intentionally different: it stays host-only and is
 used by `scripts/bootstrap.sh` to clone private targets. It is never declared as
