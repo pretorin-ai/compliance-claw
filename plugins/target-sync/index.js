@@ -35,6 +35,21 @@ const WRAPPER = "/opt/compliance-claw/sync-targets.sh";
 // abort. This is the backstop for a wrapper that never returns at all.
 const TIMEOUT_MS = 600_000;
 
+// How long the wrapper gets to clean up after SIGTERM before SIGKILL.
+//
+// THIS EXISTS BECAUSE SIGKILL ALONE WEDGED SYNCHRONIZATION. The wrapper holds a
+// global lock and releases it from an EXIT trap; SIGKILL runs no trap, so a
+// single timeout left the lock directory behind and every later request — from
+// anyone, forever — answered "another synchronization is in progress" against a
+// pid that no longer existed. Observed, not theorised.
+//
+// Two changes together fix it: SIGTERM first, so the trap actually runs, and to
+// the whole PROCESS GROUP rather than the shell alone, so a git child cannot
+// outlive its parent and keep writing to a working tree nobody is watching. The
+// wrapper also reclaims a lock whose owner is provably dead, as a second line of
+// defence for the case where even SIGKILL is what ends it.
+const TERM_GRACE_MS = 10_000;
+
 // The wrapper's own exit codes. 3 is "someone else holds the lock", which is a
 // normal answer rather than a failure.
 const EXIT_BUSY = 3;
@@ -55,6 +70,10 @@ function runWrapper(arg, { requester, route }) {
     let child;
     try {
       child = spawn(WRAPPER, args, {
+        // Its own process group, so the timeout below can signal the wrapper AND
+        // every git it started, as one unit. Without this, killing the shell
+        // orphans a running `git fetch` against the same working tree.
+        detached: true,
         // stderr is INHERITED on purpose. The wrapper writes its audit line to
         // both a file in the volume and stderr; inheriting is what puts the
         // stderr copy into `docker compose logs`, outside the volume the agent
@@ -75,17 +94,47 @@ function runWrapper(arg, { requester, route }) {
     let stdout = "";
     child.stdout?.on("data", (d) => { stdout += String(d); });
 
+    // Negative pid = the whole process group. Falls back to the child alone if
+    // the group signal is refused, so a platform without process groups still
+    // gets the old behaviour rather than no behaviour.
+    const signalGroup = (sig) => {
+      try {
+        process.kill(-child.pid, sig);
+      } catch {
+        try { child.kill(sig); } catch { /* already gone */ }
+      }
+    };
+
+    let killTimer = null;
+    let timedOut = false;
     const timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      timedOut = true;
+      signalGroup("SIGTERM");
+      // Escalate only if the grace period expires. The wrapper's trap releases
+      // the lock on SIGTERM, so in the normal timeout case nothing is left
+      // behind and this second timer never fires.
+      killTimer = setTimeout(() => signalGroup("SIGKILL"), TERM_GRACE_MS);
     }, TIMEOUT_MS);
 
-    child.on("error", (err) => {
+    const done = (result) => {
       clearTimeout(timer);
-      resolve({ ok: false, code: -1, stdout, error: String(err?.message ?? err) });
+      if (killTimer) clearTimeout(killTimer);
+      resolve(result);
+    };
+
+    child.on("error", (err) => {
+      done({ ok: false, code: -1, stdout, error: String(err?.message ?? err) });
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ ok: code === 0, code, stdout });
+      done({
+        ok: code === 0 && !timedOut,
+        code,
+        stdout,
+        timedOut,
+        error: timedOut
+          ? `it did not finish within ${Math.round(TIMEOUT_MS / 1000)}s`
+          : undefined,
+      });
     });
   });
 }
@@ -150,12 +199,23 @@ function describe(r) {
 }
 
 function report(res) {
+  const { results, summary } = parseResults(res.stdout);
+
+  // A timeout is NOT a failure to start, and saying so would send the operator
+  // to look in the wrong place. Partial results are reported when there are any:
+  // with `all`, the targets that finished before the timeout really did finish.
+  if (res.timedOut) {
+    const partial = results.length
+      ? `\n\nWhat completed before it was stopped:\n${results.map(describe).join("\n")}`
+      : "";
+    return `Target sync was stopped: ${res.error}. Anything not listed below was left ` +
+      `untouched, and the lock has been released.${partial}`;
+  }
+
   if (res.error) {
     return `Target sync FAILED to start (${res.error}). Nothing was changed. ` +
       "See `docker compose logs openclaw`.";
   }
-
-  const { results, summary } = parseResults(res.stdout);
 
   if (results.length === 0) {
     return `Target sync produced no result (exit ${res.code}). Nothing is known to have changed. ` +

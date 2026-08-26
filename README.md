@@ -284,9 +284,9 @@ date](#keeping-targets-up-to-date)** — from the host or from Slack.
 
 The private example ships **commented out**, and deliberately: the committed file
 has to work for a fresh clone that has nothing but a Pretorin key, and for CI,
-which holds zero credentials. A private target with no GitHub App is a hard
-failure — correct behaviour, wrong default. Uncomment it once your App is
-configured.
+which holds zero credentials. A private target with **no credential at all** —
+neither a GitHub App nor a PAT — is a hard failure, which is correct behaviour
+and the wrong default. Uncomment it once you have configured one of the two.
 
 List the scopes your key can see:
 
@@ -488,7 +488,13 @@ is, with a message naming the remedy:
 | `missing_clone` | not cloned yet — run `scripts/bootstrap.sh` |
 | `auth_failed` | the remote refused the credential |
 | `invalid_target` | not declared in `targets.yaml`, or a malformed request |
+| `targets_unreadable` | `targets.yaml` could not be parsed — nothing was examined |
 | `sync_already_running` | another sync holds the global lock |
+
+A lock left behind by a killed process is reclaimed automatically once its owner
+is provably gone, and the reclaim is announced in the log. A lock held by a live
+process, or by one this container cannot see (the host, or an earlier container),
+is never taken — clear that by hand with `rmdir` on the path the message names.
 
 `all` processes targets one at a time, keeps going after a failure, reports every
 target, and exits non-zero if any failed.

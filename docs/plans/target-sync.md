@@ -103,8 +103,9 @@ because `timeout(1)` is not on stock macOS. `GIT_TERMINAL_PROMPT=0` throughout.
 | `missing_clone` | nothing there — says to run `bootstrap.sh` | no |
 | `auth_failed` | remote refused the credential; names both fixes | no |
 | `invalid_target` | not declared, or malformed input/ref | no |
+| `targets_unreadable` | the target list could not be parsed at all | no |
 | `sync_failed` | anything else (network, ref gone upstream) | no |
-| `sync_already_running` | the global lock is held | no |
+| `sync_already_running` | the global lock is held by a live owner | no |
 
 `all` runs **sequentially**, continues past a failure, returns a line for every
 target, and exits non-zero if any failed. No parallel git.
@@ -121,8 +122,23 @@ directory the container sees through its maintenance mount, so host and
 container contend for the same lock. A held lock returns `sync_already_running`
 immediately rather than waiting, because a Slack request that waits looks hung.
 
-A stale lock is never reclaimed automatically — guessing that another process is
-dead is how two gits end up in one working tree. The owner file names the remedy.
+A lock is reclaimed **only** when its owner is provably gone: the owner file
+records `pid` and a namespace token (the kernel boot id inside a container, the
+hostname on macOS), and the lock is taken over only if the namespace matches
+*and* `kill -0` says the pid is dead. A live owner, a different namespace, a
+malformed owner file or a missing one all leave the lock alone — guessing that
+another process is dead is how two gits end up in one working tree. Every
+reclaim is announced in the log, never silent.
+
+That branch exists because of a measured failure, not a hypothetical: the plugin
+bounds the wrapper with a timeout, and the original SIGKILL ran no `EXIT` trap,
+so **one timeout wedged synchronization permanently** — every later request, from
+anyone, answered "another synchronization is in progress" against a pid that had
+not existed for hours, clearable only by an operator with a shell. The plugin now
+signals the whole **process group** with SIGTERM and escalates to SIGKILL only
+after a grace period, so the trap normally runs and no git child outlives its
+parent; the reclaim is the second line of defence for when even that is not
+enough.
 
 ## Mounts, and an honest boundary
 
@@ -202,9 +218,34 @@ measured, not assumed (see the fact table). So:
   `compose.secrets.yaml` declares, read out of the overlay itself — so the next
   release to add a secret cannot reintroduce this.
 
+## Two defects found in review, and what they cost
+
+Both were silent, both passed a green suite, and both are now regression cases.
+
+**1. A failing parser was reported as a clean run.** The target list was read
+through a process substitution — `done < <(target_list)` — whose exit status is
+unobservable, so a parser that died produced an empty stream and the loop simply
+ended. `all` answered `SUMMARY total=0 failed=0 overall=ok`, exit 0: a sync that
+examined nothing and called it success, leaving every target stale. A *named*
+request was worse — the membership test found no names, so the operator was told
+`'simple-crm' is not declared in targets.yaml` and sent to edit a file that was
+perfectly fine. The list is now materialised and its status checked before
+anything iterates it; failure is `targets_unreadable`, exit 1, in both modes.
+
+**2. A timeout wedged synchronization forever.** Described under *The lock*
+above. Fixed on both layers — graceful process-group termination in the plugin,
+provable-death reclaim in the wrapper — with the no-steal properties (live owner,
+foreign namespace, unreadable owner file) each gated separately.
+
+A third, found while fixing the second: the stale-lock check originally read the
+owner file with `sed 's/.*\bkey=…'`. `\b` is a GNU extension that **BSD sed does
+not support**, so on macOS — this POC's operator platform — every field came back
+empty, the check concluded "cannot judge", and it never reclaimed anything. It
+looked conservative and was simply broken. Now `awk`, with whole-token matching.
+
 ## Validation
 
-**`scripts/sync-targets.sh --self-test` — 89 checks, offline, no credentials.**
+**`scripts/sync-targets.sh --self-test` — 96 checks, offline, no credentials.**
 Runs in CI as its own step and twice in smoke (host copy and image copy).
 
 - 22 refused inputs: option-shaped, injection-shaped, traversal, embedded
@@ -221,6 +262,10 @@ Runs in CI as its own step and twice in smoke (host copy and image copy).
 - the global lock: taken, refused on re-entry, reusable after release
 - `all`: 3 targets, 2 updated, 1 refused, all three reported, the failure not
   stopping the ones after it
+- a failing parser and an empty list both refused, with the parser's own words
+  carried through
+- the stale lock: reclaimed when the owner is provably dead; **never** stolen
+  from a live owner, from another namespace, or when the owner file is missing
 
 **`scripts/smoke.sh --no-creds` — 159 pass, 1 fail, 1 skip, 1 note.**
 Isolated project `ccsync`, derived port 18993, live deployment untouched.

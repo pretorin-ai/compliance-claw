@@ -234,6 +234,71 @@ ok "the sync wrapper ships at the documented path" \
 ok "the parser ships beside it (name validation, not YAML in bash)" \
    docker compose run --rm -T cli test -r /opt/compliance-claw/parse-targets.py
 
+# THE TWO DEFECTS FOUND IN REVIEW, GATED IN THE REAL CONTAINER TOO.
+#
+# Both were silent, and both are the kind that a green suite would otherwise keep
+# hiding: a broken target list reported as a clean run, and one timeout wedging
+# synchronization for good.
+SYNC_BROKEN_PARSER="$(mktemp -d "${TMPDIR:-/tmp}/cc-sync-parser.XXXXXX")"
+printf 'import sys\nsys.stderr.write("simulated parser failure\\n")\nraise SystemExit(2)\n' \
+  > "${SYNC_BROKEN_PARSER}/broken.py"
+mkdir -p "${SYNC_BROKEN_PARSER}/targets"
+printf 'system_id: s\nframework_id: f\ntargets:\n  - name: demo\n    url: https://example.invalid/d.git\n' \
+  > "${SYNC_BROKEN_PARSER}/targets.yaml"
+sync_broken() {
+  CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+  CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" \
+  CC_PARSE_TARGETS="${SYNC_BROKEN_PARSER}/broken.py" \
+  bash scripts/sync-targets.sh "$1" 2>/dev/null
+}
+for req in all demo; do
+  notok "an unreadable target list fails the run (${req})" bash -c \
+    "CC_TARGETS_FILE='${SYNC_BROKEN_PARSER}/targets.yaml' CC_TARGETS_DIR='${SYNC_BROKEN_PARSER}/targets' CC_PARSE_TARGETS='${SYNC_BROKEN_PARSER}/broken.py' bash scripts/sync-targets.sh ${req}"
+done
+BROKEN_OUT="$(sync_broken all || true)"
+has  "  and says so, rather than reporting a clean run" "targets_unreadable" "$BROKEN_OUT"
+hasnt "  and never claims overall=ok"                   "overall=ok"        "$BROKEN_OUT"
+BROKEN_ONE="$(sync_broken demo || true)"
+hasnt "  and never blames the requested name for it" "is not declared in targets.yaml" "$BROKEN_ONE"
+notok "bootstrap mode also refuses an unreadable list" bash -c \
+  "CC_TARGETS_FILE='${SYNC_BROKEN_PARSER}/targets.yaml' CC_TARGETS_DIR='${SYNC_BROKEN_PARSER}/targets' CC_PARSE_TARGETS='${SYNC_BROKEN_PARSER}/broken.py' bash scripts/sync-targets.sh --bootstrap"
+
+# The exact state a SIGKILLed wrapper leaves: a lock naming a pid in this
+# namespace that no longer exists. It used to answer "already running" forever.
+SYNC_LOCK_NS="$( [ -r /proc/sys/kernel/random/boot_id ] \
+  && printf 'boot-%s' "$(cat /proc/sys/kernel/random/boot_id)" \
+  || printf 'host-%s' "$(hostname 2>/dev/null || echo unknown)" )"
+mkdir -p "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock"
+printf 'pid=4194304 ns=%s ts=2026-01-01T00:00:00Z route=timeout\n' "$SYNC_LOCK_NS" \
+  > "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock/owner"
+WEDGED="$(CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+  CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" bash scripts/sync-targets.sh all 2>&1 || true)"
+hasnt "a lock left by a dead owner does not wedge sync forever" "sync_already_running" "$WEDGED"
+has   "  and the reclaim is announced, not silent"              "reclaiming a stale lock" "$WEDGED"
+[ ! -d "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock" ] \
+  && pass "  and the lock is released afterwards" \
+  || fail "  and the lock is released afterwards"
+
+# The property that must NOT regress in exchange: a live owner keeps its lock.
+mkdir -p "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock"
+printf 'pid=%s ns=%s ts=2026-01-01T00:00:00Z route=live\n' "$$" "$SYNC_LOCK_NS" \
+  > "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock/owner"
+LIVE="$(CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+  CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" bash scripts/sync-targets.sh all 2>/dev/null || true)"
+has "a lock held by a LIVE process is still respected" "sync_already_running" "$LIVE"
+rm -rf "$SYNC_BROKEN_PARSER"
+
+# The plugin must give the wrapper a chance to run its trap, and must signal the
+# whole process group — a SIGKILL-only path is what created the wedge.
+if grep -q 'detached: true' plugins/target-sync/index.js \
+   && grep -q 'signalGroup("SIGTERM")' plugins/target-sync/index.js \
+   && grep -q 'process.kill(-child.pid' plugins/target-sync/index.js; then
+  pass "the plugin terminates the process GROUP, SIGTERM before SIGKILL"
+else
+  fail "the plugin terminates the process GROUP, SIGTERM before SIGKILL" \
+       "a SIGKILL-only timeout leaves the global lock held forever"
+fi
+
 # ONE IMPLEMENTATION, ASSERTED. The whole design rests on bootstrap and Slack
 # running the same file; a re-implementation creeping into either would be
 # invisible until the two disagreed in production.

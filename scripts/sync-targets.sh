@@ -193,11 +193,47 @@ target_list() {
   python3 "$PARSE" list "$TARGETS_FILE"
 }
 
+# THE LIST IS MATERIALISED BEFORE ANYTHING ITERATES IT, and this is a
+# correctness fix rather than tidiness.
+#
+# `while ... done < <(target_list)` runs the parser in a PROCESS SUBSTITUTION,
+# whose exit status is unobservable: a parser that dies produces an empty stream
+# and the loop simply ends. That turned a broken or unreadable targets.yaml into
+# "SUMMARY total=0 failed=0 overall=ok", exit 0 — a sync that examined nothing,
+# reported success, and left every target stale. On a named request it was worse
+# still: the membership test found no names, so the operator was told
+# "'<name>' is not declared in targets.yaml" and sent to edit a file that was
+# fine. Both observed; both are regression cases in --self-test.
+TARGET_LIST_FILE=""
+load_target_list() {
+  local err rc=0
+  TARGET_LIST_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-targets.XXXXXX")"
+  err="$(mktemp "${TMPDIR:-/tmp}/cc-targets-err.XXXXXX")"
+  target_list > "$TARGET_LIST_FILE" 2> "$err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    TARGET_LIST_ERROR="$(head -3 "$err" | tr '\n' ' ' | sed 's/ *$//')"
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  # A parser that succeeds and emits nothing is also not a usable list.
+  # parse-targets.py already refuses an empty `targets:`, so reaching this means
+  # something else is wrong, and reporting "nothing to do" would hide it.
+  if [ ! -s "$TARGET_LIST_FILE" ]; then
+    TARGET_LIST_ERROR="the target list is empty"
+    return 1
+  fi
+  return 0
+}
+TARGET_LIST_ERROR=""
+
+cleanup_target_list() { [ -n "$TARGET_LIST_FILE" ] && rm -f "$TARGET_LIST_FILE"; return 0; }
+
 target_exists() {
   local want="$1" name
   while IFS=$'\t' read -r name _ _ _; do
     [ "$name" = "$want" ] && return 0
-  done < <(target_list)
+  done < "$TARGET_LIST_FILE"
   return 1
 }
 
@@ -410,8 +446,19 @@ sync_one() {
 
 short() { [ -n "${1:-}" ] && printf '%s' "${1:0:7}" || printf '%s' '-'; }
 
-# Named once so every auth_failed message says the same thing.
-CREDENTIAL_HINT="Configure a read-only GitHub App on the host (README.md, 'Private repositories'), or supply a fine-grained PAT in the github-readonly-pat secret file (docs/file-secrets.md)."
+# THE HINT DEPENDS ON WHERE THIS IS RUNNING, because the two callers have
+# genuinely different remedies and a single sentence was wrong for one of them.
+#
+# On the host, bootstrap.sh can mint a GitHub App token, so the App is the
+# recommended fix. Inside the container it CANNOT: the App private key is
+# deliberately host-only and is never mounted, so telling an operator to
+# configure an App after a Slack sync failed sends them to do something that
+# will not fix it. There, the PAT file is the only credential that exists.
+if [ -n "$_DEF_TOKEN_FILE" ]; then
+  CREDENTIAL_HINT="This container authenticates with the fine-grained PAT at ${_DEF_TOKEN_FILE} (from secrets/runtime/github-readonly-pat), which is empty, expired, or lacks Contents: Read-only on this repository. A GitHub App cannot be used from here — its key is host-only — so fix the PAT, or synchronize this target on the host with scripts/bootstrap.sh. See docs/file-secrets.md."
+else
+  CREDENTIAL_HINT="Configure a read-only GitHub App on the host (README.md, 'Private repositories'), which is the recommended mechanism; a fine-grained PAT in secrets/runtime/github-readonly-pat is the internal-pilot fallback (docs/file-secrets.md)."
+fi
 
 # --- the global lock -------------------------------------------------------
 # One sync at a time, across every caller, because they all operate on the SAME
@@ -429,18 +476,87 @@ release_lock() {
   rmdir "$LOCK_DIR" 2>/dev/null || true
   LOCK_HELD=0
 }
-trap 'release_lock' EXIT INT TERM
+trap 'release_lock; cleanup_target_list' EXIT INT TERM
+
+# WHICH PID NAMESPACE THIS PROCESS LIVES IN, as well as we can tell.
+#
+# A pid alone is meaningless across the mount: the host and the container write
+# the same lock directory and number their processes independently, so pid 42 on
+# one side says nothing about pid 42 on the other. The kernel boot id is stable
+# across container restarts on a host and absent on macOS, so Linux containers
+# compare against a real namespace token and the macOS host falls back to its
+# hostname — and the two never collide, which is the property that matters.
+lock_namespace() {
+  if [ -r /proc/sys/kernel/random/boot_id ]; then
+    printf 'boot-%s' "$(cat /proc/sys/kernel/random/boot_id)"
+  else
+    printf 'host-%s' "$(hostname 2>/dev/null || echo unknown)"
+  fi
+}
+
+# awk, not `sed 's/.*\bkey=...'`: \b is a GNU extension that BSD sed does not
+# support, so on macOS — this POC's operator platform — the sed version silently
+# extracted nothing, every field came back empty, and the stale-lock check
+# therefore concluded "cannot judge" and never reclaimed anything. It looked
+# conservative and was simply broken. Whole-token comparison, not a substring,
+# so `ns=` can never satisfy a request for `s`.
+lock_owner_field() {
+  awk -v k="$1" '{
+    for (i = 1; i <= NF; i++) {
+      n = index($i, "=")
+      if (n > 0 && substr($i, 1, n - 1) == k) { print substr($i, n + 1); exit }
+    }
+  }' "${LOCK_DIR}/owner" 2>/dev/null
+}
+
+# Is the recorded owner provably gone?
+#
+# CONSERVATIVE ON PURPOSE, in both directions. It reclaims only when it can see
+# that the owner was OURS to judge (same namespace) and is NOT running. Anything
+# it cannot establish — no owner file, a different namespace, an unparseable pid,
+# or a live pid — leaves the lock alone, because guessing a process is dead is
+# how two gits end up in one working tree.
+lock_owner_is_dead() {
+  local owner_pid owner_ns
+  owner_ns="$(lock_owner_field ns)"
+  owner_pid="$(lock_owner_field pid)"
+  [ -n "$owner_ns" ] && [ "$owner_ns" = "$(lock_namespace)" ] || return 1
+  case "$owner_pid" in '' | *[!0-9]* ) return 1 ;; esac
+  kill -0 "$owner_pid" 2>/dev/null && return 1
+  return 0
+}
 
 acquire_lock() {
   mkdir -p "$TARGETS_DIR" 2>/dev/null || true
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     LOCK_HELD=1
-    printf 'pid=%s ts=%s route=%s\n' "$$" "$(now_utc)" "$ROUTE" > "${LOCK_DIR}/owner" 2>/dev/null || true
+    printf 'pid=%s ns=%s ts=%s route=%s\n' \
+      "$$" "$(lock_namespace)" "$(now_utc)" "$ROUTE" > "${LOCK_DIR}/owner" 2>/dev/null || true
     return 0
   fi
-  # Held. A stale lock is NOT reclaimed automatically: guessing that another
-  # process is dead is how two gits end up in one working tree. The owner file
-  # names the remedy instead.
+
+  # Held — but by a live process, or by a corpse?
+  #
+  # THIS BRANCH EXISTS BECAUSE OF A REAL FAILURE. The plugin bounds the wrapper
+  # with a timeout, and a SIGKILL leaves no chance for the EXIT trap to run. With
+  # no reclaim, one timeout wedged synchronization PERMANENTLY: every later
+  # request answered "another synchronization is in progress" against a pid that
+  # had not existed for hours, and only an operator with a shell could clear it.
+  # The plugin now kills the whole process group with SIGTERM first and only
+  # escalates to SIGKILL, so the trap normally runs; this is the second line of
+  # defence for the case where it cannot.
+  if lock_owner_is_dead; then
+    log "WARNING — reclaiming a stale lock: pid $(lock_owner_field pid) in this namespace is gone (left at $(lock_owner_field ts))."
+    rm -f "${LOCK_DIR}/owner" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      LOCK_HELD=1
+      printf 'pid=%s ns=%s ts=%s route=%s\n' \
+        "$$" "$(lock_namespace)" "$(now_utc)" "$ROUTE" > "${LOCK_DIR}/owner" 2>/dev/null || true
+      return 0
+    fi
+    # Another process reclaimed it first. That is a live owner again.
+  fi
   return 1
 }
 
@@ -467,7 +583,7 @@ run_targets() {
     emit_result "$name" "$OUT_OUTCOME" "$OUT_PREV" "$OUT_CUR" "$OUT_MSG"
     audit "$name" "$OUT_OUTCOME" "$OUT_PREV" "$OUT_CUR"
     log "$OUT_MSG"
-  done < <(target_list)
+  done < "$TARGET_LIST_FILE"
   [ "$matched" = 1 ] || return 2
   return 0
 }
@@ -498,6 +614,17 @@ mode_sync() {
   [ -f "$TARGETS_FILE" ] || die "${TARGETS_FILE} not found. It is mounted read-only into the gateway; check compose.yaml."
   [ -d "$TARGETS_DIR" ] || die "${TARGETS_DIR} not found. It is the maintenance mount of the target directory; check compose.yaml."
 
+  # BEFORE the membership test, and its failure is fatal. Without the list there
+  # is no such thing as "not declared" — only "not known", which is a different
+  # answer and points the operator somewhere else entirely.
+  if ! load_target_list; then
+    emit_result "${raw}" targets_unreadable - - \
+      "could not read the target list from ${TARGETS_FILE}: ${TARGET_LIST_ERROR}. Nothing was examined and nothing was changed. This is a problem with the file or the parser, NOT with the requested name."
+    audit "${raw}" targets_unreadable "" ""
+    printf 'SUMMARY\ttotal=0\tupdated=0\tfailed=1\toverall=failed\n'
+    exit 1
+  fi
+
   name=""
   case "$kind" in
     all ) ;;
@@ -515,13 +642,22 @@ mode_sync() {
   if ! acquire_lock; then
     local owner; owner="$(cat "${LOCK_DIR}/owner" 2>/dev/null || echo 'unknown')"
     emit_result "${name:-all}" sync_already_running - - \
-      "another synchronization is in progress (${owner}); nothing was started. Try again when it finishes."
+      "another synchronization is in progress (${owner}); nothing was started. Try again when it finishes. A lock left by a process this one cannot see — the host, or an earlier container — is cleared with: rmdir ${LOCK_DIR}"
     audit "${name:-all}" sync_already_running "" ""
     printf 'SUMMARY\ttotal=0\tupdated=0\tfailed=0\toverall=busy\n'
     exit 3
   fi
 
-  run_targets "$name" || true
+  # `|| true` used to discard this. run_targets returns 2 when the name matched
+  # no target, which after the membership test above can only mean the list
+  # changed underfoot — still not something to report as a clean run.
+  local rc=0
+  run_targets "$name" || rc=$?
+  if [ "$rc" -eq 2 ] && [ "$FAILED" -eq 0 ]; then
+    emit_result "${name:-all}" sync_failed - - \
+      "no target matched '${name:-all}' at the moment of the run, although it was declared a moment earlier. Nothing was changed."
+    FAILED=$((FAILED + 1))
+  fi
   summary_and_exit
 }
 
@@ -541,6 +677,12 @@ mode_bootstrap() {
 
   [ -f "$TARGETS_FILE" ] || die "${TARGETS_FILE} not found."
   mkdir -p "$TARGETS_DIR"
+
+  # Fatal, and before the lock: a bootstrap that cannot read the list must not
+  # report "0 targets" as though the file said so.
+  load_target_list \
+    || die "could not read the target list from ${TARGETS_FILE}: ${TARGET_LIST_ERROR}
+  Nothing was cloned or updated. Check the file, or run:  python3 ${PARSE} list ${TARGETS_FILE}"
 
   acquire_lock || die "another synchronization is in progress ($(cat "${LOCK_DIR}/owner" 2>/dev/null || echo unknown)).
   Wait for it to finish, or remove ${LOCK_DIR} if you are certain nothing is running."
@@ -586,7 +728,7 @@ mode_bootstrap() {
     fi
 
     log "  ${name}: $(tgit "$dest" 0 rev-parse --short HEAD) on $(tgit "$dest" 0 rev-parse --abbrev-ref HEAD)"
-  done < <(target_list)
+  done < "$TARGET_LIST_FILE"
 
   [ "$count" -gt 0 ] || die "no targets parsed from ${TARGETS_FILE}."
   printf '%s\n' "$count"
@@ -861,6 +1003,7 @@ b' 'https://example.com/x.git' 'origin/main' 'simple-crm --force' 'all extra'
   # values away and the test would then be asserting on nothing.
   printf 'privatelike\t%s\ttrue\tmain\n' "$url_priv" > "${ST_TMP}/plist.tsv"
   SELFTEST_LIST="${ST_TMP}/plist.tsv"
+  load_target_list
   if ! run_targets "" > "${ST_TMP}/priv.out" 2> "${ST_TMP}/priv.err"; then :; fi
   SELFTEST_LIST=""
   local sync_out; sync_out="$(cat "${ST_TMP}/priv.out" "${ST_TMP}/priv.err")"
@@ -917,6 +1060,7 @@ b' 'https://example.com/x.git' 'origin/main' 'simple-crm --force' 'all extra'
     printf 'bravo\t%s\tfalse\tmain\n' "$url_b"
   } > "$list"
   SELFTEST_LIST="$list"
+  load_target_list
 
   local all_out
   set +e
@@ -953,6 +1097,97 @@ b' 'https://example.com/x.git' 'origin/main' 'simple-crm --force' 'all extra'
   run_targets nosuchtarget >/dev/null 2>&1 || rc_unknown=$?
   st_is "an unknown name matches no target" "$rc_unknown" "2"
   SELFTEST_LIST=""
+
+  printf '\nthe target list is data, and its absence is not "nothing to do"\n'
+  # REGRESSION, BOTH BLOCKERS FOUND IN REVIEW OF THIS FILE.
+  #
+  # 1. A parser that fails used to be indistinguishable from a parser that
+  #    returned no targets, because the loop read it through a process
+  #    substitution whose exit status nobody could see. `all` answered
+  #    "SUMMARY total=0 failed=0 overall=ok", exit 0 — a sync that examined
+  #    nothing and called it success. A NAMED target was worse: the membership
+  #    test found no names, so the operator was told the target was "not declared
+  #    in targets.yaml" and sent to edit a file that was perfectly fine.
+  SELFTEST_LIST=""
+  local broken="${ST_TMP}/broken-parser.py"
+  printf 'import sys\nsys.stderr.write("simulated parser failure\\n")\nraise SystemExit(2)\n' > "$broken"
+  local saved_parse="$PARSE" saved_file="$TARGETS_FILE"
+  PARSE="$broken"
+  TARGETS_FILE="${ST_TMP}/targets.yaml"
+  printf 'system_id: s\nframework_id: f\ntargets:\n  - name: demo\n    url: https://example.invalid/d.git\n' > "$TARGETS_FILE"
+
+  if load_target_list; then
+    st_bad "a failing parser is reported as a failure" "load_target_list returned success"
+  else
+    st_ok "a failing parser is reported as a failure"
+  fi
+  case "$TARGET_LIST_ERROR" in *"simulated parser failure"*)
+      st_ok "  and the parser's own words are carried through" ;;
+    *) st_bad "  and the parser's own words are carried through" "$TARGET_LIST_ERROR" ;;
+  esac
+
+  # A parser that succeeds but emits nothing is also not a usable list.
+  printf 'import sys\nraise SystemExit(0)\n' > "$broken"
+  if load_target_list; then
+    st_bad "an empty target list is reported as a failure" "it was accepted"
+  else
+    st_ok "an empty target list is reported as a failure"
+  fi
+
+  PARSE="$saved_parse"; TARGETS_FILE="$saved_file"
+
+  printf '\na stale lock left by a dead owner\n'
+  # 2. The plugin bounds the wrapper with a timeout. A SIGKILL runs no EXIT trap,
+  #    so the lock directory survived its owner and every later request — from
+  #    anyone, forever — answered "another synchronization is in progress"
+  #    against a pid that no longer existed. The plugin now signals the whole
+  #    process group with SIGTERM first; this is the second line of defence.
+  release_lock
+  rm -rf "$LOCK_DIR"
+  mkdir -p "$LOCK_DIR"
+  # A pid that cannot be alive, in THIS namespace.
+  printf 'pid=%s ns=%s ts=%s route=timeout-test\n' 4194304 "$(lock_namespace)" "$(now_utc)" \
+    > "${LOCK_DIR}/owner"
+  if acquire_lock; then
+    st_ok "a lock whose owner is provably dead is reclaimed"
+    release_lock
+  else
+    st_bad "a lock whose owner is provably dead is reclaimed" "it stayed held"
+  fi
+
+  # A LIVE owner is never reclaimed. This is the property that must not regress
+  # in exchange for the one above.
+  rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR"
+  printf 'pid=%s ns=%s ts=%s route=live-test\n' "$$" "$(lock_namespace)" "$(now_utc)" \
+    > "${LOCK_DIR}/owner"
+  if acquire_lock; then
+    st_bad "a lock held by a LIVE process is never reclaimed" "it was stolen"
+    release_lock
+  else
+    st_ok "a lock held by a LIVE process is never reclaimed"
+  fi
+
+  # Nor is one from another namespace, where a pid means nothing. The host and
+  # the container write this same directory and number processes independently.
+  rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR"
+  printf 'pid=1 ns=%s ts=%s route=other-ns\n' 'boot-00000000-0000-0000-0000-000000000000' "$(now_utc)" \
+    > "${LOCK_DIR}/owner"
+  if acquire_lock; then
+    st_bad "a lock from another namespace is never reclaimed" "it was stolen"
+    release_lock
+  else
+    st_ok "a lock from another namespace is never reclaimed"
+  fi
+
+  # An unreadable or malformed owner file is the same answer: leave it alone.
+  rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR"
+  if acquire_lock; then
+    st_bad "a lock with no owner file is never reclaimed" "it was stolen"
+    release_lock
+  else
+    st_ok "a lock with no owner file is never reclaimed"
+  fi
+  rm -rf "$LOCK_DIR"
 
   printf '\n'
   if [ "$ST_FAIL" -eq 0 ]; then
