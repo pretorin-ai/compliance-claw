@@ -302,15 +302,14 @@ Runs in CI as its own step and twice in smoke (host copy and image copy).
 - the stale lock: reclaimed when the owner is provably dead; **never** stolen
   from a live owner, from another namespace, or when the owner file is missing
 
-**`scripts/smoke.sh --no-creds` — 159 pass, 1 fail, 1 skip, 1 note.**
-Isolated project `ccsync`, derived port 18993, live deployment untouched.
+**`scripts/test-fresh-slack-seed.sh` — 10/10 pass.** The gate uses its own
+Compose project, volumes, secret directory, canary tokens and port. It proves
+that bootstrap does not seed configuration during image inspection and that the
+first legitimate seed enables Slack without a manual patch.
 
-The single failure is `.env carries a gateway token (legacy path)` — **pre-existing
-and environmental**, not caused by this change: the check is byte-identical to
-`origin/master`, and it fails only because this machine's `.env` belongs to the
-file-secret path while the overlay under test selects the legacy one. It passes
-in CI, where `bootstrap.sh` writes a fresh `.env` with a generated token, and it
-passed here on the file-secret path.
+**`scripts/smoke.sh --no-creds` — 173 pass, 0 fail in CI.** The two current CI
+runs are green. The file-secret contract, sync self-test, updater self-test,
+parser self-test and heredoc lint also pass.
 
 New rows include: both plugins active in both profiles (`10 plugins` without
 Slack; exactly `pretorin-update, slack, target-sync` under the exclusive
@@ -335,13 +334,12 @@ The audit line lands in `docker compose logs` and in
 `/home/node/.pretorin/target-sync-audit.log`, carrying target, outcome, both
 SHAs, credential *source* (never the value), requester and route.
 
-## Blocked on operator
+## Live operator validation and remaining gap
 
-- **A real Slack round trip.** Needs credentials and a live workspace. Push a
-  commit to a public target, `/target-sync simple-crm`, confirm the reply shows
-  `old → new`, then ask the Claw to read the new HEAD content — which should
-  work with **no gateway restart**, since the resolvers bind paths and the mount
-  is live. Repeat in plain language to exercise the tool route.
+- **Slack target synchronization passed.** A fresh local deployment configured
+  Slack automatically, and both `/claw /target-sync simple-crm` and the
+  conversational target-sync route completed successfully without a manual
+  config patch or gateway restart.
 - **A real private clone over HTTPS with a fine-grained PAT.** The self-test
   proves the credential path and the absence of leaks against a local remote; it
   cannot prove GitHub's side of the handshake. Sweep afterwards for the token in

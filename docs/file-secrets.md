@@ -191,27 +191,39 @@ docker compose exec -T openclaw sh -c 'tr "\0" "\n" < /proc/1/environ | grep OPE
 Reading it any other way is how an earlier round of this work "observed" an empty
 adapter and went looking for a bug that was not there.
 
-## Azure mapping
+## Azure pilot mapping
 
-On the Azure VM, a root-owned startup service will authenticate to Key Vault
-with the VM's managed identity and create the same filenames under:
+The current internal pilot does **not** implement Key Vault synchronization.
+Create the same files on the VM's persistent disk, restrict the parent directory
+to the operator, and point Compose at it. For example:
 
 ```text
-/run/compliance-claw-secrets/
+/opt/compliance-claw-secrets/
 ```
 
-The directory is RAM-backed and recreated after every boot. Start with:
+Start with:
 
 ```sh
 export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
-export COMPLIANCE_CLAW_SECRET_DIR=/run/compliance-claw-secrets
+export COMPLIANCE_CLAW_SECRET_DIR=/opt/compliance-claw-secrets
 docker compose up -d
 ```
 
 The host files must be readable by the image's `node` user (UID/GID 1000) and
-must not be readable by other host users. The Azure sync service should create
-the directory as `0700` and each file as `0400`, owned by `1000:1000`. Anyone
-with root or Docker-daemon access remains inside the workload trust boundary.
+must not be readable by other host users. Create the directory as `0700` and
+each file as `0400`, owned by `1000:1000`. Anyone with root or Docker-daemon
+access remains inside the workload trust boundary. Do not put these files under
+`/run` for the pilot: `/run` is recreated at boot and there is currently no
+service that repopulates it.
+
+A production deployment may later use the VM's managed identity and Azure Key
+Vault to recreate the same filenames under `/run/compliance-claw-secrets/` before
+Compose starts. That automation is planned, not shipped by this repository.
+
+This repository also does not yet install a system service that restarts Compose
+after a VM reboot. For the pilot, re-export the two variables above and run
+`docker compose up -d` after reboot. Automatic boot recovery belongs in the
+deployment-hardening work, alongside Key Vault integration.
 
 The GitHub App private key is intentionally different: it stays host-only and is
 used by `scripts/bootstrap.sh` to clone private targets. It is never declared as
@@ -225,6 +237,7 @@ Update the backing files atomically, then restart the gateway:
 docker compose restart openclaw
 ```
 
-Azure will replace the local files from the latest Key Vault secret versions
-before this restart. File changes are not automatically re-read by an already
-running process.
+For the pilot, replace the persistent host files yourself. A future Key Vault
+sync service would replace them from the latest secret versions before this
+restart. File changes are not automatically re-read by an already running
+process.

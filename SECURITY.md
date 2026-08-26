@@ -99,8 +99,8 @@ unused. Removing them is untested against the plugin.
 | GitHub read-only PAT | not available | `/run/secrets/github_readonly_pat` (gateway only) | no |
 | Device-code model credential | state volume | state volume | no |
 
-The file-secret path is `compose.secrets.yaml`; how to select it, what it requires
-and how it maps onto Azure Key Vault are in
+The file-secret path is `compose.secrets.yaml`; how to select it, what the Azure
+pilot does today, and the deferred Key Vault mapping are in
 [file-backed runtime secrets](docs/file-secrets.md).
 
 Verified, with canary values: no **complete** secret of any class reaches the

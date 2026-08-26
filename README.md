@@ -18,7 +18,10 @@ attribution limit and the unsandboxed-tool-execution boundary.
 
 ## Status
 
-Verified against the published image, pulled by digest, on a fresh clone:
+Baseline operation was verified against the published image, pulled by digest,
+on a fresh clone. Target synchronization and the fresh Slack-seeding fix were
+then verified against this branch's local image and in CI; they reach the
+published image only after the next release and digest-pin update.
 
 | | |
 | --- | --- |
@@ -29,7 +32,7 @@ Verified against the published image, pulled by digest, on a fresh clone:
 | Published image pulled by immutable digest | **passed** |
 | Private GitHub repository support | **implemented; live validation deferred** |
 | Target synchronization from the host | **passed** |
-| Target synchronization from Slack | **implemented; live validation deferred** |
+| Target synchronization from Slack | **passed — command and conversational routes** |
 
 Three honest caveats, not passes:
 
@@ -42,10 +45,11 @@ Three honest caveats, not passes:
   `slack/app-manifest.json` is the reproducible setup path for a *new* app and is
   reviewed, but importing it from scratch was not separately tested.
 - **Target synchronization:** the engine, its refusals, the global lock and the
-  credential hygiene are gated offline against real local repositories, and the
-  wrapper was driven end to end inside the running gateway container. What is not
-  yet observed is a Slack round trip and a private clone over HTTPS with a
-  fine-grained PAT. Details and evidence: [docs/plans/target-sync.md](docs/plans/target-sync.md).
+  credential hygiene are gated offline against real local repositories. Both the
+  deterministic Slack command and conversational tool route were then exercised
+  successfully against the fresh local deployment. The remaining live gap is a
+  private clone over HTTPS with a fine-grained PAT. Details and evidence:
+  [docs/plans/target-sync.md](docs/plans/target-sync.md).
 
 The image is **unsigned**. Its integrity controls are the digest pin, the
 per-release SBOM, the release-time vulnerability scan, and documented release
@@ -53,6 +57,8 @@ provenance — see "Verifying what you pulled".
 
 ## Requirements
 
+- Docker Compose **v2.24.0 or newer**. The file-secret overlay uses the `!reset`
+  tag introduced in that release; older versions may retain `.env` unexpectedly.
 - Docker Desktop (or another daemon) with **linux/amd64** support. Upstream ships
   no linux/arm64 Pretorin binary, so on Apple Silicon this runs emulated — enable
   Rosetta for amd64 in Docker Desktop settings. `bootstrap.sh` checks before it
@@ -85,7 +91,9 @@ scripts/bootstrap.sh             # generates the gateway token; writes NO secret
 
 # 4. paste values into the files bootstrap just created — nothing goes in .env
 vi secrets/runtime/pretorin-api-key
-vi secrets/runtime/openai-api-key         # OR anthropic-api-key; exactly one
+vi secrets/runtime/openai-api-key         # matches the shipped default model
+# OR use anthropic-api-key, then select an Anthropic model before first use:
+# docker compose run --rm cli openclaw models set anthropic/<model>
 #  optional: slack-app-token, slack-bot-token  (+ SLACK_CHANNEL_ID in .env)
 #  full checklist and per-service delivery matrix: docs/file-secrets.md
 
@@ -150,14 +158,11 @@ Two ordering rules, both of which bite silently if ignored:
 
   ```sh
   docker compose restart openclaw
-```
+  ```
 
   Not `openclaw mcp reload` from the `cli` service: that disposes cached MCP
   runtimes in the *calling* process only, so a one-off container disposes its own
   empty cache and exits, leaving the gateway's children untouched.
-
-  ```sh
-  ```
 
 Check what you bound at any time, read-only:
 
@@ -246,7 +251,7 @@ The default path pulls, and `compose.yaml` deliberately has no `build:` section 
 released, scanned image. To build:
 
 ```sh
-export COMPOSE_FILE=compose.yaml:compose.build.yaml
+export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml
 scripts/bootstrap.sh --build
 ```
 
@@ -581,9 +586,11 @@ and a message can be answered by whichever Claw happened to receive it.
 The **image** contains the pinned Slack plugin and the logic that generates the
 Slack configuration. It contains **no Slack credentials**, and no channel id.
 
-`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` are **deployment-time
-values supplied through `.env`**, read from the environment at load time. They are
-never baked into an image and never written into the config in the state volume.
+`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` are deployment-time
+values. On the recommended path the two tokens come from mounted secret files and
+only the non-secret channel ID stays in `.env`; the legacy path puts all three in
+`.env`. None is baked into the image. The tokens are never written into the
+state-volume config; the channel ID is written there as the allowlist key.
 
 - On a **fresh** OpenClaw volume, Slack is configured **automatically** when all
   three are present — no manual JSON, no plugin editing.
@@ -612,12 +619,13 @@ only the one allowlisted channel is served, and the agent answers only when
 **explicitly mentioned**.
 
 Enabling Slack also **trims the plugin surface**, because `plugins.allow` is an
-exclusive allowlist. The gateway banner goes from
-`(8 plugins: browser, canvas, device-pair, file-transfer, memory-core, ollama,
-phone-control, talk-voice)` to `(1 plugin: slack)`. This is intended — it removes
-the browser plugin and six others from a container whose tool execution is
-unsandboxed. To restore one, add its id to `plugins.allow`; to restore all of
-them, delete the `allow` line. If you remove `channels.slack`, remove `allow` too.
+exclusive allowlist. The no-Slack profile loads the eight bundled plugins plus
+the two local plugins (`pretorin-update` and `target-sync`), for 10 total. The
+Slack profile loads exactly three: `pretorin-update`, `slack`, and `target-sync`.
+This removes the browser and other bundled tools from a container whose tool
+execution is unsandboxed. To restore a bundled plugin, add its id to
+`plugins.allow`; to restore all of them, delete the `allow` line. If you remove
+`channels.slack`, remove `allow` too.
 
 > **Security, not a footnote.** Every member of that Slack channel acts with the
 > authority of the configured Pretorin key, and there is **no per-user
@@ -631,9 +639,10 @@ them, delete the `allow` line. If you remove `channels.slack`, remove `allow` to
 **image build time**. It is an image-build choice: changing that line needs a
 rebuild.
 
-**No model credential is ever baked into the image.** Provider authentication
-happens at **deployment time** and persists in the OpenClaw state volume, which is
-why it survives `docker compose down` and is destroyed by `down -v`.
+**No model credential is ever baked into the image.** API keys are read from the
+mounted secret files on every gateway start. A device-code login is different: it
+is stored in the OpenClaw state volume, survives `docker compose down`, and is
+destroyed by `down -v`.
 
 For VM deployments, OpenAI and Anthropic API keys can instead arrive through the
 file-secret overlay and remain outside Docker's configured environment. See
@@ -641,7 +650,9 @@ file-secret overlay and remain outside Docker's configured environment. See
 separate runtime action (`openclaw models set`); supplying a credential does not
 silently change the selected model.
 
-The POC's tested path is OpenAI/ChatGPT **device-code** login:
+File-backed model-provider credentials are the recommended VM path and were
+exercised during the fresh-deployment validation. OpenAI/ChatGPT **device-code**
+login remains supported for an interactive local deployment:
 
 ```sh
 docker compose run --rm cli openclaw models auth login --provider openai --device-code
@@ -677,7 +688,7 @@ docker compose restart openclaw
 full Pretorin tool surface and does not second-guess it: what the agent can do is
 whatever the key authorizes, enforced server-side.
 
-| | Read-only (default) | Write-enabled (opt-in) |
+| | Read-only key | Write-enabled key |
 | --- | --- | --- |
 | Bootstrap, onboarding, verification | works | works |
 | Read frameworks, controls, recipes, plans | works | works |
@@ -828,8 +839,8 @@ proves onboarding end to end, that a read tool works through MCP, and that a wri
 tool is rejected server-side.
 
 Pre-release, run the tests against a local build (`export
-COMPOSE_FILE=compose.yaml:compose.build.yaml`), since the pull path needs a
-published image.
+COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml`), since the
+pull path needs a published image.
 
 ## Updating an existing deployment
 
@@ -965,7 +976,7 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | `Missing required scopes: write` | Read-only key, write tool | Correct behaviour — see "Read-only vs write-enabled" |
 | `Scope is not approved with a confirmed scale yet` | Platform prerequisite | Approve scope setup on platform.pretorin.com |
 | Agent answers with no sources bound | Framework switched in chat | One scope per deployment; re-run onboarding for another |
-| `plugins list` shows 9 plugins, not 2 | Slack not configured | Expected; the two profiles are documented above |
+| `plugins list` shows 10 plugins instead of 3 | Slack not configured | Expected; the two profiles are documented above |
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
 | Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`. `--status` confirms which binary is active |
