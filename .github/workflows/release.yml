@@ -381,7 +381,10 @@ jobs:
 
           ARCH="$(docker run --rm --entrypoint bash "${IMAGE_REPO}@${DIGEST}" -lc 'uname -m')"
           [ "$ARCH" = x86_64 ] || { echo "::error::pulled image arch is ${ARCH}"; exit 1; }
-          docker run --rm --entrypoint bash "${IMAGE_REPO}@${DIGEST}" -lc 'pretorin version'
+          # The SEED, by its absolute path: it is deliberately off PATH, and the
+          # login shell here rebuilds PATH anyway. Same probe as the built-image
+          # smoke above.
+          docker run --rm --entrypoint bash "${IMAGE_REPO}@${DIGEST}" -lc '/opt/compliance-claw/pretorin-seed/pretorin version'
 
           syft "docker:${IMAGE_REPO}@${DIGEST}" -o spdx-json > sbom.pulled.json
           BUILT="$(python3 -c "import json;print(len(json.load(open('sbom-${VERSION}.spdx.json')).get('packages',[])))")"
