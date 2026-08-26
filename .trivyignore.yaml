@@ -67,6 +67,23 @@ vulnerabilities:
       fix, and worth raising with them.
     expired_at: 2026-11-04
 
+  # THE SAME ADVISORY AS ABOVE, UNDER ITS SECOND IDENTIFIER. GitHub and OSV both
+  # alias GHSA-p63j-vcc4-9vmv <-> CVE-2026-73653. Trivy's database now reports it
+  # under the CVE, so the GHSA-keyed entry stopped matching and blocked the v0.3.0
+  # release with a finding that had already been reviewed and accepted. Both ids
+  # are kept so a re-key in either direction cannot silently reopen the gate.
+  # This is not a new exception: same finding, same reasoning, same expiry.
+  - id: CVE-2026-73653
+    statement: >-
+      @vitest/browser 4.1.9 at /app/node_modules — a TEST framework that upstream
+      ships inside its runtime image. Browser Mode's file-access permission gate
+      can be bypassed by provider commands. Not reachable in this deployment:
+      nothing invokes vitest, and the browser plugin is not even loaded when Slack
+      is configured (plugins.allow is exclusive). The deeper issue is that a test
+      dependency is present in a production image at all; that is upstream's to
+      fix, and worth raising with them.
+    expired_at: 2026-11-04
+
   - id: CVE-2026-59873
     statement: >-
       node-tar denial of service via a crafted gzip bomb, present TWICE in the
