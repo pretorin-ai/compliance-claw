@@ -209,6 +209,23 @@ else
 fi
 ok  "image runs as x86_64" bash -c '[ "$(docker compose run --rm -T cli uname -m | tr -d "\r\n")" = x86_64 ]'
 
+# Release-image probes must name the seed by its absolute path. The binary is
+# deliberately off PATH and `bash -lc` rebuilds PATH, so a bare `pretorin` exits
+# 127 — which is why the v0.3.1 run pushed an image and then tagged nothing.
+# Two probes are expected: the built image, and the digest pulled back from GHCR.
+REL_YML=".github/workflows/release.yml"
+SEED_BIN="/opt/compliance-claw/pretorin-seed/pretorin"
+BARE_PROBE="$(grep -nE "(-lc|run) +'([^']*[^/-])?pretorin " "$REL_YML" || true)"
+SEED_PROBES="$(grep -cE "(-lc|run) +'[^']*${SEED_BIN}" "$REL_YML" || true)"
+if [ -n "$BARE_PROBE" ]; then
+  fail "release.yml probes Pretorin only by its seed path" "bare invocation: ${BARE_PROBE}"
+elif [ "${SEED_PROBES:-0}" -lt 2 ]; then
+  fail "release.yml probes Pretorin only by its seed path" \
+       "expected the built-image and pulled-image probes; found ${SEED_PROBES}"
+else
+  pass "release.yml probes Pretorin only by its seed path (${SEED_PROBES} probes)"
+fi
+
 head2 "A2. Pretorin MCP tool surface (mock-based, no key)"
 S="$(val pretorin mcp-smoke-test)"
 has "mcp-smoke-test passes" "PASSED" "$S"
