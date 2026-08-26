@@ -135,6 +135,15 @@ jobs:
       - name: File-secret contract (runtime behaviour)
         run: bash scripts/test-file-secrets.sh compliance-claw:local
 
+      # THE INTERACTION NEITHER OF THE GATES ABOVE CAN SEE. test-file-secrets.sh
+      # points bootstrap at an unreachable target, so it dies at the clone and
+      # never reaches the image phase; smoke's Slack rows invoke the image with
+      # `docker run`, bypassing bootstrap, Compose and COMPOSE_FILE entirely.
+      # A fresh file-secret deployment coming up Slack-less lived in the gap
+      # between them. Its own isolated project, canary tokens, no credentials.
+      - name: Fresh deployment configures Slack by itself (isolated project)
+        run: bash scripts/test-fresh-slack-seed.sh
+
       - name: Gateway logs on failure
         if: failure()
         run: docker compose logs --no-color openclaw || true

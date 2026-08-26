@@ -385,7 +385,38 @@ case "${COMPOSE_FILE:-}" in
 esac
 
 if [ "$DO_BUILD" = 1 ]; then
-  export COMPOSE_FILE="compose.yaml:compose.build.yaml"
+  # APPEND THE BUILD OVERLAY. NEVER REBUILD THIS VARIABLE.
+  #
+  # This line used to be an unconditional
+  #     export COMPOSE_FILE="compose.yaml:compose.build.yaml"
+  # which silently DISCARDED every other overlay the operator had selected. The
+  # one that mattered was compose.secrets.yaml, and the failure it caused was
+  # remote from its cause:
+  #
+  #   1. the operator exports compose.yaml:compose.secrets.yaml:compose.build.yaml
+  #   2. this line rewrites it to compose.yaml:compose.build.yaml
+  #   3. the image check further down starts a container, which runs the
+  #      entrypoint against the REAL state volume and SEEDS ~/.openclaw/openclaw.json
+  #   4. that seed cannot see the Slack tokens, because the overlay that mounts
+  #      them was dropped in step 2 — so it writes a Slack-less config
+  #   5. the gateway starts later WITH the tokens, finds a config already there,
+  #      and correctly refuses to overwrite it
+  #
+  # The deployment then has Slack credentials and no Slack, permanently, and the
+  # only evidence is that openclaw.json is ~35 seconds older than the gateway
+  # container. Observed on a fresh deployment; the image check below no longer
+  # starts a container at all, so both halves of that chain are gone.
+  #
+  # COMPOSE_PATH_SEPARATOR is docker compose's own knob for this; honour it
+  # rather than hardcoding a colon.
+  SEP="${COMPOSE_PATH_SEPARATOR:-:}"
+  case "${SEP}${COMPOSE_FILE:-}${SEP}" in
+    *"${SEP}compose.build.yaml${SEP}"*)
+      : ;;                                    # already selected, leave it exactly as it is
+    *)
+      COMPOSE_FILE="${COMPOSE_FILE:-compose.yaml}${SEP}compose.build.yaml" ;;
+  esac
+  export COMPOSE_FILE
   log "--build: building locally (amd64; slow under emulation on first run)"
   log "  COMPOSE_FILE=${COMPOSE_FILE}"
   # What the image will report as its own version. A local build is NOT a
@@ -413,12 +444,38 @@ else
 fi
 
 # The image is what actually has to be amd64, so confirm it on the real image
-# rather than trusting the earlier host probe. Runs through the entrypoint, which
-# is fine: the token check is scoped to gateway invocations.
-IMAGE_ARCH="$(docker compose run --rm -T cli uname -m | tr -d '\r\n')"
-[ "$IMAGE_ARCH" = "x86_64" ] \
-  || die "image reports arch '${IMAGE_ARCH}', expected x86_64."
-log "image runs as ${IMAGE_ARCH}"
+# rather than trusting the earlier host probe.
+#
+# BY INSPECTION, NOT BY RUNNING IT. This was
+#     docker compose run --rm -T cli uname -m
+# which is a container start: it goes through the entrypoint and mounts the
+# deployment's named volumes, so a question about CPU architecture had the side
+# effect of SEEDING ~/.openclaw/openclaw.json. Bootstrap runs before the operator
+# has necessarily finished supplying credentials, and seeding is write-if-absent
+# and never-clobber by design — so a config written here is the config the
+# deployment keeps. That is how a deployment ended up with Slack credentials and
+# a permanently Slack-less config.
+#
+# `docker image inspect` answers the same question from the image metadata:
+# no entrypoint, no container, no volume, no seed, and no network. The image name
+# comes from `docker compose config`, which is also read-only, so this honours
+# whatever overlays are selected instead of guessing at a tag.
+IMAGE_NAME="$(docker compose config --format json 2>/dev/null \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["openclaw"]["image"])' 2>/dev/null || true)"
+[ -n "$IMAGE_NAME" ] \
+  || die "could not determine the image name from the Compose configuration.
+  Check it renders:  docker compose config"
+
+IMAGE_PLATFORM="$(docker image inspect "$IMAGE_NAME" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+[ -n "$IMAGE_PLATFORM" ] \
+  || die "the image ${IMAGE_NAME} is not present locally, so its architecture cannot be checked.
+  This should not happen directly after a build or a pull. Retry, or inspect it:
+    docker image inspect ${IMAGE_NAME}"
+[ "$IMAGE_PLATFORM" = "linux/amd64" ] \
+  || die "image ${IMAGE_NAME} is ${IMAGE_PLATFORM}, expected linux/amd64.
+  Upstream ships no linux/arm64 Pretorin binary. If this is an arm64 build, remove
+  the local image and re-run so it is built or pulled for linux/amd64."
+log "image is ${IMAGE_PLATFORM} (by inspection; no container was started)"
 
 SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
 if [ "$FILE_SECRETS" = 1 ]; then

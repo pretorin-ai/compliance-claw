@@ -800,7 +800,18 @@ scripts/smoke.sh --no-creds   # Section A only — exactly what CI runs
 python3 scripts/parse-targets.py --self-test
 bash scripts/sync-targets.sh --self-test   # target sync: rules, outcomes, lock, leak canary
 scripts/pretorin-update.sh --self-test     # CLI updater input rules
+scripts/test-file-secrets.sh compliance-claw:local   # secret delivery, at runtime
+scripts/test-fresh-slack-seed.sh                     # a FRESH deployment configures Slack itself
 ```
+
+`test-fresh-slack-seed.sh` builds a throwaway deployment — its own Compose
+project, volumes, secret directory, canary tokens and derived port — runs the
+real `bootstrap.sh --build` against it, and asserts that bootstrap creates no
+OpenClaw configuration and that the first legitimate seed comes up
+Slack-configured with no manual patch. It exists because that property lived in
+the gap between the other two gates: `test-file-secrets.sh` points bootstrap at
+an unreachable target so it never reaches the image phase, and smoke's Slack rows
+invoke the image directly, bypassing bootstrap and Compose.
 
 The two `--self-test` gates need no network, no credentials and no containers.
 `sync-targets.sh --self-test` builds throwaway local repositories and drives the

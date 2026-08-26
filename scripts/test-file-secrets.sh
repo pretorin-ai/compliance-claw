@@ -225,6 +225,14 @@ SCRATCH="$TMP/scratch"
 mkdir -p "$SCRATCH"
 cp -R scripts "$SCRATCH/"
 cp .env.example versions.env Dockerfile compose.yaml compose.secrets.yaml compose.build.yaml "$SCRATCH/"
+# DELIBERATELY UNREACHABLE, AND THAT HAS A COST WORTH NAMING. Bootstrap dies at
+# the clone, which is what keeps this gate fast, offline and credential-free —
+# but it also means everything AFTER the target phase is never exercised here:
+# the COMPOSE_FILE handling, the image validation, and whether bootstrap creates
+# deployment state. A defect lived in exactly that region (a fresh file-secret
+# deployment came up permanently Slack-less) and this file could not have seen
+# it. scripts/test-fresh-slack-seed.sh covers that region on purpose; if you add
+# a check here that needs bootstrap to COMPLETE, it belongs there instead.
 cat > "$SCRATCH/targets.yaml" <<'FIXTURE'
 system_id: 00000000-0000-0000-0000-000000000000
 framework_id: soc2

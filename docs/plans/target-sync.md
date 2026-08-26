@@ -243,6 +243,41 @@ not support**, so on macOS — this POC's operator platform — every field came
 empty, the check concluded "cannot judge", and it never reclaimed anything. It
 looked conservative and was simply broken. Now `awk`, with whole-token matching.
 
+## A fresh-deployment defect found while validating this branch
+
+Not caused by target sync, but found by running a genuinely fresh deployment for
+it, and fixed here because it makes Slack unusable on first install.
+
+**Symptom.** A brand-new file-secret deployment came up with Slack credentials
+present and Slack absent from the config — permanently, because seeding is
+never-clobber. The only evidence was that `openclaw.json` was ~35 seconds older
+than the gateway container.
+
+**Chain.**
+
+1. the operator exports `compose.yaml:compose.secrets.yaml:compose.build.yaml`
+2. `bootstrap.sh --build` did `export COMPOSE_FILE="compose.yaml:compose.build.yaml"`
+   — an unconditional replacement that dropped the overlay mounting the Slack tokens
+3. its architecture check ran `docker compose run --rm -T cli uname -m`, which
+   starts a container, runs the entrypoint and mounts the real state volume — so
+   a question about CPU architecture **seeded the configuration**
+4. that seed could not see the Slack tokens, so it wrote a Slack-less config
+5. the gateway started later *with* the tokens, found a config, and correctly
+   refused to overwrite it
+
+**Fix, both halves minimal.** `--build` now appends `compose.build.yaml` only
+when absent and never rebuilds the variable; the architecture check is
+`docker image inspect` on the image `docker compose config` names — no
+entrypoint, no container, no volume, no seed, no network. The entrypoint is
+unchanged: never-clobber was behaving correctly and is not the thing to loosen.
+
+**Why nothing caught it.** `test-file-secrets.sh` points bootstrap at an
+unreachable target, so it dies at the clone and never reaches the image phase;
+smoke's Slack rows invoke the image with `docker run`, bypassing bootstrap,
+Compose and `COMPOSE_FILE`. Each was right about its own subject; the defect
+lived in the interaction. `scripts/test-fresh-slack-seed.sh` now covers exactly
+that region, plus two static guards in smoke.
+
 ## Validation
 
 **`scripts/sync-targets.sh --self-test` — 96 checks, offline, no credentials.**

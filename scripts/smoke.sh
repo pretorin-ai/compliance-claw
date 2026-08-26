@@ -1099,6 +1099,38 @@ has "the refusal explains it will not delete" "remove it yourself" "$OUT"
   || fail "bootstrap did not delete the broken clone"
 rm -f "$NEG_YAML"
 
+head2 "A9b. bootstrap does not seed the deployment, and does not eat overlays"
+# STATIC, CHEAP, AND IN CI. The behavioural proof is
+# scripts/test-fresh-slack-seed.sh, which builds a whole isolated deployment;
+# these two rows cost nothing and fail the moment either property is reverted.
+#
+# 1. The image check must not START A CONTAINER. `docker compose run` goes
+#    through the entrypoint and mounts the state volume, so it SEEDS
+#    ~/.openclaw/openclaw.json — and seeding is write-if-absent and
+#    never-clobber, so whatever it writes is what the deployment keeps. A fresh
+#    deployment ended up permanently Slack-less exactly this way.
+# `^[^#]*` so the COMMENT that documents the old command — deliberately kept,
+# because the reason it was removed is worth reading — is not mistaken for the
+# command itself. The first version of this row failed on the fixed script.
+if grep -qE '^[^#]*docker compose run .*(uname|arch)' scripts/bootstrap.sh; then
+  fail "bootstrap validates the image without starting a container" \
+       "the architecture check runs a container, which seeds configuration before credentials are in scope"
+else
+  pass "bootstrap validates the image without starting a container"
+fi
+ok "  and does so by inspection" \
+   bash -c "grep -q 'docker image inspect' scripts/bootstrap.sh"
+
+# 2. --build must APPEND the build overlay, never rebuild COMPOSE_FILE. The
+#    replacement form silently dropped compose.secrets.yaml, which is how the
+#    seed above could not see the Slack tokens.
+if grep -qE '^\s*export COMPOSE_FILE="compose\.yaml:compose\.build\.yaml"' scripts/bootstrap.sh; then
+  fail "bootstrap --build preserves operator-selected overlays" \
+       "COMPOSE_FILE is assigned by replacement, which discards compose.secrets.yaml"
+else
+  pass "bootstrap --build preserves operator-selected overlays"
+fi
+
 head2 "A10. bootstrap is idempotent and never overwrites .env"
 # Chosen by availability, not by exit code: a missing md5sum still leaves awk
 # exiting 0, so an `||` chain silently returns an empty digest and every
