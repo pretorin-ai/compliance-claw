@@ -216,6 +216,105 @@ has "mcp-smoke-test passes" "PASSED" "$S"
 head2 "A3. targets.yaml parser"
 ok "parse-targets.py --self-test" python3 scripts/parse-targets.py --self-test
 
+head2 "A3bb. Target sync — offline rules and real-git outcomes"
+# The SAME implementation bootstrap.sh runs and the SAME implementation the two
+# Slack routes run, exercised against temporary local repositories. No network,
+# no credentials, no containers, so it is the first thing to fail when the sync
+# semantics break rather than the fortieth.
+ok "sync-targets.sh --self-test (offline, host copy)" \
+   bash scripts/sync-targets.sh --self-test
+
+# And the copy that actually ships, at the path the plugin hardcodes. A wrapper
+# present on the host but missing or unrunnable in the image is a feature that
+# works in CI and not in Slack.
+ok "sync-targets.sh --self-test (offline, image copy)" \
+   docker compose run --rm -T cli /opt/compliance-claw/sync-targets.sh --self-test
+ok "the sync wrapper ships at the documented path" \
+   docker compose run --rm -T cli test -x /opt/compliance-claw/sync-targets.sh
+ok "the parser ships beside it (name validation, not YAML in bash)" \
+   docker compose run --rm -T cli test -r /opt/compliance-claw/parse-targets.py
+
+# THE TWO DEFECTS FOUND IN REVIEW, GATED IN THE REAL CONTAINER TOO.
+#
+# Both were silent, and both are the kind that a green suite would otherwise keep
+# hiding: a broken target list reported as a clean run, and one timeout wedging
+# synchronization for good.
+SYNC_BROKEN_PARSER="$(mktemp -d "${TMPDIR:-/tmp}/cc-sync-parser.XXXXXX")"
+printf 'import sys\nsys.stderr.write("simulated parser failure\\n")\nraise SystemExit(2)\n' \
+  > "${SYNC_BROKEN_PARSER}/broken.py"
+mkdir -p "${SYNC_BROKEN_PARSER}/targets"
+printf 'system_id: s\nframework_id: f\ntargets:\n  - name: demo\n    url: https://example.invalid/d.git\n' \
+  > "${SYNC_BROKEN_PARSER}/targets.yaml"
+sync_broken() {
+  CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+  CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" \
+  CC_PARSE_TARGETS="${SYNC_BROKEN_PARSER}/broken.py" \
+  bash scripts/sync-targets.sh "$1" 2>/dev/null
+}
+for req in all demo; do
+  notok "an unreadable target list fails the run (${req})" bash -c \
+    "CC_TARGETS_FILE='${SYNC_BROKEN_PARSER}/targets.yaml' CC_TARGETS_DIR='${SYNC_BROKEN_PARSER}/targets' CC_PARSE_TARGETS='${SYNC_BROKEN_PARSER}/broken.py' bash scripts/sync-targets.sh ${req}"
+done
+BROKEN_OUT="$(sync_broken all || true)"
+has  "  and says so, rather than reporting a clean run" "targets_unreadable" "$BROKEN_OUT"
+hasnt "  and never claims overall=ok"                   "overall=ok"        "$BROKEN_OUT"
+BROKEN_ONE="$(sync_broken demo || true)"
+hasnt "  and never blames the requested name for it" "is not declared in targets.yaml" "$BROKEN_ONE"
+notok "bootstrap mode also refuses an unreadable list" bash -c \
+  "CC_TARGETS_FILE='${SYNC_BROKEN_PARSER}/targets.yaml' CC_TARGETS_DIR='${SYNC_BROKEN_PARSER}/targets' CC_PARSE_TARGETS='${SYNC_BROKEN_PARSER}/broken.py' bash scripts/sync-targets.sh --bootstrap"
+
+# The exact state a SIGKILLed wrapper leaves: a lock naming a pid in this
+# namespace that no longer exists. It used to answer "already running" forever.
+SYNC_LOCK_NS="$( [ -r /proc/sys/kernel/random/boot_id ] \
+  && printf 'boot-%s' "$(cat /proc/sys/kernel/random/boot_id)" \
+  || printf 'host-%s' "$(hostname 2>/dev/null || echo unknown)" )"
+mkdir -p "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock"
+printf 'pid=4194304 ns=%s ts=2026-01-01T00:00:00Z route=timeout\n' "$SYNC_LOCK_NS" \
+  > "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock/owner"
+WEDGED="$(CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+  CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" bash scripts/sync-targets.sh all 2>&1 || true)"
+hasnt "a lock left by a dead owner does not wedge sync forever" "sync_already_running" "$WEDGED"
+has   "  and the reclaim is announced, not silent"              "reclaiming a stale lock" "$WEDGED"
+[ ! -d "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock" ] \
+  && pass "  and the lock is released afterwards" \
+  || fail "  and the lock is released afterwards"
+
+# The property that must NOT regress in exchange: a live owner keeps its lock.
+mkdir -p "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock"
+printf 'pid=%s ns=%s ts=2026-01-01T00:00:00Z route=live\n' "$$" "$SYNC_LOCK_NS" \
+  > "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock/owner"
+LIVE="$(CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+  CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" bash scripts/sync-targets.sh all 2>/dev/null || true)"
+has "a lock held by a LIVE process is still respected" "sync_already_running" "$LIVE"
+rm -rf "$SYNC_BROKEN_PARSER"
+
+# The plugin must give the wrapper a chance to run its trap, and must signal the
+# whole process group — a SIGKILL-only path is what created the wedge.
+if grep -q 'detached: true' plugins/target-sync/index.js \
+   && grep -q 'signalGroup("SIGTERM")' plugins/target-sync/index.js \
+   && grep -q 'process.kill(-child.pid' plugins/target-sync/index.js; then
+  pass "the plugin terminates the process GROUP, SIGTERM before SIGKILL"
+else
+  fail "the plugin terminates the process GROUP, SIGTERM before SIGKILL" \
+       "a SIGKILL-only timeout leaves the global lock held forever"
+fi
+
+# ONE IMPLEMENTATION, ASSERTED. The whole design rests on bootstrap and Slack
+# running the same file; a re-implementation creeping into either would be
+# invisible until the two disagreed in production.
+if grep -q 'sync-targets.sh --bootstrap' scripts/bootstrap.sh \
+   && ! grep -qE '^\s*(git_auth|assert_no_credential)\(\)' scripts/bootstrap.sh; then
+  pass "bootstrap delegates to sync-targets.sh and keeps no copy of the git logic"
+else
+  fail "bootstrap delegates to sync-targets.sh and keeps no copy of the git logic"
+fi
+if grep -q '/opt/compliance-claw/sync-targets.sh' plugins/target-sync/index.js \
+   && ! grep -qE "spawn\(\s*[\"']git" plugins/target-sync/index.js; then
+  pass "the plugin shells out to the wrapper and runs no git of its own"
+else
+  fail "the plugin shells out to the wrapper and runs no git of its own"
+fi
+
 head2 "A3b. CLI updater — offline input rules and the drift contract"
 # The input rules are pure: no network, no credentials, no volume. They are also
 # the whole authorization surface of the model-visible route, so they get a gate
@@ -409,21 +508,28 @@ else
   if [ "$SLACK_PROFILE" = 1 ]; then
     has "runtime plugin set includes slack (Slack profile)" "slack" "$PLUGIN_NAMES"
     has "runtime plugin set includes pretorin-update (Slack profile)" "pretorin-update" "$PLUGIN_NAMES"
-    # The allowlist is exclusive, so it must name BOTH ids and nothing else: an
-    # id left out is a plugin silently disabled, and a bundled id creeping in
-    # would mean the trim stopped working.
-    if [ "$PLUGIN_NAMES" = "pretorin-update, slack" ] || [ "$PLUGIN_NAMES" = "slack, pretorin-update" ]; then
-      pass "no bundled plugin activates under the exclusive allowlist"
+    has "runtime plugin set includes target-sync (Slack profile)" "target-sync" "$PLUGIN_NAMES"
+    # The allowlist is exclusive, so it must name EVERY local id and nothing
+    # else: an id left out is a plugin silently disabled — the exact failure the
+    # Slack patch's comments warn about — and a bundled id creeping in would mean
+    # the trim stopped working. Compared as a sorted set so banner ordering, which
+    # is not a contract, cannot fail this.
+    EXPECTED_ALLOWED="pretorin-update slack target-sync"
+    GOT_ALLOWED="$(printf '%s' "$PLUGIN_NAMES" | tr ',' '\n' | tr -d ' ' | sort | tr '\n' ' ' | sed 's/ $//')"
+    if [ "$GOT_ALLOWED" = "$EXPECTED_ALLOWED" ]; then
+      pass "the exclusive allowlist activates exactly the local plugins"
     else
-      fail "no bundled plugin activates under the exclusive allowlist" "got: ${PLUGIN_NAMES}"
+      fail "the exclusive allowlist activates exactly the local plugins" \
+           "expected '${EXPECTED_ALLOWED}', got '${GOT_ALLOWED}'"
     fi
   else
-    # 9, not 8: the base template adds the updater's load path and deliberately
-    # sets NO plugins.allow, so the bundled eight still load and the updater joins
-    # them. That is what keeps this profile — the one CI runs — able to exercise
-    # both update routes.
-    has "runtime plugin set is the 8 bundled + updater (no-Slack profile)" "9 plugins" "$PLUGIN_LINE"
+    # 10, not 8: the base template adds two local load paths and deliberately
+    # sets NO plugins.allow, so the bundled eight still load and both local
+    # plugins join them. That is what keeps this profile — the one CI runs — able
+    # to exercise every route without a Slack workspace.
+    has "runtime plugin set is the 8 bundled + 2 local (no-Slack profile)" "10 plugins" "$PLUGIN_LINE"
     has "  updater plugin present: pretorin-update" "pretorin-update" "$PLUGIN_NAMES"
+    has "  sync plugin present: target-sync" "target-sync" "$PLUGIN_NAMES"
     for p in browser canvas device-pair file-transfer memory-core ollama phone-control talk-voice; do
       has "  bundled plugin present: ${p}" "$p" "$PLUGIN_NAMES"
     done
@@ -444,6 +550,7 @@ has "config registers the Pretorin MCP server" '/home/node/.pretorin/bin/pretori
 # and CLI updates would land somewhere MCP never runs.
 hasnt "config does not still point MCP at the image seed" '/usr/local/bin/pretorin' "$CFG"
 has "config carries the updater plugin load path" '/opt/compliance-claw/plugins/pretorin-update' "$CFG"
+has "config carries the sync plugin load path" '/opt/compliance-claw/plugins/target-sync' "$CFG"
 hasnt "config no longer loads a skill directory" 'extraDirs' "$CFG"
 
 # The updater plugin, checked through OpenClaw's own diagnostics rather than by
@@ -465,6 +572,11 @@ PINSPECT="$(val openclaw plugins inspect pretorin-update --runtime --json 2>&1 |
 has "updater plugin loads at runtime" 'pretorin-update' "$PINSPECT"
 has "updater registers its agent tool" 'pretorin_update' "$PINSPECT"
 hasnt "updater plugin passes OpenClaw file-safety checks" 'blocked plugin candidate' "$PINSPECT"
+
+SINSPECT="$(val openclaw plugins inspect target-sync --runtime --json 2>&1 || true)"
+has "sync plugin loads at runtime" 'target-sync' "$SINSPECT"
+has "sync registers its agent tool" 'target_sync' "$SINSPECT"
+hasnt "sync plugin passes OpenClaw file-safety checks" 'blocked plugin candidate' "$SINSPECT"
 has "config keeps the key as a substitution, not a value" '${PRETORIN_API_KEY}' "$CFG"
 has "config carries the MCP cwd fix" '/opt/compliance-claw/no-repo' "$CFG"
 
@@ -569,7 +681,8 @@ head2 "A4d. FILE-BACKED SECRET DEPLOYMENT"
 # base env_file entirely, mount every secret explicitly, and expose only *_FILE
 # paths plus documented non-secret configuration to Docker.
 FILE_SECRET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cc-file-secrets.XXXXXX")"
-for f in pretorin-api-key openclaw-gateway-token slack-app-token slack-bot-token openai-api-key anthropic-api-key; do
+for f in pretorin-api-key openclaw-gateway-token slack-app-token slack-bot-token \
+         openai-api-key anthropic-api-key github-readonly-pat; do
   : > "${FILE_SECRET_DIR}/${f}"
 done
 FILE_SECRET_CONFIG="$(COMPLIANCE_CLAW_SECRET_DIR="$FILE_SECRET_DIR" \
@@ -598,7 +711,8 @@ for name,svc in d.items():
 # that hides: everything works, some container just holds a credential it never
 # needed, and nobody notices until it leaks. So each side is pinned exactly.
 want_openclaw={"pretorin_api_key","slack_app_token","slack_bot_token",
-               "openclaw_gateway_token","openai_api_key","anthropic_api_key"}
+               "openclaw_gateway_token","openai_api_key","anthropic_api_key",
+               "github_readonly_pat"}
 want_cli={"pretorin_api_key","slack_app_token","slack_bot_token"}
 got_openclaw={x["source"] for x in d["openclaw"].get("secrets",[])}
 got_cli={x["source"] for x in d["cli"].get("secrets",[])}
@@ -610,6 +724,41 @@ assert got_cli == want_cli, f"cli secrets {sorted(got_cli)} != {sorted(want_cli)
 for gateway_only in ("OPENAI_API_KEY_FILE","ANTHROPIC_API_KEY_FILE","OPENCLAW_GATEWAY_TOKEN_FILE"):
     assert gateway_only in d["openclaw"].get("environment",{}), f"openclaw lacks {gateway_only}"
     assert gateway_only not in d["cli"].get("environment",{}), f"cli should not receive {gateway_only}"
+# THE PAT HAS NO ENVIRONMENT VARIABLE AT ALL, ON EITHER SERVICE, AND THAT IS THE
+# WHOLE DESIGN. Every other secret is exported into PID 1 by the entrypoint, so
+# unsandboxed tool execution in the agent process inherits it. The PAT is read
+# from the mounted path by a git credential helper instead. NO APOSTROPHES IN
+# THIS BLOCK: it lives inside a single-quoted python3 -c argument, so one would
+# close the shell string and the whole file would stop parsing. That is not
+# hypothetical — it happened twice while writing this, including once in this
+# very comment. A GITHUB_READONLY_PAT_FILE
+# appearing here would mean somebody wired it into load_secret_file, which would
+# silently put a git credential into the model process environment.
+for name,svc in d.items():
+    env=svc.get("environment",{})
+    assert "GITHUB_READONLY_PAT" not in env, f"{name} has a direct PAT value"
+    assert "GITHUB_READONLY_PAT_FILE" not in env, \
+        f"{name} exports the PAT as an environment variable; it must stay file-only"
+# MOUNT POSTURE, ASSERTED IN BOTH DIRECTIONS. The writable maintenance alias and
+# targets.yaml belong to the gateway alone, and the assessment mount must stay
+# read-only on BOTH — a YAML merge key replaces a volumes list rather than
+# appending to it, so this is exactly the mistake that ships silently.
+def mounts(svc):
+    return {v["target"]: v for v in d[svc].get("volumes",[])}
+mo, mc = mounts("openclaw"), mounts("cli")
+assert mo["/workspace/targets"].get("read_only"), "openclaw assessment mount is not read-only"
+assert mc["/workspace/targets"].get("read_only"), "cli assessment mount is not read-only"
+assert "/var/lib/compliance-claw/targets" in mo, "openclaw lacks the maintenance mount"
+assert not mo["/var/lib/compliance-claw/targets"].get("read_only"), "maintenance mount is not writable"
+assert "/var/lib/compliance-claw/targets" not in mc, "cli must not get the maintenance mount"
+assert "/etc/compliance-claw/targets.yaml" in mo, "openclaw lacks targets.yaml"
+assert mo["/etc/compliance-claw/targets.yaml"].get("read_only"), "targets.yaml is not read-only"
+assert "/etc/compliance-claw/targets.yaml" not in mc, "cli must not get targets.yaml"
+# The gateway keeps the state volumes it had before this feature: a restated
+# volumes list that dropped one would come up broken in a way no other row here
+# would notice.
+for required in ("/home/node/.openclaw","/home/node/.pretorin"):
+    assert required in mo and required in mc, f"a service lost {required}"
 print("ok")
 ' 2>&1 || true)"
 if [ "$FILE_SECRET_CHECK" = ok ]; then
@@ -617,6 +766,74 @@ if [ "$FILE_SECRET_CHECK" = ok ]; then
 else
   fail "overlay removes env_file and mounts only file-secret references" "$FILE_SECRET_CHECK"
 fi
+
+# UPGRADING A DEPLOYMENT THAT PREDATES THIS SECRET.
+#
+# A release that adds a `secrets:` entry turns a missing file into a FAILED
+# START, not a warning: the daemon refuses the bind with "bind source path does
+# not exist" and the gateway container never comes up. On an existing deployment
+# that is an outage caused by a credential it may not even use.
+#
+# WHAT THIS ROW CAN AND CANNOT PROVE CHEAPLY. `docker compose config` renders
+# happily with the file missing — it neither errors nor warns — so it cannot
+# stand in for the failure. Actually reproducing it means starting the gateway
+# with a broken secret directory, which is not something to do inside a suite
+# that shares a project with a running deployment. So the failure itself is
+# recorded as measured evidence in docs/plans/target-sync.md (observed:
+# `up -d openclaw` with the file absent, container never created), and what is
+# gated here is the REPAIR — which is the part that has to keep working.
+OLD_SECRET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cc-old-secrets.XXXXXX")"
+for f in pretorin-api-key openclaw-gateway-token slack-app-token slack-bot-token \
+         openai-api-key anthropic-api-key; do
+  : > "${OLD_SECRET_DIR}/${f}"       # note: no github-readonly-pat
+done
+printf '%s' 'PRE-EXISTING-VALUE' > "${OLD_SECRET_DIR}/pretorin-api-key"
+COMPLIANCE_CLAW_SECRET_DIR="$OLD_SECRET_DIR" bash scripts/init-file-secrets.sh >/dev/null 2>&1 || true
+if [ -e "${OLD_SECRET_DIR}/github-readonly-pat" ]; then
+  pass "init-file-secrets.sh creates the missing PAT file (write-if-absent)"
+else
+  fail "init-file-secrets.sh creates the missing PAT file (write-if-absent)"
+fi
+if [ ! -s "${OLD_SECRET_DIR}/github-readonly-pat" ]; then
+  pass "  and creates it EMPTY, so it means \"no PAT\" rather than an empty token"
+else
+  fail "  and creates it EMPTY, so it means \"no PAT\" rather than an empty token"
+fi
+if [ "$(cat "${OLD_SECRET_DIR}/pretorin-api-key")" = PRE-EXISTING-VALUE ]; then
+  pass "  and overwrites no existing secret while doing it"
+else
+  fail "  and overwrites no existing secret while doing it" "an existing value was replaced"
+fi
+# EVERY secret the overlay declares must be creatable this way, or the next
+# release to add one reintroduces the same outage. Compared as a set against the
+# overlay itself rather than against a list maintained here.
+# Read with grep, not a YAML parser: compose.secrets.yaml uses Compose's own
+# `!reset []` tag, which is not standard YAML and makes yaml.safe_load raise —
+# which the first version of this row swallowed, compared against an empty list,
+# and reported as a failure with no explanation.
+DECLARED_SECRETS="$(grep -oE '\$\{COMPLIANCE_CLAW_SECRET_DIR:-[^}]*\}/[A-Za-z0-9._-]+' compose.secrets.yaml \
+  | sed 's|.*/||' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+CREATED_SECRETS="$(ls -A "$OLD_SECRET_DIR" | sort | tr '\n' ' ' | sed 's/ $//')"
+if [ -n "$DECLARED_SECRETS" ] && [ "$DECLARED_SECRETS" = "$CREATED_SECRETS" ]; then
+  pass "init-file-secrets.sh creates exactly the files compose.secrets.yaml declares"
+else
+  fail "init-file-secrets.sh creates exactly the files compose.secrets.yaml declares" \
+       "overlay declares [${DECLARED_SECRETS}]; the script created [${CREATED_SECRETS}]"
+fi
+# update.sh must run that repair BEFORE it stops anything, or the guard is just a
+# nicer error message printed during an outage.
+# Anchored to the START of a line, so the header comment that merely MENTIONS
+# `docker compose up -d` is not mistaken for the command itself — the first
+# version of this row compared the guard against a comment on line 7 and failed
+# on a correct script.
+if grep -q 'SECRET-FILE PREFLIGHT' scripts/update.sh \
+   && [ "$(grep -n 'SECRET-FILE PREFLIGHT' scripts/update.sh | head -1 | cut -d: -f1)" \
+        -lt "$(grep -n '^docker compose up -d' scripts/update.sh | head -1 | cut -d: -f1)" ]; then
+  pass "update.sh repairs secret files before it restarts anything"
+else
+  fail "update.sh repairs secret files before it restarts anything"
+fi
+rm -rf "$OLD_SECRET_DIR"
 
 head2 "A4c. SECRET CONTAINMENT — every secret class, not just the Pretorin key"
 # Phase 3 canaried PRETORIN_API_KEY across the rendered config, the state volume,
@@ -703,6 +920,48 @@ ok    "pretorin state volume is writable"  cli touch /home/node/.pretorin/.smoke
 cli rm -f /home/node/.openclaw/.smoke-canary /home/node/.pretorin/.smoke-canary >/dev/null 2>&1
 ok    "container runs as node"             bash -c '[ "$(docker compose run --rm -T cli id -un | tr -d "\r\n")" = node ]'
 
+# THE TWO HALVES OF THE MAINTENANCE ALIAS, on the service that has it.
+#
+# `cli` deliberately has neither, so both are checked through the gateway. The
+# assessment mount must stay read-only THERE too — it is the same container the
+# agent runs in, and the row above only proves it for `cli`.
+if [ "$GATEWAY_STARTED" = 1 ] || docker compose ps --status running --services 2>/dev/null | grep -qx openclaw; then
+  notok "gateway: /workspace/targets is read-only (the assessment path)" \
+        docker compose exec -T openclaw touch /workspace/targets/.smoke-assess-canary
+  if docker compose exec -T openclaw test -d /var/lib/compliance-claw/targets >/dev/null 2>&1; then
+    if docker compose exec -T openclaw sh -c \
+         'touch /var/lib/compliance-claw/targets/.smoke-maint-canary 2>/dev/null && rm -f /var/lib/compliance-claw/targets/.smoke-maint-canary'; then
+      pass "gateway: the maintenance alias is writable (the sync path)"
+    else
+      # A bind mount carries the HOST directory's ownership, so a CI runner whose
+      # uid is not 1000 cannot write it. That is an environment fact, not a
+      # regression, and reporting it as a pass would be a lie either way.
+      note "the maintenance alias is present but not writable by uid $(docker compose exec -T openclaw id -u 2>/dev/null | tr -d '\r\n') — host directory ownership, not a mount-posture regression"
+    fi
+  else
+    fail "gateway: the maintenance alias is mounted" "/var/lib/compliance-claw/targets is absent"
+  fi
+  ok "gateway: targets.yaml is mounted for name validation" \
+     docker compose exec -T openclaw test -r /etc/compliance-claw/targets.yaml
+  notok "gateway: targets.yaml is read-only" \
+        docker compose exec -T openclaw sh -c 'echo x >> /etc/compliance-claw/targets.yaml'
+  docker compose exec -T openclaw rm -f /workspace/targets/.smoke-assess-canary >/dev/null 2>&1 || true
+
+  # THE INPUT CONTRACT, INSIDE THE REAL CONTAINER. The self-test proves the rules;
+  # this proves the rules are what a request actually reaches, through the same
+  # binary and the same mounts the plugin uses.
+  for bad_req in '--upload-pack=/bin/sh' '../etc' 'no-such-target' 'all extra'; do
+    notok "gateway: sync refuses $(printf '%s' "$bad_req")" \
+          docker compose exec -T openclaw /opt/compliance-claw/sync-targets.sh "$bad_req"
+  done
+  SYNC_REFUSAL="$(docker compose exec -T openclaw /opt/compliance-claw/sync-targets.sh no-such-target 2>/dev/null || true)"
+  has "gateway: the refusal names targets.yaml as the only source of names" \
+      "not declared in targets.yaml" "$SYNC_REFUSAL"
+  has "gateway: the refusal is machine-readable" "invalid_target" "$SYNC_REFUSAL"
+else
+  skip "gateway mount and sync-refusal checks" "the gateway is not running"
+fi
+
 head2 "A6. THE CWD FIX — the mcp-serve child's working directory"
 CWD_OUT="$(inbox <<'EOF' 2>&1
 set -u
@@ -728,6 +987,18 @@ has   "mcp-serve child runs in the sentinel directory" "CHILD_CWD=/opt/complianc
 hasnt "mcp-serve child does NOT run in /app"           "CHILD_CWD=/app" "$CWD_OUT"
 ok    "sentinel directory holds no repo and no markdown" \
       cli bash -c '! ls -A /opt/compliance-claw/no-repo | grep -qE "\.git$|\.md$"'
+
+# TARGET SYNC MUST NOT HAVE MOVED ANYTHING INTO THAT TREE. Pretorin derives
+# host-local source resolvers from the current directory, so a targets.yaml or a
+# clone appearing anywhere under /opt/compliance-claw would be CWD-discoverable
+# from the sentinel. That is exactly why they are mounted at /etc/... and
+# /var/lib/... instead, and why this is asserted rather than left to the comment.
+ok    "no targets.yaml under the sentinel tree" \
+      cli bash -c '! find /opt/compliance-claw -maxdepth 2 -name targets.yaml | grep -q .'
+ok    "no git repository under the sentinel tree" \
+      cli bash -c '! find /opt/compliance-claw -maxdepth 3 -name .git | grep -q .'
+ok    "the maintenance mount is NOT inside the sentinel tree" \
+      bash -c 'case /var/lib/compliance-claw/targets in /opt/compliance-claw/*) exit 1 ;; *) exit 0 ;; esac'
 
 head2 "A7. stale-template warning (warn only, never overwrites)"
 CFG_BEFORE="$(val md5sum /home/node/.openclaw/openclaw.json | awk '{print $1}')"
@@ -828,6 +1099,38 @@ has "the refusal explains it will not delete" "remove it yourself" "$OUT"
   || fail "bootstrap did not delete the broken clone"
 rm -f "$NEG_YAML"
 
+head2 "A9b. bootstrap does not seed the deployment, and does not eat overlays"
+# STATIC, CHEAP, AND IN CI. The behavioural proof is
+# scripts/test-fresh-slack-seed.sh, which builds a whole isolated deployment;
+# these two rows cost nothing and fail the moment either property is reverted.
+#
+# 1. The image check must not START A CONTAINER. `docker compose run` goes
+#    through the entrypoint and mounts the state volume, so it SEEDS
+#    ~/.openclaw/openclaw.json — and seeding is write-if-absent and
+#    never-clobber, so whatever it writes is what the deployment keeps. A fresh
+#    deployment ended up permanently Slack-less exactly this way.
+# `^[^#]*` so the COMMENT that documents the old command — deliberately kept,
+# because the reason it was removed is worth reading — is not mistaken for the
+# command itself. The first version of this row failed on the fixed script.
+if grep -qE '^[^#]*docker compose run .*(uname|arch)' scripts/bootstrap.sh; then
+  fail "bootstrap validates the image without starting a container" \
+       "the architecture check runs a container, which seeds configuration before credentials are in scope"
+else
+  pass "bootstrap validates the image without starting a container"
+fi
+ok "  and does so by inspection" \
+   bash -c "grep -q 'docker image inspect' scripts/bootstrap.sh"
+
+# 2. --build must APPEND the build overlay, never rebuild COMPOSE_FILE. The
+#    replacement form silently dropped compose.secrets.yaml, which is how the
+#    seed above could not see the Slack tokens.
+if grep -qE '^\s*export COMPOSE_FILE="compose\.yaml:compose\.build\.yaml"' scripts/bootstrap.sh; then
+  fail "bootstrap --build preserves operator-selected overlays" \
+       "COMPOSE_FILE is assigned by replacement, which discards compose.secrets.yaml"
+else
+  pass "bootstrap --build preserves operator-selected overlays"
+fi
+
 head2 "A10. bootstrap is idempotent and never overwrites .env"
 # Chosen by availability, not by exit code: a missing md5sum still leaves awk
 # exiting 0, so an `||` chain silently returns an empty digest and every
@@ -898,22 +1201,57 @@ priv_yaml() {
     "$SCRATCH_SYS" "$SCRATCH_FW" "${1:-https://github.com/pretorin-ai/does-not-exist.git}" > "$PRIV_YAML"
 }
 
-# 1. private target, no GitHub App configured at all.
+# THE CREDENTIAL LADDER IS TESTED WITH AN EMPTY SECRET DIRECTORY, deliberately.
+# These cases are about what happens when a credential is ABSENT, so they must
+# not accidentally pick up the operator's real PAT and pass for the wrong reason.
+NOCRED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/smoke-nocred.XXXXXX")"
+
+# 1. private target, no GitHub App and no PAT: refuse, naming both fixes.
 priv_yaml
 OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+       COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
-[ "$RC" != 0 ] && pass "bootstrap refuses a private target with no GitHub App" \
-  || fail "bootstrap refuses a private target with no GitHub App" "it succeeded"
+[ "$RC" != 0 ] && pass "bootstrap refuses a private target with no credential at all" \
+  || fail "bootstrap refuses a private target with no credential at all" "it succeeded"
 has "the refusal names GITHUB_APP_ID" "GITHUB_APP_ID" "$OUT"
+has "the refusal also names the PAT file" "github-readonly-pat" "$OUT"
 hasnt "the refusal does not hang on a credential prompt" "Username for" "$OUT"
 
 # 2. App id present, key file missing.
 OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
        GITHUB_APP_PRIVATE_KEY_FILE=secrets/definitely-not-here.pem \
+       COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
 [ "$RC" != 0 ] && pass "bootstrap refuses a private target with a missing key file" \
   || fail "bootstrap refuses a private target with a missing key file" "it succeeded"
 has "the refusal names the key path" "definitely-not-here.pem" "$OUT"
+
+# 2b. NO SILENT DOWNGRADE. An App that is configured but broken must NOT fall
+#     through to the PAT, even when a perfectly good PAT is sitting right there.
+#     An operator who set up an App expects the App; quietly substituting a
+#     longer-lived personal credential is the kind of downgrade nobody notices.
+printf '%s' 'CANARY-PAT-SHOULD-NOT-BE-USED' > "${NOCRED_DIR}/github-readonly-pat"
+chmod 600 "${NOCRED_DIR}/github-readonly-pat"
+OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
+       GITHUB_APP_PRIVATE_KEY_FILE=secrets/definitely-not-here.pem \
+       COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
+       bash scripts/bootstrap.sh 2>&1)"; RC=$?
+[ "$RC" != 0 ] && pass "a broken GitHub App does NOT silently fall back to the PAT" \
+  || fail "a broken GitHub App does NOT silently fall back to the PAT" "it succeeded"
+hasnt "  and the refusal used no PAT" "fine-grained PAT from" "$OUT"
+has   "  and it says why it will not fall back" "will NOT fall back" "$OUT"
+hasnt "  and no token value was printed" "CANARY-PAT-SHOULD-NOT-BE-USED" "$OUT"
+
+# 2c. NO App, PAT present: the pilot path is taken, said out loud, and the value
+#     is never printed. The clone still fails (the repository does not exist and
+#     the token is fake) — what is asserted here is WHICH credential was chosen.
+OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+       COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
+       bash scripts/bootstrap.sh 2>&1)"; RC=$?
+has   "with no App, a present PAT is used for private targets" "fine-grained PAT from" "$OUT"
+has   "  and the pilot-only status is stated on every run" "GitHub App is the recommended" "$OUT"
+hasnt "  and the token value is never printed" "CANARY-PAT-SHOULD-NOT-BE-USED" "$OUT"
+rm -rf "$NOCRED_DIR"
 
 # 3. A private target must not be silently cloned anonymously.
 [ ! -e workspace/targets/smoke-private ] \

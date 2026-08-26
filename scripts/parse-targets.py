@@ -54,10 +54,11 @@ TOP_KEYS = ("system_id", "framework_id")
 ITEM_KEYS = ("name", "url", "ref", "private")
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
-# A private target is cloned by scripts/bootstrap.sh using a GitHub App
-# installation token, which only exists for github.com. Any other host would
-# silently fall back to an anonymous clone and fail as if the repo were missing,
-# so the host is restricted here where the error can name the real reason.
+# A private target is authenticated with a GitHub App installation token (host,
+# scripts/bootstrap.sh) or a fine-grained PAT (container, scripts/sync-targets.sh).
+# Both are github.com credentials. Any other host would silently fall back to an
+# anonymous clone and fail as if the repo were missing, so the host is restricted
+# here where the error can name the real reason.
 PRIVATE_URL_PREFIX = "https://github.com/"
 
 
@@ -220,9 +221,10 @@ def validate(scope, targets):
         if raw == "true" and not item["url"].startswith(PRIVATE_URL_PREFIX):
             raise ParseError(
                 line,
-                "target '%s' is private but its url is not on github.com; private"
-                " targets are cloned with a GitHub App installation token, which"
-                " only works for %s" % (name, PRIVATE_URL_PREFIX),
+                "target '%s' is private but its url is not on github.com; both"
+                " supported credentials — a GitHub App installation token on the"
+                " host, and the fine-grained PAT used for synchronization from"
+                " the container — only work for %s" % (name, PRIVATE_URL_PREFIX),
             )
     return scope, targets
 
@@ -289,7 +291,7 @@ CASES = [
     ("private: yes", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: yes\n", "must be exactly 'true' or 'false'"),
     ("private: True", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: True\n", "must be exactly 'true' or 'false'"),
     ("private: 1", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: 1\n", "must be exactly 'true' or 'false'"),
-    ("private on a non-github host", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://gitlab.com/o/r.git\n    private: true\n", "only works for https://github.com/"),
+    ("private on a non-github host", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://gitlab.com/o/r.git\n    private: true\n", "only work for https://github.com/"),
     ("duplicate private key", "system_id: a\nframework_id: b\ntargets:\n  - name: x\n    url: https://github.com/o/r.git\n    private: true\n    private: false\n", "duplicate key 'private'"),
 ]
 

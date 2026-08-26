@@ -8,6 +8,8 @@
 #   2. write .env with a generated gateway token, ONLY if absent
 #   3. clone or update every target from targets.yaml into workspace/targets/,
 #      minting a short-lived read-only GitHub App token if any target is private
+#      (the clone/update logic itself lives in scripts/sync-targets.sh, which is
+#      the same implementation the Slack /target-sync route runs)
 #   4. pull the published image (or build it with --build), then confirm the
 #      image really runs as x86_64
 #
@@ -19,11 +21,28 @@
 # or an existing .env — when reality disagrees with targets.yaml it reports and
 # exits non-zero rather than resolving it for you.
 #
-# GIT CREDENTIALS NEVER LEAVE THIS HOST. A private target is cloned with a
-# GitHub App installation token that lives in a 0600 temp file for the duration
-# of this script, is passed to git through a credential helper rather than in the
-# URL or in argv, and is never written into the clone's .git/config. The container
-# receives the resulting working tree over a read-only bind mount and nothing else.
+# GIT CREDENTIALS ON THIS PATH NEVER LEAVE THIS HOST, AND THAT SENTENCE IS NOW
+# NARROWER THAN IT USED TO BE. Read it carefully before relying on it.
+#
+# What still holds, unchanged: the GitHub App private key is host-only, the
+# installation token it mints lives in a 0600 temp file for the duration of this
+# script, both are passed to git through a credential helper rather than in the
+# URL or in argv, neither is ever written into a clone's .git/config, and neither
+# is ever mounted into a container.
+#
+# What has been DELIBERATELY RELAXED for the internal pilot: private targets can
+# now also be synchronized from Slack, inside the container, which means that
+# path needs a credential of its own. That credential is a fine-grained,
+# read-only, selected-repositories PAT delivered as a mounted file
+# (secrets/runtime/github-readonly-pat). It is a git credential that DOES live
+# inside the container. It is never exported into the environment and never
+# reaches the model's prompt, but tool execution in that container is
+# unsandboxed, so a prompt-injected agent can read the file. That is an accepted
+# internal-pilot limitation, not a boundary — SECURITY.md says so plainly, and
+# the GitHub App remains the recommended mechanism for anything beyond the pilot.
+#
+# THIS SCRIPT still prefers the App and will not silently fall back to the PAT:
+# if an App is configured and minting fails, it stops.
 #
 # Written for macOS (the POC's operator platform) but plain POSIX-ish bash, so it
 # also runs on the Linux CI runner. Dependencies are git, python3, openssl and
@@ -42,7 +61,7 @@ DO_BUILD=0
 for arg in "$@"; do
   case "$arg" in
     --build) DO_BUILD=1 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) printf 'bootstrap: ERROR — unknown option %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -229,19 +248,21 @@ if [ "$FILE_SECRETS" = 1 ]; then
 fi
 
 # --- 3. targets ------------------------------------------------------------
+#
+# THE CLONE/UPDATE LOGIC IS NOT HERE ANY MORE. It lives in
+# scripts/sync-targets.sh, which is the single implementation shared with the
+# Slack /target-sync command and the target_sync agent tool. One definition of
+# "safe" — fast-forward only, never reset, never discard, refuse and report —
+# instead of two that drift, and its --self-test drives those same functions.
+#
+# What stays here is the part that is HOST-ONLY by design: deciding which git
+# credential exists, and minting the GitHub App installation token.
 
 mkdir -p "$TARGETS_DIR"
-TARGET_COUNT=0
-
-# Never prompt for credentials. A private or moved remote must fail immediately
-# with a clear error instead of blocking on a password prompt — and because the
-# loop below reads its target list from stdin, a prompt would also swallow the
-# rest of that list.
-export GIT_TERMINAL_PROMPT=0
 
 # Private targets need one installation token covering all of them, minted once
-# before the loop. Collected in a first pass so a missing GitHub App is reported
-# before anything is cloned rather than halfway through.
+# before anything is cloned. Collected in a first pass so a missing credential is
+# reported before the first clone rather than halfway through.
 #
 # Field order is name/url/private/ref, and reading it in that order matters: tab
 # is IFS whitespace, so consecutive tabs collapse. With ref third, a target that
@@ -259,105 +280,86 @@ while IFS=$'\t' read -r NAME URL PRIVATE _REF; do
   PRIVATE_SLUGS+=("$SLUG")
 done < <(python3 "$PARSE" list "$TARGETS_FILE")
 
+# Prefer the process environment, fall back to .env. Deliberately NOT `source
+# .env`: that file is operator-editable and sourcing it would execute whatever it
+# contains. Same helper, same reasoning, as scripts/github-app-token.sh.
+env_val() {
+  local name="$1" val
+  eval "val=\${${name}:-}"
+  if [ -z "$val" ] && [ -r .env ]; then
+    val="$(grep -E "^${name}=" .env | head -1 | cut -d= -f2- | tr -d '\r' || true)"
+  fi
+  printf '%s' "$val"
+}
+
+# THE CREDENTIAL LADDER, AND THE ONE RUNG THAT MUST NOT EXIST.
+#
+#   public target                 -> anonymous. No credential is consulted at all.
+#   private + GitHub App          -> mint an installation token. IF THAT FAILS,
+#                                    STOP. There is deliberately no fall-through
+#                                    to the PAT: an operator who configured an App
+#                                    expects the App, and quietly using a
+#                                    longer-lived personal credential instead is
+#                                    exactly the kind of downgrade nobody notices.
+#   private + no App + a PAT      -> use the PAT. Pilot-acceptable, and said out
+#                                    loud on every run so it cannot become the
+#                                    silent default.
+#   private + neither             -> refuse, naming both fixes.
+GIT_TOKEN_FILE=""
+GIT_TOKEN_SOURCE="none"
+PAT_FILE="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}/github-readonly-pat"
+
 if [ "${#PRIVATE_SLUGS[@]}" -gt 0 ]; then
   log "${#PRIVATE_SLUGS[@]} private target(s): ${PRIVATE_SLUGS[*]}"
-  GH_TOKEN_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-gh-token.XXXXXX")"
-  chmod 600 "$GH_TOKEN_FILE"
-  # Fails closed with its own diagnostics: missing App id, unreadable key,
-  # repository not in the installation, permission never granted.
-  bash scripts/github-app-token.sh "$GH_TOKEN_FILE" "${PRIVATE_SLUGS[@]}" \
-    || die "could not mint a GitHub App token for the private target(s).
+  if [ -n "$(env_val GITHUB_APP_ID)" ]; then
+    log "  private credential: GitHub App (the recommended mechanism)"
+    GH_TOKEN_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-gh-token.XXXXXX")"
+    chmod 600 "$GH_TOKEN_FILE"
+    # Fails closed with its own diagnostics: missing App id, unreadable key,
+    # repository not in the installation, permission never granted.
+    bash scripts/github-app-token.sh "$GH_TOKEN_FILE" "${PRIVATE_SLUGS[@]}" \
+      || die "could not mint a GitHub App token for the private target(s).
   Nothing was cloned. See the messages above, or README.md ('Private repositories').
-  A fine-grained PAT is a development-only fallback; the App is the supported path."
+  GITHUB_APP_ID is set, so this script will NOT fall back to the PAT: fix the App,
+  or clear GITHUB_APP_ID if you deliberately want the PAT path."
+    GIT_TOKEN_FILE="$GH_TOKEN_FILE"
+    GIT_TOKEN_SOURCE="github-app"
+  elif [ -s "$PAT_FILE" ]; then
+    GIT_TOKEN_FILE="$PAT_FILE"
+    GIT_TOKEN_SOURCE="pat"
+    log "  private credential: fine-grained PAT from ${PAT_FILE}"
+    warn "no GitHub App is configured, so the PAT is being used to clone private targets."
+    warn "  Acceptable for the internal pilot. It must be fine-grained, limited to the"
+    warn "  selected repositories, and carry Contents: Read-only and nothing else."
+    warn "  The GitHub App is the recommended mechanism — README.md ('Private repositories')."
+  else
+    die "a private target is declared but no git credential is configured.
+  Nothing was cloned. Pick one:
+    - GitHub App (recommended): set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_FILE
+      in .env. See README.md ('Private repositories').
+    - Fine-grained PAT (internal pilot): put a selected-repositories,
+      Contents: Read-only token in ${PAT_FILE}
+      (create the file with scripts/init-file-secrets.sh, then paste the value).
+    - Or drop 'private: true' from targets.yaml if the repository is public."
+  fi
 fi
 
-# Runs git with the installation token supplied by a credential helper.
-#
-# Three properties this shape has and the obvious alternatives do not:
-#   - The token is NOT in the URL, so it is never written into .git/config by
-#     `git clone` and never ends up in `git remote -v` output.
-#   - The token is NOT in argv, so it does not appear in `ps` for other users on
-#     this host. The helper reads it from a 0600 file at the moment git asks.
-#   - `git -c` sits BEFORE the subcommand, which makes it a one-shot override.
-#     `git clone -c` would persist the setting into the new repository's config.
-git_auth() {
-  git -c credential.helper= \
-      -c credential.helper='!f() { test "$1" = get && { echo username=x-access-token; echo "password=$(cat "'"$GH_TOKEN_FILE"'")"; }; }; f' \
-      "$@"
-}
+# One implementation, invoked with explicit configuration rather than inherited
+# globals, so the same call is readable from here and from the image.
+if ! TARGET_COUNT="$(
+      CC_TARGETS_FILE="$TARGETS_FILE" \
+      CC_TARGETS_DIR="$TARGETS_DIR" \
+      CC_PARSE_TARGETS="$PARSE" \
+      CC_GIT_TOKEN_FILE="$GIT_TOKEN_FILE" \
+      CC_GIT_TOKEN_SOURCE="$GIT_TOKEN_SOURCE" \
+      CC_SYNC_REQUESTER="host:$(id -un 2>/dev/null || echo unknown)" \
+      CC_SYNC_ROUTE="bootstrap" \
+      bash scripts/sync-targets.sh --bootstrap )"; then
+  die "could not prepare the target repositories; see the messages above."
+fi
 
-# Every private clone is checked for a persisted credential. This is an assertion
-# about the property above, not a hope: a git version that changed the rules
-# should fail the run loudly, not leak a token into a file on disk.
-assert_no_credential() {
-  local dir="$1" name="$2"
-  if grep -qE 'x-access-token|ghs_|github_pat_' "${dir}/.git/config" 2>/dev/null; then
-    die "a git credential was persisted into ${dir}/.git/config for '${name}'.
-  This must never happen. Remove the clone and report it:  rm -rf ${dir}"
-  fi
-}
-
-while IFS=$'\t' read -r NAME URL PRIVATE REF; do
-  [ -n "$NAME" ] || continue
-  TARGET_COUNT=$((TARGET_COUNT + 1))
-  DEST="${TARGETS_DIR}/${NAME}"
-  if [ "$PRIVATE" = "true" ]; then GIT=git_auth; else GIT=git; fi
-
-  if [ ! -e "$DEST" ]; then
-    log "cloning ${NAME} from ${URL}${PRIVATE:+ (private: $PRIVATE)}"
-    "$GIT" clone --quiet "$URL" "$DEST"
-    [ "$PRIVATE" = "true" ] && assert_no_credential "$DEST" "$NAME"
-    if [ -n "$REF" ]; then
-      git -C "$DEST" checkout --quiet "$REF" \
-        || die "cloned ${NAME} but ref '${REF}' does not exist in ${URL}."
-    fi
-  elif [ ! -d "$DEST" ]; then
-    die "${DEST} exists but is not a directory. Move it aside and retry."
-  elif [ "$(git -C "$DEST" rev-parse --show-toplevel 2>/dev/null || true)" != "$(cd "$DEST" && pwd -P)" ]; then
-    # An interrupted clone leaves a directory that is neither absent nor a
-    # usable repository. Reporting beats guessing, and beats deleting: this
-    # script never removes anything under workspace/targets.
-    #
-    # The test compares --show-toplevel against this directory rather than just
-    # asking `rev-parse --git-dir`: git searches PARENT directories, so an empty
-    # workspace/targets/<name> inside this repository answers with
-    # compliance-claw's own .git and looks like a valid clone that merely has the
-    # wrong remote. --show-toplevel is documented as the top-level directory of
-    # the working tree, so requiring it to be this path is the real question.
-    die "${DEST} exists but is not the root of a git repository (an interrupted clone?).
-  Inspect it, then remove it yourself and re-run:  rm -rf ${DEST}"
-  else
-    ACTUAL_URL="$(git -C "$DEST" remote get-url origin 2>/dev/null || echo '')"
-    if [ "$ACTUAL_URL" != "$URL" ]; then
-      die "${DEST} tracks a different remote.
-  targets.yaml: ${URL}
-  on disk:      ${ACTUAL_URL:-<no origin>}
-  Refusing to touch it. Fix targets.yaml, or move the directory aside."
-    fi
-    log "updating ${NAME} (fetch)"
-    "$GIT" -C "$DEST" fetch --quiet --prune origin
-    [ "$PRIVATE" = "true" ] && assert_no_credential "$DEST" "$NAME"
-
-    if [ -n "$REF" ]; then
-      if [ -n "$(git -C "$DEST" status --porcelain)" ]; then
-        warn "${NAME} has local changes; fetched but not moved to '${REF}'."
-      else
-        git -C "$DEST" checkout --quiet "$REF" \
-          || die "ref '${REF}' does not exist in ${NAME}."
-        # --ff-only: never create a merge commit in a review target. An upstream
-        # force-push shows up here as a clear failure instead of a silent merge.
-        if git -C "$DEST" rev-parse --quiet --verify "origin/${REF}" >/dev/null; then
-          git -C "$DEST" merge --quiet --ff-only "origin/${REF}" \
-            || warn "${NAME} cannot fast-forward to origin/${REF} (diverged?); left as-is."
-        fi
-      fi
-    fi
-  fi
-
-  log "  ${NAME}: $(git -C "$DEST" rev-parse --short HEAD) on $(git -C "$DEST" rev-parse --abbrev-ref HEAD)"
-done < <(python3 "$PARSE" list "$TARGETS_FILE")
-
-[ "$TARGET_COUNT" -gt 0 ] || die "no targets parsed from ${TARGETS_FILE}."
+[ "${TARGET_COUNT:-0}" -gt 0 ] 2>/dev/null \
+  || die "no targets parsed from ${TARGETS_FILE}."
 log "${TARGET_COUNT} target(s) present under ${TARGETS_DIR}"
 
 # --- 4. image --------------------------------------------------------------
@@ -383,7 +385,38 @@ case "${COMPOSE_FILE:-}" in
 esac
 
 if [ "$DO_BUILD" = 1 ]; then
-  export COMPOSE_FILE="compose.yaml:compose.build.yaml"
+  # APPEND THE BUILD OVERLAY. NEVER REBUILD THIS VARIABLE.
+  #
+  # This line used to be an unconditional
+  #     export COMPOSE_FILE="compose.yaml:compose.build.yaml"
+  # which silently DISCARDED every other overlay the operator had selected. The
+  # one that mattered was compose.secrets.yaml, and the failure it caused was
+  # remote from its cause:
+  #
+  #   1. the operator exports compose.yaml:compose.secrets.yaml:compose.build.yaml
+  #   2. this line rewrites it to compose.yaml:compose.build.yaml
+  #   3. the image check further down starts a container, which runs the
+  #      entrypoint against the REAL state volume and SEEDS ~/.openclaw/openclaw.json
+  #   4. that seed cannot see the Slack tokens, because the overlay that mounts
+  #      them was dropped in step 2 — so it writes a Slack-less config
+  #   5. the gateway starts later WITH the tokens, finds a config already there,
+  #      and correctly refuses to overwrite it
+  #
+  # The deployment then has Slack credentials and no Slack, permanently, and the
+  # only evidence is that openclaw.json is ~35 seconds older than the gateway
+  # container. Observed on a fresh deployment; the image check below no longer
+  # starts a container at all, so both halves of that chain are gone.
+  #
+  # COMPOSE_PATH_SEPARATOR is docker compose's own knob for this; honour it
+  # rather than hardcoding a colon.
+  SEP="${COMPOSE_PATH_SEPARATOR:-:}"
+  case "${SEP}${COMPOSE_FILE:-}${SEP}" in
+    *"${SEP}compose.build.yaml${SEP}"*)
+      : ;;                                    # already selected, leave it exactly as it is
+    *)
+      COMPOSE_FILE="${COMPOSE_FILE:-compose.yaml}${SEP}compose.build.yaml" ;;
+  esac
+  export COMPOSE_FILE
   log "--build: building locally (amd64; slow under emulation on first run)"
   log "  COMPOSE_FILE=${COMPOSE_FILE}"
   # What the image will report as its own version. A local build is NOT a
@@ -411,12 +444,38 @@ else
 fi
 
 # The image is what actually has to be amd64, so confirm it on the real image
-# rather than trusting the earlier host probe. Runs through the entrypoint, which
-# is fine: the token check is scoped to gateway invocations.
-IMAGE_ARCH="$(docker compose run --rm -T cli uname -m | tr -d '\r\n')"
-[ "$IMAGE_ARCH" = "x86_64" ] \
-  || die "image reports arch '${IMAGE_ARCH}', expected x86_64."
-log "image runs as ${IMAGE_ARCH}"
+# rather than trusting the earlier host probe.
+#
+# BY INSPECTION, NOT BY RUNNING IT. This was
+#     docker compose run --rm -T cli uname -m
+# which is a container start: it goes through the entrypoint and mounts the
+# deployment's named volumes, so a question about CPU architecture had the side
+# effect of SEEDING ~/.openclaw/openclaw.json. Bootstrap runs before the operator
+# has necessarily finished supplying credentials, and seeding is write-if-absent
+# and never-clobber by design — so a config written here is the config the
+# deployment keeps. That is how a deployment ended up with Slack credentials and
+# a permanently Slack-less config.
+#
+# `docker image inspect` answers the same question from the image metadata:
+# no entrypoint, no container, no volume, no seed, and no network. The image name
+# comes from `docker compose config`, which is also read-only, so this honours
+# whatever overlays are selected instead of guessing at a tag.
+IMAGE_NAME="$(docker compose config --format json 2>/dev/null \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["openclaw"]["image"])' 2>/dev/null || true)"
+[ -n "$IMAGE_NAME" ] \
+  || die "could not determine the image name from the Compose configuration.
+  Check it renders:  docker compose config"
+
+IMAGE_PLATFORM="$(docker image inspect "$IMAGE_NAME" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+[ -n "$IMAGE_PLATFORM" ] \
+  || die "the image ${IMAGE_NAME} is not present locally, so its architecture cannot be checked.
+  This should not happen directly after a build or a pull. Retry, or inspect it:
+    docker image inspect ${IMAGE_NAME}"
+[ "$IMAGE_PLATFORM" = "linux/amd64" ] \
+  || die "image ${IMAGE_NAME} is ${IMAGE_PLATFORM}, expected linux/amd64.
+  Upstream ships no linux/arm64 Pretorin binary. If this is an arm64 build, remove
+  the local image and re-run so it is built or pulled for linux/amd64."
+log "image is ${IMAGE_PLATFORM} (by inspection; no container was started)"
 
 SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
 if [ "$FILE_SECRETS" = 1 ]; then
@@ -442,10 +501,28 @@ else
   SLACK_HINT="and SLACK_CHANNEL_ID in .env,"
 fi
 
+# NAME THE CREDENTIAL THAT WAS ACTUALLY USED. This line used to say "GitHub App"
+# unconditionally, so a run that fell back to the PAT reported the wrong — and
+# more reassuring — story: a short-lived App token deleted on exit, when what
+# really happened was a long-lived personal token read from a file that is still
+# there. A completion banner that misstates which credential touched a private
+# repository is worse than no banner.
+PRIVATE_SUMMARY=""
+if [ "${#PRIVATE_SLUGS[@]}" -gt 0 ]; then
+  case "$GIT_TOKEN_SOURCE" in
+    github-app)
+      PRIVATE_SUMMARY="$(printf '\n             %s private, cloned with a read-only GitHub App token that\n             stayed on this host and has been deleted' "${#PRIVATE_SLUGS[@]}")" ;;
+    pat)
+      PRIVATE_SUMMARY="$(printf '\n             %s private, cloned with the fine-grained PAT in\n             %s (NOT a GitHub App; the file remains).\n             The App is the recommended mechanism — README.md.' "${#PRIVATE_SLUGS[@]}" "$PAT_FILE")" ;;
+    *)
+      PRIVATE_SUMMARY="$(printf '\n             %s private' "${#PRIVATE_SLUGS[@]}")" ;;
+  esac
+fi
+
 cat <<EOF
 
 bootstrap: done.
-  targets:   ${TARGET_COUNT} under ${TARGETS_DIR} (bind-mounted read-only at /workspace/targets)$([ "${#PRIVATE_SLUGS[@]}" -gt 0 ] && printf '\n             %s private, cloned with a read-only GitHub App token that\n             stayed on this host and has been deleted' "${#PRIVATE_SLUGS[@]}")
+  targets:   ${TARGET_COUNT} under ${TARGETS_DIR} (bind-mounted read-only at /workspace/targets)${PRIVATE_SUMMARY}
   scope:     ${SYSTEM_ID} / ${FRAMEWORK_ID}
   image:     $([ "$DO_BUILD" = 1 ] && echo 'built locally (compose.build.yaml)' || echo "pulled ${IMAGE_REF:-}")
 

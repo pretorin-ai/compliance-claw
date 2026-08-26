@@ -88,7 +88,7 @@ jobs:
           # Phase 5 adds two more secret classes that must never reach CI: Slack
           # tokens and the GitHub App private key. Checked by name rather than by
           # value, because there is no value here to compare against.
-          for k in PRETORIN_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN GITHUB_APP_ID; do
+          for k in PRETORIN_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN GITHUB_APP_ID GITHUB_READONLY_PAT; do
             if grep -qE "^${k}=.+" .env; then
               echo "::error::CI generated a .env with ${k} set. It must stay empty."
               fail=1
@@ -96,6 +96,13 @@ jobs:
           done
           if ls secrets/*.pem >/dev/null 2>&1; then
             echo "::error::a private key is present under secrets/. CI must hold none."
+            fail=1
+          fi
+          # The git credential the container can hold. CI must never carry one:
+          # every target-sync test builds its own local repositories, and the
+          # private path is manual acceptance against real GitHub by design.
+          if [ -s secrets/runtime/github-readonly-pat ]; then
+            echo "::error::a GitHub PAT is present under secrets/runtime/. CI must hold none."
             fail=1
           fi
           [ "$fail" = 0 ] || exit 1
@@ -106,6 +113,15 @@ jobs:
       # first thing the log says rather than the fortieth.
       - name: CLI updater input rules (offline, no credentials)
         run: bash scripts/pretorin-update.sh --self-test
+
+      # Same reasoning, and same position: no credentials, no gateway, no
+      # network. It builds throwaway local repositories and drives the REAL
+      # sync functions against them — the ones bootstrap.sh and both Slack
+      # routes use — so a break in the fast-forward semantics, the refusal
+      # outcomes, the input rules, the global lock or the credential handling
+      # fails here in seconds rather than in the full suite.
+      - name: Target sync rules and outcomes (offline, no credentials)
+        run: bash scripts/sync-targets.sh --self-test
 
       - name: Smoke test (no-credential section only)
         run: bash scripts/smoke.sh --no-creds
@@ -118,6 +134,15 @@ jobs:
       # own gate. It uses fake canary values only and needs no credentials.
       - name: File-secret contract (runtime behaviour)
         run: bash scripts/test-file-secrets.sh compliance-claw:local
+
+      # THE INTERACTION NEITHER OF THE GATES ABOVE CAN SEE. test-file-secrets.sh
+      # points bootstrap at an unreachable target, so it dies at the clone and
+      # never reaches the image phase; smoke's Slack rows invoke the image with
+      # `docker run`, bypassing bootstrap, Compose and COMPOSE_FILE entirely.
+      # A fresh file-secret deployment coming up Slack-less lived in the gap
+      # between them. Its own isolated project, canary tokens, no credentials.
+      - name: Fresh deployment configures Slack by itself (isolated project)
+        run: bash scripts/test-fresh-slack-seed.sh
 
       - name: Gateway logs on failure
         if: failure()

@@ -3,9 +3,11 @@
 # update.sh — move an EXISTING deployment to the release this checkout pins.
 #
 #   1. fast-forward the checkout        (git pull --ff-only)
-#   2. pull the pinned image            (docker compose pull)
-#   3. restart the gateway on it        (docker compose up -d)
-#   4. report what the operator has to know, and change nothing else
+#   2. create any secret file this release added, write-if-absent, BEFORE
+#      anything stops — a missing one would otherwise fail `up` as an outage
+#   3. pull the pinned image            (docker compose pull)
+#   4. restart the gateway on it        (docker compose up -d)
+#   5. report what the operator has to know, and change nothing else
 #
 #   scripts/update.sh
 #
@@ -144,6 +146,57 @@ fi
 # version the deployment does not use.
 IMAGE_REF="$(awk -F= '/^IMAGE_REPO=/{r=$2} /^IMAGE_VERSION=/{v=$2} END{print r":"v}' versions.env)"
 log "this checkout pins ${IMAGE_REF}"
+
+# ---------------------------------------------------------------------------
+# SECRET-FILE PREFLIGHT — after the fast-forward, BEFORE anything stops.
+# ---------------------------------------------------------------------------
+# A release that adds a file-backed secret adds a `secrets:` entry to
+# compose.secrets.yaml, and Compose resolves every secret source at `up` time: a
+# file that does not exist yet fails the whole command. On an existing deployment
+# that is an outage caused by a credential it may not even use.
+#
+# So this runs after the merge — which is what could have introduced the new
+# entry — and before `docker compose pull`/`up`. It creates the missing files
+# write-if-absent rather than only complaining, because every one of them is
+# valid empty and "create an empty file" is not a decision an operator needs to
+# be consulted about. If it cannot, it stops here, with the deployment still
+# running and the exact command named.
+case "${COMPOSE_FILE:-}" in
+  *compose.secrets.yaml*)
+    SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
+    MISSING=""
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ -e "${SECRET_DIR}/${f}" ] || MISSING="${MISSING} ${f}"
+    done <<'SECRETS'
+pretorin-api-key
+openclaw-gateway-token
+slack-app-token
+slack-bot-token
+openai-api-key
+anthropic-api-key
+github-readonly-pat
+SECRETS
+
+    if [ -n "$MISSING" ]; then
+      log "this release expects secret file(s) this deployment does not have yet:${MISSING}"
+      log "creating them empty (never overwrites an existing value)"
+      bash "${REPO_ROOT}/scripts/init-file-secrets.sh" 2>&1 | sed 's/^/  /' \
+        || die "could not create the missing secret file(s). NOTHING WAS STOPPED and the
+  running deployment is untouched. Create them, then re-run this script:
+
+    scripts/init-file-secrets.sh"
+      for f in $MISSING; do
+        [ -e "${SECRET_DIR}/${f}" ] || die "\
+  ${SECRET_DIR}/${f} is still missing, and \`docker compose up\` would fail on it.
+  NOTHING WAS STOPPED. Create it, then re-run this script:
+
+    scripts/init-file-secrets.sh"
+      done
+      log "  secret files are complete; continuing"
+    fi
+    ;;
+esac
 
 log "pulling the pinned image"
 docker compose pull --quiet 2>/dev/null || docker compose pull || die \

@@ -96,10 +96,11 @@ unused. Removing them is untested against the plugin.
 | Slack tokens | values in container env | two `/run/secrets/*` mounts | no |
 | Model API keys | values in container env | provider `/run/secrets/*` mount | no |
 | GitHub App private key | host only | host only | no |
+| GitHub read-only PAT | not available | `/run/secrets/github_readonly_pat` (gateway only) | no |
 | Device-code model credential | state volume | state volume | no |
 
-The file-secret path is `compose.secrets.yaml`; how to select it, what it requires
-and how it maps onto Azure Key Vault are in
+The file-secret path is `compose.secrets.yaml`; how to select it, what the Azure
+pilot does today, and the deferred Key Vault mapping are in
 [file-backed runtime secrets](docs/file-secrets.md).
 
 Verified, with canary values: no **complete** secret of any class reaches the
@@ -119,6 +120,39 @@ the declared repositories, clones with it through a credential helper that keeps
 it out of both the URL and the process table, deletes it on exit, and asserts that
 no clone's `.git/config` retained it. The container sees only the resulting
 working tree, read-only.
+
+### The PAT is a deliberately relaxed invariant, not an oversight
+
+Earlier releases said flatly that the container never holds a git credential.
+**That is no longer true, and the docs that said it have been corrected rather
+than left standing.**
+
+Target synchronization from Slack runs inside the container, so a private target
+needs a credential *there* — and the App private key cannot be it, for the reason
+directly above. The pilot therefore accepts a **fine-grained,
+selected-repositories, Contents: Read-only PAT**, mounted read-only on the
+gateway service alone.
+
+What is still true, and enforced:
+
+- It is the **only secret with no environment variable**. Every other credential
+  is exported into PID 1 by the entrypoint; this one is read from the mounted
+  path by a git credential helper at the moment git asks. `smoke.sh` fails if a
+  `GITHUB_READONLY_PAT_FILE` ever appears on either service.
+- It is never in a URL, in `argv`, in `.git/config`, in the audit record, in any
+  message the plugin returns, or in the image. Asserted after every authenticated
+  operation and canary-tested offline in `sync-targets.sh --self-test`.
+- `bootstrap.sh` prefers the GitHub App and **will not fall back to the PAT if
+  minting fails** — a broken App stops the run rather than silently substituting
+  a longer-lived personal credential.
+- `cli` does not get it. Only the gateway carries the sync routes.
+
+What is **not** true: that this puts the token beyond a prompt-injected agent.
+Tool execution here is unsandboxed and runs as the same uid, so the file is
+readable by anything the agent can run. The containment that actually bounds the
+damage is GitHub's: read-only, one permission, only the selected repositories.
+The GitHub App remains the recommended mechanism for anything past this pilot,
+and moving the synchronizer into its own container is the fix — see the ledger.
 
 ## The Pretorin CLI trust root, and how this release changes it
 
@@ -147,13 +181,28 @@ What did **not** change: the seed is still pinned and still fails closed at buil
 time, the anchor is still vendored and reviewed in a diff (`vendor/README.md`),
 and the image is still unsigned with its digest as the integrity control.
 
-### The updater is an audited path, not a security boundary
+### The local plugins are audited paths, not security boundaries
 
-The CLI updater exposes exactly one fixed action by two routes. The command route
-(`/claw /pretorin-update`) bypasses the model entirely and cannot be reached by a
-prompt-injected agent. The tool route can be, deliberately, in this
-trusted-repository pilot; its blast radius is bounded to *which signed Pretorin
-version installs* — no command, path or URL is expressible through it.
+Two plugins expose one fixed action each, by two routes each. The command routes
+(`/claw /pretorin-update`, `/claw /target-sync`) bypass the model entirely and
+cannot be reached by a prompt-injected agent. The tool routes can be,
+deliberately, in this trusted-repository pilot, and each has a bounded blast
+radius:
+
+- `pretorin_update` — *which signed Pretorin version installs*. No command, path
+  or URL is expressible.
+- `target_sync` — *which already-declared target fast-forwards*. Only `all` or a
+  name present in the mounted `targets.yaml` is accepted; no URL, ref, path, flag
+  or shell fragment is expressible; nothing can add, remove, re-point or onboard
+  a target; and the operation itself is fast-forward-only, so it cannot reset,
+  discard local changes, switch branches or delete anything. A target that cannot
+  move safely is reported and left alone.
+
+The writable maintenance mount that synchronization needs is on the gateway
+service only, at a path distinct from the read-only assessment mount. **That is
+process-level separation inside one container, not a boundary** — the agent runs
+as the same uid and can reach it. What it buys is that the assessment path, which
+every evidence citation comes from, stays read-only.
 
 **Neither route is a boundary, and the docs must not imply otherwise.** Tool
 execution in this container is unsandboxed (see below), so an agent can already
@@ -178,7 +227,9 @@ ledger item 4.
   absent, but log access and export still require access control and redaction.
 - **A malicious or compromised review target.** Tool execution inside the
   container is **unsandboxed** (`sandbox` is off). See the boundary statement
-  below — this is the single most important limitation in this document.
+  below — this is the single most important limitation in this document. Since
+  target synchronization landed, this also means the read-only GitHub PAT and the
+  writable maintenance mount are both reachable by a prompt-injected agent.
 - **Any Slack channel member.** Everyone in the allowlisted channel has the same
   authority. There is no per-user policy and no attribution.
 - **A hostile operator.** Anyone who can edit `.env`, `targets.yaml` or the state
@@ -195,16 +246,19 @@ ledger item 4.
 
 OpenClaw's sandbox is **not enabled**. Tools that execute commands do so directly
 inside the container as `node` (uid 1000), with the target repositories mounted
-read-only and both state volumes writable.
+read-only for assessment, both state volumes writable, and — on the gateway — a
+writable maintenance alias of the target directory plus a mounted read-only
+GitHub PAT that target synchronization needs. Same uid, same container: the split
+between those paths is separation of *purpose*, not of *privilege*.
 
 > **Required hardening before onboarding third-party or untrusted repositories:**
 > trim the tool surface, evaluate and enable OpenClaw's sandbox, and move secrets
 > out of the environment. Until all three are done, only review repositories your
 > organisation already trusts.
 
-Phase 5 does part of the first item: `plugins.allow: ["slack"]` is an exclusive
-allowlist, so the runtime activates one plugin instead of eight and the `browser`
-plugin in particular is not loaded. That reduces the surface; it does not create a
+Phase 5 does part of the first item: `plugins.allow` is an exclusive allowlist, so
+on a Slack deployment the runtime activates the three local/Slack plugins instead
+of eight bundled ones and the `browser` plugin in particular is not loaded. That reduces the surface; it does not create a
 boundary. Sandbox enablement is future work, not a documented posture that can be
 substituted for it.
 
@@ -236,6 +290,22 @@ Ordered roughly by how much it matters, not by effort.
    file is the narrow fix; enabling the sandbox is the broad one. **Required
    before production** — the provenance workflow in `AGENTS.md` currently depends
    on `git`, so neither can simply be switched on without replacing that path.
+
+   Target synchronization widens the same gap again, and in two specific ways
+   worth naming rather than folding into the sentence above: the gateway now has
+   a **writable** alias of the target directory, and a **mounted git credential**.
+   Both are reachable by anything the agent can execute. The narrow fix is the
+   same allowlist; the real fix is item 4b.
+
+4b. **Move the synchronizer out of the agent's container.** Today the wrapper, the
+   writable maintenance mount and the PAT all live in the gateway container as the
+   same uid as unsandboxed tool execution, so the read-only assessment mount is a
+   separation of purpose rather than of privilege. A sidecar with its own uid —
+   holding the credential and the writable mount, reached over a socket that
+   accepts only `all` or a declared target name — is what would make it a boundary.
+   Deliberately out of scope for the internal pilot; **required before a customer
+   deployment with private repositories.**
+
 5. **Fail-closed runtime-pin validation.** The `models.providers.openai.
    agentRuntime` pin is currently observable only as a log line the smoke test
    greps. If it silently regressed, agent turns would route through the Codex

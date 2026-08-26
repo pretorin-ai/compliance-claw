@@ -6,6 +6,13 @@
 #   scripts/init-file-secrets.sh --from-env  # copy existing secret values from .env
 #
 # Existing destination files are never overwritten. Values are never printed.
+#
+# RUN IT AGAIN AFTER AN UPGRADE THAT ADDS A SECRET. compose.secrets.yaml resolves
+# every secret source at `up` time, so a file this script has not created yet
+# fails the whole command. Creating the file empty is what makes a deployment
+# that does not use a given credential keep working — an empty file means "not
+# configured", not "configured as the empty string". scripts/update.sh checks
+# this before it stops anything, and scripts/bootstrap.sh just runs this script.
 # This is a LOCAL migration helper; Azure will populate the same filenames under
 # /run/compliance-claw-secrets using the VM's managed identity.
 set -euo pipefail
@@ -88,6 +95,7 @@ SLACK_APP_TOKEN|slack-app-token
 SLACK_BOT_TOKEN|slack-bot-token
 OPENAI_API_KEY|openai-api-key
 ANTHROPIC_API_KEY|anthropic-api-key
+GITHUB_READONLY_PAT|github-readonly-pat
 EOF
 
 log "ready. Use:"

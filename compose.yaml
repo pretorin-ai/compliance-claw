@@ -44,6 +44,41 @@ name: compliance-claw
 # publishes a port. The anchor is what keeps them from drifting apart — a `cli`
 # whose mounts differ from the gateway's would debug a different container than
 # the one that runs.
+# EVERY SHARED MOUNT, DEFINED EXACTLY ONCE.
+#
+# These exist as individual anchors because a service that needs the shared set
+# PLUS one more has to restate the whole list — YAML merge keys replace a
+# `volumes:` list, they do not append to it. Anchoring each entry means the
+# restatement below references these definitions instead of copying them, so
+# `openclaw` and `cli` cannot drift apart even though only one of them can use
+# the list wholesale.
+x-mounts:
+  # Named volume, not a bind: auth, gateway and MCP state live here and must
+  # survive `docker compose down`. `down -v` is what deletes it.
+  openclaw-state: &vol-openclaw-state "openclaw-state:/home/node/.openclaw"
+  # Pretorin's own state — active context, preflight source resolvers, active
+  # recipe set — which lives OUTSIDE ~/.openclaw. It needs its own volume, and
+  # it must be mounted on BOTH services: scripts/onboard-targets.sh writes it
+  # from a one-off `run --rm cli` container, and the gateway's per-session
+  # `pretorin mcp-serve` children are what read it back. Without this, every
+  # onboarding run would evaporate with the container that performed it.
+  pretorin-state: &vol-pretorin-state "pretorin-state:/home/node/.pretorin"
+  # The PARENT of every review target, mounted read-only — the agent reviews
+  # code, it never edits it. No repo is named here or in the image: targets.yaml
+  # declares them and scripts/bootstrap.sh clones them into this directory.
+  #
+  # THIS MOUNT STAYS READ-ONLY, ON BOTH SERVICES. Target synchronization needs a
+  # writable view of the same data and gets one on the gateway only, at a
+  # different path. Making THIS one writable instead would hand it to `cli` too
+  # and would make the assessment path itself writable, which is the property
+  # the agent's instructions depend on.
+  targets-ro: &vol-targets-ro "./workspace/targets:/workspace/targets:ro"
+
+x-shared-mounts: &shared-mounts
+  - *vol-openclaw-state
+  - *vol-pretorin-state
+  - *vol-targets-ro
+
 x-compliance-claw: &compliance-claw
   # Upstream publishes no linux/arm64 Pretorin binary, so amd64 is the
   # deployment target even on Apple Silicon (emulated). This belongs to the
@@ -75,25 +110,49 @@ x-compliance-claw: &compliance-claw
     # writes it, and `cli` commands still work without one.
     - path: .env
       required: false
-  volumes:
-    # Named volume, not a bind: auth, gateway and MCP state live here and must
-    # survive `docker compose down`. `down -v` is what deletes it.
-    - openclaw-state:/home/node/.openclaw
-    # Pretorin's own state — active context, preflight source resolvers, active
-    # recipe set — which lives OUTSIDE ~/.openclaw. It needs its own volume, and
-    # it must be mounted on BOTH services: scripts/onboard-targets.sh writes it
-    # from a one-off `run --rm cli` container, and the gateway's per-session
-    # `pretorin mcp-serve` children are what read it back. Without this, every
-    # onboarding run would evaporate with the container that performed it.
-    - pretorin-state:/home/node/.pretorin
-    # The PARENT of every review target, mounted read-only — the agent reviews
-    # code, it never edits it. No repo is named here or in the image: targets.yaml
-    # declares them and scripts/bootstrap.sh clones them into this directory.
-    - ./workspace/targets:/workspace/targets:ro
+  volumes: *shared-mounts
 
 services:
   openclaw:
     <<: *compliance-claw
+
+    # RESTATED, NOT MERGED — and that is a property of YAML, not a style choice.
+    # A `volumes:` key on the service REPLACES the one the merge key brought in;
+    # it does not append to it. Writing only the two extra mounts here silently
+    # dropped the state volumes and the read-only target mount, and the gateway
+    # came up with neither. So every shared mount is a named scalar anchor
+    # defined exactly once above, referenced by both services: the list is
+    # restated, but no mount is ever DEFINED twice, so the two cannot drift.
+    volumes:
+      - *vol-openclaw-state
+      - *vol-pretorin-state
+      - *vol-targets-ro
+      # THE MAINTENANCE ALIAS. The same host directory as /workspace/targets,
+      # mounted writable at a different path, for scripts/sync-targets.sh — git
+      # has to be able to move refs and update the working tree, which is exactly
+      # what the assessment mount must never allow. Gateway only: `cli` is a
+      # one-off command runner and has no business writing to a review target.
+      #
+      # SAY WHAT THIS IS AND IS NOT. It is process-level separation inside ONE
+      # container: the wrapper runs as `node`, and so does the agent's
+      # unsandboxed tool execution, so a prompt-injected agent can reach this
+      # path directly. It is NOT a security boundary, and SECURITY.md says so.
+      # What it does buy is that the ordinary assessment path — the one the agent
+      # is told to use, and the one every evidence citation comes from — stays
+      # read-only, so an accidental write fails instead of silently succeeding.
+      # A real boundary is a separate container with its own uid; that is
+      # deliberately out of scope for the pilot.
+      - ./workspace/targets:/var/lib/compliance-claw/targets:rw
+      # The declaration of WHICH repositories exist, read-only. The wrapper
+      # refuses any name that is not in this file, so this file is the whole of
+      # what a Slack request can address.
+      #
+      # /etc/, deliberately NOT /opt/compliance-claw/: the `pretorin mcp-serve`
+      # child runs with cwd /opt/compliance-claw/no-repo and Pretorin derives
+      # host-local source resolvers from the current directory, so nothing
+      # repository-shaped or target-shaped may appear in that tree.
+      - ./targets.yaml:/etc/compliance-claw/targets.yaml:ro
+
     ports:
       # Never "18789:18789" — a bare port publishes on 0.0.0.0 and exposes the
       # gateway to the whole LAN. The 127.0.0.1 prefix is the security control.
@@ -101,6 +160,10 @@ services:
 
   cli:
     <<: *compliance-claw
+    # No `volumes:` key, so the anchor's shared list applies unchanged: the three
+    # mounts above and nothing else. In particular NOT the writable maintenance
+    # alias and NOT targets.yaml — a one-off command runner needs neither.
+    #
     # Run-only: the profile keeps `up` from starting a second gateway.
     profiles: ["cli"]
 

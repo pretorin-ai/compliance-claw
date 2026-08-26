@@ -69,6 +69,7 @@ points here rather than restating it, so the two cannot drift.
 | `slack-bot-token` | `SLACK_BOT_TOKEN` | only for Slack | `openclaw`, `cli` |
 | `openai-api-key` | `OPENAI_API_KEY` | **exactly one** model key | `openclaw` only |
 | `anthropic-api-key` | `ANTHROPIC_API_KEY` | **exactly one** model key | `openclaw` only |
+| `github-readonly-pat` | *(none — see below)* | only to sync a **private** target from Slack | `openclaw` only |
 
 `SLACK_CHANNEL_ID` is the third Slack value and is **not** a secret — it stays in
 `.env`, along with the host-side GitHub App identifiers and private-key path,
@@ -82,10 +83,47 @@ token is the one that fails closed.
 One workflow, different reach. A service receives a credential only if it needs
 it, and the two exclusions are the interesting part:
 
+### `github-readonly-pat` is the one secret with no environment variable
+
+Every other row above is read by the entrypoint and **exported into PID 1's
+environment**, because OpenClaw and the Pretorin MCP child consume environment
+variables — which means the agent's tool execution inherits them.
+
+The PAT is not. It is consumed by a git credential helper that reads the mounted
+path at the moment git asks, so it never has to become an environment variable,
+and it is deliberately absent from the entrypoint's `load_secret_file` list.
+There is no `GITHUB_READONLY_PAT_FILE`; `scripts/smoke.sh` fails if one appears.
+
+**Be honest about what that buys.** It keeps the token out of `docker inspect`,
+out of every child process's environment, and out of anything that dumps `env`.
+It does **not** put it out of reach of a prompt-injected agent: tool execution in
+this container is unsandboxed and runs as the same uid, so the file is readable.
+The real containment is on GitHub's side — make it fine-grained, limited to the
+selected repositories, with **Contents: Read-only** and nothing else. The GitHub
+App remains the recommended mechanism for anything past the internal pilot.
+
+Leave the file **empty** if you have no private targets. Empty means "no
+credential"; a private target then reports `auth_failed` and names both fixes.
+
+### Upgrading a deployment that predates a secret
+
+Compose resolves every secret source when the container is created, and a
+missing file is a hard failure — `bind source path does not exist`, container
+never created — not a warning. So after pulling a release that adds one:
+
+```sh
+scripts/init-file-secrets.sh      # write-if-absent; never overwrites a value
+```
+
+`scripts/bootstrap.sh` already does this, and `scripts/update.sh` does it after
+the fast-forward and **before it stops anything**, so an upgrade cannot turn into
+an outage over a credential the deployment does not even use.
+
 | Excluded from `cli` | Why |
 | --- | --- |
 | model API keys | agent turns run only in the gateway. Handing a one-off container a provider credential gives it spend authority it has no use for. |
 | `openclaw-gateway-token` | the entrypoint requires it only for gateway invocations, and `cli` is one-off by Compose profile. Without it, `cli` cannot start a second gateway against the same volumes. |
+| `github-readonly-pat` | only the gateway carries the target-sync routes, and only the gateway has the writable maintenance mount. A git credential in a container with nothing to use it on is pure exposure. |
 
 If a `cli` invocation ever genuinely needs the gateway token, the entrypoint
 refuses with a message naming the file to mount, rather than failing somewhere
@@ -153,27 +191,39 @@ docker compose exec -T openclaw sh -c 'tr "\0" "\n" < /proc/1/environ | grep OPE
 Reading it any other way is how an earlier round of this work "observed" an empty
 adapter and went looking for a bug that was not there.
 
-## Azure mapping
+## Azure pilot mapping
 
-On the Azure VM, a root-owned startup service will authenticate to Key Vault
-with the VM's managed identity and create the same filenames under:
+The current internal pilot does **not** implement Key Vault synchronization.
+Create the same files on the VM's persistent disk, restrict the parent directory
+to the operator, and point Compose at it. For example:
 
 ```text
-/run/compliance-claw-secrets/
+/opt/compliance-claw-secrets/
 ```
 
-The directory is RAM-backed and recreated after every boot. Start with:
+Start with:
 
 ```sh
 export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
-export COMPLIANCE_CLAW_SECRET_DIR=/run/compliance-claw-secrets
+export COMPLIANCE_CLAW_SECRET_DIR=/opt/compliance-claw-secrets
 docker compose up -d
 ```
 
 The host files must be readable by the image's `node` user (UID/GID 1000) and
-must not be readable by other host users. The Azure sync service should create
-the directory as `0700` and each file as `0400`, owned by `1000:1000`. Anyone
-with root or Docker-daemon access remains inside the workload trust boundary.
+must not be readable by other host users. Create the directory as `0700` and
+each file as `0400`, owned by `1000:1000`. Anyone with root or Docker-daemon
+access remains inside the workload trust boundary. Do not put these files under
+`/run` for the pilot: `/run` is recreated at boot and there is currently no
+service that repopulates it.
+
+A production deployment may later use the VM's managed identity and Azure Key
+Vault to recreate the same filenames under `/run/compliance-claw-secrets/` before
+Compose starts. That automation is planned, not shipped by this repository.
+
+This repository also does not yet install a system service that restarts Compose
+after a VM reboot. For the pilot, re-export the two variables above and run
+`docker compose up -d` after reboot. Automatic boot recovery belongs in the
+deployment-hardening work, alongside Key Vault integration.
 
 The GitHub App private key is intentionally different: it stays host-only and is
 used by `scripts/bootstrap.sh` to clone private targets. It is never declared as
@@ -187,6 +237,7 @@ Update the backing files atomically, then restart the gateway:
 docker compose restart openclaw
 ```
 
-Azure will replace the local files from the latest Key Vault secret versions
-before this restart. File changes are not automatically re-read by an already
-running process.
+For the pilot, replace the persistent host files yourself. A future Key Vault
+sync service would replace them from the latest secret versions before this
+restart. File changes are not automatically re-read by an already running
+process.
