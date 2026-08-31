@@ -123,6 +123,40 @@ jobs:
       - name: Target sync rules and outcomes (offline, no credentials)
         run: bash scripts/sync-targets.sh --self-test
 
+      # Same reasoning and same position as the two gates above: no credentials,
+      # no gateway, no network, no containers. The effort schema turns operator
+      # text into directory names, container paths, credential file paths and
+      # process environment, so its rejection table is the first thing that
+      # should speak when it breaks.
+      - name: Effort schema, injection rules and the credential ladder (offline)
+        run: python3 scripts/parse-efforts.py --self-test
+
+      # The committed example must stay valid and credential-free, for the same
+      # two readers the targets.yaml guard above exists for: a fresh clone with
+      # nothing but a Pretorin key, and CI, which holds none.
+      - name: Assert the committed efforts.example.yaml is valid and credential-free
+        run: |
+          set -euo pipefail
+          python3 scripts/parse-efforts.py validate efforts.example.yaml
+          for e in $(python3 scripts/parse-efforts.py efforts efforts.example.yaml); do
+            if python3 scripts/parse-efforts.py list "$e" efforts.example.yaml \
+                 | cut -f3 | grep -qx true; then
+              echo "::error::efforts.example.yaml declares a private target. The"
+              echo "::error::committed example must need no credential at all."
+              exit 1
+            fi
+          done
+          echo "efforts.example.yaml is valid and credential-free, as required."
+
+      # Drives the REAL clawctl against a stub `docker` that records argv, so
+      # this asserts what clawctl WOULD run rather than what it says it would:
+      # migrate correctness and idempotence, `plan` starting zero containers and
+      # changing zero bytes, the scope pin and named credential on every Pretorin
+      # invocation, `context set` on none of them, and each echoed line
+      # byte-identical to the argv issued.
+      - name: clawctl behaviour (offline, stub docker, no credentials)
+        run: bash scripts/clawctl --self-test
+
       - name: Smoke test (no-credential section only)
         run: bash scripts/smoke.sh --no-creds
 
@@ -134,6 +168,18 @@ jobs:
       # own gate. It uses fake canary values only and needs no credentials.
       - name: File-secret contract (runtime behaviour)
         run: bash scripts/test-file-secrets.sh compliance-claw:local
+
+      # THE HALF THE SCHEMA SELF-TEST CANNOT SEE. parse-efforts.py proves the
+      # credential LADDER resolves the right path; only a running container can
+      # prove the value actually reaches the MCP child, that it stays out of
+      # `docker inspect` and out of argv, and — the one that matters most — that
+      # a missing, empty or unresolvable credential FAILS CLOSED instead of
+      # falling through to the container-wide default key. A launcher that fell
+      # through would run one effort's agent on another effort's credential,
+      # writing to the wrong compliance scope with a perfectly valid key.
+      # Canary values only; no credentials.
+      - name: Per-effort credential containment (runtime behaviour)
+        run: bash scripts/test-effort-credentials.sh compliance-claw:local
 
       # THE INTERACTION NEITHER OF THE GATES ABOVE CAN SEE. test-file-secrets.sh
       # points bootstrap at an unreachable target, so it dies at the clone and

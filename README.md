@@ -450,6 +450,38 @@ before enabling it.
 fall back to the PAT if minting fails** — a broken App stops the run rather than
 silently substituting a longer-lived credential.
 
+## Multiple compliance efforts
+
+`targets.yaml` describes **one** system and framework. One deployment can serve
+several — an **effort** is one system + one framework, with its own targets and
+its own named Pretorin credential. That pairing is Pretorin's own: preflight state
+and the active recipe set are keyed on system + framework, so the same system
+under SOC 2 and under HIPAA is two separate compliance efforts.
+
+Efforts are declared in `efforts.yaml` and driven by one command:
+
+```sh
+scripts/clawctl migrate --name crm-soc2   # convert targets.yaml; it is NOT modified
+scripts/clawctl credential add hipaa-key  # a per-effort key file, correct mode
+scripts/clawctl validate                  # every effort, one table, one run
+scripts/clawctl plan                      # the exact commands; starts no containers
+scripts/clawctl apply                     # onboard each effort, scope-pinned
+```
+
+`credential_ref` is a **name**, never a token, so `efforts.yaml` holds no secret.
+`default` resolves to the key this deployment already has, so migrating creates no
+new secret file.
+
+**`targets.yaml` is still what the running deployment reads.** This release adds
+the format, the control command and the per-effort credential mechanism; a later
+one makes `efforts.yaml` authoritative and generates an agent and a Slack channel
+per effort.
+
+Full guide, including how to add a second effort, what you choose when you mint
+each token, and the one-key-or-many trade-off:
+**[docs/efforts.md](docs/efforts.md)**. The design and its measured evidence:
+[docs/plans/effort-config.md](docs/plans/effort-config.md).
+
 ## Keeping targets up to date
 
 Targets do not move on their own. Three ways to advance them, all running the

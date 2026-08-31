@@ -1,0 +1,73 @@
+# compose.efforts.yaml — multi-effort overlay.
+#
+#   export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
+#
+# `scripts/clawctl` APPENDS THIS FILE FOR YOU when it is missing from
+# COMPOSE_FILE, and prints the effective line so you can persist it. That is safe
+# precisely because this overlay only ADDS MOUNTS: it defines no service
+# behaviour, overrides nothing, and cannot remove anything. The other overlay
+# clawctl needs — compose.secrets.yaml — is a real fork in how credentials are
+# delivered, so that one is a refusal rather than a fix-up.
+#
+# WHAT IT ADDS, AND WHY EACH IS NEEDED.
+#
+#   /etc/compliance-claw/efforts.yaml
+#       The effort declarations, read-only. scripts/pretorin-mcp-launch reads
+#       this to derive an effort's system, framework and credential NAME. It sits
+#       beside targets.yaml, which the gateway already mounts the same way for
+#       /target-sync, and for the same reason: the declaration of what exists is
+#       the whole of what a request can address.
+#
+#       /etc/, deliberately NOT /opt/compliance-claw/: the `pretorin mcp-serve`
+#       child runs with cwd /opt/compliance-claw/no-repo and Pretorin derives
+#       host-local source resolvers from the current directory, so nothing
+#       repository-shaped or target-shaped may appear in that tree.
+#
+#   /run/compliance-claw/credentials
+#       The per-effort named credentials, read-only. ONE DIRECTORY MOUNT, N
+#       CREDENTIALS, selected per process — not one Compose secret per
+#       credential, which would mean generating a compose file every time an
+#       operator adds an effort.
+#
+#       The `default` credential is deliberately NOT in here. It resolves to
+#       /run/secrets/pretorin_api_key, which compose.secrets.yaml already mounts,
+#       so a deployment migrating from single-effort needs no new secret file at
+#       all. scripts/parse-efforts.py owns that mapping; nothing else knows it.
+#
+# BOTH DIRECTORIES MUST EXIST ON THE HOST BEFORE `up`. Compose resolves every
+# bind source at `up` time and a missing one fails the whole command — the same
+# failure class as a missing file secret. `scripts/clawctl` creates
+# secrets/runtime/pretorin (mode 0700) before it runs any compose command, and
+# refuses with a named fix when efforts.yaml is absent, pointing at
+# `scripts/clawctl migrate`.
+#
+# VOLUME LISTS MERGE ACROSS COMPOSE FILES, keyed on the container path — which is
+# NOT how a YAML merge key behaves inside a single file. compose.yaml carries a
+# long comment about that difference, because writing only the extra mounts on a
+# service there silently dropped both state volumes. Here, across files, the base
+# mounts survive and these are added. scripts/smoke.sh asserts it with
+# `docker compose config` rather than trusting it.
+#
+# WHY BOTH SERVICES. `cli` runs the one-off commands `clawctl` issues, so it needs
+# the credentials to authenticate as the right effort. `openclaw` runs the
+# per-session `pretorin mcp-serve` children that a later release will launch
+# through pretorin-mcp-launch, so it needs the same two mounts. A mount present
+# on only one of them is the drift the anchors in compose.yaml exist to prevent.
+
+x-effort-mounts: &effort-mounts
+  # The effort declarations. Read-only: nothing in a container may edit them.
+  - "./efforts.yaml:/etc/compliance-claw/efforts.yaml:ro"
+  # Named per-effort Pretorin credentials. Read-only, and note this is the
+  # DIRECTORY: which file a process reads is decided at spawn time from the
+  # effort's credential_ref, not by the mount.
+  - "${COMPLIANCE_CLAW_SECRET_DIR:-./secrets/runtime}/pretorin:/run/compliance-claw/credentials:ro"
+
+services:
+  openclaw:
+    volumes: *effort-mounts
+
+  cli:
+    volumes: *effort-mounts
+    # Restated for readability; the profile is what keeps `up` from starting a
+    # second gateway.
+    profiles: ["cli"]
