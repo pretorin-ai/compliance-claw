@@ -28,10 +28,11 @@ efforts:
   # all. `default` is a RESERVED name: a file at secrets/runtime/pretorin/default
   # would shadow the real one, so it is refused.
   - name: crm-soc2
-    # The UUID or the system name. `docker compose run --rm cli pretorin --json
-    # context list` shows what your key can see. It becomes an argv element and a
-    # container environment value, so it is restricted to [A-Za-z0-9._-]; if your
-    # system NAME contains anything else, use the UUID.
+    # THE CANONICAL SYSTEM UUID, never a friendly name. Pretorin resolves a
+    # write's target to a UUID before comparing it against the pinned scope, and
+    # the comparison is literal — so a name here refuses writes to the very system
+    # it names. Find yours with:
+    #   docker compose run --rm cli pretorin --json context list
     system_id: 00000000-0000-0000-0000-000000000000
     framework_id: soc2
     credential_ref: default
@@ -45,11 +46,6 @@ efforts:
         url: https://github.com/pretorin-ai/simple-crm.git
         ref: main
 
-    # RESERVED for Pretorin Connected Sources (Azure, AWS). Validated as
-    # present-but-empty and consumed by nothing yet. Declared now so the shape is
-    # fixed before it carries meaning; putting anything under it is refused today,
-    # on purpose.
-    connections: []
 
   # ---------------------------------------------------------------------------
   # Effort two: THE SAME SYSTEM under a different framework. This is the case the
@@ -85,4 +81,3 @@ efforts:
       - name: simple-crm
         url: https://github.com/pretorin-ai/simple-crm.git
         ref: main
-    connections: []

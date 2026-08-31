@@ -74,7 +74,11 @@ die()  { printf 'clawctl: ERROR — %s\n' "$*" >&2; exit 1; }
 # operator's other overlays, and the deployment ended up with Slack credentials
 # and no Slack, permanently. COMPOSE_PATH_SEPARATOR is compose's own knob for
 # this; honour it rather than hardcoding a colon.
+# check_only=1 reports without changing anything: no COMPOSE_FILE rewrite, no
+# mkdir, no container. `plan` uses it so it cannot report success for a
+# configuration `apply` would reject on its first line.
 ensure_compose_stack() {
+  local check_only="${1:-0}"
   local sep="${COMPOSE_PATH_SEPARATOR:-:}"
   local current="${COMPOSE_FILE:-compose.yaml}"
 
@@ -94,6 +98,11 @@ ensure_compose_stack() {
     *"${sep}compose.efforts.yaml${sep}"*)
       COMPOSE_FILE="$current" ;;
     *)
+      if [ "$check_only" = 1 ]; then
+        log "COMPOSE_FILE does not select compose.efforts.yaml; 'apply' would append it."
+        log "    export COMPOSE_FILE=${current}${sep}compose.efforts.yaml"
+        return 0
+      fi
       COMPOSE_FILE="${current}${sep}compose.efforts.yaml"
       log "COMPOSE_FILE did not select compose.efforts.yaml; appending it."
       log "  That overlay only ADDS two read-only mounts, so appending cannot drop"
@@ -301,21 +310,29 @@ cmd_migrate() {
   local system framework
   IFS=$'\t' read -r system framework < <(python3 "$PARSE_TARGETS" scope "$TARGETS_FILE")
 
-  # THE NAME MATTERS MORE THAN IT LOOKS. In a later release this string becomes
-  # an agent identity and a Slack channel name, and a UUID in a channel name is
-  # permanent. So a name derived from a bare UUID is refused rather than
-  # generated.
+  # targets.yaml accepts a system NAME or a UUID; efforts.yaml takes the UUID
+  # only, because the CLI compares a write's resolved target against the pinned
+  # scope literally, so a name there refuses writes to its own system.
+  case "$system" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-????-????-????-????????????) ;;
+    *)
+      die "${TARGETS_FILE} names the system as '${system}', which is not a UUID.
+  efforts.yaml requires the canonical system UUID: Pretorin resolves a write's
+  target to a UUID before comparing it against the pinned scope, and the
+  comparison is literal, so a name refuses writes to the very system it names.
+  Nothing was written. Find the UUID and put it in ${TARGETS_FILE} first:
+    docker compose run --rm cli pretorin --json context list" ;;
+  esac
+
+  # The effort name is a stable identifier for the effort and its agent. A UUID
+  # makes an unreadable one, and system_id is always a UUID here, so it is asked
+  # for rather than derived.
   local name="$want_name"
   if [ -z "$name" ]; then
-    case "$system" in
-      [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*-*-*-*)
-        die "your system_id is a UUID (${system}), so an auto-generated effort name
-  would be '${system}-${framework}'. That string becomes an agent identity and a
-  Slack channel name in a later release, where a UUID is permanent and unreadable.
-  Nothing was written. Choose a short name:
-    scripts/clawctl migrate --name crm-${framework}" ;;
-      *) name="${system}-${framework}" ;;
-    esac
+    die "an effort name is required: system_id is a UUID, so a derived name would be
+  '${system}-${framework}' — unreadable, and it becomes the stable identifier for
+  this effort and its agent. Nothing was written. Choose a short name:
+    scripts/clawctl migrate --name crm-${framework}"
   fi
   python3 - "$name" <<'PY' || die "effort name '$name' is not usable (see the message above)."
 import sys, os, importlib.util
@@ -340,6 +357,8 @@ PY
 # active recipe set on that pair, so the same system under two frameworks is two
 # separate compliance efforts, each with its own targets and its own credential.
 #
+# \`system_id\` is the canonical system UUID, never a friendly name.
+#
 # \`credential_ref\` is a NAME, never a token and never a path to one. This file is
 # safe to commit. \`default\` resolves to the credential this deployment already
 # had, secrets/runtime/pretorin-api-key. Add a new one with:
@@ -363,13 +382,6 @@ HDR
       [ -n "$tref" ] && printf '        ref: %s\n' "$tref"
       [ "$tprivate" = "true" ] && printf '        private: true\n'
     done < <(python3 "$PARSE_TARGETS" list "$TARGETS_FILE")
-    cat <<'FTR'
-    # RESERVED for Pretorin Connected Sources (Azure, AWS). Declared and
-    # validated as present-but-empty; nothing consumes it yet. Putting anything
-    # under it is refused today, on purpose, so the shape is fixed before it
-    # carries meaning.
-    connections: []
-FTR
   } > "$tmp"
 
   # Validate what was generated BEFORE putting it in place. A migrate that emits
@@ -572,7 +584,7 @@ cmd_validate() {
 # Measured on CLI 0.28.7 — docs/plans/effort-config.md, finding F1.
 PROBE_DETAIL=""
 probe_effort() {
-  local effort="$1" system="$2" framework="$3" out got_sys got_fw
+  local effort="$1" system="$2" framework="$3" out got_sys got_fw attached
   PROBE_DETAIL=""
 
   if ! out="$(docker compose run --rm -T -e MCP_CALL_COMMAND="${LAUNCHER} ${effort}" \
@@ -603,6 +615,12 @@ print("%s %s" % ((d.get("active_system") or {}).get("id", "-"),
     return 1
   fi
 
+  # The scoped platform read. get_compliance_status IGNORES framework_id entirely
+  # — measured on 0.28.7, a nonsense framework returns the identical system-wide
+  # payload — so it proves the SYSTEM only. What it does carry is the system's
+  # ATTACHED frameworks, which is the pair check: the declared framework must be
+  # in that list. A framework that merely EXISTS is not enough; this key can see
+  # seven, of which two are attached to this system.
   if ! out="$(docker compose run --rm -T -e MCP_CALL_COMMAND="${LAUNCHER} ${effort}" \
                cli python3 "$MCP_CALL" get_compliance_status "{\"system_id\":\"${system}\"}" < /dev/null 2>&1)"; then
     # THE PERMISSION MESSAGE. Never infer, report or modify what the key can do —
@@ -618,6 +636,29 @@ print("%s %s" % ((d.get("active_system") or {}).get("id", "-"),
       them."
     return 1
   fi
+
+  # THE PAIR CHECK. Without it, `validate` is green for a framework that is not
+  # attached to this system — and every later command would run against a scope
+  # the platform does not have.
+  attached="$(printf '%s' "$out" | python3 -c '
+import json, sys
+raw = sys.stdin.read(); start = raw.find("{")
+try:
+    d = json.loads(raw[start:]) if start >= 0 else {}
+except ValueError:
+    d = {}
+print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))' 2>/dev/null || true)"
+
+  case " ${attached} " in
+    *" ${framework} "*) ;;
+    *)
+      PROBE_DETAIL="    ${effort}: system ${system} is reachable, but framework
+      '${framework}' is NOT attached to it.
+      attached here: ${attached:-<none reported>}
+      A framework that merely exists is not enough — it has to be on THIS system.
+      Attach it in Pretorin, or correct framework_id in ${EFFORTS_FILE}."
+      return 1 ;;
+  esac
   return 0
 }
 
@@ -661,7 +702,18 @@ run_efforts() {
     scripts/clawctl migrate"
   python3 "$PARSE_EFFORTS" validate "$EFFORTS_FILE" || exit 2
 
-  if [ "$dry" = 0 ]; then
+  if [ "$dry" = 1 ]; then
+    # SAME prerequisite checks as apply, none of the effects. The legacy-path
+    # refusal is identical; the overlay is reported rather than appended; the
+    # credential directory is reported rather than created. The one apply check
+    # that CANNOT run here is the launcher-in-image probe, because it needs a
+    # container — noted in the closing line rather than silently skipped.
+    ensure_compose_stack 1
+    [ -f "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} not found.
+  Convert your existing single-effort configuration with:
+    scripts/clawctl migrate"
+    [ -d "$CREDENTIAL_DIR" ] || log "note: ${CREDENTIAL_DIR} does not exist yet; 'apply' would create it."
+  else
     ensure_compose_stack
     ensure_mount_sources
     require_launcher_in_image
@@ -752,6 +804,8 @@ run_efforts() {
     printf '\n'
     log "plan only: no container was started, no network call was made, and no"
     log "  credential value was read. Every line above is the command 'apply' runs."
+    log "  Not checked here (it needs a container): that the running image contains"
+    log "  ${LAUNCHER}. 'apply' and 'validate' check it."
   fi
   return "$rc"
 }

@@ -12,8 +12,9 @@ declares them; `scripts/clawctl` validates, migrates and applies them.
 
 > **Status.** `targets.yaml` is still what the running deployment reads. This
 > release adds the format, the control command and the credential mechanism, and
-> proves them. A later release makes `efforts.yaml` authoritative and generates
-> one agent and one Slack channel per effort.
+> proves them. A later release makes `efforts.yaml` authoritative and gives each
+> effort its own agent, bound to an existing Slack channel by ID. **No Slack
+> configuration is added by this release.**
 
 ---
 
@@ -37,18 +38,21 @@ efforts:
       - name: simple-crm
         url: https://github.com/pretorin-ai/simple-crm.git
         ref: main
-    connections: []
 
   - name: crm-hipaa                                  # NEW
-    system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411  # the same system
+    system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411  # the same system, by UUID
     framework_id: hipaa                              # a different framework
     credential_ref: hipaa-key                        # its own credential
     targets:
       - name: simple-crm                             # the SAME repository
         url: https://github.com/pretorin-ai/simple-crm.git
         ref: main
-    connections: []
 ```
+
+`system_id` is the **canonical UUID**, never a friendly system name. Pretorin
+resolves a write's target to a UUID before comparing it against the pinned scope,
+and that comparison is literal — so a name refuses writes to the system it names.
+`docker compose run --rm cli pretorin --json context list` shows yours.
 
 `simple-crm` appears in both, and that is intended. Target names are a **global
 namespace**: every target is cloned once to `workspace/targets/<name>`, and
@@ -105,7 +109,10 @@ because probing a credential the container cannot read produces a misleading
 error.
 
 The probe runs through the real chain: the mounted credential directory, the
-launcher, the credential ladder, the scope pin, and a scoped platform read.
+launcher, the credential ladder, the scope pin, and a scoped platform read. It
+confirms the **pair**, not just the system: the declared framework must be one of
+the frameworks actually attached to that system. A framework that merely exists is
+not enough, and the failure names which ones are attached.
 
 ### 4. Preview, then apply
 
@@ -195,10 +202,9 @@ running deployment reads. Every target carries over verbatim — name, url, ref 
 the `private` flag. The scope becomes effort #1, and its `credential_ref` is
 `default`, so **no secret is copied and no new file is created**.
 
-**Why `--name` is required when your `system_id` is a UUID.** The effort name
-becomes an agent identity and a Slack channel name in a later release, where a
-UUID is permanent and unreadable. `migrate` refuses to generate one rather than
-leave you with `13c1f44e-…-soc2` in a channel list.
+**Why `--name` is required.** `system_id` is always a UUID, so a derived name
+would be `13c1f44e-…-soc2`. That string is the stable identifier for this effort
+and its agent, so `migrate` asks for a readable one rather than generating that.
 
 **It runs once.** A second `migrate` refuses cleanly rather than overwriting your
 edits, the same write-if-absent rule the rest of this deployment follows.
@@ -242,9 +248,3 @@ with the requesting user's permissions. There is no per-user authorization in th
 pilot. Keep an effort's channel membership to the people who should be able to act
 in that compliance scope.
 
-**`connections:` is reserved and inert.** It is validated as present-but-empty and
-consumed by nothing. It is the future home of Pretorin **Connected Sources** —
-Azure and AWS — which is how the capabilities a local workspace cannot satisfy
-(branch protection, pull-request records, code-review records) get supplied.
-Declaring the shape now means it is fixed before it carries meaning; putting
-anything under it is refused today, on purpose.

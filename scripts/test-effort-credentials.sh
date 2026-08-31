@@ -73,7 +73,6 @@ efforts:
     targets:
       - name: t
         url: https://example.com/t.git
-    connections: []
   - name: uses-default
     system_id: 22222222-2222-4222-8222-222222222222
     framework_id: soc2

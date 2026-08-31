@@ -32,10 +32,11 @@ st_head() { printf '\n%s\n' "$1"; }
 # A stub `docker` that records every invocation and answers the few questions
 # clawctl asks. Written to $1/docker; $2 is the record file.
 st_write_stub_docker() {
-  local dir="$1" record="$2" mode="${3:-answer}"
+  local dir="$1" record="$2" mode="${3:-answer}" root="${4:-}" efile="${5:-}"
   mkdir -p "$dir"
   cat > "${dir}/docker" <<STUB
 #!/usr/bin/env bash
+STUB_ATTACHED="\${STUB_ATTACHED:-}"
 # DRAIN STDIN, BECAUSE REAL \`docker compose run\` DOES.
 #
 # This is what makes the two-effort fixture meaningful. Compose attaches the
@@ -71,6 +72,33 @@ esac
 # the assert reports "onboarding has not run" rather than crashing the harness.
 case " \$* " in
   *" preflight show "*) echo '{"kinds":[]}'; exit 0 ;;
+esac
+# The two probe calls validate makes. check_context echoes whatever scope the
+# process was pinned to; get_compliance_status reports the system's ATTACHED
+# frameworks, which is what the pair check reads. STUB_ATTACHED controls it.
+case " \$* " in
+  *" check_context "*)
+    # The pins do NOT arrive as -e flags: the real launcher derives them from
+    # efforts.yaml. Stand in for it the same way, so the stub cannot report a
+    # scope the launcher would not have produced.
+    _effort=""
+    for a in "\$@"; do
+      case "\$a" in MCP_CALL_COMMAND=*) _effort="\${a##* }" ;; esac
+    done
+    _scope="\$(python3 '${root}/scripts/parse-efforts.py' scope "\$_effort" '${efile}' 2>/dev/null)"
+    _sys="\$(printf '%s' "\$_scope" | cut -f1)"
+    _fw="\$(printf '%s' "\$_scope" | cut -f2)"
+    printf '{"connected":true,"active_system":{"id":"%s","name":"Stub"},"active_framework_id":"%s"}\n' "\$_sys" "\$_fw"
+    exit 0 ;;
+  *" get_compliance_status "*)
+    printf '{"system_id":"x","system_name":"Stub","frameworks":['
+    _first=1
+    for f in \${STUB_ATTACHED:-soc2}; do
+      [ "\$_first" = 1 ] || printf ','
+      printf '{"framework_id":"%s"}' "\$f"; _first=0
+    done
+    printf ']}\n'
+    exit 0 ;;
 esac
 exit 0
 STUB
@@ -152,10 +180,10 @@ clawctl_self_test() {
     st_bad "every target carried over verbatim" "got: $got"
   fi
 
-  if grep -q 'connections: \[\]' "$E"; then
-    st_ok "the reserved connections section is emitted"
+  if grep -q 'connections' "$E"; then
+    st_bad "no reserved 'connections' section is emitted" "it belongs to a later change"
   else
-    st_bad "the reserved connections section is emitted"
+    st_ok "no reserved 'connections' section is emitted"
   fi
 
   # targets.yaml must be untouched: it is still what the deployment reads.
@@ -166,7 +194,7 @@ clawctl_self_test() {
   fi
 
   # Idempotence: a second migrate refuses, and does not rewrite.
-  local before after
+  local before after plan_out
   before="$(st_manifest "$tmp")"
   if TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
        bash "${root}/scripts/clawctl" migrate --name crm-soc2 >/dev/null 2>&1; then
@@ -181,15 +209,15 @@ clawctl_self_test() {
     st_bad "the refused migrate changed nothing on disk" "$(diff <(echo "$before") <(echo "$after") | head -5)"
   fi
 
-  # A UUID system_id with no --name must be refused, not auto-named.
+  # system_id is always a UUID, so a name must be asked for, never derived.
   rm -f "$E"
   if out="$(TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
               bash "${root}/scripts/clawctl" migrate 2>&1)"; then
-    st_bad "migrate refuses to auto-name from a bare UUID" "it generated a name"
+    st_bad "migrate refuses to derive an effort name" "it generated one"
   else
     case "$out" in
-      *"--name"*) st_ok "migrate refuses to auto-name from a UUID and names --name" ;;
-      *) st_bad "migrate refuses to auto-name from a UUID" "message did not mention --name" ;;
+      *"--name"*) st_ok "migrate refuses to derive a name and names --name" ;;
+      *) st_bad "migrate refuses to derive a name" "message did not mention --name" ;;
     esac
   fi
   [ -e "$E" ] && st_bad "the refused migrate wrote no file" || st_ok "the refused migrate wrote no file"
@@ -217,7 +245,6 @@ clawctl_self_test() {
         ref: main
       - name: other
         url: https://example.com/other.git
-    connections: []
 SECOND
   if python3 "${root}/scripts/parse-efforts.py" validate "$E" >/dev/null 2>&1; then
     st_ok "a second effort sharing IDENTICAL targets is accepted"
@@ -299,6 +326,7 @@ SECOND
   before="$(st_manifest "$tmp")"
   out="$(PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
            COMPLIANCE_CLAW_SECRET_DIR="$S" \
+           COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml \
            bash "${root}/scripts/clawctl" plan 2>&1 || true)"
   after="$(st_manifest "$tmp")"
 
@@ -316,6 +344,26 @@ SECOND
     *"docker compose run"*) st_ok "plan printed the commands apply would run" ;;
     *) st_bad "plan printed the commands apply would run" "$(printf '%s' "$out" | tail -3)" ;;
   esac
+  # PLAN RUNS APPLY'S PREREQUISITE CHECKS. Without this, plan reports success for
+  # a configuration apply rejects on its first line — a plan that lies.
+  plan_out="$(PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
+                COMPLIANCE_CLAW_SECRET_DIR="$S" COMPOSE_FILE=compose.yaml \
+                bash "${root}/scripts/clawctl" plan 2>&1 || true)"
+  case "$plan_out" in
+    *"not on the file-backed credential path"*)
+      st_ok "plan REFUSES the legacy compose path, exactly as apply does" ;;
+    *) st_bad "plan refuses the legacy compose path" "$(printf '%s' "$plan_out" | tail -3)" ;;
+  esac
+  # ...and still starts nothing while doing it.
+  rm -f "$record"; st_write_stub_docker "$bin" "$record" refuse
+  PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
+    COMPLIANCE_CLAW_SECRET_DIR="$S" \
+    COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml \
+    bash "${root}/scripts/clawctl" plan >/dev/null 2>&1 || true
+  [ ! -s "$record" ] \
+    && st_ok "plan's prerequisite checks start no container either" \
+    || st_bad "plan's prerequisite checks start no container" "$(head -2 "$record")"
+
   # EVERY effort, not just the first. See the two-effort fixture note above.
   if printf '%s' "$out" | grep -q 'effort crm-soc2' \
      && printf '%s' "$out" | grep -q 'effort crm-hipaa'; then
@@ -485,6 +533,41 @@ SECOND
       st_ok "the effective COMPOSE_FILE line is printed for the operator to persist" ;;
     *) st_bad "the effective COMPOSE_FILE line is printed" ;;
   esac
+
+  # -------------------------------------------------- validate: the pair check
+  st_head "6. validate confirms the system+framework PAIR"
+
+  rm -f "$record"
+  st_write_stub_docker "$bin" "$record" answer "$root" "$E"
+
+  # Both fixture efforts are framework f / hipaa. Report only 'f' as attached and
+  # the hipaa effort must FAIL — a framework that exists is not enough, it has to
+  # be attached to THIS system.
+  out="$( cd "$tmp" && PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
+            COMPLIANCE_CLAW_SECRET_DIR="$S" CC_TARGETS_DIR="${tmp}/workspace/targets" \
+            COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml \
+            STUB_ATTACHED="soc2" \
+            bash "${root}/scripts/clawctl" validate 2>&1 || true )"
+  case "$out" in
+    *"is NOT attached to it"*) st_ok "an UNATTACHED framework FAILS the probe" ;;
+    *) st_bad "an unattached framework fails the probe" "$(printf '%s' "$out" | tail -4)" ;;
+  esac
+  case "$out" in
+    *"attached here: soc2"*) st_ok "the failure names what IS attached" ;;
+    *) st_bad "the failure names what is attached" ;;
+  esac
+
+  # With both attached, both rows go green — the check is not simply always-fail.
+  out="$( cd "$tmp" && PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
+            COMPLIANCE_CLAW_SECRET_DIR="$S" CC_TARGETS_DIR="${tmp}/workspace/targets" \
+            COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml \
+            STUB_ATTACHED="soc2 hipaa" \
+            bash "${root}/scripts/clawctl" validate 2>&1 || true )"
+  if printf '%s' "$out" | grep -q 'all green'; then
+    st_ok "with both frameworks attached, every row is green"
+  else
+    st_bad "with both attached, every row is green" "$(printf '%s' "$out" | tail -4)"
+  fi
 
   # ------------------------------------------------------------------ done
   printf '\n'

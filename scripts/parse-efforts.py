@@ -49,13 +49,16 @@ The subset:
             url: <scalar>
             ref: <scalar>        # optional
             private: true|false  # optional, default false
-        connections: []          # optional, RESERVED, must be empty
+
+`system_id` must be a CANONICAL UUID. See _check_system_uuid for why a friendly
+name is refused rather than resolved.
 
 FILE defaults to efforts.yaml beside this script's parent directory.
 """
 
 import importlib.util
 import os
+import re
 import sys
 
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,11 +88,11 @@ pt = _load_parse_targets()
 ParseError = pt.ParseError
 _scalar = pt._scalar
 
-EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref", "targets", "connections")
+EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref", "targets")
 REQUIRED_EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref")
 # Keys whose value may legally be empty on its own line, because their content
 # is the indented block beneath them.
-BLOCK_KEYS = ("targets", "connections")
+BLOCK_KEYS = ("targets",)
 
 # THE RESERVED CREDENTIAL NAME. `default` means "the credential this deployment
 # already had", i.e. the single pretorin-api-key that predates efforts. It is
@@ -108,6 +111,45 @@ HOST_CREDENTIAL_SUBDIR = "pretorin"
 
 
 # --- token rules -----------------------------------------------------------
+
+# Canonical 8-4-4-4-12. Case-insensitive on input; compared case-insensitively
+# for duplicate detection, and passed through verbatim otherwise.
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _check_system_uuid(value, owner, lineno):
+    """system_id must be the canonical UUID, never a friendly system name.
+
+    Pretorin accepts either in many places, but the CLI resolves a write's target
+    to a UUID BEFORE comparing it against the environment-pinned scope, and the
+    comparison is literal. Measured on 0.28.7: with PRETORIN_SYSTEM_ID=Fathom, a
+    write to that same system's own UUID is REFUSED —
+
+        Active context is 'Fathom / soc2'; refusing write to
+        '13c1f44e-b66d-417c-8604-4ac7b988b411 / soc2' without explicit
+        scope override.
+
+    So a friendly name here rejects legitimate writes. It also defeats the
+    duplicate-pair check below, which compares literals: 'Fathom' and the UUID
+    are the same system and would not be seen as one.
+
+    Refused, not resolved. Resolving would mean a name lookup on every parse,
+    which turns a pure offline validator into something that needs a credential.
+    """
+    if not value:
+        raise ParseError(lineno, "system_id for effort '%s' is empty" % owner)
+    if not UUID_RE.match(value):
+        raise ParseError(
+            lineno,
+            "system_id '%s' (effort '%s') must be the canonical system UUID, not a"
+            " name. Pretorin resolves a write's target to a UUID before comparing"
+            " it against the pinned scope, and the comparison is literal — so a"
+            " name here refuses writes to the very system it names. Find the UUID"
+            " with:  docker compose run --rm cli pretorin --json context list"
+            % (value, owner),
+        )
+
 
 def _check_token(value, what, owner, lineno):
     """Every operator-supplied identifier that becomes a path, an argv element,
@@ -174,7 +216,7 @@ def reserved_collision_path(secret_dir=None):
 
 def _split_pair_allow_block(text, lineno):
     """Like parse-targets' _split_pair, but tolerates an empty value for the
-    keys whose content is the block beneath them (`targets:`, `connections:`)."""
+    keys whose content is the block beneath them (`targets:`)."""
     if ":" not in text:
         raise ParseError(lineno, "expected 'key: value', got: %s" % text)
     key, _, value = text.partition(":")
@@ -194,7 +236,7 @@ def parse(text):
     target = None
     effort_indent = None
     target_indent = None
-    section = None            # None | "targets" | "connections"
+    section = None            # None | "targets"
     section_indent = None
     seen_efforts_key = False
 
@@ -245,8 +287,7 @@ def parse(text):
                 if key != "name":
                     raise ParseError(
                         lineno, "each effort must start with '- name:', got '%s'" % key)
-                effort = {"name": value, "_lineno": lineno, "targets": [],
-                          "_has_connections": False}
+                effort = {"name": value, "_lineno": lineno, "targets": []}
                 efforts.append(effort)
                 target = None
                 section = None
@@ -261,13 +302,6 @@ def parse(text):
                 target_indent = indent
                 effort["targets"].append(target)
                 continue
-            if section == "connections":
-                raise ParseError(
-                    lineno,
-                    "'connections:' is RESERVED for Pretorin Connected Sources and"
-                    " must be empty in this release; nothing consumes it yet."
-                    " Remove the entries beneath it.",
-                )
             raise ParseError(lineno, "unexpected list item at this indentation: %s" % body)
 
         if body == "-" or body.startswith("-"):
@@ -291,14 +325,6 @@ def parse(text):
             target[key] = value
             continue
 
-        if section == "connections":
-            raise ParseError(
-                lineno,
-                "'connections:' is RESERVED for Pretorin Connected Sources and must"
-                " be empty in this release; nothing consumes it yet. Remove the"
-                " content beneath it.",
-            )
-
         if indent <= effort_indent:
             raise ParseError(
                 lineno, "effort key must be indented past its '- name:': %s" % body)
@@ -317,24 +343,6 @@ def parse(text):
                     lineno,
                     "'targets:' takes an indented list, not an inline value")
             section = "targets"
-            section_indent = indent
-            continue
-
-        if key == "connections":
-            if effort["_has_connections"]:
-                raise ParseError(
-                    lineno, "duplicate key 'connections' in effort '%s'" % effort["name"])
-            effort["_has_connections"] = True
-            # `connections: []` is the documented spelling; a bare `connections:`
-            # with nothing under it is accepted too. Anything else is refused.
-            if value not in ("", "[]"):
-                raise ParseError(
-                    lineno,
-                    "'connections:' is RESERVED for Pretorin Connected Sources and"
-                    " must be empty ([] or nothing) in this release; nothing"
-                    " consumes it yet. Got: %s" % value,
-                )
-            section = "connections"
             section_indent = indent
             continue
 
@@ -367,8 +375,8 @@ def validate(efforts):
         line = effort["_lineno"]
         name = effort["name"]
 
-        # The effort name becomes an agent identity and a Slack channel name in a
-        # later release, so it is held to the same charset as a target name.
+        # The effort name is a stable identifier for the effort and its agent, so
+        # it is held to the same charset as a target name.
         _check_token(name, "effort name", name, line)
         if name in seen_effort_names:
             raise ParseError(
@@ -380,14 +388,14 @@ def validate(efforts):
             if key not in effort:
                 raise ParseError(line, "effort '%s' has no %s" % (name, key))
 
-        _check_token(effort["system_id"], "system_id", name, line)
+        _check_system_uuid(effort["system_id"], name, line)
         _check_token(effort["framework_id"], "framework_id", name, line)
         _check_token(effort["credential_ref"], "credential_ref", name, line)
 
         # One preflight artifact is keyed on system+framework. Two efforts on the
         # same pair are the same compliance effort wearing two names, and they
         # would sweep and bind over each other's resolvers forever.
-        pair = (effort["system_id"], effort["framework_id"])
+        pair = (effort["system_id"].lower(), effort["framework_id"])
         if pair in seen_pairs:
             other, other_line = seen_pairs[pair]
             raise ParseError(
@@ -501,7 +509,6 @@ efforts:
       - name: secret-repo
         url: 'https://github.com/acme/secret-repo.git'   # trailing comment
         private: true
-    connections: []
 
   - name: crm-hipaa
     system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411
@@ -517,14 +524,18 @@ efforts:
 E = "efforts:\n  - name: %s\n    system_id: %s\n    framework_id: %s\n    credential_ref: %s\n    targets:\n      - name: t\n        url: https://example.com/a.git\n"
 
 
-def _e(name="a", sys_="s", fw="f", cred="default"):
+UUID_A = "11111111-1111-4111-8111-111111111111"
+UUID_B = "22222222-2222-4222-8222-222222222222"
+
+
+def _e(name="a", sys_=UUID_A, fw="f", cred="default"):
     return E % (name, sys_, fw, cred)
 
 
 SHARED = ("efforts:\n"
-          "  - name: one\n    system_id: s\n    framework_id: f1\n    credential_ref: default\n"
+          "  - name: one\n    system_id: " + UUID_A + "\n    framework_id: f1\n    credential_ref: default\n"
           "    targets:\n      - name: t\n        url: https://example.com/a.git\n%s"
-          "  - name: two\n    system_id: s\n    framework_id: f2\n    credential_ref: default\n"
+          "  - name: two\n    system_id: " + UUID_A + "\n    framework_id: f2\n    credential_ref: default\n"
           "    targets:\n      - name: t\n        url: %s\n%s")
 
 CASES = [
@@ -532,62 +543,64 @@ CASES = [
     ("unknown top-level key", "nope: 1\nefforts:\n  - name: a\n", "unknown top-level key"),
     ("targets.yaml key at top level", "system_id: a\nefforts:\n  - name: a\n", "clawctl migrate"),
     ("targets: at top level", "targets:\n  - name: a\n", "clawctl migrate"),
-    ("duplicate efforts key", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\nefforts:\n", "duplicate key 'efforts'"),
+    ("duplicate efforts key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\nefforts:\n", "duplicate key 'efforts'"),
     ("no efforts", "efforts:\n", "no efforts defined"),
     ("indented line before efforts:", "  stray: 1\nefforts:\n", "before 'efforts:'"),
     ("duplicate effort name", _e("a") + _e("a").replace("efforts:\n", ""), "duplicate effort name"),
     ("duplicate system+framework pair",
-     "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t1\n        url: https://e/r.git\n"
-     "  - name: b\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t2\n        url: https://e/r.git\n",
+     "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t1\n        url: https://e/r.git\n"
+     "  - name: b\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t2\n        url: https://e/r.git\n",
      "same system_id + framework_id"),
     ("missing system_id", "efforts:\n  - name: a\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no system_id"),
-    ("missing framework_id", "efforts:\n  - name: a\n    system_id: s\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no framework_id"),
-    ("missing credential_ref", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no credential_ref"),
-    ("effort with no targets", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n", "has no targets"),
+    ("missing framework_id", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no framework_id"),
+    ("missing credential_ref", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no credential_ref"),
+    ("effort with no targets", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n", "has no targets"),
     # --- injection shapes ---
     ("command substitution in name", _e(name="$(whoami)"), "must match"),
     ("backtick in name", _e(name="a`id`"), "must match"),
-    ("semicolon in system_id", _e(sys_="s;rm -rf /"), "must match"),
+    ("semicolon in system_id", _e(sys_="s;rm -rf /"), "must be the canonical system UUID"),
     ("pipe in framework_id", _e(fw="f|nc"), "must match"),
     ("path traversal in credential_ref", _e(cred="../../etc/passwd"), "must match"),
     ("absolute path in credential_ref", _e(cred="/etc/passwd"), "must match"),
-    ("space in system_id", _e(sys_="My System"), "must match"),
+    ("space in system_id", _e(sys_="My System"), "must be the canonical system UUID"),
     # A quote MID-value is not "unbalanced" — _scalar only unquotes when the
     # value OPENS with a quote — so it falls through to the charset check, which
     # is the correct refusal. The unbalanced-quote path is the next case.
     ("quote in name", _e(name='a"b'), "must match"),
     ("unbalanced quote", "efforts:\n  - name: 'a\n", "unbalanced quote"),
-    ("ARGV INJECTION: leading dash system_id", _e(sys_="--system"), "must not start with '-'"),
+    ("ARGV INJECTION: leading dash system_id", _e(sys_="--system"), "must be the canonical system UUID"),
     ("leading dash framework_id", _e(fw="-f"), "must not start with '-'"),
     ("leading dash credential_ref", _e(cred="-c"), "must not start with '-'"),
     ("leading dot effort name", _e(name=".hidden"), "must not start with a dot"),
     ("leading dot credential_ref", _e(cred=".ssh"), "must not start with a dot"),
     ("empty value", "efforts:\n  - name: a\n    system_id:\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "empty value"),
+    # --- system_id must be a UUID, never a friendly name ---
+    ("FRIENDLY NAME as system_id", _e(sys_="Fathom"), "must be the canonical system UUID"),
+    ("almost-a-uuid (too short)", _e(sys_="11111111-1111-4111-8111-11111111111"), "must be the canonical system UUID"),
+    ("uuid with wrong separators", _e(sys_="11111111_1111_4111_8111_111111111111"), "must be the canonical system UUID"),
     # --- the global target namespace ---
     ("shared target, CONFLICTING url", SHARED % ("", "https://example.com/DIFFERENT.git", ""), "conflicts with target"),
     ("shared target, CONFLICTING ref", SHARED % ("        ref: main\n", "https://example.com/a.git", "        ref: develop\n"), "conflicts with target"),
     ("shared target, CONFLICTING private", SHARED % ("", "https://github.com/o/t.git", "        private: true\n"), "conflicts with target"),
-    ("duplicate target within one effort", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n      - name: t\n        url: https://e/r.git\n", "duplicate target name 't' within effort"),
-    # --- the reserved connections section ---
-    ("connections with list content", _e() + "    connections:\n      - name: azure\n", "RESERVED"),
-    ("connections with map content", _e() + "    connections:\n      kind: aws\n", "RESERVED"),
-    ("connections with inline value", _e() + "    connections: azure\n", "RESERVED"),
-    ("duplicate connections", _e() + "    connections: []\n    connections: []\n", "duplicate key 'connections'"),
+    ("duplicate target within one effort", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n      - name: t\n        url: https://e/r.git\n", "duplicate target name 't' within effort"),
+    # `connections:` is NOT part of this schema; it must read as an unknown key
+    # rather than being silently tolerated for a future release.
+    ("connections is not a key yet", _e() + "    connections: []\n", "unknown effort key"),
     # --- structure ---
     ("unknown effort key", _e() + "    region: us\n", "unknown effort key"),
-    ("unknown target key", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n        branch: main\n", "unknown target key"),
-    ("duplicate effort key", "efforts:\n  - name: a\n    system_id: s\n    system_id: t\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "duplicate key 'system_id'"),
+    ("unknown target key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n        branch: main\n", "unknown target key"),
+    ("duplicate effort key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    system_id: t\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "duplicate key 'system_id'"),
     ("duplicate targets key", _e() + "    targets:\n      - name: u\n        url: https://e/r.git\n", "duplicate key 'targets'"),
-    ("targets with inline value", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets: nope\n", "indented list, not an inline value"),
-    ("effort not starting with - name", "efforts:\n  - system_id: s\n    name: a\n", "each effort must start with '- name:'"),
-    ("target not starting with - name", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - url: https://e/r.git\n", "each target must start with '- name:'"),
+    ("targets with inline value", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets: nope\n", "indented list, not an inline value"),
+    ("effort not starting with - name", "efforts:\n  - system_id: 11111111-1111-4111-8111-111111111111\n    name: a\n", "each effort must start with '- name:'"),
+    ("target not starting with - name", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - url: https://e/r.git\n", "each target must start with '- name:'"),
     ("bare dash", "efforts:\n  -\n", "expected '- name: <value>'"),
     # --- target rules inherited from parse-targets.py (must NOT drift) ---
-    ("non-https url", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: git@github.com:o/r.git\n", "must start with https://"),
-    ("missing url", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        ref: main\n", "has no url"),
-    ("private: yes", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://github.com/o/r.git\n        private: yes\n", "must be exactly 'true' or 'false'"),
-    ("private on a non-github host", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://gitlab.com/o/r.git\n        private: true\n", "only work for https://github.com/"),
-    ("target name traversal", "efforts:\n  - name: a\n    system_id: s\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: ../etc\n        url: https://e/r.git\n", "must match"),
+    ("non-https url", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: git@github.com:o/r.git\n", "must start with https://"),
+    ("missing url", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        ref: main\n", "has no url"),
+    ("private: yes", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://github.com/o/r.git\n        private: yes\n", "must be exactly 'true' or 'false'"),
+    ("private on a non-github host", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://gitlab.com/o/r.git\n        private: true\n", "only work for https://github.com/"),
+    ("target name traversal", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: ../etc\n        url: https://e/r.git\n", "must match"),
 ]
 
 
@@ -601,7 +614,7 @@ def _shell_reads_list_correctly():
     format kept the contract.
     """
     import subprocess
-    text = ("efforts:\n  - name: e\n    system_id: s\n    framework_id: f\n"
+    text = ("efforts:\n  - name: e\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n"
             "    credential_ref: default\n    targets:\n"
             "      - name: p\n        url: https://github.com/o/p.git\n        private: true\n"
             "      - name: q\n        url: https://github.com/o/q.git\n        ref: main\n")
@@ -646,12 +659,31 @@ def self_test():
         ("ref" not in efforts[1]["targets"][0] or efforts[1]["targets"][0]["ref"] == "main",
          "shared target keeps its ref"),
         (efforts[1]["credential_ref"] == "hipaa-key", "second effort credential_ref"),
-        (efforts[0]["_has_connections"] is True, "connections: [] accepted"),
-        (efforts[1]["_has_connections"] is False, "absent connections accepted"),
     ]
     # The whole point of the exemption: this file has two efforts naming one target.
     checks.append((efforts[1]["targets"][0]["name"] == "simple-crm",
                    "SHARED target with an IDENTICAL definition is ACCEPTED"))
+
+    # An UPPERCASE UUID is still a UUID, and two spellings of one UUID are still
+    # one system — the pair check compares case-insensitively.
+    try:
+        parse(_e(sys_=UUID_A.upper()))
+        checks.append((True, "an uppercase UUID is accepted"))
+    except ParseError as exc:
+        checks.append((False, "an uppercase UUID is accepted (%s)" % exc.message))
+    _dup = ("efforts:\n"
+            "  - name: a\n    system_id: " + UUID_A + "\n    framework_id: f\n"
+            "    credential_ref: default\n    targets:\n      - name: t1\n"
+            "        url: https://example.com/a.git\n"
+            "  - name: b\n    system_id: " + UUID_A.upper() + "\n    framework_id: f\n"
+            "    credential_ref: default\n    targets:\n      - name: t2\n"
+            "        url: https://example.com/a.git\n")
+    try:
+        parse(_dup)
+        checks.append((False, "the same UUID in two cases is caught as a duplicate pair"))
+    except ParseError as exc:
+        checks.append(("same system_id + framework_id" in exc.message,
+                       "the same UUID in two cases is caught as a duplicate pair"))
 
     # The credential ladder, both modes, both rungs.
     checks += [

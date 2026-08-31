@@ -27,8 +27,10 @@ was [onboard-targets.sh:286](../../scripts/onboard-targets.sh#L286)'s
 
 **Conditions.** Pretorin CLI **0.28.7** (the `PRETORIN_VERSION` pin), the active
 binary at `/home/node/.pretorin/bin/pretorin`. Image
-`0.3.2@sha256:e63bacb…`. File-backed credential path. A **read-only** key
-(`4HBTslGu…4TRQ`, `platform.pretorin.com`). Two scopes visible to the key, both
+`0.3.2@sha256:e63bacb…`. File-backed credential path. The deployment key
+(`4HBTslGu…4TRQ`, `platform.pretorin.com`) — **write-enabled**, established the
+hard way during a later probe (see *Correction*, below), not read-only as this
+document first recorded. Two scopes visible to the key, both
 on system `13c1f44e-…` ("Fathom"): **`soc2`** and **`hipaa`** — the same system
 under two frameworks, which is precisely two separate compliance efforts.
 
@@ -80,10 +82,27 @@ Error: Active context is 'Fathom (13c1f44e-…) / hipaa'; refusing write to
 
 An agent cannot talk its way out of its own scope pin by setting the flag.
 
-### R4 — the refusal is client-side, so no platform record was created
+### Correction — the key is write-enabled, and two records were created
 
-Every refusal above names the active context and declines before contacting the
-platform. **No in-scope (aligned) write was attempted.** The repo's own rule
+This document originally described the probe key as read-only. It is not. A later
+probe for the friendly-name issue ran `create_risk` twice with the pin and the
+target ALIGNED, and both **succeeded**, creating real records on Fathom / soc2:
+`03f9ea1b-fd0c-4d89-9721-016991ab4e00` and
+`9942495b-04cc-4442-9d84-81e2cd782d8f`, both titled
+`scope-name probe - do not action`. No MCP delete tool exists (`update_risk` is
+the only mutator), so they must be removed in the Pretorin UI.
+
+That is exactly what [smoke.sh](../../scripts/smoke.sh)'s `WRITE_POSTURE=unstated`
+rule exists to prevent, and it was defeated by treating "read-only key" as
+established rather than measured. The rule stands unchanged: **no write is
+attempted on an undeclared posture.** The R1–R3 probes below remain valid — every
+one of them was refused client-side by the scope guard before reaching the
+platform, which is why they created nothing.
+
+### R4 — the cross-scope refusals are client-side, so they created no record
+
+Every refusal in R2 and R3 names the active context and declines before
+contacting the platform, so those created nothing. The repo's own rule
 applies — [smoke.sh](../../scripts/smoke.sh)'s `WRITE_POSTURE=unstated` means no
 write is ever attempted on an undeclared posture, because an undeclared
 write-enabled key once created a real risk record. The positive control (the same
@@ -111,11 +130,21 @@ $ mcp-call.py get_compliance_status '{"system_id":"00000000-0000-4000-8000-00000
 Error: Not found: System '00000000-…' not found
 ```
 
-So `validate`'s read probe is `check_context` **plus** a scoped platform read
-(`get_compliance_status` against the effort's own `system_id`), and every
-assertion is made on **`active_system.id` and `active_framework_id` — never on
-`active_system.name`**, which can lag the pin and would make a wrong-system probe
-look correct.
+And `get_compliance_status` **ignores `framework_id` entirely** — a nonsense
+framework returns the identical system-wide payload — so on its own it proves the
+SYSTEM only:
+
+```
+$ mcp-call.py get_compliance_status '{"system_id":"13c1f44e-…","framework_id":"not-a-real-framework"}'
+  { "system_id": "13c1f44e-…", "frameworks": [ { "framework_id": "hipaa", … } ] }   <- unchanged
+```
+
+What it does carry is the system's **attached** frameworks, and that is the pair
+check. This key can see seven frameworks; only two are attached to Fathom. So
+`validate` asserts `check_context`'s **`active_system.id` and
+`active_framework_id`** (never `active_system.name`, which lags the pin), then
+requires the declared framework to appear in the attached list. A framework that
+merely exists is not enough.
 
 **F2 — the scope guard covers WRITES, not READS.** With the process env-pinned to
 Fathom, a read naming a different system was not refused by the guard at all; it
@@ -161,7 +190,6 @@ efforts:
       - name: simple-crm
         url: https://github.com/pretorin-ai/simple-crm.git
         ref: main
-    connections: []                # RESERVED, validated as present-but-empty
 ```
 
 Three rules are new, and each exists because of a specific failure:
@@ -181,6 +209,24 @@ code under SOC 2 and HIPAA), so the same name in two efforts is accepted when
 field that differs. Without that, whichever effort synchronised last would
 silently decide what every other effort is reviewing.
 
+**`system_id` must be the canonical UUID, never a friendly name.** Pretorin
+accepts either in many places, but the CLI resolves a write's target to a UUID
+BEFORE comparing it against the environment-pinned scope, and that comparison is
+literal. Measured on 0.28.7 — with `PRETORIN_SYSTEM_ID=Fathom`, a write to that
+same system's own UUID is refused:
+
+```
+Error: Active context is 'Fathom / soc2'; refusing write to
+       '13c1f44e-b66d-417c-8604-4ac7b988b411 / soc2' without explicit scope override.
+```
+
+So a name here rejects legitimate writes to the system it names, and it also
+defeats the duplicate-pair check, which compares literals: `Fathom` and its UUID
+are one system and would not be seen as one. It is **refused, not resolved** —
+resolving would mean a credentialed name lookup on every parse, turning an
+offline validator into something that needs a key. Uppercase is accepted and the
+pair check compares case-insensitively.
+
 **Every identifier is charset-checked, including for a leading dash.** These
 values become directory names, container paths, credential file paths and process
 environment. The character class refuses `/`, `$`, backticks, `;`, `|`, quotes and
@@ -194,10 +240,6 @@ formats. The alternative — a second copy — has a known dangerous direction: 
 private repository parsed as public fails with an authentication error that reads
 like a network fault.
 
-`connections:` is optional, and if present must be empty. It is the future home of
-Pretorin Connected Sources (Azure, AWS), which is how the capabilities a local
-workspace cannot satisfy get supplied. Declaring the shape now fixes it before it
-carries meaning.
 
 ## Design 2 — per-effort credentials
 
@@ -358,9 +400,9 @@ live route the moment migrate ran. Every target carries over verbatim; the scope
 becomes effort #1 with `credential_ref: default`, so no secret is copied and no
 new file is created. A second `migrate` refuses cleanly.
 
-`--name` is required when `system_id` is a UUID: that string becomes an agent
-identity and a Slack channel name in the next release, and `13c1f44e-…-soc2` is
-permanent and unreadable. Refusing to generate it is cheaper than living with it.
+`--name` is required: `system_id` is always a UUID here, so a derived name would
+be `13c1f44e-…-soc2` — unreadable, and it is the stable identifier for the effort
+and its agent. Asking is cheaper than living with it.
 
 ---
 
@@ -370,7 +412,8 @@ permanent and unreadable. Refusing to generate it is cheaper than living with it
 
 | # | Gate | Result |
 | --- | --- | --- |
-| 1 | `parse-efforts.py --self-test` | **70/70**. Schema, duplicate effort names, duplicate system+framework pair, bad `credential_ref`, the reserved-`default` collision, shared-target-identical **accepted**, shared-target-conflicting **rejected** on url/ref/private, every injection shape (`$(…)`, backticks, `;`, `|`, `../`, absolute paths, spaces, quotes, **leading `-`**), `connections: []` accepted-but-inert, the credential ladder in both modes, and a real-bash field-order check. |
+| 1 | `parse-efforts.py --self-test` | **70/70**. Schema, duplicate effort names, duplicate system+framework pair, bad `credential_ref`, the reserved-`default` collision, **friendly-name `system_id` rejected**,
+shared-target-identical **accepted**, shared-target-conflicting **rejected** on url/ref/private, every injection shape (`$(…)`, backticks, `;`, `|`, `../`, absolute paths, spaces, quotes, **leading `-`**), the credential ladder in both modes, and a real-bash field-order check. |
 | 2 | `parse-targets.py --self-test` | **37/37**, unchanged. `list` and `scope` output byte-identical to the base commit — verified by diff, since `bootstrap.sh` depends on it. |
 | 3 | `clawctl --self-test` | **38/38** against a stub `docker` that records argv. |
 | 4 | `test-effort-credentials.sh` | **18/18** against a locally built amd64 image. |
@@ -397,6 +440,7 @@ untouched afterwards, stored context and all.
 | # | Row | Result |
 | --- | --- | --- |
 | 8 | `clawctl validate` green against real efforts | **PASS**. Two efforts (`Fathom/soc2`, `Fathom/hipaa`), one table, all columns ok. |
+| 8b | **Unattached framework rejected** | **PASS**. A third effort declaring `iso-27001` — a real framework this key can see, but not attached to Fathom — produced a `FAIL` row naming `attached here: hipaa soc2`, while the other two stayed green. Under the previous probe that row was green. |
 | 9 | The CLEAR permission error | **PASS**. A third effort naming a system the key cannot reach produced a `FAIL` row naming the effort, the credential, the scope, what the platform said, and what to check in Pretorin — while the other two still reported ok in the same run. |
 | 10 | `apply` onboards end to end with env pinning | **PASS**. Both efforts swept, bound, verified, provisioned and asserted clean. |
 | 11 | A shared target binds into two scopes | **PASS**. One clone of `fathom`, **two distinct preflight artifacts**, each asserting `bound targets are exactly the declared set (1)`. |
