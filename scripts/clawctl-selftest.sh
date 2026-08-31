@@ -247,6 +247,23 @@ SECOND
                       || st_bad "mode is 604 (container-readable)" "got $mode"
   fi
 
+  # THE DIRECTORY MODE IS HALF THE CONTRACT, AND THE HALF THAT HIDES.
+  # compose.efforts.yaml mounts the credentials DIRECTORY whole, so the container's
+  # uid-1000 user needs traverse on it as well as read on the file. A 0700
+  # directory makes every credential inside report "does not exist" — a permission
+  # problem wearing a missing-file message. Docker Desktop masks it on macOS by
+  # presenting mounts as owned by the container user; Linux does not, and CI is
+  # where it surfaced.
+  local dmode
+  dmode="$(stat -c '%a' "${S}/pretorin" 2>/dev/null || stat -f '%Lp' "${S}/pretorin" 2>/dev/null || echo '?')"
+  if [ "$(id -u)" = 1000 ]; then
+    [ "$dmode" = 700 ] && st_ok "credential dir is 700 (host uid IS 1000)" \
+                       || st_bad "credential dir mode" "got $dmode"
+  else
+    [ "$dmode" = 701 ] && st_ok "credential dir is 701 — traversable by the container's uid-1000 user" \
+                       || st_bad "credential dir is 701 (container-traversable)" "got $dmode"
+  fi
+
   [ -s "$cpath" ] && st_bad "the new credential is empty (no value invented)" \
                   || st_ok "the new credential is empty (no value invented)"
 

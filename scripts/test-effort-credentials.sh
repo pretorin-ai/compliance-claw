@@ -51,7 +51,13 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 \
        echo "  build it first: docker compose build cli" >&2; exit 1; }
 
 mkdir -p "$TMP/credentials"
-chmod 700 "$TMP/credentials"
+# 0701, not 0700: the DIRECTORY is bind-mounted whole, and the container's
+# uid-1000 user must be able to traverse it to open a file inside. A 0700
+# directory makes every credential report "does not exist" — a permission problem
+# wearing a missing-file message. Docker Desktop masks this on macOS by presenting
+# mounts as owned by the container user; Linux does not. Mirrors
+# container_traversable_dir() in scripts/clawctl.
+chmod 701 "$TMP/credentials"
 printf '%s' "$CANARY_EFFORT" > "$TMP/credentials/hipaa-key"
 printf '%s' ''               > "$TMP/credentials/empty-key"
 chmod 604 "$TMP/credentials"/*

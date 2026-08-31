@@ -409,7 +409,7 @@ untouched afterwards, stored context and all.
 | 18 | Suppressed repair | **PASS, with a control.** With a staged interrupted-update marker: lock held → no repair message and the **marker intact**; lock free → repair message and marker consumed. |
 | 19 | The audit record | **PASS**. One line per effort per run, in the volume and in the logs, carrying the credential **name**; a grep for the real key value found nothing. |
 
-### Three defects this testing found, which unit tests had missed
+### Four defects this testing found, which unit tests had missed
 
 **1. `docker compose run` swallowed the loop's stdin, silently skipping every
 effort after the first.** A real two-effort `validate` reported `1 effort(s)
@@ -433,5 +433,21 @@ assertions passed on a command that never executed. It now reads the image's rea
 platform, proves the launcher reached the probe before trusting any absence check,
 and requires the launcher's own refusal text rather than mere silence.
 
+**4. The credentials DIRECTORY was `chmod 700`, making every named credential
+invisible inside the container — on Linux only.** `compose.secrets.yaml` mounts
+individual *files*, so the directory above them never mattered.
+`compose.efforts.yaml` mounts the *directory*, and a 0700 directory owned by the
+host user cannot be traversed by the container's uid-1000 user: each credential
+inside then reports "does not exist", which reads like a missing file rather than
+a permission problem. It is the file-mode footgun one level up.
+
+**Docker Desktop hid it.** macOS bind mounts are presented as owned by the
+container user, so 0700 worked locally and every local run passed. **CI caught
+it**, on the first push. The directory is now 0701 when the host uid is not 1000
+— traverse only, since the launcher opens a known path and never enumerates — and
+the self-test asserts the directory mode next to the file mode. A local macOS run
+cannot verify this fix; Linux CI is the only place it is meaningful.
+
 None of these would have been caught by the schema self-test alone. They are the
-argument for the credentialed rows existing at all.
+argument for the credentialed and runtime rows existing at all — and #4 is the
+argument for CI running on Linux rather than trusting a developer's laptop.

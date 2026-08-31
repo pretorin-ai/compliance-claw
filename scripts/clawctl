@@ -103,6 +103,27 @@ ensure_compose_stack() {
   export COMPOSE_FILE
 }
 
+# THE CREDENTIAL DIRECTORY IS MOUNTED WHOLE, SO IT NEEDS TRAVERSE FOR THE
+# CONTAINER USER — one level up from the file-mode footgun, and it hides on macOS.
+#
+# compose.secrets.yaml bind-mounts individual FILES, so the mode of the directory
+# above them never mattered. compose.efforts.yaml mounts the DIRECTORY, and a
+# 0700 directory owned by the host user cannot be traversed by the container's
+# uid-1000 user: every named credential inside it then reports "does not exist",
+# which reads like a missing file rather than a permission problem.
+#
+# Docker Desktop's file sharing masks this — it presents bind mounts as owned by
+# the container user, so 0700 works on macOS and fails on Linux. It was caught by
+# CI, not locally. `--x` (0701) is enough: the launcher OPENS a known path and
+# never enumerates the directory, so read is not granted.
+container_traversable_dir() {
+  local path="$1"
+  chmod 700 "$path"
+  if [ "$(id -u)" != 1000 ]; then
+    chmod 701 "$path"
+  fi
+}
+
 # Both bind sources must exist before any compose command, or `up`/`run` fails
 # with "bind source path does not exist" and the message names neither.
 ensure_mount_sources() {
@@ -110,7 +131,7 @@ ensure_mount_sources() {
   Convert your existing single-effort configuration with:
     scripts/clawctl migrate"
   mkdir -p "$CREDENTIAL_DIR"
-  chmod 700 "$CREDENTIAL_DIR" 2>/dev/null || true
+  container_traversable_dir "$CREDENTIAL_DIR" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -394,7 +415,7 @@ except m.ParseError as exc:
 PY
 
   mkdir -p "$CREDENTIAL_DIR"
-  chmod 700 "$CREDENTIAL_DIR"
+  container_traversable_dir "$CREDENTIAL_DIR"
   local path="${CREDENTIAL_DIR}/${name}"
 
   if [ -e "$path" ]; then
@@ -416,7 +437,9 @@ PY
   if [ "$(id -u)" != 1000 ]; then
     chmod 604 "$path"
   fi
-  log "mode $(file_mode "$path") — readable by the container's uid-1000 user"
+  log "mode $(file_mode "$path") (file), $(file_mode "$CREDENTIAL_DIR") (directory)"
+  log "  both are needed: the file must be READABLE and the directory TRAVERSABLE"
+  log "  by the container's uid-1000 user. Compose bind mounts cannot remap uid."
   log ""
   log "PASTE THE PRETORIN API KEY INTO IT (this command never prints or reads a value):"
   log "  ${path}"

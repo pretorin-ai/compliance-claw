@@ -69,14 +69,21 @@ scripts/clawctl credential add hipaa-key
 Then paste the Pretorin API key into the file it names. The command never reads
 or prints a value.
 
-**Use this command rather than creating the file by hand.** Compose file secrets
-are bind mounts and cannot remap uid or mode. The container runs as uid 1000; you
-almost certainly do not. A hand-made `chmod 600` file is therefore **unreadable
-inside the container**, and the symptom is a Pretorin *authentication* error —
-sending you to the platform to check a key that is perfectly fine. `credential add`
-applies the same mode logic `scripts/init-file-secrets.sh` already uses, and
-`clawctl validate` names a wrong-mode file explicitly rather than letting it
-surface as a fake auth failure.
+**Use this command rather than creating the file by hand.** Compose bind mounts
+cannot remap uid or mode. The container runs as uid 1000; you almost certainly do
+not. Two things must both be right, and by hand you will get one of them wrong:
+
+- the **file** must be readable by uid 1000 (`0604`, not `0600`), or you get a
+  Pretorin *authentication* error that sends you to the platform to check a key
+  which is perfectly fine;
+- the **directory** must be traversable by uid 1000 (`0701`, not `0700`), or every
+  credential in it reports *"does not exist"* — a permission problem wearing a
+  missing-file message.
+
+On macOS neither mistake shows up: Docker Desktop presents bind mounts as owned by
+the container user. On Linux, and on the VM this is headed for, both bite.
+`credential add` sets both correctly, and `clawctl validate` names a wrong mode
+explicitly rather than letting it surface as a fake auth failure.
 
 ### 3. Check it
 
