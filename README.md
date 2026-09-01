@@ -905,9 +905,16 @@ agent's write path, which is why the record is written twice.
 
 ## Testing
 
+`smoke.sh` writes to the volumes it runs against, so it requires a **disposable
+Compose project** and refuses the live `compliance-claw` name.
+
 ```sh
-scripts/smoke.sh              # Section A always; Section B if a key authenticates
-scripts/smoke.sh --no-creds   # Section A only — exactly what CI runs
+# Section A always; Section B if a key authenticates.
+COMPOSE_PROJECT_NAME=cc-smoke CC_TEST_PORT=18990 scripts/smoke.sh
+# Section A only — exactly what CI runs.
+COMPOSE_PROJECT_NAME=cc-smoke CC_TEST_PORT=18990 scripts/smoke.sh --no-creds
+COMPOSE_PROJECT_NAME=cc-smoke docker compose down -v   # remove it afterwards
+
 python3 scripts/parse-targets.py --self-test
 bash scripts/sync-targets.sh --self-test   # target sync: rules, outcomes, lock, leak canary
 scripts/pretorin-update.sh --self-test     # CLI updater input rules
@@ -1080,7 +1087,7 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | `code_repository` is `degraded` | Expected | Needs a platform Connected Source; future work |
 | `Missing required scopes: write` | Read-only key, write tool | Correct behaviour — see "Read-only vs write-enabled" |
 | `Scope is not approved with a confirmed scale yet` | Platform prerequisite | Approve scope setup on platform.pretorin.com |
-| Agent answers with no sources bound | Framework switched in chat | One scope per deployment; re-run onboarding for another |
+| Agent answers with no sources bound | Wrong channel for the effort | Each agent serves one effort and refuses to switch; ask in that effort's own channel |
 | `plugins list` shows 10 plugins instead of 3 | Slack not configured | Expected; the two profiles are documented above |
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
@@ -1093,7 +1100,8 @@ Logs and state:
 docker compose logs -f openclaw
 docker compose run --rm cli openclaw doctor
 docker compose run --rm cli openclaw plugins inspect slack
-scripts/onboard-targets.sh --verify-only
+scripts/clawctl validate                 # the efforts, credentials and channels
+scripts/onboard-targets.sh --verify-only # LEGACY single-effort deployments only
 ```
 
 ## Releasing

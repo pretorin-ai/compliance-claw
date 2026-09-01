@@ -71,6 +71,19 @@ USAGE
   shift
 done
 
+# ISOLATION, BEFORE ANY DOCKER COMMAND. compose.yaml pins `name: compliance-claw`,
+# so a run without its own project name attaches to the live deployment — and this
+# suite writes to the volumes it attaches to (audit rows, a scratch preflight
+# artifact, the template marker). There is deliberately no override.
+case "${COMPOSE_PROJECT_NAME:-}" in
+  "" | compliance-claw )
+    printf 'smoke: ERROR — this suite writes to the volumes it runs against, so it\n' >&2
+    printf '  needs a disposable Compose project, not the live "compliance-claw":\n' >&2
+    printf '    COMPOSE_PROJECT_NAME=cc-smoke CC_TEST_PORT=18990 bash scripts/smoke.sh --no-creds\n' >&2
+    printf '    COMPOSE_PROJECT_NAME=cc-smoke docker compose down -v\n' >&2
+    exit 2 ;;
+esac
+
 PASS=0; FAIL=0; SKIP=0; WARN=0
 FAILED_CHECKS=()
 

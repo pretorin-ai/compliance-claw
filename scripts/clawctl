@@ -1920,9 +1920,10 @@ PY
 # workspace built for the OLD scope.
 #
 # So a DM mutation is allowed only when the fleet on disk is the fleet last
-# applied. One hash over efforts.yaml's scope, channel, credential and target
-# names (openclaw-patch.py: fleet_fingerprint). DM bindings are deliberately not
-# in it, since changing those is the point.
+# applied. One hash over efforts.yaml's scope, channel, credential and each
+# target's complete normalized definition — name, url, ref, private
+# (openclaw-patch.py: fleet_fingerprint). DM bindings are deliberately not in it,
+# since changing those is the point.
 require_applied_fleet() {
   local want have
   want="$(python3 "$PATCH_TOOL" fingerprint --efforts "$EFFORTS_FILE" 2>/dev/null || true)"

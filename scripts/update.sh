@@ -38,6 +38,18 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# WHICH COMMAND REBUILDS THIS DEPLOYMENT. Once efforts.yaml exists it is what the
+# deployment reads, and onboard-targets.sh would rebuild the legacy single-effort
+# path instead of the fleet.
+EFFORTS_FILE="${CC_EFFORTS_FILE:-${REPO_ROOT}/efforts.yaml}"
+if [ -f "$EFFORTS_FILE" ]; then
+  REBUILD_CMD="scripts/clawctl apply"
+  DECLARATION_FILE="efforts.yaml"
+else
+  REBUILD_CMD="scripts/onboard-targets.sh"
+  DECLARATION_FILE="targets.yaml"
+fi
+
 log()  { printf 'update: %s\n' "$*"; }
 warn() { printf 'update: WARNING — %s\n' "$*" >&2; }
 die()  { printf 'update: ERROR — %s\n' "$*" >&2; exit 1; }
@@ -239,8 +251,8 @@ if printf '%s' "$STARTUP" | grep -q 'predates the image'; then
         'cat /opt/compliance-claw/config-template.version > /home/node/.openclaw/.compliance-claw-templates'
 
     or reset — DESTROYS both volumes, including your model login:
-      docker compose down -v && scripts/bootstrap.sh && scripts/onboard-targets.sh
 DRIFT
+  printf '      docker compose down -v && scripts/bootstrap.sh && %s\n\n' "$REBUILD_CMD" >&2
 fi
 
 if printf '%s' "$STARTUP" | grep -q 'Slack credentials are supplied but NOT'; then
@@ -268,7 +280,7 @@ fi
 printf '\n'
 log "onboarding was NOT touched. Bound sources, the active context and the recipe"
 log "set live in the Pretorin state volume and survive an update like this one."
-log "Re-run scripts/onboard-targets.sh only after 'down -v', or when targets.yaml"
+log "Re-run ${REBUILD_CMD} only after 'down -v', or when ${DECLARATION_FILE}"
 log "changes — it is idempotent either way."
 printf '\n'
 log "done. Check it came up:  docker compose ps"

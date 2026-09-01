@@ -1130,25 +1130,33 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
 
   # Each drift case: edit efforts.yaml, do NOT apply, then try a DM command. The
   # configuration and the recorded state must both come out untouched.
-  st_dm_drift() {                            # $1 = label, $2 = python edit of $E
-    local cfg_before state_before
-    cfg_before="$(cat "$OC")"; state_before="$(cat "${tmp}/state/last-applied.json")"
+  # $3 selects the routes: `revoke` runs the same generate/apply sequence as
+  # `allow`, so both need the guard. It revokes U0FLEET01, bound just above.
+  st_dm_drift() {                            # $1 = label, $2 = edit of $E, $3 = routes
+    local cfg_before state_before route args
     cp "$E" "${tmp}/efforts.restore.yaml"
     CC_E="$E" python3 -c "$2"
-    st_dm "allow U0DRIFT01 --effort crm-soc2" \
-      && st_bad "a DM command refuses $1" "it exited 0" \
-      || st_ok "a DM command refuses $1"
-    case "$(cat "$fleetlog")" in
-      *"scripts/clawctl apply"*) st_ok "  and says to run 'scripts/clawctl apply' first" ;;
-      *) st_bad "  and says to run apply first" "$(tail -6 "$fleetlog")" ;;
-    esac
-    if [ "$(cat "$OC")" = "$cfg_before" ] \
-       && [ "$(cat "${tmp}/state/last-applied.json")" = "$state_before" ]; then
-      st_ok "  and the configuration AND the recorded state are untouched"
-    else
-      st_bad "  and the configuration and recorded state are untouched" \
-             "cfg changed=$([ "$(cat "$OC")" = "$cfg_before" ] && echo no || echo yes)"
-    fi
+    for route in ${3:-allow}; do
+      case "$route" in
+        allow)  args="allow U0DRIFT01 --effort crm-soc2" ;;
+        revoke) args="revoke U0FLEET01" ;;
+      esac
+      cfg_before="$(cat "$OC")"; state_before="$(cat "${tmp}/state/last-applied.json")"
+      st_dm "$args" \
+        && st_bad "'dm ${route}' refuses $1" "it exited 0" \
+        || st_ok "'dm ${route}' refuses $1"
+      case "$(cat "$fleetlog")" in
+        *"scripts/clawctl apply"*) st_ok "  and says to run 'scripts/clawctl apply' first" ;;
+        *) st_bad "  and says to run apply first" "$(tail -6 "$fleetlog")" ;;
+      esac
+      if [ "$(cat "$OC")" = "$cfg_before" ] \
+         && [ "$(cat "${tmp}/state/last-applied.json")" = "$state_before" ]; then
+        st_ok "  and the configuration AND the recorded state are byte-identical"
+      else
+        st_bad "  and the configuration and recorded state are byte-identical" \
+               "cfg changed=$([ "$(cat "$OC")" = "$cfg_before" ] && echo no || echo yes)"
+      fi
+    done
     cp "${tmp}/efforts.restore.yaml" "$E"
   }
 
@@ -1168,27 +1176,23 @@ p = os.environ["CC_E"]; s = open(p).read()
 open(p, "w").write(s.replace("    targets:\n",
     "    targets:\n      - name: added-later\n        url: https://example.invalid/x.git\n", 1))'
 
-  # A TARGET'"'"'S DEFINITION, NOT ONLY ITS NAME. Hashing names alone let a target be
-  # repointed at a fork, moved to another branch, or flipped to private with an
-  # unchanged fingerprint — and a DM command would then deploy that repository
-  # change without the clone step that has to act on it. Every target name is
-  # rewritten in each case, because the same name in two efforts must stay
-  # identically defined or the parser refuses for a different reason.
+  # A target definition, not only its name. Each case rewrites every occurrence,
+  # since the same name in two efforts must stay identically defined.
   st_dm_drift "a target repointed at a different url" '
 import os
 p = os.environ["CC_E"]; s = open(p).read()
-open(p, "w").write(s.replace("simple-crm.git", "simple-crm-fork.git"))'
+open(p, "w").write(s.replace("simple-crm.git", "simple-crm-fork.git"))' "allow revoke"
 
   st_dm_drift "a target moved to a different ref" '
 import os
 p = os.environ["CC_E"]; s = open(p).read()
-open(p, "w").write(s.replace("ref: main", "ref: release/1.x"))'
+open(p, "w").write(s.replace("ref: main", "ref: release/1.x"))' "allow revoke"
 
   st_dm_drift "a target flipped to private" '
 import os, re
 p = os.environ["CC_E"]; s = open(p).read()
 open(p, "w").write(re.sub(r"(\n        url: https://github\.com/\S+\n)",
-                          r"\1        private: true\n", s))'
+                          r"\1        private: true\n", s))' "allow revoke"
 
   # ------------------------------------------- 9. --effort, and rollback
   st_head "9. refusals that protect the fleet"

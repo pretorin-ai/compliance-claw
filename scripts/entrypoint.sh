@@ -123,9 +123,9 @@ unset secret_name
 # load time, so this is a per-container decision made fresh on every start rather
 # than a value baked into the volume.
 #
-# WHY NOT DECIDE IT WHEN SEEDING. The documented order runs onboard-targets.sh
-# before `up`, which seeds the config from the `cli` service — and `cli` is
-# deliberately not given a model key. A seed-time choice was therefore made by a
+# WHY NOT DECIDE IT WHEN SEEDING. The documented order runs `clawctl apply`
+# before a gateway exists, which seeds the config from the `cli` service — and
+# `cli` is deliberately not given a model key. A seed-time choice was therefore made by a
 # container that could not see the credential, and never-clobber locked the wrong
 # answer in for good. Per-process resolution removes the dependency instead of
 # moving the secret.

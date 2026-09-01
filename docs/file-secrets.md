@@ -150,9 +150,9 @@ it on every start, so the config carries a `${OPENAI_REQUEST_ADAPTER}` marker
 rather than a baked value.
 
 That indirection is load-bearing. Deciding the adapter when the config is *seeded*
-does not work: the documented order runs `scripts/onboard-targets.sh` before
-`docker compose up`, which seeds from the `cli` service — and `cli` deliberately
-has no model key. A seed-time choice was therefore made by a container that could
+does not work: the documented order runs `scripts/clawctl apply` before the
+gateway exists, which seeds from the `cli` service — and `cli` deliberately has no
+model key. A seed-time choice was therefore made by a container that could
 not see the credential, and never-clobber then locked the wrong value in for the
 life of the volume. Resolving per process removes the dependency instead of
 widening the credential's reach.
