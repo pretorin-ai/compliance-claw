@@ -1168,6 +1168,28 @@ p = os.environ["CC_E"]; s = open(p).read()
 open(p, "w").write(s.replace("    targets:\n",
     "    targets:\n      - name: added-later\n        url: https://example.invalid/x.git\n", 1))'
 
+  # A TARGET'"'"'S DEFINITION, NOT ONLY ITS NAME. Hashing names alone let a target be
+  # repointed at a fork, moved to another branch, or flipped to private with an
+  # unchanged fingerprint — and a DM command would then deploy that repository
+  # change without the clone step that has to act on it. Every target name is
+  # rewritten in each case, because the same name in two efforts must stay
+  # identically defined or the parser refuses for a different reason.
+  st_dm_drift "a target repointed at a different url" '
+import os
+p = os.environ["CC_E"]; s = open(p).read()
+open(p, "w").write(s.replace("simple-crm.git", "simple-crm-fork.git"))'
+
+  st_dm_drift "a target moved to a different ref" '
+import os
+p = os.environ["CC_E"]; s = open(p).read()
+open(p, "w").write(s.replace("ref: main", "ref: release/1.x"))'
+
+  st_dm_drift "a target flipped to private" '
+import os, re
+p = os.environ["CC_E"]; s = open(p).read()
+open(p, "w").write(re.sub(r"(\n        url: https://github\.com/\S+\n)",
+                          r"\1        private: true\n", s))'
+
   # ------------------------------------------- 9. --effort, and rollback
   st_head "9. refusals that protect the fleet"
 

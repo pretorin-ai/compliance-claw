@@ -598,8 +598,8 @@ if [ "$FILE_SECRETS" = 1 ]; then
   4. docker compose ps                          # http://127.0.0.1:18789
 
      apply works with no gateway container yet and starts one itself, so there is
-     no `up -d` before it — starting the gateway first would only mean apply
-     immediately recreating it."
+     no 'docker compose up -d' before it — starting the gateway first would only
+     mean apply immediately recreating it."
   SLACK_HINT="in ${SECRET_DIR}/slack-app-token and slack-bot-token (which channels are served comes from efforts.yaml, not .env),"
 else
   NEXT_STEPS="  1. put a PRETORIN_API_KEY in .env             (see .env.example)

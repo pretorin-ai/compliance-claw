@@ -476,16 +476,28 @@ def fleet_fingerprint(efforts):
     """A stable hash of the non-DM fleet: scope, channel, credential and targets.
 
     Sorted and canonical so that reordering efforts.yaml, or reformatting it, is
-    not a change. Target ORDER within an effort is not meaningful either, so the
-    names are sorted too.
+    not a change. Effort order and target order within an effort are both
+    meaningless, so both are sorted.
+
+    THE WHOLE TARGET DEFINITION, not just its name. Hashing names alone left
+    url, ref and private out of the fingerprint, so repointing a target at a fork,
+    moving it to another branch, or flipping it to private all produced an
+    identical hash — and `clawctl dm` would then deploy that repository change
+    without the clone step that has to act on it. `_lineno` is deliberately
+    excluded: it moves when the file is merely reformatted.
     """
+    def target(t):
+        return {"name": t["name"], "url": t.get("url"),
+                "ref": t.get("ref"), "private": t.get("private")}
+
     canonical = [
         {"name": e["name"],
          "system_id": e["system_id"],
          "framework_id": e["framework_id"],
          "slack_channel_id": e["slack_channel_id"],
          "credential_ref": e["credential_ref"],
-         "targets": sorted(t["name"] for t in e["targets"])}
+         "targets": sorted((target(t) for t in e["targets"]),
+                           key=lambda t: t["name"])}
         for e in sorted(efforts, key=lambda e: e["name"])
     ]
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
@@ -1041,6 +1053,38 @@ def self_test():
     patch, manifest = _gen(TWO_EFFORTS)
     check(len(manifest["fleetFingerprint"]) == 64,
           "the manifest carries a fleet fingerprint")
+
+    # THE FINGERPRINT COVERS A TARGET'S DEFINITION, NOT ONLY ITS NAME. Each of
+    # these is a repository change `clawctl dm` must refuse to deploy.
+    import importlib.util as _ilu
+
+    def _fp(text):
+        import tempfile
+        handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+        handle.write(text)
+        handle.close()
+        try:
+            return fleet_fingerprint(pe.load(handle.name))
+        finally:
+            os.unlink(handle.name)
+
+    base_fp = _fp(TWO_EFFORTS)
+    check(_fp(TWO_EFFORTS.replace("example.com/shared.git", "example.com/shared-fork.git"))
+          != base_fp, "a url-only change alters the fleet fingerprint")
+    check(_fp(TWO_EFFORTS.replace("ref: main", "ref: release/1.x")) != base_fp,
+          "a ref-only change alters the fleet fingerprint")
+    # `private` is only accepted on a github host, so the pair differs in nothing
+    # else: the same github url in both, the flag in one.
+    gh_public = TWO_EFFORTS.replace("https://example.com/shared.git",
+                                    "https://github.com/acme/shared.git")
+    gh_private = gh_public.replace("        url: https://github.com/acme/shared.git",
+                                   "        url: https://github.com/acme/shared.git\n"
+                                   "        private: true")
+    check(_fp(gh_private) != _fp(gh_public),
+          "a private-only change alters the fleet fingerprint")
+    # ...and it stays blind to formatting, which is not a change.
+    check(_fp(TWO_EFFORTS.replace("efforts:", "efforts:\n")) == base_fp,
+          "reformatting does not alter the fleet fingerprint")
     agents = patch["agents"]["list"]
     servers = patch["mcp"]["servers"]
 

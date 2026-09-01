@@ -645,7 +645,7 @@ interchangeable, and the container tells you which set it is enforcing:
       in efforts.yaml (NOT .env: one channel per effort)
 5. Supply the two tokens as secret files (recommended) or in .env (legacy). Then:
      docker compose down -v && scripts/bootstrap.sh
-       && docker compose up -d && scripts/clawctl apply
+       && scripts/clawctl plan && scripts/clawctl apply && docker compose ps
 ```
 
 For a **new** app, import the manifest rather than assembling scopes by hand — that
@@ -674,14 +674,26 @@ and a message can be answered by whichever Claw happened to receive it.
 The **image** contains the pinned Slack plugin and the logic that generates the
 Slack configuration. It contains **no Slack credentials**, and no channel id.
 
-`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are deployment-time
-values. On the recommended path the two tokens come from mounted secret files and
-only the non-secret channel ID stays in `.env`; the legacy path puts all three in
-`.env`. None is baked into the image. The tokens are never written into the
-state-volume config; the channel ID is written there as the allowlist key.
+`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are deployment-time values. **How many
+values Slack needs depends on which path you are on:**
 
-- On a **fresh** OpenClaw volume, Slack is configured **automatically** when all
-  three are present — no manual JSON, no plugin editing.
+| | multi-effort (`efforts.yaml` present) | legacy single-effort |
+|---|---|---|
+| credentials | the **two** tokens | the two tokens **and** `SLACK_CHANNEL_ID` |
+| where the channels come from | each effort's `slack_channel_id` in `efforts.yaml`, written into the config by `clawctl apply` | `SLACK_CHANNEL_ID` in `.env`, written by the entrypoint |
+| `SLACK_CHANNEL_ID` in `.env` | **ignored**, and the container says so | required |
+
+On the recommended path the tokens come from mounted secret files rather than
+`.env`; on the legacy path every value is in `.env`. None is baked into the image.
+The tokens are never written into the state-volume config; channel ids are, as the
+allowlist keys.
+
+- On a **fresh** OpenClaw volume, Slack is configured **automatically** once the
+  credentials that path requires are present — the two tokens on the multi-effort
+  path, all three values on the legacy one. No manual JSON, no plugin editing. The
+  multi-effort seed writes the Slack half with an **empty** channel allowlist and
+  `dmPolicy: "disabled"`; `clawctl apply` fills in the channels, so a deployment
+  that never runs it stays closed rather than open.
 - An **existing** config volume is **never overwritten**. Adding the Slack
   variables to a volume that was previously Slack-less does nothing on its own; the
   container detects exactly that and prints the two ways forward — the documented
