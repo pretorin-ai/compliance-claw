@@ -74,10 +74,27 @@ jobs:
           fi
           echo "targets.yaml is credential-free, as required."
 
+      # efforts.yaml IS THE RUNTIME AUTHORITY AND IS GITIGNORED, so CI has none —
+      # it names YOUR systems. It is produced here the same way an operator
+      # produces one, from the committed targets.yaml, which keeps CI on the
+      # documented path instead of a shortcut that could rot unnoticed.
+      #
+      # The channel id is a throwaway: CI has no Slack app, nothing routes, and
+      # `migrate` refuses to invent one precisely because a placeholder that
+      # validates and routes nowhere is the failure that looks like a broken bot.
+      # Here there is no bot to break, and the id has to satisfy the schema.
+      - name: Convert targets.yaml into efforts.yaml (the documented migration)
+        run: |
+          set -euo pipefail
+          scripts/clawctl migrate --name ci-effort --slack-channel-id C0000000CI
+          python3 scripts/parse-efforts.py validate efforts.yaml
+          echo "efforts.yaml generated from targets.yaml and valid."
+
       # Runs the documented operator path rather than a CI-only shortcut, so a
       # break in bootstrap.sh fails here instead of on someone's laptop. It
-      # clones the public target from targets.yaml, writes a throwaway .env with
-      # a generated gateway token (PRETORIN_API_KEY stays empty), and builds.
+      # clones the public target declared in efforts.yaml, writes a throwaway
+      # .env with a generated gateway token (PRETORIN_API_KEY stays empty), and
+      # builds.
       - name: Bootstrap (write .env, clone targets, build image)
         run: bash scripts/bootstrap.sh --build
 
@@ -131,6 +148,15 @@ jobs:
       - name: Effort schema, injection rules and the credential ladder (offline)
         run: python3 scripts/parse-efforts.py --self-test
 
+      # Same position and same reasoning again. This one owns the OpenClaw
+      # configuration this deployment generates, so its rejection table covers
+      # the failures that would be invisible until Slack behaved oddly: a DM
+      # admitted with no binding (which routes to the DEFAULT agent), one user
+      # bound to two efforts, a binding to an agent that no longer exists, and a
+      # patch naming a config path this deployment does not own.
+      - name: OpenClaw patch generation and its refusals (offline)
+        run: python3 scripts/openclaw-patch.py --self-test
+
       # The committed example must stay valid and credential-free, for the same
       # two readers the targets.yaml guard above exists for: a fresh clone with
       # nothing but a Pretorin key, and CI, which holds none.
@@ -152,8 +178,11 @@ jobs:
       # this asserts what clawctl WOULD run rather than what it says it would:
       # migrate correctness and idempotence, `plan` starting zero containers and
       # changing zero bytes, the scope pin and named credential on every Pretorin
-      # invocation, `context set` on none of them, and each echoed line
-      # byte-identical to the argv issued.
+      # invocation, `context set` on none of them, each echoed line byte-identical
+      # to the argv issued, and — new with multi-agent — that every gateway-bound
+      # verification goes through `compose exec -T openclaw` rather than the `cli`
+      # container, which cannot reach the gateway and would report a dead check as
+      # a skip forever.
       - name: clawctl behaviour (offline, stub docker, no credentials)
         run: bash scripts/clawctl --self-test
 

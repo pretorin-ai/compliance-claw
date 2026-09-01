@@ -14,11 +14,23 @@
 //     substitution only works on config VALUES — so the channel id has to be
 //     substituted before the file is applied, which a patch file makes explicit.
 //
-// @SLACK_CHANNEL_ID@ is replaced by entrypoint.sh from $SLACK_CHANNEL_ID, but
-// only after the value matches ^C[A-Z0-9]{6,}$ and only into a temporary copy —
-// this file is never modified. `config patch --dry-run` then validates the result
-// against the schema before anything is applied, so a malformed value is
-// rejected twice over.
+// @SLACK_CHANNEL_ID@ has TWO fates, decided by whether efforts.yaml is mounted.
+//
+//   efforts.yaml PRESENT (the multi-effort deployment). The whole placeholder
+//     LINE is deleted, leaving `channels: {}` — an empty allowlist. Which
+//     channels are served is then `scripts/clawctl apply`'s business: it
+//     generates one entry per effort from the same list it generates the
+//     bindings from, so an admitted channel and a routed channel can never
+//     drift. Deleting the line rather than substituting an empty string
+//     matters: "" is a real key, and would be a routing rule for a channel
+//     named nothing.
+//
+//   efforts.yaml ABSENT (legacy, pre-migration). Replaced by entrypoint.sh from
+//     $SLACK_CHANNEL_ID, but only after the value matches ^C[A-Z0-9]{6,}$ and
+//     only into a temporary copy — this file is never modified.
+//
+// Either way `config patch --dry-run` validates the result against the schema
+// before anything is applied, so a malformed value is rejected twice over.
 //
 // NOTE ON COMMENTS: `config patch` rewrites ~/.openclaw/openclaw.json as strict
 // JSON, so none of these comments reach the volume. They document the shipped
@@ -144,6 +156,12 @@
       // @mention. Keys MUST be Slack channel IDs (C...): a name-based key such
       // as "#compliance" silently never routes under groupPolicy "allowlist",
       // which looks identical to the bot being broken.
+      //
+      // ON A MULTI-EFFORT DEPLOYMENT THIS MAP IS EMPTY HERE and is filled by
+      // `scripts/clawctl apply` from each effort's slack_channel_id. Empty plus
+      // "allowlist" means the bot answers nowhere until an operator applies,
+      // which is the correct fail-closed state for a deployment that has been
+      // started but not configured.
       //
       // Find the id: right-click the channel in Slack -> Copy link -> the C...
       // value at the end of the URL.

@@ -16,7 +16,8 @@
 # The only ref-moving operation in this file is `merge --ff-only`. A target that
 # cannot fast-forward is reported and left exactly as it was.
 #
-# WHAT IT WILL NEVER MANAGE. Targets are declared in targets.yaml by the operator.
+# WHAT IT WILL NEVER MANAGE. Targets are declared by the operator, in efforts.yaml
+# (or, before migration, targets.yaml).
 # Nothing here adds, removes, renames, re-points or onboards a target, and no
 # input reaching this script can name a URL, a ref, a path or a flag. The only
 # accepted request is `all`, or the name of a target that is already declared.
@@ -35,8 +36,10 @@ SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "${SELF_DIR}/../compose.yaml" ]; then
   _ROOT="$(cd -- "${SELF_DIR}/.." && pwd)"
   _DEF_TARGETS_FILE="${_ROOT}/targets.yaml"
+  _DEF_EFFORTS_FILE="${_ROOT}/efforts.yaml"
   _DEF_TARGETS_DIR="${_ROOT}/workspace/targets"
   _DEF_PARSE="${SELF_DIR}/parse-targets.py"
+  _DEF_PARSE_EFFORTS="${SELF_DIR}/parse-efforts.py"
   _DEF_AUDIT=""
   # No default credential on the host. bootstrap.sh decides between the GitHub
   # App and the PAT there, because only the host can mint an App token at all.
@@ -47,8 +50,10 @@ else
   # Pretorin derives host-local source resolvers from the current directory, so
   # nothing repository-shaped or target-shaped may appear in that tree.
   _DEF_TARGETS_FILE="/etc/compliance-claw/targets.yaml"
+  _DEF_EFFORTS_FILE="/etc/compliance-claw/efforts.yaml"
   _DEF_TARGETS_DIR="/var/lib/compliance-claw/targets"
   _DEF_PARSE="/opt/compliance-claw/parse-targets.py"
+  _DEF_PARSE_EFFORTS="/opt/compliance-claw/parse-efforts.py"
   _DEF_AUDIT="/home/node/.pretorin/target-sync-audit.log"
   # The container has exactly one possible git credential and it is a mounted
   # file, so the policy lives HERE rather than in the plugin. The plugin then has
@@ -65,7 +70,20 @@ TARGETS_DIR="${CC_TARGETS_DIR:-$_DEF_TARGETS_DIR}"
 # nothing to do with the sync. bootstrap.sh passes a repo-relative path.
 case "$TARGETS_DIR" in /*) ;; *) TARGETS_DIR="${PWD}/${TARGETS_DIR}" ;; esac
 PARSE="${CC_PARSE_TARGETS:-$_DEF_PARSE}"
+EFFORTS_FILE="${CC_EFFORTS_FILE:-$_DEF_EFFORTS_FILE}"
+PARSE_EFFORTS="${CC_PARSE_EFFORTS:-$_DEF_PARSE_EFFORTS}"
 AUDIT="${CC_SYNC_AUDIT:-$_DEF_AUDIT}"
+
+# THE EFFORT THIS REQUEST BELONGS TO, or empty for "every declared target".
+#
+# Set by the target-sync plugin from the OpenClaw agent id, which the HOST
+# populates from the routed session — never from anything the model can write.
+# One effort agent therefore cannot address another effort's repositories, and
+# `all` means "all of MINE" rather than "all of everyone's".
+EFFORT="${CC_EFFORT:-}"
+# Recorded in the audit line so a synchronisation can be traced back to the
+# channel it was asked in. Never used to decide anything.
+SLACK_CHANNEL="${CC_SLACK_CHANNEL:-}"
 
 # The credential, as a FILE PATH. Never a value: a value would be visible in the
 # process environment of every child, which is the property this avoids.
@@ -123,8 +141,9 @@ emit_result() {
 # failure. The token is not a field here and never will be.
 audit() {
   local name="$1" outcome="$2" prev="$3" cur="$4" line
-  line="$(printf 'v=1 ts=%s op=target-sync target=%s outcome=%s previous=%s resulting=%s credential=%s requester=%s route=%s' \
-    "$(now_utc)" "$name" "$outcome" "${prev:--}" "${cur:--}" "$TOKEN_SOURCE" "$REQUESTER" "$ROUTE")"
+  line="$(printf 'v=1 ts=%s op=target-sync effort=%s channel=%s target=%s outcome=%s previous=%s resulting=%s credential=%s requester=%s route=%s' \
+    "$(now_utc)" "${EFFORT:--}" "${SLACK_CHANNEL:--}" "$name" "$outcome" "${prev:--}" "${cur:--}" \
+    "$TOKEN_SOURCE" "$REQUESTER" "$ROUTE")"
   printf '%s\n' "$line" >&2
   [ -n "$AUDIT" ] || return 0
   { umask 077; printf '%s\n' "$line" >> "$AUDIT"; } 2>/dev/null \
@@ -149,7 +168,7 @@ valid_target_name() {
   return 0
 }
 
-# `ref` in targets.yaml is a BRANCH NAME. Not a tag, not a SHA, not a revision
+# `ref` in the declaration is a BRANCH NAME. Not a tag, not a SHA, not a revision
 # expression: this script only ever fast-forwards a branch to its upstream, and a
 # detached checkout at a tag has no upstream to fast-forward to.
 valid_branch_name() {
@@ -187,10 +206,51 @@ classify_request() {
 # SELFTEST_LIST is set only by self_test(), in this same process, and is
 # unconditionally cleared here so an inherited environment variable can never
 # reach it.
+# THE ONE CHOKE POINT, AND THE ONLY PLACE THAT DECIDES WHICH REPOSITORIES EXIST.
+#
+# Everything downstream — membership tests, `all`, bootstrap cloning, the audit
+# record — reads this function, so effort scoping is a change here and nowhere
+# else. The three cases, most specific first:
+#
+#   CC_EFFORT set            exactly that effort's targets. This is the Slack
+#                            path: the agent id decides, so `all` means all of
+#                            THIS effort and a name outside it is simply not in
+#                            the list, which target_exists() already refuses.
+#
+#   efforts.yaml present     the deduped union across every effort. This is the
+#                            clone path: bootstrap needs every repository any
+#                            effort declares, exactly once, because a shared
+#                            target is one clone bound into several scopes.
+#
+#   neither                  targets.yaml. LEGACY, and reachable only before
+#                            `clawctl migrate` has run. efforts.yaml is the
+#                            runtime authority; targets.yaml survives as migration
+#                            input and is no longer mounted into any container.
+#
+# The output shape is identical in all three: name/url/private/ref, tab
+# separated. That contract is why this is a small change rather than a rewrite.
 SELFTEST_LIST=""
 target_list() {
   if [ -n "$SELFTEST_LIST" ]; then cat "$SELFTEST_LIST"; return 0; fi
+  if [ -n "$EFFORT" ]; then
+    python3 "$PARSE_EFFORTS" list "$EFFORT" "$EFFORTS_FILE"
+    return
+  fi
+  if [ -f "$EFFORTS_FILE" ]; then
+    python3 "$PARSE_EFFORTS" targets-all "$EFFORTS_FILE"
+    return
+  fi
   python3 "$PARSE" list "$TARGETS_FILE"
+}
+
+# Which file the messages should name, so a refusal points at the file the
+# operator actually edits rather than at whichever one happened to be the default.
+target_source() {
+  if [ -n "$EFFORT" ] || [ -f "$EFFORTS_FILE" ]; then
+    printf '%s' "$EFFORTS_FILE"
+  else
+    printf '%s' "$TARGETS_FILE"
+  fi
 }
 
 # THE LIST IS MATERIALISED BEFORE ANYTHING ITERATES IT, and this is a
@@ -329,7 +389,7 @@ sync_one() {
 
   # A declared ref must be a usable branch name before anything else happens.
   if [ -n "$ref" ] && ! valid_branch_name "$ref"; then
-    _result invalid_target "targets.yaml declares ref '${ref}' for '${name}', which is not a valid branch name. Fix targets.yaml."
+    _result invalid_target "$(target_source) declares ref '${ref}' for '${name}', which is not a valid branch name. Fix it there."
     return 1
   fi
 
@@ -356,7 +416,7 @@ sync_one() {
   local actual
   actual="$(tgit "$dest" 0 remote get-url origin 2>/dev/null || true)"
   if [ "$actual" != "$url" ]; then
-    _result origin_mismatch_refused "${name} tracks ${actual:-<no origin>} but targets.yaml declares ${url}. Refusing to touch it; fix targets.yaml or move the directory aside."
+    _result origin_mismatch_refused "${name} tracks ${actual:-<no origin>} but $(target_source) declares ${url}. Refusing to touch it; fix that file or move the directory aside."
     return 1
   fi
 
@@ -373,7 +433,7 @@ sync_one() {
   fi
 
   if [ -n "$ref" ] && [ "$branch" != "$ref" ]; then
-    _result branch_mismatch_refused "${name} is on '${branch}' but targets.yaml declares ref '${ref}'. Refusing to switch branches; check it out yourself or fix targets.yaml."
+    _result branch_mismatch_refused "${name} is on '${branch}' but $(target_source) declares ref '${ref}'. Refusing to switch branches; check it out yourself or fix that file."
     return 1
   fi
 
@@ -411,7 +471,7 @@ sync_one() {
 
   remote="$(tgit "$dest" 0 rev-parse --quiet --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
   if [ -z "$remote" ]; then
-    _result sync_failed "${name}: origin/${branch} does not exist on the remote any more. Fix targets.yaml or re-clone."
+    _result sync_failed "${name}: origin/${branch} does not exist on the remote any more. Fix $(target_source) or re-clone."
     return 1
   fi
 
@@ -605,13 +665,13 @@ mode_sync() {
 
   if ! kind="$(classify_request "$raw")"; then
     emit_result "${raw:-<empty>}" invalid_target - - \
-      "refusing '${raw:-<empty>}'. The only accepted requests are 'all' or the name of a target already declared in targets.yaml. No URL, ref, path or option is accepted."
+      "refusing '${raw:-<empty>}'. The only accepted requests are 'all' or the name of a target already declared in $(target_source). No URL, ref, path or option is accepted."
     audit "${raw:-<empty>}" invalid_target "" ""
     printf 'SUMMARY\ttotal=0\tupdated=0\tfailed=1\toverall=failed\n'
     exit 1
   fi
 
-  [ -f "$TARGETS_FILE" ] || die "${TARGETS_FILE} not found. It is mounted read-only into the gateway; check compose.yaml."
+  [ -f "$(target_source)" ] || die "$(target_source) not found. It is mounted read-only into the gateway; check that compose.efforts.yaml is in COMPOSE_FILE."
   [ -d "$TARGETS_DIR" ] || die "${TARGETS_DIR} not found. It is the maintenance mount of the target directory; check compose.yaml."
 
   # BEFORE the membership test, and its failure is fatal. Without the list there
@@ -619,7 +679,7 @@ mode_sync() {
   # answer and points the operator somewhere else entirely.
   if ! load_target_list; then
     emit_result "${raw}" targets_unreadable - - \
-      "could not read the target list from ${TARGETS_FILE}: ${TARGET_LIST_ERROR}. Nothing was examined and nothing was changed. This is a problem with the file or the parser, NOT with the requested name."
+      "could not read the target list from $(target_source): ${TARGET_LIST_ERROR}. Nothing was examined and nothing was changed. This is a problem with the file or the parser, NOT with the requested name."
     audit "${raw}" targets_unreadable "" ""
     printf 'SUMMARY\ttotal=0\tupdated=0\tfailed=1\toverall=failed\n'
     exit 1
@@ -632,8 +692,20 @@ mode_sync() {
   esac
 
   if [ -n "$name" ] && ! target_exists "$name"; then
+    # TWO DIFFERENT REFUSALS THROUGH ONE TEST. With an effort in scope, a name
+    # that is not in the list may still be a perfectly real repository — it just
+    # belongs to a different effort, and saying "not declared" would send the
+    # operator to add something that already exists. Naming the effort is the
+    # difference between a useful refusal and a misleading one.
+    if [ -n "$EFFORT" ]; then
+      emit_result "$name" out_of_effort - - \
+        "'${name}' is not one of effort '${EFFORT}'s targets. Each effort agent can only synchronize the repositories declared for its own effort in $(target_source); if '${name}' belongs to another effort, ask in that effort's Slack channel."
+      audit "$name" out_of_effort "" ""
+      printf 'SUMMARY\ttotal=0\tupdated=0\tfailed=1\toverall=failed\n'
+      exit 1
+    fi
     emit_result "$name" invalid_target - - \
-      "'${name}' is not declared in targets.yaml. Sync can only move targets the operator has already declared; adding one is an operator action on the host."
+      "'${name}' is not declared in $(target_source). Sync can only move targets the operator has already declared; adding one is an operator action on the host."
     audit "$name" invalid_target "" ""
     printf 'SUMMARY\ttotal=0\tupdated=0\tfailed=1\toverall=failed\n'
     exit 1
@@ -681,7 +753,7 @@ mode_bootstrap() {
   # Fatal, and before the lock: a bootstrap that cannot read the list must not
   # report "0 targets" as though the file said so.
   load_target_list \
-    || die "could not read the target list from ${TARGETS_FILE}: ${TARGET_LIST_ERROR}
+    || die "could not read the target list from $(target_source): ${TARGET_LIST_ERROR}
   Nothing was cloned or updated. Check the file, or run:  python3 ${PARSE} list ${TARGETS_FILE}"
 
   acquire_lock || die "another synchronization is in progress ($(cat "${LOCK_DIR}/owner" 2>/dev/null || echo unknown)).
@@ -693,7 +765,7 @@ mode_bootstrap() {
     dest="${TARGETS_DIR}/${name}"
 
     if [ -n "$ref" ] && ! valid_branch_name "$ref"; then
-      die "targets.yaml declares ref '${ref}' for '${name}', which is not a valid branch name."
+      die "$(target_source) declares ref '${ref}' for '${name}', which is not a valid branch name."
     fi
 
     if [ ! -e "$dest" ]; then
@@ -701,6 +773,14 @@ mode_bootstrap() {
       clone_one "$name" "$url" "$private" "$ref"
     elif [ ! -d "$dest" ]; then
       die "${dest} exists but is not a directory. Move it aside and retry."
+    elif [ "${CC_CLONE_ONLY:-0}" = 1 ]; then
+      # CLONE-ONLY: make missing clones exist, and touch nothing that already
+      # does. `clawctl apply` runs this way because binding an effort's scope
+      # must not also move the code that effort is reviewing — an apply that
+      # silently fast-forwarded a target would change what every open review
+      # cites, and the operator asked to configure efforts, not to update code.
+      # Moving a target stays an explicit /target-sync.
+      log "  ${name}: already cloned, left at its current commit (clone-only)"
     else
       log "updating ${name} (fetch)"
       if ! sync_one "$name" "$url" "$private" "$ref"; then rc=1; else rc=0; fi
@@ -708,12 +788,12 @@ mode_bootstrap() {
         updated | already_current )
           log "  ${OUT_MSG}" ;;
         # Fatal: bootstrap owns the shape of the tree, and these mean the tree is
-        # not the one targets.yaml describes. smoke.sh A9 asserts both.
+        # not the one the declaration describes. smoke.sh A9 asserts both.
         origin_mismatch_refused )
           die "${dest} tracks a different remote.
-  targets.yaml: ${url}
+  declared:     ${url}
   on disk:      $(tgit "$dest" 0 remote get-url origin 2>/dev/null || echo '<no origin>')
-  Refusing to touch it. Fix targets.yaml, or move the directory aside." ;;
+  Refusing to touch it. Fix $(target_source), or move the directory aside." ;;
         missing_clone )
           die "${dest} exists but is not the root of a git repository (an interrupted clone?).
   Inspect it, then remove it yourself and re-run:  rm -rf ${dest}" ;;
@@ -1111,9 +1191,14 @@ b' 'https://example.com/x.git' 'origin/main' 'simple-crm --force' 'all extra'
   SELFTEST_LIST=""
   local broken="${ST_TMP}/broken-parser.py"
   printf 'import sys\nsys.stderr.write("simulated parser failure\\n")\nraise SystemExit(2)\n' > "$broken"
-  local saved_parse="$PARSE" saved_file="$TARGETS_FILE"
+  local saved_parse="$PARSE" saved_file="$TARGETS_FILE" saved_efforts="$EFFORTS_FILE"
   PARSE="$broken"
   TARGETS_FILE="${ST_TMP}/targets.yaml"
+  # POINT THE EFFORTS DISPATCH AT NOTHING, so this case exercises the LEGACY
+  # branch it was written for. Without it the checkout's own efforts.yaml is
+  # picked up and the substituted broken parser is never reached — the test would
+  # then be asserting on a real parse error from an unrelated file.
+  EFFORTS_FILE="${ST_TMP}/absent-efforts.yaml"
   printf 'system_id: s\nframework_id: f\ntargets:\n  - name: demo\n    url: https://example.invalid/d.git\n' > "$TARGETS_FILE"
 
   if load_target_list; then
@@ -1134,7 +1219,101 @@ b' 'https://example.com/x.git' 'origin/main' 'simple-crm --force' 'all extra'
     st_ok "an empty target list is reported as a failure"
   fi
 
-  PARSE="$saved_parse"; TARGETS_FILE="$saved_file"
+  PARSE="$saved_parse"; TARGETS_FILE="$saved_file"; EFFORTS_FILE="$saved_efforts"
+
+  # --- effort scoping ------------------------------------------------------
+  #
+  # THE PROPERTY: one effort agent can only address its OWN repositories, and it
+  # learns which those are from the effort name the HOST put in the environment —
+  # never from anything a model wrote. These drive the real target_list() and
+  # target_exists(), so the scoping cannot be true here and false in production.
+  printf '\neffort scoping\n'
+  local saved_effort="$EFFORT"
+  saved_parse="$PARSE"; saved_file="$TARGETS_FILE"; saved_efforts="$EFFORTS_FILE"
+  SELFTEST_LIST=""
+  EFFORTS_FILE="${ST_TMP}/efforts.yaml"
+  PARSE_EFFORTS="${SELF_DIR}/parse-efforts.py"
+  cat > "$EFFORTS_FILE" <<'EFF'
+efforts:
+  - name: eff-a
+    system_id: 11111111-1111-4111-8111-111111111111
+    framework_id: soc2
+    credential_ref: default
+    slack_channel_id: C0AAAAAAA
+    targets:
+      - name: shared
+        url: https://example.invalid/shared.git
+      - name: only-a
+        url: https://example.invalid/only-a.git
+  - name: eff-b
+    system_id: 11111111-1111-4111-8111-111111111111
+    framework_id: hipaa
+    credential_ref: default
+    slack_channel_id: C0BBBBBBB
+    targets:
+      - name: shared
+        url: https://example.invalid/shared.git
+      - name: only-b
+        url: https://example.invalid/only-b.git
+EFF
+
+  EFFORT="eff-a"
+  if load_target_list && [ "$(cut -f1 < "$TARGET_LIST_FILE" | tr '\n' ' ')" = "shared only-a " ]; then
+    st_ok "an effort sees exactly its own targets"
+  else
+    st_bad "an effort sees exactly its own targets" "$(cut -f1 < "$TARGET_LIST_FILE" | tr '\n' ' ')"
+  fi
+  if target_exists only-a; then
+    st_ok "  a target of this effort is addressable"
+  else
+    st_bad "  a target of this effort is addressable" "only-a was not found"
+  fi
+  # THE ONE THAT MATTERS. only-b is a perfectly real repository; it is simply not
+  # this effort's, and the membership test is what refuses it.
+  if target_exists only-b; then
+    st_bad "  a target of ANOTHER effort is refused" "only-b was addressable from eff-a"
+  else
+    st_ok "  a target of ANOTHER effort is refused"
+  fi
+  case "$(target_source)" in *efforts.yaml) st_ok "  refusals name efforts.yaml, not targets.yaml" ;;
+    *) st_bad "  refusals name efforts.yaml, not targets.yaml" "$(target_source)" ;;
+  esac
+
+  # The clone path: the union, deduped, so a shared repository is cloned once.
+  EFFORT=""
+  if load_target_list && [ "$(cut -f1 < "$TARGET_LIST_FILE" | tr '\n' ' ')" = "shared only-a only-b " ]; then
+    st_ok "with no effort in scope the list is the deduped union of every effort"
+  else
+    st_bad "with no effort in scope the list is the deduped union of every effort" \
+      "$(cut -f1 < "$TARGET_LIST_FILE" | tr '\n' ' ')"
+  fi
+  if [ "$(cut -f1 < "$TARGET_LIST_FILE" | grep -c '^shared$')" = 1 ]; then
+    st_ok "  a target shared by two efforts appears ONCE (one clone)"
+  else
+    st_bad "  a target shared by two efforts appears ONCE (one clone)" "it appeared more than once"
+  fi
+
+  # The audit line carries the effort and the channel, and never a token.
+  EFFORT="eff-a"; SLACK_CHANNEL="C0AAAAAAA"
+  local audit_line
+  audit_line="$(TOKEN_SOURCE=pat audit shared already_current abc def 2>&1)"
+  case "$audit_line" in
+    *"effort=eff-a"*) st_ok "the audit line records the effort" ;;
+    *) st_bad "the audit line records the effort" "$audit_line" ;;
+  esac
+  case "$audit_line" in
+    *"channel=C0AAAAAAA"*) st_ok "  and the channel it was asked in" ;;
+    *) st_bad "  and the channel it was asked in" "$audit_line" ;;
+  esac
+  # credential= carries the SOURCE LABEL and never a value; asserted because this
+  # line is echoed to container logs.
+  case "$audit_line" in
+    *"credential=pat"*) st_ok "  and the credential SOURCE, never a value" ;;
+    *) st_bad "  and the credential SOURCE, never a value" "$audit_line" ;;
+  esac
+
+  EFFORT="$saved_effort"; SLACK_CHANNEL=""
+  PARSE="$saved_parse"; TARGETS_FILE="$saved_file"; EFFORTS_FILE="$saved_efforts"
 
   printf '\na stale lock left by a dead owner\n'
   # 2. The plugin bounds the wrapper with a timeout. A SIGKILL runs no EXIT trap,

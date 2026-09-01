@@ -152,15 +152,19 @@ services:
       # A real boundary is a separate container with its own uid; that is
       # deliberately out of scope for the pilot.
       - ./workspace/targets:/var/lib/compliance-claw/targets:rw
-      # The declaration of WHICH repositories exist, read-only. The wrapper
-      # refuses any name that is not in this file, so this file is the whole of
-      # what a Slack request can address.
       #
-      # /etc/, deliberately NOT /opt/compliance-claw/: the `pretorin mcp-serve`
-      # child runs with cwd /opt/compliance-claw/no-repo and Pretorin derives
-      # host-local source resolvers from the current directory, so nothing
-      # repository-shaped or target-shaped may appear in that tree.
-      - ./targets.yaml:/etc/compliance-claw/targets.yaml:ro
+      # THE DECLARATION OF WHICH REPOSITORIES EXIST IS NO LONGER MOUNTED HERE.
+      # It moved to efforts.yaml, which compose.efforts.yaml mounts read-only at
+      # /etc/compliance-claw/efforts.yaml on BOTH services. targets.yaml survives
+      # only as input to `scripts/clawctl migrate`, which runs on the host, so
+      # nothing in a container reads it any more.
+      #
+      # The mount lives in that OVERLAY rather than here because efforts.yaml is
+      # gitignored — it names your systems — and compose resolves every bind
+      # source at `up` time, so naming it in the base file would make a fresh
+      # clone fail with "bind source path does not exist" before anything could
+      # explain why. scripts/bootstrap.sh creates it first; scripts/clawctl
+      # refuses with a named fix if it is missing.
 
     ports:
       # Never "18789:18789" — a bare port publishes on 0.0.0.0 and exposes the

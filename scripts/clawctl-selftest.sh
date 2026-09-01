@@ -33,6 +33,8 @@ st_head() { printf '\n%s\n' "$1"; }
 # clawctl asks. Written to $1/docker; $2 is the record file.
 st_write_stub_docker() {
   local dir="$1" record="$2" mode="${3:-answer}" root="${4:-}" efile="${5:-}"
+  # STUB_OC_CONFIG / STUB_OC_FAIL are read from the ENVIRONMENT by the generated
+  # stub, so one stub serves every configuration case without being rewritten.
   mkdir -p "$dir"
   cat > "${dir}/docker" <<STUB
 #!/usr/bin/env bash
@@ -47,6 +49,70 @@ STUB_ATTACHED="\${STUB_ATTACHED:-}"
 # with the bug deliberately reintroduced. Now it consumes stdin exactly as
 # compose does, so a missing \`< /dev/null\` makes the second effort vanish here
 # too.
+# THE AGENT-WORKSPACE SCRIPT ALSO ARRIVES ON STDIN, AND IS EXECUTED FOR REAL.
+#
+# An earlier version of this stub only recorded argv, so a bug that handed the
+# container an EMPTY script passed every row here: apply logged a workspace for
+# each effort, wrote none, and exited 0. Running the script locally — with the
+# container's /home/node/.openclaw rewritten to STUB_WS_ROOT — is what lets the
+# tests assert on files that actually exist.
+case " \$* " in
+  *" cli sh -s "*)
+    _script="\$(cat)"
+    _rest=""; _hit=0
+    for a in "\$@"; do
+      if [ "\$_hit" = 1 ]; then
+        case "\$a" in -s|--) continue ;; esac
+        _rest="\$_rest \$(printf '%s' "\$a" | sed "s|/home/node/.openclaw|\${STUB_WS_ROOT:-/tmp/stub-ws}|")"
+      fi
+      [ "\$a" = sh ] && _hit=1
+    done
+    # Run it against the rewritten host path, then map the path back on the way
+    # out: clawctl asserts on the CONTAINER path it asked for, and a stub that
+    # reported its own scratch directory would fail a check that is correct.
+    printf '%s' "\$_script" | sh -s -- \$_rest \
+      | sed "s|\${STUB_WS_ROOT:-/tmp/stub-ws}|/home/node/.openclaw|g"
+    exit \$?
+    ;;
+esac
+
+# THE PATCH ARRIVES ON STDIN, SO IT IS HANDLED BEFORE THE DRAIN BELOW.
+# \`config patch --stdin\` is the one call whose stdin is the payload rather than
+# an accident of compose attaching it. Draining first would leave the patch
+# empty and the stub would silently apply nothing — which is exactly how this
+# section first reported a config that had never been written.
+# \`openclaw config patch --stdin [--dry-run]\`, applied to the stand-in config by
+# the REAL merge semantics rather than a guess: objects merge, arrays and scalars
+# replace, null deletes. Getting this wrong in the stub would make the tests
+# assert against behaviour OpenClaw does not have.
+case " \$* " in
+  *" openclaw config patch --stdin "*|*" openclaw config patch --stdin")
+    _patch="\$(cat)"
+    case " \$* " in *" --dry-run "*|*" --dry-run") exit 0 ;; esac
+    [ "\${STUB_OC_FAIL}" = patch ] && exit 1
+    CC_PATCH="\$_patch" CC_CFG="\${STUB_OC_CONFIG}" python3 -c '
+import json, os
+patch = json.loads(os.environ["CC_PATCH"])
+try:
+    cfg = json.load(open(os.environ["CC_CFG"]))
+except Exception:
+    cfg = {}
+def merge(dst, src):
+    for k, v in src.items():
+        if v is None:
+            dst.pop(k, None)
+        elif isinstance(v, dict) and isinstance(dst.get(k), dict):
+            merge(dst[k], v)
+        else:
+            dst[k] = v
+merge(cfg, patch)
+cfg.setdefault("meta", {})["lastTouchedAt"] = "stub"
+json.dump(cfg, open(os.environ["CC_CFG"], "w"), indent=2, sort_keys=True)
+'
+    exit 0 ;;
+esac
+
+
 # Only \`compose run\` attaches stdin, and only when stdin is not a terminal —
 # draining unconditionally hangs forever against a tty. \`logs\`, \`inspect\` and
 # \`rm\` never touch it.
@@ -72,6 +138,57 @@ esac
 # the assert reports "onboarding has not run" rather than crashing the harness.
 case " \$* " in
   *" preflight show "*) echo '{"kinds":[]}'; exit 0 ;;
+esac
+
+# --- the OpenClaw configuration stage -------------------------------------
+#
+# STUB_OC_CONFIG names a file standing in for the config INSIDE the volume, so
+# the tests can seed a starting configuration and inspect what apply did to it.
+# STUB_OC_FAIL selects a failure to inject: patch | verify.
+STUB_OC_CONFIG="\${STUB_OC_CONFIG:-}"
+STUB_OC_FAIL="\${STUB_OC_FAIL:-}"
+
+# Reading the live config out of the volume.
+case " \$* " in
+  *" cli sh -c cat "*|*"cli sh -c "*"openclaw.json"*)
+    case " \$* " in
+      *".pre-apply."*)
+        # snapshot read, or the snapshot copy
+        case " \$* " in
+          *" cp "*) cp "\${STUB_OC_CONFIG}" "\${STUB_OC_CONFIG}.snap" 2>/dev/null || true; exit 0 ;;
+        esac
+        cat "\${STUB_OC_CONFIG}.snap" 2>/dev/null || true; exit 0 ;;
+      *" cp "*)
+        # rollback: snapshot -> config
+        cp "\${STUB_OC_CONFIG}.snap" "\${STUB_OC_CONFIG}" 2>/dev/null || true; exit 0 ;;
+    esac
+    cat "\${STUB_OC_CONFIG}" 2>/dev/null || true; exit 0 ;;
+esac
+
+# The gateway container: recreate, and the exec'd verification commands.
+case " \$* " in
+  *" up -d --force-recreate openclaw "*) exit 0 ;;
+  *" exec -T openclaw "*)
+    [ "\${STUB_OC_FAIL}" = verify ] && { echo "gateway unreachable" >&2; exit 1; }
+    case " \$* " in
+      *" openclaw health"*) echo '{"ok":true}'; exit 0 ;;
+      *" agents list "*)
+        CC_CFG="\${STUB_OC_CONFIG}" python3 -c '
+import json, os
+cfg = json.load(open(os.environ["CC_CFG"]))
+print(json.dumps({"agents": cfg.get("agents", {}).get("list", []),
+                  "bindings": cfg.get("bindings", [])}))
+'
+        exit 0 ;;
+      *" mcp list "*)
+        CC_CFG="\${STUB_OC_CONFIG}" python3 -c '
+import json, os
+cfg = json.load(open(os.environ["CC_CFG"]))
+print(json.dumps({"servers": sorted(cfg.get("mcp", {}).get("servers", {}))}))
+'
+        exit 0 ;;
+    esac
+    exit 0 ;;
 esac
 # The two probe calls validate makes. check_context echoes whatever scope the
 # process was pinned to; get_compliance_status reports the system's ATTACHED
@@ -147,7 +264,7 @@ clawctl_self_test() {
 
   local out
   if out="$(TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
-              bash "${root}/scripts/clawctl" migrate --name crm-soc2 2>&1)"; then
+              bash "${root}/scripts/clawctl" migrate --name crm-soc2 --slack-channel-id C0SOC2AAA 2>&1)"; then
     st_ok "migrate converts a single-effort targets.yaml"
   else
     st_bad "migrate converts a single-effort targets.yaml" "$out"
@@ -197,7 +314,7 @@ clawctl_self_test() {
   local before after plan_out
   before="$(st_manifest "$tmp")"
   if TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
-       bash "${root}/scripts/clawctl" migrate --name crm-soc2 >/dev/null 2>&1; then
+       bash "${root}/scripts/clawctl" migrate --name crm-soc2 --slack-channel-id C0SOC2AAA >/dev/null 2>&1; then
     st_bad "a second migrate refuses" "it succeeded, which means it may have rewritten the file"
   else
     st_ok "a second migrate refuses cleanly (write-if-absent)"
@@ -212,7 +329,7 @@ clawctl_self_test() {
   # system_id is always a UUID, so a name must be asked for, never derived.
   rm -f "$E"
   if out="$(TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
-              bash "${root}/scripts/clawctl" migrate 2>&1)"; then
+              bash "${root}/scripts/clawctl" migrate --slack-channel-id C0SOC2AAA 2>&1)"; then
     st_bad "migrate refuses to derive an effort name" "it generated one"
   else
     case "$out" in
@@ -221,6 +338,33 @@ clawctl_self_test() {
     esac
   fi
   [ -e "$E" ] && st_bad "the refused migrate wrote no file" || st_ok "the refused migrate wrote no file"
+
+  # THE CHANNEL IS THE OTHER THING THAT CANNOT BE DERIVED. targets.yaml has no
+  # Slack in it at all, and a placeholder would produce a file that validates and
+  # routes nowhere — the exact failure that looks like a broken bot.
+  if out="$(TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
+              bash "${root}/scripts/clawctl" migrate --name crm-soc2 2>&1)"; then
+    st_bad "migrate refuses to invent a Slack channel id" "it generated one"
+  else
+    case "$out" in
+      *"--slack-channel-id"*) st_ok "migrate refuses to invent a channel and names the flag" ;;
+      *) st_bad "migrate refuses to invent a channel" "message did not name the flag" ;;
+    esac
+  fi
+  [ -e "$E" ] && st_bad "that refusal wrote no file either" || st_ok "that refusal wrote no file either"
+
+  # A D id is a DM conversation, not a channel; refusing it here is what keeps a
+  # DM from being configured as an effort's home.
+  if out="$(TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
+              bash "${root}/scripts/clawctl" migrate --name crm-soc2 \
+              --slack-channel-id D0123ABCDEF 2>&1)"; then
+    st_bad "migrate refuses a DM id as an effort channel" "it accepted one"
+  else
+    case "$out" in
+      *"DM conversation id"*) st_ok "migrate refuses a D... id, naming why" ;;
+      *) st_bad "migrate refuses a D... id" "$out" ;;
+    esac
+  fi
 
   # Put the good file back for the remaining sections, and ADD A SECOND EFFORT.
   #
@@ -232,13 +376,14 @@ clawctl_self_test() {
   # "1 effort(s) checked" with the second one silently gone. A one-effort fixture
   # cannot see that. This one can.
   TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
-    bash "${root}/scripts/clawctl" migrate --name crm-soc2 >/dev/null 2>&1
+    bash "${root}/scripts/clawctl" migrate --name crm-soc2 --slack-channel-id C0SOC2AAA >/dev/null 2>&1
   cat >> "$E" <<'SECOND'
 
   - name: crm-hipaa
     system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411
     framework_id: hipaa
     credential_ref: default
+    slack_channel_id: C0HIPAABB
     targets:
       - name: simple-crm
         url: https://github.com/pretorin-ai/simple-crm.git
@@ -569,10 +714,413 @@ SECOND
     st_bad "with both attached, every row is green" "$(printf '%s' "$out" | tail -4)"
   fi
 
+  # ------------------------------------------------- 7. the OpenClaw fleet
+  #
+  # The properties this section exists for, in order of how badly they fail if
+  # they are wrong:
+  #
+  #   - one agent per effort, each denying the OTHER efforts' MCP tools
+  #   - exactly the declared Slack channels admitted AND bound, from one list
+  #   - the configuration this deployment does not own comes out untouched
+  #   - a re-apply of unchanged input changes nothing
+  #   - an operator's DM binding survives
+  #   - verification runs in the GATEWAY container, never in `cli`
+  st_head "7. the OpenClaw fleet"
+
+  local OC="${tmp}/openclaw.json"
+  # A base configuration carrying things we must NOT touch. plugins.load.paths is
+  # the array an earlier release silently emptied by naming it in a patch.
+  cat > "$OC" <<'BASE'
+{
+  "gateway": { "mode": "local", "port": 18789, "bind": "lan" },
+  "models": { "providers": { "openai": { "api": "openai-responses" } } },
+  "agents": { "defaults": { "model": "gpt-5.5", "workspace": "/home/node/.openclaw/workspace" } },
+  "tools": { "toolSearch": { "mode": "directory" } },
+  "plugins": { "load": { "paths": ["/opt/compliance-claw/plugins/target-sync"] },
+               "allow": ["slack", "pretorin-update", "target-sync"] },
+  "mcp": { "servers": { "pretorin": { "command": "/home/node/.pretorin/bin/pretorin" } } },
+  "channels": { "slack": { "enabled": true, "mode": "socket", "groupPolicy": "allowlist",
+                           "dmPolicy": "disabled", "configWrites": false, "channels": {} } }
+}
+BASE
+
+  rm -f "$record"
+  st_write_stub_docker "$bin" "$record" answer
+  local fleetlog="${tmp}/fleet.log"
+  st_fleet_apply() {
+    ( cd "$tmp" && PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
+        COMPLIANCE_CLAW_SECRET_DIR="$S" \
+        COMPOSE_FILE=compose.yaml:compose.secrets.yaml \
+        CC_TARGETS_DIR="${tmp}/workspace/targets" CC_STATE_DIR="${tmp}/state" \
+        STUB_OC_CONFIG="$OC" STUB_OC_FAIL="${1:-}" STUB_WS_ROOT="${tmp}/ocstate" \
+        bash "${root}/scripts/clawctl" apply ) >"$fleetlog" 2>&1
+  }
+  st_fleet_apply || true
+
+  # --- agents ---
+  local q
+  q() { CC_OC="$OC" python3 -c "
+import json, os, sys
+cfg = json.load(open(os.environ['CC_OC']))
+$1" 2>/dev/null; }
+
+  if [ "$(q "print(','.join(a['id'] for a in cfg['agents']['list']))")" = "crm-soc2,crm-hipaa" ]; then
+    st_ok "two efforts produce two agents, named for the efforts"
+  else
+    st_bad "two efforts produce two agents" "$(q "print(cfg.get('agents'))")"
+  fi
+  if [ "$(q "print(cfg['agents']['list'][0].get('default'))")" = "True" ]; then
+    st_ok "the first effort is the EXPLICIT default agent (not chosen by position)"
+  else
+    st_bad "the first effort is the explicit default agent"
+  fi
+  if [ "$(q "print(cfg['agents']['list'][0]['workspace'] != cfg['agents']['list'][1]['workspace'] and cfg['agents']['list'][0]['agentDir'] != cfg['agents']['list'][1]['agentDir'])")" = "True" ]; then
+    st_ok "separate workspace AND agentDir (OpenClaw forbids sharing agentDir)"
+  else
+    st_bad "separate workspace and agentDir"
+  fi
+
+  # THE ISOLATION ASSERTION. Each agent denies the other's MCP tool prefix and
+  # never its own — a deny naming its own prefix would silence the agent.
+  if [ "$(q "print(cfg['agents']['list'][0]['tools']['deny'])")" = "['pretorin-crm-hipaa__*']" ] \
+     && [ "$(q "print(cfg['agents']['list'][1]['tools']['deny'])")" = "['pretorin-crm-soc2__*']" ]; then
+    st_ok "each agent denies the OTHER effort's MCP tool prefix, and only that"
+  else
+    st_bad "per-agent tool policy" "$(q "print([a.get('tools') for a in cfg['agents']['list']])")"
+  fi
+
+  # --- MCP ---
+  if [ "$(q "print(sorted(cfg['mcp']['servers']))")" = "['pretorin-crm-hipaa', 'pretorin-crm-soc2']" ]; then
+    st_ok "one named MCP server per effort, and the single-effort one is retired"
+  else
+    st_bad "MCP servers" "$(q "print(sorted(cfg['mcp']['servers']))")"
+  fi
+  if [ "$(q "
+a=cfg['mcp']['servers']['pretorin-crm-soc2']; b=cfg['mcp']['servers']['pretorin-crm-hipaa']
+print(a['command']==b['command'] and a['args']==['crm-soc2'] and b['args']==['crm-hipaa'])")" = "True" ]; then
+    st_ok "both MCP servers run the SAME launcher with different effort names"
+  else
+    st_bad "MCP servers share one launcher binary"
+  fi
+
+  # --- Slack routing: the allowlist and the bindings come from one list ---
+  if [ "$(q "
+ch = sorted(cfg['channels']['slack']['channels'])
+bd = sorted(b['match']['peer']['id'] for b in cfg['bindings'] if b['match']['peer']['kind']=='channel')
+print(ch == bd == ['C0HIPAABB','C0SOC2AAA'])")" = "True" ]; then
+    st_ok "the Slack allowlist and the channel bindings name exactly the same channels"
+  else
+    st_bad "allowlist and bindings agree" "$(q "print(sorted(cfg['channels']['slack']['channels']), cfg['bindings'])")"
+  fi
+  if [ "$(q "print(any(b['match']['peer']['kind']=='group' for b in cfg['bindings']))")" = "False" ]; then
+    st_ok "NO speculative 'group' binding is emitted (MPIM is not supported here)"
+  else
+    st_bad "no group binding is emitted"
+  fi
+  if [ "$(q "print('dm' in cfg['channels']['slack'])")" = "False" ]; then
+    st_ok "channels.slack.dm.* is never written (no MPIM admission machinery)"
+  else
+    st_bad "channels.slack.dm is untouched"
+  fi
+  if [ "$(q "print(cfg['channels']['slack']['dmPolicy'])")" = "disabled" ]; then
+    st_ok "with no DM configured, dmPolicy stays 'disabled' and all DMs are blocked"
+  else
+    st_bad "DMs are disabled by default"
+  fi
+
+  # --- what we do NOT own survived ---
+  if [ "$(q "print(cfg['plugins']['load']['paths'])")" = "['/opt/compliance-claw/plugins/target-sync']" ]; then
+    st_ok "plugins.load.paths survived (the array an earlier release emptied)"
+  else
+    st_bad "plugins.load.paths survived" "$(q "print(cfg.get('plugins'))")"
+  fi
+  if [ "$(q "print(cfg['models']['providers']['openai']['api'], cfg['tools']['toolSearch']['mode'], cfg['gateway']['port'])")" = "openai-responses directory 18789" ]; then
+    st_ok "unrelated models, tools and gateway configuration is untouched"
+  else
+    st_bad "unrelated configuration is untouched"
+  fi
+
+  # --- verification goes through the GATEWAY container, never `cli` ---
+  #
+  # This is a regression guard with a history: a check written on the `cli` path
+  # could never have passed, because that container has its own empty loopback,
+  # and it reported skip on every run instead of failing.
+  if grep -q 'exec -T openclaw' "$record"; then
+    st_ok "verification runs via 'compose exec -T openclaw'"
+  else
+    st_bad "verification runs in the gateway container" "no exec call was recorded"
+  fi
+  if grep -E 'exec -T openclaw' "$record" | grep -q 'openclaw_gateway_token'; then
+    st_ok "  and re-reads the gateway token INSIDE the container"
+  else
+    st_bad "  and re-reads the gateway token inside the container" "$(grep 'exec -T' "$record" | head -2)"
+  fi
+  if grep -E 'run .*cli openclaw (health|agents|mcp)' "$record" >/dev/null 2>&1; then
+    st_bad "no gateway-bound command is issued through the cli container" \
+           "$(grep -E 'cli openclaw (health|agents|mcp)' "$record" | head -2)"
+  else
+    st_ok "  and NO gateway-bound command is issued through the cli container"
+  fi
+  if grep -q 'OPENCLAW_GATEWAY_TOKEN=[^"$]' "$record"; then
+    st_bad "the token never appears in host argv" "$(grep -o 'OPENCLAW_GATEWAY_TOKEN=[^ ]*' "$record" | head -2)"
+  else
+    st_ok "  and the token value never appears in host argv"
+  fi
+
+  # --- the managed workspace, asserted on the FILES, not on the log ---
+  #
+  # The log line proves only that clawctl intended to write a workspace. What has
+  # to be true is that the files exist and say the right thing — the bug this
+  # replaced was a run that logged both workspaces and wrote neither.
+  local WSA="${tmp}/ocstate/workspace-crm-soc2" WSB="${tmp}/ocstate/workspace-crm-hipaa"
+  if [ -f "${WSA}/AGENTS.md" ] && [ -f "${WSB}/AGENTS.md" ]; then
+    st_ok "a managed workspace with AGENTS.md exists for each effort"
+  else
+    st_bad "a managed workspace per effort" "no AGENTS.md under ${tmp}/ocstate"
+  fi
+  if grep -q "crm-soc2" "${WSA}/AGENTS.md" 2>/dev/null \
+     && ! grep -q "crm-hipaa" "${WSA}/AGENTS.md" 2>/dev/null; then
+    st_ok "  and each names ONLY its own effort"
+  else
+    st_bad "  and each names only its own effort" "$(head -20 "${WSA}/AGENTS.md" 2>/dev/null)"
+  fi
+  if grep -q "@EFFORT@\|@SYSTEM@\|@TARGET_LINES@" "${WSA}/AGENTS.md" 2>/dev/null; then
+    st_bad "  no template placeholder survives into the generated file"
+  else
+    st_ok "  no template placeholder survives into the generated file"
+  fi
+  # The per-effort repository view: symlinks to the shared clones, and only the
+  # targets this effort declares.
+  if [ -L "${WSA}/targets/simple-crm" ] && [ -L "${WSA}/targets/other" ]; then
+    st_ok "  the targets/ view holds a symlink per declared target"
+  else
+    st_bad "  the targets/ view holds a symlink per declared target" \
+           "$(ls -l "${WSA}/targets" 2>&1 | head -4)"
+  fi
+  if [ "$(readlink "${WSA}/targets/simple-crm")" = "/workspace/targets/simple-crm" ]; then
+    st_ok "  and each points at the ONE shared clone (not a copy)"
+  else
+    st_bad "  and each points at the one shared clone" "$(readlink "${WSA}/targets/simple-crm")"
+  fi
+  if grep -q "NOT A SANDBOX" "${WSA}/targets/README.md" 2>/dev/null; then
+    st_ok "  and the view says plainly that it is not a boundary"
+  else
+    st_bad "  and the view says plainly that it is not a boundary"
+  fi
+
+  # STALE-ENTRY REMOVAL, AND THE FILES IT MUST NOT TOUCH. Only paths this tool
+  # recorded last time are eligible; an operator's own file never is.
+  printf 'operator notes\n' > "${WSA}/NOTES.md"
+  ln -sf /workspace/targets/gone "${WSA}/targets/gone"
+  printf 'targets/gone\ntargets/simple-crm\ntargets/other\ntargets/README.md\nAGENTS.md\n' \
+    > "${WSA}/.compliance-claw-managed"
+  st_fleet_apply || true
+  if [ ! -e "${WSA}/targets/gone" ]; then
+    st_ok "a managed entry that is no longer declared is removed"
+  else
+    st_bad "a managed entry no longer declared is removed" "targets/gone survived"
+  fi
+  if [ -f "${WSA}/NOTES.md" ]; then
+    st_ok "  and an operator file in the same workspace is left alone"
+  else
+    st_bad "  and an operator file in the same workspace is left alone" "NOTES.md was deleted"
+  fi
+
+  # --- the last-applied record ---
+  if [ -f "${tmp}/state/last-applied.json" ]; then
+    st_ok "the last-applied record is written after verification passes"
+  else
+    st_bad "the last-applied record is written"
+  fi
+  if grep -q 'CANARY-VALUE' "${tmp}/state/last-applied.json" 2>/dev/null \
+     || grep -qE 'pretorin-api-key|/run/secrets' "${tmp}/state/last-applied.json" 2>/dev/null; then
+    st_bad "the record holds no credential value or path"
+  else
+    st_ok "the record holds no credential value and no credential path"
+  fi
+
+  # --- idempotence ---
+  local sig_before sig_after
+  sig_before="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  st_fleet_apply || true
+  sig_after="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  if [ "$sig_before" = "$sig_after" ]; then
+    st_ok "re-applying unchanged input changes nothing (idempotent)"
+  else
+    st_bad "re-applying unchanged input is idempotent" "$(diff <(echo "$sig_before") <(echo "$sig_after") | head -3)"
+  fi
+
+  # ------------------------------------------------- 8. DMs, and refusals
+  st_head "8. Slack DMs"
+
+  # An operator-created DM binding, as the Control UI would leave it.
+  CC_OC="$OC" python3 -c "
+import json, os
+cfg = json.load(open(os.environ['CC_OC']))
+cfg['bindings'].append({'agentId': 'crm-hipaa',
+                        'match': {'channel': 'slack', 'peer': {'kind': 'direct', 'id': 'U0OPER123'}},
+                        'session': {'dmScope': 'per-channel-peer'}})
+cfg['channels']['slack']['allowFrom'] = ['U0OPER123']
+cfg['channels']['slack']['dmPolicy'] = 'allowlist'
+json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
+"
+  st_fleet_apply || true
+  if [ "$(q "print([b['agentId'] for b in cfg['bindings'] if b['match']['peer'].get('id')=='U0OPER123'])")" = "['crm-hipaa']" ]; then
+    st_ok "an operator-created DM binding SURVIVES a later apply, unchanged"
+  else
+    st_bad "an operator DM binding survives apply" "$(q "print(cfg['bindings'])")"
+  fi
+  if [ "$(q "print(cfg['channels']['slack']['dmPolicy'], cfg['channels']['slack']['allowFrom'])")" = "allowlist ['U0OPER123']" ]; then
+    st_ok "dmPolicy and allowFrom are DERIVED from the surviving binding"
+  else
+    st_bad "dmPolicy and allowFrom are derived"
+  fi
+  if [ "$(q "
+ch = sorted(cfg['channels']['slack']['channels'])
+print(ch == ['C0HIPAABB','C0SOC2AAA'])")" = "True" ]; then
+    st_ok "  and the generated channel bindings are unaffected by it"
+  else
+    st_bad "channel bindings unaffected by a DM binding"
+  fi
+
+  # Two users, two sessions. Session isolation rides on the binding, so the
+  # assertion is that each binding carries its own per-channel-peer scope.
+  CC_OC="$OC" python3 -c "
+import json, os
+cfg = json.load(open(os.environ['CC_OC']))
+cfg['bindings'].append({'agentId': 'crm-soc2',
+                        'match': {'channel': 'slack', 'peer': {'kind': 'direct', 'id': 'U0SECOND1'}},
+                        'session': {'dmScope': 'per-channel-peer'}})
+cfg['channels']['slack']['allowFrom'] = ['U0OPER123', 'U0SECOND1']
+json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
+"
+  st_fleet_apply || true
+  # Session isolation rides on the BINDING, not on a global: each direct binding
+  # carries its own per-channel-peer scope, so two users never share a session.
+  local scopes
+  scopes="$(q "print(' '.join(sorted(b['match']['peer']['id'] + '=' + str(b.get('session',{}).get('dmScope')) for b in cfg['bindings'] if b['match']['peer']['kind']=='direct')))")"
+  if [ "$scopes" = "U0OPER123=per-channel-peer U0SECOND1=per-channel-peer" ]; then
+    st_ok "two allowed users keep two bindings, each with its own session scope"
+  else
+    st_bad "two allowed users have separate sessions" "$scopes"
+  fi
+  if [ "$(q "print('dmScope' in cfg.get('session', {}))")" = "False" ]; then
+    st_ok "  and global session.dmScope is never written (nothing to fight over)"
+  else
+    st_bad "global session.dmScope is untouched"
+  fi
+
+  # --- the refusals ---
+  st_dm_refuses() {
+    local label="$1" expect="$2"
+    local out; out="$(st_fleet_apply 2>&1 || true; cat "$fleetlog")"
+    case "$out" in
+      *"$expect"*) st_ok "refuses $label" ;;
+      *) st_bad "refuses $label" "$(printf '%s' "$out" | tail -4)" ;;
+    esac
+  }
+
+  st_oc_bindings() { CC_OC="$OC" CC_ADD="$1" python3 -c "
+import json, os
+cfg = json.load(open(os.environ['CC_OC']))
+cfg['bindings'] = [b for b in cfg['bindings'] if b['match']['peer']['kind'] != 'direct']
+cfg['bindings'].extend(json.loads(os.environ['CC_ADD']))
+cfg['channels']['slack'].pop('allowFrom', None)
+json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
+"; }
+
+  st_oc_bindings '[{"agentId":"crm-soc2","match":{"channel":"slack","peer":{"kind":"direct","id":"U0DUP1234"}}},{"agentId":"crm-hipaa","match":{"channel":"slack","peer":{"kind":"direct","id":"U0DUP1234"}}}]'
+  st_dm_refuses "one user bound to two efforts" "is bound twice"
+
+  st_oc_bindings '[{"agentId":"retired-effort","match":{"channel":"slack","peer":{"kind":"direct","id":"U0GHOST12"}}}]'
+  st_dm_refuses "a DM binding to an agent that no longer exists" "no longer exists"
+
+  st_oc_bindings '[{"agentId":"crm-soc2","match":{"channel":"slack","peer":{"kind":"direct","id":"D0123ABCD"}}}]'
+  st_dm_refuses "a DM binding using a D... conversation id" "not a Slack USER id"
+
+  st_oc_bindings '[]'
+  CC_OC="$OC" python3 -c "
+import json, os
+cfg = json.load(open(os.environ['CC_OC']))
+cfg['channels']['slack']['allowFrom'] = ['U0UNBOUND']
+json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
+"
+  st_dm_refuses "an allowFrom entry with no binding (it would reach the default agent)" \
+                "routes the DM to the default agent"
+
+  st_oc_bindings '[]'
+  CC_OC="$OC" python3 -c "
+import json, os
+cfg = json.load(open(os.environ['CC_OC']))
+cfg['channels']['slack']['allowFrom'] = ['*']
+json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
+"
+  st_dm_refuses "a wildcard in allowFrom" "A wildcard admits every Slack user"
+
+  # ------------------------------------------- 9. --effort, and rollback
+  st_head "9. refusals that protect the fleet"
+
+  # --effort would emit a one-effort agents.list and bindings array, which
+  # REMOVES every other agent. It is refused rather than honoured.
+  rm -f "$record"
+  local before_state; before_state="$(st_manifest "$tmp")"
+  for verb in plan apply; do
+    out="$( ( cd "$tmp" && PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
+              COMPLIANCE_CLAW_SECRET_DIR="$S" CC_STATE_DIR="${tmp}/state" \
+              COMPOSE_FILE=compose.yaml:compose.secrets.yaml \
+              bash "${root}/scripts/clawctl" "$verb" --effort crm-soc2 2>&1 || true ) )"
+    case "$out" in
+      *"REMOVES every other agent"*) st_ok "'${verb} --effort' is refused, naming what it would delete" ;;
+      *) st_bad "'${verb} --effort' is refused" "$(printf '%s' "$out" | tail -3)" ;;
+    esac
+  done
+  if [ "$(grep -c . "$record" 2>/dev/null || echo 0)" = 0 ]; then
+    st_ok "  and the refusal starts no container at all"
+  else
+    st_bad "the refusal starts no container" "$(head -2 "$record")"
+  fi
+  if [ "$before_state" = "$(st_manifest "$tmp")" ]; then
+    st_ok "  and changes nothing on disk"
+  else
+    st_bad "the refusal changes nothing on disk"
+  fi
+
+  # --- rollback ---
+  st_oc_bindings '[]'
+  st_fleet_apply || true
+  local good; good="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+
+  # Verification fails -> the previous configuration is restored, and the command
+  # exits non-zero rather than reporting a success it cannot stand behind.
+  if st_fleet_apply verify; then
+    st_bad "a verification failure fails the command" "apply exited 0"
+  else
+    st_ok "a verification failure fails the command (non-zero exit)"
+  fi
+  case "$(cat "$fleetlog")" in
+    *"restoring the configuration that was there before"*)
+      st_ok "  and the previous configuration is restored automatically" ;;
+    *) st_bad "  and the previous configuration is restored" "$(tail -4 "$fleetlog")" ;;
+  esac
+
+  # A patch that fails to apply must leave the runtime untouched.
+  st_fleet_apply patch || true
+  case "$(cat "$fleetlog")" in
+    *"nothing was applied"*) st_ok "a failed patch reports that nothing was applied" ;;
+    *) st_bad "a failed patch reports nothing was applied" "$(tail -4 "$fleetlog")" ;;
+  esac
+
+  # Keep the fixture on request, so a failure here can be inspected rather than
+  # reproduced from scratch.
+  if [ -n "${CC_KEEP_SELFTEST_TMP:-}" ]; then
+    printf 'clawctl self-test: fixture kept at %s\n' "$tmp"
+    ST_KEEP=1
+  fi
+
   # ------------------------------------------------------------------ done
   printf '\n'
   printf 'clawctl self-test: %d pass, %d fail\n' "$ST_PASS" "$ST_FAIL"
-  rm -rf "$tmp"
+  [ "${ST_KEEP:-0}" = 1 ] || rm -rf "$tmp"
   [ "$ST_FAIL" = 0 ] || return 1
   return 0
 }

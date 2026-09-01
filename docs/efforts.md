@@ -10,11 +10,11 @@ system under SOC 2 and under HIPAA is **two separate compliance efforts** with
 two separate sets of bound repositories and two separate recipe sets. `efforts.yaml`
 declares them; `scripts/clawctl` validates, migrates and applies them.
 
-> **Status.** `targets.yaml` is still what the running deployment reads. This
-> release adds the format, the control command and the credential mechanism, and
-> proves them. A later release makes `efforts.yaml` authoritative and gives each
-> effort its own agent, bound to an existing Slack channel by ID. **No Slack
-> configuration is added by this release.**
+> **`efforts.yaml` is the runtime authority.** Each effort gets its own OpenClaw
+> agent — its own workspace, sessions, memory, instructions, Pretorin MCP server
+> and Slack channel — inside one gateway and one Slack app. `targets.yaml`
+> survives only as input to `clawctl migrate`; nothing reads it at runtime and it
+> is no longer mounted into any container.
 
 ---
 
@@ -191,20 +191,30 @@ container user, and so is anything else that user can reach. See `SECURITY.md`.
 ## Migrating from `targets.yaml`
 
 ```sh
-scripts/clawctl migrate --name crm-soc2
+scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 scripts/clawctl validate
 scripts/clawctl plan
 scripts/clawctl apply
 ```
 
-**What is preserved.** `targets.yaml` is **not modified** and is still what the
-running deployment reads. Every target carries over verbatim — name, url, ref and
-the `private` flag. The scope becomes effort #1, and its `credential_ref` is
-`default`, so **no secret is copied and no new file is created**.
+**What is preserved.** `targets.yaml` is **not modified**. Every target carries
+over verbatim — name, url, ref and the `private` flag. The scope becomes effort
+#1, and its `credential_ref` is `default`, so **no secret is copied and no new
+file is created**. After this, `targets.yaml` is inert: nothing reads it at
+runtime and it is no longer mounted into any container.
+
+**Why `--slack-channel-id` is required.** It is how messages reach this effort's
+agent, and there is nothing in `targets.yaml` to derive it from. A placeholder
+would produce a file that validates and routes nowhere, which is exactly the
+failure that looks like a broken bot — so `migrate` asks instead of guessing.
 
 **Why `--name` is required.** `system_id` is always a UUID, so a derived name
-would be `13c1f44e-…-soc2`. That string is the stable identifier for this effort
-and its agent, so `migrate` asks for a readable one rather than generating that.
+would be `13c1f44e-…-soc2`. That string is the stable identifier for this effort,
+its agent, its workspace and its memory, so `migrate` asks for a readable one
+rather than generating that. It is also capped at 21 characters and must stay
+unique after OpenClaw's tool-name sanitization — the per-agent tool policy denies
+other efforts by MCP tool prefix, and a truncated or collided prefix would deny
+the wrong server.
 
 **It runs once.** A second `migrate` refuses cleanly rather than overwriting your
 edits, the same write-if-absent rule the rest of this deployment follows.
@@ -234,16 +244,130 @@ This is the same convention as the target-sync and CLI-update records.
 
 ---
 
+---
+
+## One channel, one agent, one effort
+
+Each effort declares the Slack channel it lives in:
+
+```yaml
+  - name: crm-soc2
+    slack_channel_id: C0123ABCDEF
+```
+
+`clawctl apply` turns that into three things generated from **one** list, so they
+cannot drift: an entry in the Slack channel allowlist (which admits the channel),
+an exact routing binding (which picks the agent), and that agent's own workspace.
+
+A message in `C0123ABCDEF` reaches an agent that is pinned to this effort's system
+and framework, sees only this effort's repositories, and has only this effort's
+Pretorin tools. An unlisted channel is not served at all.
+
+**The id, never the name.** Right-click the channel → Copy link; the `C…` value at
+the end of the URL is the id. A name-based key silently never routes, which is
+indistinguishable from the bot being broken.
+
+**`C` only.** A `D…` id is a DM conversation — see below. A legacy `G…` id is
+refused, because Slack uses `G` for both legacy private channels and multi-person
+DMs, and the two are admitted differently: an MPIM additionally needs
+`channels.slack.dm.groupEnabled`, which this deployment deliberately does not set.
+Telling them apart needs a live Slack lookup that offline validation cannot make,
+so a `G` id is refused rather than half-configured.
+
+**What isolates one effort from another, and what does not.** Each agent's tool
+policy denies every other effort's Pretorin MCP tools, and each agent's
+instructions state its fixed scope and refuse to switch. That is a
+tool-visibility and prompt boundary. It is **not** a process or filesystem
+boundary: `mcp.servers` is global to the gateway, tool execution is unsandboxed,
+and an absolute path still reaches another effort's clone. What actually protects
+another system's data is the Pretorin API key's own server-side scopes and the
+platform's cross-scope write guard.
+
+---
+
+## Optional: Slack DMs
+
+DMs are **off** by default and stay off until you bind someone. A deployment that
+never runs the command below keeps `dmPolicy: "disabled"`, and every DM is
+refused.
+
+```bash
+scripts/clawctl dm allow U0123ABCDEF --effort crm-soc2
+scripts/clawctl dm list
+scripts/clawctl dm revoke U0123ABCDEF
+```
+
+**One user, one effort.** With a single Slack app, one person's DM conversation
+with the bot cannot represent two efforts, and there is deliberately no way to
+switch between them in conversation. Binding the same user twice is refused.
+
+**The Slack USER id (`U…`), not the DM conversation id (`D…`).** Routing matches
+on who sent the message. Find it in Slack: click the person → View full profile →
+More (…) → Copy member ID.
+
+**Why a binding and not just an allowlist.** `dmPolicy` and `allowFrom` decide who
+is *admitted*; a binding decides *which agent answers*. An admitted user with no
+binding falls through every routing tier to the default agent — an effort chosen
+by position rather than by intent. So `apply` derives `dmPolicy` and `allowFrom`
+**from** the bindings, and refuses an `allowFrom` entry that has no binding.
+
+**The Control UI works too.** There is no dedicated DM screen, but you can add the
+same binding through Settings → Config. `apply` preserves any Slack direct-peer
+binding it finds and re-derives `dmPolicy`/`allowFrom` around it, so getting the
+binding right is enough. Do not edit configuration in the Control UI *while*
+`apply` is running: the UI writes through the gateway RPC with a concurrency
+guard, `clawctl` writes the file directly without one, and the lock `clawctl`
+takes does not cover the UI.
+
+---
+
+## Removing and renaming an effort
+
+**Removal is non-destructive.** Delete the effort from `efforts.yaml` and apply.
+Its Slack binding, agent entry, MCP server and channel allowlist entry go. Its
+workspace, memory, sessions, credential file and repository clones **stay**, and
+re-adding the same name later reuses them. There is no prune command.
+
+**Renaming is remove-old plus add-new.** The name is the stable identity of an
+agent, its workspace and its memory, so the old state stays behind, inactive,
+under the old name.
+
+**Repointing a name is refused.** Changing an existing effort's `system_id` or
+`framework_id` would hand one effort's accumulated context to a different scope.
+`apply` compares against `workspace/.compliance-claw/last-applied.json` and stops.
+
+---
+
+## What `apply` does to the OpenClaw configuration
+
+It **owns** a small named set of paths and regenerates them every run:
+`agents.list`, `bindings`, `channels.slack.channels`, `channels.slack.dmPolicy`,
+`channels.slack.allowFrom`, and `mcp.servers.pretorin-<effort>`.
+
+It **never names** anything else — `gateway`, `models`, `agents.defaults`,
+`tools`, **all of `plugins`**, `session`, `messages`, the Slack tokens, or
+`channels.slack.dm`. That rule is deliberate and load-bearing: `config patch`
+merges objects but *replaces* arrays, so naming an array you do not own empties
+it. An earlier release lost `plugins.load.paths` exactly that way.
+
+Then it snapshots the configuration, validates the patch with OpenClaw's own
+`--dry-run`, applies it, recreates the gateway once, and verifies — health, the
+expected agents and bindings, the expected MCP servers, and that every path it
+does not own is unchanged. **If verification fails it restores the snapshot,
+recreates, re-verifies and exits non-zero.** If the rollback also fails it prints
+the exact commands to recover by hand. It never reports success while unhealthy.
+
+---
+
 ## Known limitations in this release
 
-**Effort-aware cloning is not wired yet.** `scripts/bootstrap.sh` still clones
-from `targets.yaml`. A migrated effort and any effort sharing its repositories are
-already cloned and work today; a genuinely new repository must be added to
-`targets.yaml` and cloned there for now. `apply` refuses rather than binding a
-path that is not present, and says so.
-
 **Slack RBAC is channel-level, not user-level.** Every member of a shared channel
-can address the agent, and the agent acts with the deployment's credential — not
-with the requesting user's permissions. There is no per-user authorization in the
-pilot. Keep an effort's channel membership to the people who should be able to act
-in that compliance scope.
+can address that effort's agent, and the agent acts with the deployment's
+credential — not with the requesting user's permissions. There is no per-user
+authorization in the pilot. Keep an effort's channel membership to the people who
+should be able to act in that compliance scope.
+
+**Multi-person DMs (MPIMs) are not supported.** An effort's home is a channel.
+
+**Prompt routing is not a security boundary**, and the agents are told to say so
+rather than imply otherwise. See "What isolates one effort from another" above.

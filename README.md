@@ -81,10 +81,14 @@ provenance — see "Verifying what you pulled".
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
 
 # 1. select the file-backed credential path (recommended, and what Azure needs)
-export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
+export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
 
-# 2. declare what you are reviewing, and for which compliance scope
-vi targets.yaml                  # system_id, framework_id, one or more targets
+# 2. declare what you are reviewing, for which compliance scope, and where it
+#    lives in Slack. efforts.yaml is what the deployment reads.
+cp efforts.example.yaml efforts.yaml
+vi efforts.yaml                  # system_id, framework_id, slack_channel_id, targets
+#    Already have a single-effort targets.yaml? Convert it instead:
+#    scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 
 # 3. clone the targets, PULL the released image, create the secret files
 scripts/bootstrap.sh             # generates the gateway token; writes NO secret to .env
@@ -94,14 +98,18 @@ vi secrets/runtime/pretorin-api-key
 vi secrets/runtime/openai-api-key         # matches the shipped default model
 # OR use anthropic-api-key, then select an Anthropic model before first use:
 # docker compose run --rm cli openclaw models set anthropic/<model>
-#  optional: slack-app-token, slack-bot-token  (+ SLACK_CHANNEL_ID in .env)
+#  optional: slack-app-token, slack-bot-token
+#    (SLACK_CHANNEL_ID is NOT needed: which channels are served comes from each
+#     effort's slack_channel_id in efforts.yaml)
 #  full checklist and per-service delivery matrix: docs/file-secrets.md
 
-# 5. register the targets with Pretorin (idempotent; safe to re-run)
-scripts/onboard-targets.sh
-
-# 6. start the gateway
+# 5. start the gateway
 docker compose up -d             # http://127.0.0.1:18789
+
+# 6. onboard every effort with Pretorin and generate the agents, Slack bindings
+#    and per-effort MCP servers (idempotent; safe to re-run)
+scripts/clawctl plan             # shows the whole change; starts no containers
+scripts/clawctl apply
 
 # anything one-off, in the same image with the same mounts:
 docker compose run --rm cli pretorin --json context show
@@ -259,7 +267,13 @@ scripts/bootstrap.sh --build
 it up with no extra flags. A local build is tagged `compliance-claw:local` so it
 cannot be mistaken for the published image in `docker images`.
 
-## `targets.yaml`
+## `targets.yaml` (legacy — see `efforts.yaml` above)
+
+> This is the single-effort format. It is still the shape `scripts/clawctl
+> migrate` reads, and the per-target rules below are unchanged in `efforts.yaml`,
+> but **nothing reads this file at runtime any more** and it is not mounted into
+> any container. A multi-effort deployment declares the same targets under each
+> effort in `efforts.yaml`.
 
 ```yaml
 system_id: 7b74d8f3-d77c-49e4-8792-c372dd154d38   # UUID or system name
@@ -306,7 +320,7 @@ Nothing to configure. Any `https://` remote that clones anonymously works.
 ### Private repositories
 
 `private: true` is a flag only — **no token, no credential and no path to one ever
-appears in `targets.yaml`**, which is committed.
+appears in the declaration**, in either format.
 
 The supported path is a **read-only GitHub App**. Creating one on an organisation
 requires **organisation owner** permission; a member cannot do it. If you are not
@@ -374,12 +388,12 @@ account, in which case bootstrap lists the candidates and asks you to pick.
 
 #### 8. Declare the target and run (operator)
 
-Uncomment the private block in `targets.yaml` — the committed file ships it
-commented out so a clone with no App still works — then:
+Add the target with `private: true` to the relevant effort in `efforts.yaml`
+(`efforts.example.yaml` documents the shape), then:
 
 ```sh
 scripts/bootstrap.sh        # mints the token, clones, deletes the token
-scripts/onboard-targets.sh  # registers it with Pretorin like any other target
+scripts/clawctl apply       # registers it with Pretorin like any other target
 ```
 
 Bootstrap mints an installation token scoped to `contents:read` on exactly the
@@ -452,30 +466,49 @@ silently substituting a longer-lived credential.
 
 ## Multiple compliance efforts
 
-`targets.yaml` describes **one** system and framework. One deployment can serve
-several — an **effort** is one system + one framework, with its own targets and
-its own named Pretorin credential. That pairing is Pretorin's own: preflight state
-and the active recipe set are keyed on system + framework, so the same system
-under SOC 2 and under HIPAA is two separate compliance efforts.
+One deployment serves several. An **effort** is one system + one framework, with
+its own targets, its own named Pretorin credential and its own Slack channel. That
+pairing is Pretorin's own: preflight state and the active recipe set are keyed on
+system + framework, so the same system under SOC 2 and under HIPAA is two separate
+compliance efforts.
+
+```text
+One VM
+└── one OpenClaw gateway, one Slack app
+    ├── #soc2   (C0AAA…) → agent crm-soc2   → MCP pretorin-crm-soc2   → SOC 2 scope
+    └── #hipaa  (C0BBB…) → agent crm-hipaa  → MCP pretorin-crm-hipaa  → HIPAA scope
+```
+
+Each agent gets its own workspace, sessions, memory, generated `AGENTS.md`, and a
+repository view containing only its own targets. Every Pretorin MCP server runs
+the **same** persistent CLI binary, so one `pretorin-update` moves the version for
+every agent at once.
 
 Efforts are declared in `efforts.yaml` and driven by one command:
 
 ```sh
-scripts/clawctl migrate --name crm-soc2   # convert targets.yaml; it is NOT modified
+scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 scripts/clawctl credential add hipaa-key  # a per-effort key file, correct mode
 scripts/clawctl validate                  # every effort, one table, one run
-scripts/clawctl plan                      # the exact commands; starts no containers
-scripts/clawctl apply                     # onboard each effort, scope-pinned
+scripts/clawctl plan                      # the whole change; starts no containers
+scripts/clawctl apply                     # onboard, generate, verify, or roll back
+scripts/clawctl dm allow U0123ABCDEF --effort crm-soc2   # optional; DMs are off
 ```
 
 `credential_ref` is a **name**, never a token, so `efforts.yaml` holds no secret.
 `default` resolves to the key this deployment already has, so migrating creates no
 new secret file.
 
-**`targets.yaml` is still what the running deployment reads.** This release adds
-the format, the control command and the per-effort credential mechanism; a later
-one makes `efforts.yaml` authoritative and generates an agent and a Slack channel
-per effort.
+**`efforts.yaml` is the runtime authority.** `targets.yaml` survives only as input
+to `clawctl migrate`; nothing reads it at runtime and it is no longer mounted into
+any container.
+
+**What separates one effort from another, and what does not.** Each agent's tool
+policy denies every other effort's Pretorin tools, and its instructions state a
+fixed scope and refuse to switch. That is a tool-visibility and prompt boundary,
+not a process or filesystem one — tool execution is unsandboxed and `mcp.servers`
+is gateway-wide. The enforced boundary is the Pretorin key's own server-side
+scopes and the platform's cross-scope write guard.
 
 Full guide, including how to add a second effort, what you choose when you mint
 each token, and the one-key-or-many trade-off:
@@ -520,12 +553,13 @@ is, with a message naming the remedy:
 | `detached_refused` | HEAD is not on a branch |
 | `no_upstream_refused` | the branch does not track `origin/<branch>` |
 | `branch_mismatch_refused` | checked out on a branch other than `ref` |
-| `origin_mismatch_refused` | the clone tracks a different remote than `targets.yaml` |
+| `origin_mismatch_refused` | the clone tracks a different remote than `efforts.yaml` declares |
 | `diverged_refused` | local commits the remote lacks, or upstream rewrote history |
 | `missing_clone` | not cloned yet — run `scripts/bootstrap.sh` |
 | `auth_failed` | the remote refused the credential |
-| `invalid_target` | not declared in `targets.yaml`, or a malformed request |
-| `targets_unreadable` | `targets.yaml` could not be parsed — nothing was examined |
+| `invalid_target` | not declared at all, or a malformed request |
+| `out_of_effort` | a real target, but not one this effort declares — ask in that effort's channel |
+| `targets_unreadable` | `efforts.yaml` could not be parsed — nothing was examined |
 | `sync_already_running` | another sync holds the global lock |
 
 A lock left behind by a killed process is reclaimed automatically once its owner
@@ -536,11 +570,15 @@ is never taken — clear that by hand with `rmdir` on the path the message names
 `all` processes targets one at a time, keeps going after a failure, reports every
 target, and exits non-zero if any failed.
 
-**What it cannot do.** Only `all` or the name of a target already declared in
-`targets.yaml` is accepted — no URL, ref, path, flag or shell fragment is
-expressible on any route. Adding, removing, re-pointing or onboarding a target
-stays an operator action on the host: edit `targets.yaml`, then run
-`scripts/bootstrap.sh` and `scripts/onboard-targets.sh`.
+**What it cannot do.** Only `all` or the name of a target declared **for the
+calling agent's own effort** is accepted — no URL, ref, path, flag or shell
+fragment is expressible on any route, and `all` means all of that effort's
+targets, never every repository on the deployment. A target belonging to another
+effort is refused by name. Which effort is calling comes from the OpenClaw agent
+id, which the host resolves from the routed session before the tool runs, so a
+prompt cannot name a different one. Adding, removing, re-pointing or onboarding a
+target stays an operator action on the host: edit `efforts.yaml`, then run
+`scripts/clawctl apply`.
 
 Ordinary synchronization does **not** re-run onboarding and does **not** restart
 the gateway. Source resolvers bind paths rather than commits, and
@@ -862,7 +900,7 @@ The two `--self-test` gates need no network, no credentials and no containers.
 Slack routes call — so it is evidence about the code that actually runs.
 
 Section A needs no credentials at all: versions, the Pretorin MCP surface, the
-`targets.yaml` parser, the target-sync rules and mount matrix, gateway startup
+the declaration parsers, the target-sync rules and mount matrix, gateway startup
 and the plugin profile, config and
 `AGENTS.md` seeding, mount posture, the stale-template warning, the CWD fix,
 secret containment for every secret class, the private-target refusals, and proof
@@ -917,8 +955,8 @@ does **not** roll the CLI backwards: the volume keeps whatever version it has.
 The CLI moves in exactly one way, `scripts/pretorin-update.sh`.
 
 Re-run
-`scripts/onboard-targets.sh` only after `down -v`, or when `targets.yaml` changes;
-it is idempotent either way.
+`scripts/clawctl apply` only after `down -v`, or when `efforts.yaml` changes; it
+is idempotent either way.
 
 `smoke.sh` also reports this state on its own:
 
@@ -996,14 +1034,14 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | `Slack is only partially configured` | 1 or 2 of the 3 variables set | All three are required together |
 | `SLACK_CHANNEL_ID is not a Slack channel id` | A name or a URL was used | Right-click channel → Copy link → the `C...` value |
 | `GITHUB_APP_ID is not set` on a private target | No App configured | Follow "Private repositories", or drop `private: true` |
-| `/target-sync` says `missing_clone` | The target was added to `targets.yaml` but never cloned | `scripts/bootstrap.sh` on the host — sync never clones |
+| `/target-sync` says `missing_clone` | The target was added to `efforts.yaml` but never cloned | `scripts/clawctl apply` on the host — sync never clones |
 | `/target-sync` says `dirty_refused` | Something wrote into the clone | `git -C workspace/targets/<name> status`; resolve it yourself, sync will not |
 | `/target-sync` says `diverged_refused` | Upstream force-pushed, or the clone has local commits | `git -C workspace/targets/<name> log --oneline <branch> ^origin/<branch>` |
 | `/target-sync` says `auth_failed` on a private target | No usable credential in the container | Put a fine-grained PAT in `secrets/runtime/github-readonly-pat` and use `compose.secrets.yaml` |
 | `up` fails with `bind source path does not exist: …/github-readonly-pat` | Upgraded without creating the new secret file | `scripts/init-file-secrets.sh` — or use `scripts/update.sh`, which does it before stopping anything |
 | `the GitHub App installation does not include:` | App not installed on that repo | Add it on the linked installation page |
 | `exists but is not the root of a git repository` | Interrupted clone | Inspect, then `rm -rf` that directory yourself and re-run |
-| `tracks a different remote` | `targets.yaml` URL changed | Fix the URL, or move the directory aside |
+| `tracks a different remote` | the declared URL changed | Fix the URL, or move the directory aside |
 | `code_repository` is `degraded` | Expected | Needs a platform Connected Source; future work |
 | `Missing required scopes: write` | Read-only key, write tool | Correct behaviour — see "Read-only vs write-enabled" |
 | `Scope is not approved with a confirmed scale yet` | Platform prerequisite | Approve scope setup on platform.pretorin.com |

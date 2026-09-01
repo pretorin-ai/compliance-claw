@@ -54,13 +54,30 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 TARGETS_FILE="${TARGETS_FILE:-targets.yaml}"
-TARGETS_DIR="workspace/targets"
+EFFORTS_FILE="${CC_EFFORTS_FILE:-efforts.yaml}"
+# Overridable for the same reason sync-targets.sh makes its equivalent
+# overridable: the clawctl self-test drives this real code against a throwaway
+# tree instead of re-implementing the clone step.
+TARGETS_DIR="${CC_TARGETS_DIR:-workspace/targets}"
 PARSE="scripts/parse-targets.py"
+PARSE_EFFORTS="scripts/parse-efforts.py"
 
 DO_BUILD=0
+# --targets-only: run step 3 and nothing else.
+#
+# `clawctl apply` needs to clone the repositories a NEW effort declares, and the
+# rule it has to honour is the one written out at length in step 3 below: the
+# GitHub App is preferred, a configured-but-broken App STOPS rather than quietly
+# using a longer-lived personal credential, the PAT is the pilot fallback, and
+# neither with a private target is a refusal. Re-deciding any of that in clawctl
+# would be a second copy of a security-relevant ladder, and the direction two
+# copies drift is "one of them silently downgrades the credential". So clawctl
+# calls THIS, and the ladder keeps exactly one definition.
+TARGETS_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --build) DO_BUILD=1 ;;
+    --targets-only) TARGETS_ONLY=1 ;;
     -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) printf 'bootstrap: ERROR — unknown option %s\n' "$arg" >&2; exit 2 ;;
   esac
@@ -82,6 +99,192 @@ cleanup() {
   return 0
 }
 trap cleanup EXIT INT TERM
+
+# --- 0. efforts.yaml, the runtime authority --------------------------------
+#
+# BEFORE ANY COMPOSE COMMAND. compose.efforts.yaml bind-mounts this file, and
+# compose resolves every bind source at `up` time — a missing one fails the whole
+# command with a message that names neither the file nor the fix. It is also
+# gitignored, because it names YOUR systems, so a fresh clone never has one.
+#
+# Converted from targets.yaml when that is all there is, refused otherwise. The
+# conversion is `clawctl migrate`, not a second copy of it here.
+ensure_efforts_file() {
+  [ -f "$EFFORTS_FILE" ] && return 0
+  [ -f "$TARGETS_FILE" ] || die "neither ${EFFORTS_FILE} nor ${TARGETS_FILE} exists.
+  ${EFFORTS_FILE} is what this deployment reads at runtime. Start from the
+  documented shape:
+    cp efforts.example.yaml ${EFFORTS_FILE}   # then edit it for your systems"
+  die "${EFFORTS_FILE} not found, and it is what this deployment reads at runtime.
+  Convert your single-effort ${TARGETS_FILE} — it is left untouched:
+    scripts/clawctl migrate --name <effort-name> --slack-channel-id C0123ABCDEF
+  Then re-run this script."
+}
+
+# WHICH REPOSITORIES EXIST. efforts.yaml is authoritative; targets.yaml is
+# reachable only before migration and is never mounted into a container.
+bootstrap_target_list() {
+  if [ -f "$EFFORTS_FILE" ]; then
+    python3 "$PARSE_EFFORTS" targets-all "$EFFORTS_FILE"
+  else
+    python3 "$PARSE" list "$TARGETS_FILE"
+  fi
+}
+
+run_targets_only() {
+  # clawctl has already validated efforts.yaml and holds the lock. Everything
+  # steps 1 and 2 do — daemon probes, .env, secret files, the image — is either
+  # already true or not this command's business.
+  log "--targets-only: cloning from ${EFFORTS_FILE}; skipping preflight, credentials and image"
+  command -v git >/dev/null 2>&1 || die "git not found."
+  command -v python3 >/dev/null 2>&1 || die "python3 not found."
+  ensure_efforts_file
+  prepare_targets
+  exit 0
+}
+
+# --- prepare_targets: the clone step, defined once -------------------------
+#
+# The body of step 3, hoisted into a function so `--targets-only` can run exactly
+# this and nothing else. `clawctl apply` needs the clone step — including the
+# GitHub App / PAT ladder below — without re-running host preflight, credential
+# seeding or the image pull, and re-deciding that ladder in clawctl would be a
+# second copy of a security-relevant rule. Defined up here rather than in place
+# because the --targets-only entry point below has to be able to call it.
+prepare_targets() {
+  # THE CLONE/UPDATE LOGIC IS NOT HERE ANY MORE. It lives in
+  # scripts/sync-targets.sh, which is the single implementation shared with the
+  # Slack /target-sync command and the target_sync agent tool. One definition of
+  # "safe" — fast-forward only, never reset, never discard, refuse and report —
+  # instead of two that drift, and its --self-test drives those same functions.
+  #
+  # What stays here is the part that is HOST-ONLY by design: deciding which git
+  # credential exists, and minting the GitHub App installation token.
+
+  mkdir -p "$TARGETS_DIR"
+
+  # Private targets need one installation token covering all of them, minted once
+  # before anything is cloned. Collected in a first pass so a missing credential is
+  # reported before the first clone rather than halfway through.
+  #
+  # Field order is name/url/private/ref, and reading it in that order matters: tab
+  # is IFS whitespace, so consecutive tabs collapse. With ref third, a target that
+  # omits ref would put "true" into the ref variable and leave private empty — a
+  # private repository silently cloned anonymously. parse-targets.py documents the
+  # contract and its self-test drives this exact shape through bash.
+  PRIVATE_SLUGS=()
+  while IFS=$'\t' read -r NAME URL PRIVATE _REF; do
+    [ -n "$NAME" ] || continue
+    [ "$PRIVATE" = "true" ] || continue
+    # A CREDENTIAL IS ONLY NEEDED FOR A CLONE THAT HAS TO HAPPEN.
+    #
+    # In clone-only mode nothing already on disk is contacted, so demanding a
+    # GitHub App or a PAT for a private target that is already cloned would
+    # refuse an operation that needs no network at all. That is not theoretical:
+    # `clawctl apply` runs this way, and on a deployment whose private targets
+    # are all present it would otherwise die asking for a credential it was
+    # never going to use.
+    #
+    # The full path is unchanged: there every private target is fetched, so every
+    # private target still needs one.
+    if [ "${CC_CLONE_ONLY:-0}" = 1 ] && [ -d "${TARGETS_DIR}/${NAME}/.git" ]; then
+      continue
+    fi
+    # https://github.com/owner/repo.git -> owner/repo. The parser has already
+    # guaranteed the host, so this is pure string work.
+    SLUG="${URL#https://github.com/}"
+    SLUG="${SLUG%.git}"
+    PRIVATE_SLUGS+=("$SLUG")
+  done < <(bootstrap_target_list)
+
+  # Prefer the process environment, fall back to .env. Deliberately NOT `source
+  # .env`: that file is operator-editable and sourcing it would execute whatever it
+  # contains. Same helper, same reasoning, as scripts/github-app-token.sh.
+  env_val() {
+    local name="$1" val
+    eval "val=\${${name}:-}"
+    if [ -z "$val" ] && [ -r .env ]; then
+      val="$(grep -E "^${name}=" .env | head -1 | cut -d= -f2- | tr -d '\r' || true)"
+    fi
+    printf '%s' "$val"
+  }
+
+  # THE CREDENTIAL LADDER, AND THE ONE RUNG THAT MUST NOT EXIST.
+  #
+  #   public target                 -> anonymous. No credential is consulted at all.
+  #   private + GitHub App          -> mint an installation token. IF THAT FAILS,
+  #                                    STOP. There is deliberately no fall-through
+  #                                    to the PAT: an operator who configured an App
+  #                                    expects the App, and quietly using a
+  #                                    longer-lived personal credential instead is
+  #                                    exactly the kind of downgrade nobody notices.
+  #   private + no App + a PAT      -> use the PAT. Pilot-acceptable, and said out
+  #                                    loud on every run so it cannot become the
+  #                                    silent default.
+  #   private + neither             -> refuse, naming both fixes.
+  GIT_TOKEN_FILE=""
+  GIT_TOKEN_SOURCE="none"
+  PAT_FILE="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}/github-readonly-pat"
+
+  if [ "${#PRIVATE_SLUGS[@]}" -gt 0 ]; then
+    log "${#PRIVATE_SLUGS[@]} private target(s): ${PRIVATE_SLUGS[*]}"
+    if [ -n "$(env_val GITHUB_APP_ID)" ]; then
+      log "  private credential: GitHub App (the recommended mechanism)"
+      GH_TOKEN_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-gh-token.XXXXXX")"
+      chmod 600 "$GH_TOKEN_FILE"
+      # Fails closed with its own diagnostics: missing App id, unreadable key,
+      # repository not in the installation, permission never granted.
+      bash scripts/github-app-token.sh "$GH_TOKEN_FILE" "${PRIVATE_SLUGS[@]}" \
+        || die "could not mint a GitHub App token for the private target(s).
+    Nothing was cloned. See the messages above, or README.md ('Private repositories').
+    GITHUB_APP_ID is set, so this script will NOT fall back to the PAT: fix the App,
+    or clear GITHUB_APP_ID if you deliberately want the PAT path."
+      GIT_TOKEN_FILE="$GH_TOKEN_FILE"
+      GIT_TOKEN_SOURCE="github-app"
+    elif [ -s "$PAT_FILE" ]; then
+      GIT_TOKEN_FILE="$PAT_FILE"
+      GIT_TOKEN_SOURCE="pat"
+      log "  private credential: fine-grained PAT from ${PAT_FILE}"
+      warn "no GitHub App is configured, so the PAT is being used to clone private targets."
+      warn "  Acceptable for the internal pilot. It must be fine-grained, limited to the"
+      warn "  selected repositories, and carry Contents: Read-only and nothing else."
+      warn "  The GitHub App is the recommended mechanism — README.md ('Private repositories')."
+    else
+      die "a private target is declared but no git credential is configured.
+    Nothing was cloned. Pick one:
+      - GitHub App (recommended): set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_FILE
+        in .env. See README.md ('Private repositories').
+      - Fine-grained PAT (internal pilot): put a selected-repositories,
+        Contents: Read-only token in ${PAT_FILE}
+        (create the file with scripts/init-file-secrets.sh, then paste the value).
+      - Or drop 'private: true' from targets.yaml if the repository is public."
+    fi
+  fi
+
+  # One implementation, invoked with explicit configuration rather than inherited
+  # globals, so the same call is readable from here and from the image.
+  if ! TARGET_COUNT="$(
+        CC_TARGETS_FILE="$TARGETS_FILE" \
+        CC_EFFORTS_FILE="$EFFORTS_FILE" \
+        CC_TARGETS_DIR="$TARGETS_DIR" \
+        CC_PARSE_TARGETS="$PARSE" \
+        CC_PARSE_EFFORTS="$PARSE_EFFORTS" \
+        CC_GIT_TOKEN_FILE="$GIT_TOKEN_FILE" \
+        CC_GIT_TOKEN_SOURCE="$GIT_TOKEN_SOURCE" \
+        CC_SYNC_REQUESTER="host:$(id -un 2>/dev/null || echo unknown)" \
+        CC_SYNC_ROUTE="bootstrap" \
+        bash scripts/sync-targets.sh --bootstrap )"; then
+    die "could not prepare the target repositories; see the messages above."
+  fi
+
+  [ "${TARGET_COUNT:-0}" -gt 0 ] 2>/dev/null \
+    || die "no targets parsed from ${EFFORTS_FILE}."
+  log "${TARGET_COUNT} target(s) present under ${TARGETS_DIR}"
+
+}
+
+# --targets-only stops here: this is the whole of what clawctl needs.
+if [ "$TARGETS_ONLY" = 1 ]; then run_targets_only; fi
 
 # --- 1. host preflight -----------------------------------------------------
 
@@ -118,7 +321,7 @@ case "$HOST_ARCH" in
     ;;
 esac
 
-[ -f "$TARGETS_FILE" ] || die "${TARGETS_FILE} not found."
+ensure_efforts_file
 python3 "$PARSE" scope "$TARGETS_FILE" >/dev/null   # fail fast on a bad file
 IFS=$'\t' read -r SYSTEM_ID FRAMEWORK_ID < <(python3 "$PARSE" scope "$TARGETS_FILE")
 log "scope: system=${SYSTEM_ID} framework=${FRAMEWORK_ID}"
@@ -248,119 +451,7 @@ if [ "$FILE_SECRETS" = 1 ]; then
 fi
 
 # --- 3. targets ------------------------------------------------------------
-#
-# THE CLONE/UPDATE LOGIC IS NOT HERE ANY MORE. It lives in
-# scripts/sync-targets.sh, which is the single implementation shared with the
-# Slack /target-sync command and the target_sync agent tool. One definition of
-# "safe" — fast-forward only, never reset, never discard, refuse and report —
-# instead of two that drift, and its --self-test drives those same functions.
-#
-# What stays here is the part that is HOST-ONLY by design: deciding which git
-# credential exists, and minting the GitHub App installation token.
-
-mkdir -p "$TARGETS_DIR"
-
-# Private targets need one installation token covering all of them, minted once
-# before anything is cloned. Collected in a first pass so a missing credential is
-# reported before the first clone rather than halfway through.
-#
-# Field order is name/url/private/ref, and reading it in that order matters: tab
-# is IFS whitespace, so consecutive tabs collapse. With ref third, a target that
-# omits ref would put "true" into the ref variable and leave private empty — a
-# private repository silently cloned anonymously. parse-targets.py documents the
-# contract and its self-test drives this exact shape through bash.
-PRIVATE_SLUGS=()
-while IFS=$'\t' read -r NAME URL PRIVATE _REF; do
-  [ -n "$NAME" ] || continue
-  [ "$PRIVATE" = "true" ] || continue
-  # https://github.com/owner/repo.git -> owner/repo. The parser has already
-  # guaranteed the host, so this is pure string work.
-  SLUG="${URL#https://github.com/}"
-  SLUG="${SLUG%.git}"
-  PRIVATE_SLUGS+=("$SLUG")
-done < <(python3 "$PARSE" list "$TARGETS_FILE")
-
-# Prefer the process environment, fall back to .env. Deliberately NOT `source
-# .env`: that file is operator-editable and sourcing it would execute whatever it
-# contains. Same helper, same reasoning, as scripts/github-app-token.sh.
-env_val() {
-  local name="$1" val
-  eval "val=\${${name}:-}"
-  if [ -z "$val" ] && [ -r .env ]; then
-    val="$(grep -E "^${name}=" .env | head -1 | cut -d= -f2- | tr -d '\r' || true)"
-  fi
-  printf '%s' "$val"
-}
-
-# THE CREDENTIAL LADDER, AND THE ONE RUNG THAT MUST NOT EXIST.
-#
-#   public target                 -> anonymous. No credential is consulted at all.
-#   private + GitHub App          -> mint an installation token. IF THAT FAILS,
-#                                    STOP. There is deliberately no fall-through
-#                                    to the PAT: an operator who configured an App
-#                                    expects the App, and quietly using a
-#                                    longer-lived personal credential instead is
-#                                    exactly the kind of downgrade nobody notices.
-#   private + no App + a PAT      -> use the PAT. Pilot-acceptable, and said out
-#                                    loud on every run so it cannot become the
-#                                    silent default.
-#   private + neither             -> refuse, naming both fixes.
-GIT_TOKEN_FILE=""
-GIT_TOKEN_SOURCE="none"
-PAT_FILE="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}/github-readonly-pat"
-
-if [ "${#PRIVATE_SLUGS[@]}" -gt 0 ]; then
-  log "${#PRIVATE_SLUGS[@]} private target(s): ${PRIVATE_SLUGS[*]}"
-  if [ -n "$(env_val GITHUB_APP_ID)" ]; then
-    log "  private credential: GitHub App (the recommended mechanism)"
-    GH_TOKEN_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-gh-token.XXXXXX")"
-    chmod 600 "$GH_TOKEN_FILE"
-    # Fails closed with its own diagnostics: missing App id, unreadable key,
-    # repository not in the installation, permission never granted.
-    bash scripts/github-app-token.sh "$GH_TOKEN_FILE" "${PRIVATE_SLUGS[@]}" \
-      || die "could not mint a GitHub App token for the private target(s).
-  Nothing was cloned. See the messages above, or README.md ('Private repositories').
-  GITHUB_APP_ID is set, so this script will NOT fall back to the PAT: fix the App,
-  or clear GITHUB_APP_ID if you deliberately want the PAT path."
-    GIT_TOKEN_FILE="$GH_TOKEN_FILE"
-    GIT_TOKEN_SOURCE="github-app"
-  elif [ -s "$PAT_FILE" ]; then
-    GIT_TOKEN_FILE="$PAT_FILE"
-    GIT_TOKEN_SOURCE="pat"
-    log "  private credential: fine-grained PAT from ${PAT_FILE}"
-    warn "no GitHub App is configured, so the PAT is being used to clone private targets."
-    warn "  Acceptable for the internal pilot. It must be fine-grained, limited to the"
-    warn "  selected repositories, and carry Contents: Read-only and nothing else."
-    warn "  The GitHub App is the recommended mechanism — README.md ('Private repositories')."
-  else
-    die "a private target is declared but no git credential is configured.
-  Nothing was cloned. Pick one:
-    - GitHub App (recommended): set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_FILE
-      in .env. See README.md ('Private repositories').
-    - Fine-grained PAT (internal pilot): put a selected-repositories,
-      Contents: Read-only token in ${PAT_FILE}
-      (create the file with scripts/init-file-secrets.sh, then paste the value).
-    - Or drop 'private: true' from targets.yaml if the repository is public."
-  fi
-fi
-
-# One implementation, invoked with explicit configuration rather than inherited
-# globals, so the same call is readable from here and from the image.
-if ! TARGET_COUNT="$(
-      CC_TARGETS_FILE="$TARGETS_FILE" \
-      CC_TARGETS_DIR="$TARGETS_DIR" \
-      CC_PARSE_TARGETS="$PARSE" \
-      CC_GIT_TOKEN_FILE="$GIT_TOKEN_FILE" \
-      CC_GIT_TOKEN_SOURCE="$GIT_TOKEN_SOURCE" \
-      CC_SYNC_REQUESTER="host:$(id -un 2>/dev/null || echo unknown)" \
-      CC_SYNC_ROUTE="bootstrap" \
-      bash scripts/sync-targets.sh --bootstrap )"; then
-  die "could not prepare the target repositories; see the messages above."
-fi
-
-[ "${TARGET_COUNT:-0}" -gt 0 ] 2>/dev/null \
-  || die "no targets parsed from ${TARGETS_FILE}."
-log "${TARGET_COUNT} target(s) present under ${TARGETS_DIR}"
+prepare_targets
 
 # --- 4. image --------------------------------------------------------------
 # Pull is the default. compose.yaml names the published GHCR image and carries no
