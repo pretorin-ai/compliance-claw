@@ -430,6 +430,26 @@ else
   pass "an unknown argument is refused rather than defaulting"
 fi
 
+head2 "A3c2. the seeded slash command is the one the Slack app registers"
+# Slack rejects an unregistered /foo BEFORE it reaches the gateway, so a mismatch
+# between these two files is invisible in our logs and looks like the bot being
+# down. Static, so it runs with no credentials and no Slack profile.
+SEED_CMD="$(python3 -c '
+import re
+s = open("scripts/slack-channel.patch.json5").read()
+m = re.search(r"slashCommand:\s*\{[^}]*name:\s*\"([^\"]+)\"", s)
+print(m.group(1) if m else "")' 2>/dev/null)"
+APP_CMD="$(python3 -c '
+import json
+c = json.load(open("slack/app-manifest.json"))["features"]["slash_commands"]
+print(c[0]["command"].lstrip("/") if c else "")' 2>/dev/null)"
+if [ -n "$SEED_CMD" ] && [ "$SEED_CMD" = "$APP_CMD" ]; then
+  pass "the seeded slashCommand name matches the manifest's command (/${SEED_CMD})"
+else
+  fail "the seeded slashCommand name matches the manifest's command" \
+       "seed='${SEED_CMD}' manifest='${APP_CMD}' — Slack would reject it unsent"
+fi
+
 head2 "A3d. no operator message is executed instead of printed"
 # An UNQUOTED heredoc runs command substitution on its body, so a command name
 # written in backticks for a human to read gets EXECUTED on the host. This is not
@@ -646,10 +666,6 @@ has "sync registers its agent tool" 'target_sync' "$SINSPECT"
 hasnt "sync plugin passes OpenClaw file-safety checks" 'blocked plugin candidate' "$SINSPECT"
 has "config keeps the key as a substitution, not a value" '${PRETORIN_API_KEY}' "$CFG"
 has "config carries the MCP cwd fix" '/opt/compliance-claw/no-repo' "$CFG"
-# THE SEEDED COMMAND NAME MUST BE THE ONE THE SLACK APP REGISTERS. Slack rejects
-# an unregistered /foo before it reaches the gateway, so a mismatch here is
-# invisible in our logs and looks like the bot being down.
-has "config registers the /compliance-claw slash command" '"compliance-claw"' "$CFG"
 
 # The orphaned-allowlist trap: plugins.allow is exclusive, so a config that keeps
 # it after channels.slack is removed silently runs with seven bundled plugins gone
