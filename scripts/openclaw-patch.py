@@ -177,17 +177,13 @@ class PatchError(Exception):
 
 # --- reading the live config -----------------------------------------------
 #
-# THE SEEDED CONFIG IS JSON5, NOT JSON, and that is the fresh-deployment path
-# rather than an edge case. entrypoint.sh installs openclaw-config.template.json
-# verbatim, comments and all; OpenClaw parses JSON5 and only rewrites the file as
-# strict JSON the first time something patches it. So on a deployment that has
-# never been applied to, `json.loads` fails on line 1 — which is exactly where
-# this ran aground the first time it was pointed at a real fresh gateway.
+# THE SEEDED CONFIG IS JSON5, not JSON: entrypoint.sh installs the template
+# verbatim and OpenClaw only rewrites it as strict JSON on the first patch, so on
+# a never-applied deployment `json.loads` fails on line 1.
 #
-# STRING-AWARE, because a naive comment stripper is worse than none: the shipped
-# config contains "http://127.0.0.1:18789", and cutting at the first `//` would
-# silently truncate a value rather than fail. This walks the text tracking
-# whether it is inside a string and honouring backslash escapes.
+# STRING-AWARE, because a naive stripper is worse than none: the shipped config
+# contains "http://127.0.0.1:18789" and cutting at the first `//` would silently
+# truncate a value rather than fail.
 def strip_json5(text):
     out = []
     i = 0
@@ -814,16 +810,11 @@ def cmd_verify(args):
 
 # --- rollback verification -------------------------------------------------
 #
-# A ROLLBACK CANNOT BE CHECKED WITH THE NORMAL VERIFIER, and running it there was
-# a real defect: that verifier compares the live config against the manifest of
-# the change we were trying to make. After a restore the change is precisely what
-# is NOT there, so for any real change it could only fail — and the failure would
-# be reported as "the restored configuration did not verify either", which reads
-# like the rollback broke something when in fact it worked.
-#
-# The question after a restore is a different one: is the configuration back to
-# what it was? That is a whole-document comparison against the snapshot, not a
-# manifest check.
+# NOT THE FORWARD VERIFIER. That one compares the live config against the manifest
+# of the change being undone, so after a restore it could only fail — reported as
+# "the restored configuration did not verify either", which reads like the rollback
+# broke something when it worked. The question here is whether the configuration is
+# back: a whole-document comparison against the snapshot.
 def cmd_verify_rollback(args):
     with open(args.config) as handle:
         after = load_config_text(handle.read())
@@ -1207,9 +1198,7 @@ def self_test():
           "the single-effort 'pretorin' MCP server is retired with a null")
 
     # --- verification: what we own, and what we must NOT require ------------
-    #
-    # These drive cmd_verify/cmd_verify_rollback through real files, because both
-    # bugs they cover were in the comparison itself rather than in generation.
+    # Driven through real files: both bugs these cover were in the comparison.
     import tempfile
 
     def _verify(cfg, manifest_obj, snap=None):

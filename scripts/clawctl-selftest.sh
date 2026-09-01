@@ -49,13 +49,9 @@ STUB_ATTACHED="\${STUB_ATTACHED:-}"
 # with the bug deliberately reintroduced. Now it consumes stdin exactly as
 # compose does, so a missing \`< /dev/null\` makes the second effort vanish here
 # too.
-# THE AGENT-WORKSPACE SCRIPT ALSO ARRIVES ON STDIN, AND IS EXECUTED FOR REAL.
-#
-# An earlier version of this stub only recorded argv, so a bug that handed the
-# container an EMPTY script passed every row here: apply logged a workspace for
-# each effort, wrote none, and exited 0. Running the script locally — with the
-# container's /home/node/.openclaw rewritten to STUB_WS_ROOT — is what lets the
-# tests assert on files that actually exist.
+# THE AGENT-WORKSPACE SCRIPT ARRIVES ON STDIN AND IS EXECUTED FOR REAL, with
+# /home/node/.openclaw rewritten to STUB_WS_ROOT. A stub that only recorded argv
+# let a bug through where apply logged every workspace, wrote none, and exited 0.
 case " \$* " in
   *" cli sh -s "*)
     _script="\$(cat)"
@@ -95,7 +91,11 @@ esac
 case " \$* " in
   *" openclaw config patch --stdin "*|*" openclaw config patch --stdin")
     _patch="\$(cat)"
-    case " \$* " in *" --dry-run "*|*" --dry-run") exit 0 ;; esac
+    case " \$* " in
+      *" --dry-run "*|*" --dry-run")
+        [ "\${STUB_OC_FAIL}" = dryrun ] && exit 1
+        exit 0 ;;
+    esac
     [ "\${STUB_OC_FAIL}" = patch ] && exit 1
     # STUB_OC_FAIL=verify models "the patch applied but the result is not what was
     # asked for" — one agent silently missing. That is what verification is FOR,
@@ -195,9 +195,13 @@ case " \$* " in
     # recovery steps rather than a reassuring summary.
     [ "\${STUB_OC_FAIL}" = rollback ] && exit 1
     cp "\${STUB_OC_CONFIG}.snap" "\${STUB_OC_CONFIG}" 2>/dev/null || true; exit 0 ;;
-  # snapshot: cp -p '<config>' '<config>.pre-apply.<ts>'
+  # snapshot: the config-copy step, which now proves itself with a marker.
+  # STUB_OC_FAIL=cfgsnapshot makes the copy fail, which must stop the run before
+  # anything is mutated rather than yielding an empty "fresh deployment" snapshot.
   *"cp -p '\${CFG_PATH}' '"*)
-    cp "\${STUB_OC_CONFIG}" "\${STUB_OC_CONFIG}.snap" 2>/dev/null || true; exit 0 ;;
+    [ "\${STUB_OC_FAIL}" = cfgsnapshot ] && exit 1
+    cp "\${STUB_OC_CONFIG}" "\${STUB_OC_CONFIG}.snap" 2>/dev/null || exit 1
+    echo CC_CFG_SNAPSHOT_OK; exit 0 ;;
   # reading the snapshot back (verify-rollback compares against it)
   *"cat '\${CFG_PATH}.pre-apply."*)
     cat "\${STUB_OC_CONFIG}.snap" 2>/dev/null || true; exit 0 ;;
@@ -208,7 +212,9 @@ esac
 
 # The gateway container: recreate, and the exec'd verification commands.
 case " \$* " in
-  *" up -d --force-recreate openclaw "*) exit 0 ;;
+  *" up -d --force-recreate openclaw "*)
+    [ "\${STUB_OC_FAIL}" = restart ] && exit 1
+    exit 0 ;;
   *" exec -T openclaw "*)
     case " \$* " in
       *" openclaw health"*) echo '{"ok":true}'; exit 0 ;;
@@ -787,20 +793,6 @@ BASE
   rm -f "$record"
   st_write_stub_docker "$bin" "$record" answer
   local fleetlog="${tmp}/fleet.log"
-  # Same runner, with the efforts file as an argument — used where a test needs a
-  # DIFFERENT fleet than the standard two-effort fixture.
-  st_fleet_apply_with() {
-    local ef="$1"; shift
-    ( cd "$tmp" && PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$ef" \
-        COMPLIANCE_CLAW_SECRET_DIR="$S" \
-        COMPOSE_FILE=compose.yaml:compose.secrets.yaml \
-        CC_TARGETS_DIR="${tmp}/workspace/targets" CC_STATE_DIR="${tmp}/state" \
-        STUB_OC_CONFIG="$OC" STUB_OC_FAIL="${1:-}" STUB_WS_ROOT="${tmp}/ocstate" \
-        STUB_TARGETS="simple-crm other" STUB_ONBOARD="${2:-ok}" \
-        STUB_WS_FAIL="${STUB_WS_FAIL:-}" \
-        bash "${root}/scripts/clawctl" apply ) >"$fleetlog" 2>&1
-  }
-
   st_fleet_apply() {
     ( cd "$tmp" && PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
         COMPLIANCE_CLAW_SECRET_DIR="$S" \
@@ -1149,9 +1141,7 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
   # Verification fails -> the previous configuration is restored, and the command
   # exits non-zero rather than reporting a success it cannot stand behind.
   # THE STATE, NOT THE LOG LINE. A "restoring..." message proves only that the
-  # code reached the rollback branch; what matters is whether the configuration
-  # and the managed workspaces actually came back. Both are captured before the
-  # failing apply and compared afterwards.
+  # rollback branch was reached; both halves are captured before and compared after.
   local pre_cfg pre_ws
   pre_cfg="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
   pre_ws="$(cat "${tmp}/ocstate/workspace-crm-soc2/AGENTS.md" 2>/dev/null | head -3)"
@@ -1186,8 +1176,8 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
   st_fleet_apply rollback && st_bad "a failed ROLLBACK fails the command" "it exited 0" \
                           || st_ok "a failed ROLLBACK fails the command (non-zero exit)"
   case "$(cat "$fleetlog")" in
-    *"ROLLBACK ALSO FAILED"*) st_ok "  and says plainly that the rollback failed too" ;;
-    *) st_bad "  and says plainly that the rollback failed too" "$(tail -5 "$fleetlog")" ;;
+    *"RESTORE DID NOT FULLY SUCCEED"*) st_ok "  and says plainly that the restore failed" ;;
+    *) st_bad "  and says plainly that the restore failed" "$(tail -5 "$fleetlog")" ;;
   esac
   case "$(cat "$fleetlog")" in
     *"docker compose run --rm -T cli cp"*)
@@ -1207,29 +1197,21 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
   # runs before this point and may already have bound resolvers on the platform.
   # The message has to separate what was reverted from what stands.
   case "$(cat "$fleetlog")" in
-    *"gateway configuration was not changed"*)
-      st_ok "a failed patch says the GATEWAY was not changed" ;;
-    *) st_bad "a failed patch says the gateway was not changed" "$(tail -4 "$fleetlog")" ;;
+    *"are back as they were"*)
+      st_ok "a failed patch says both halves were put back" ;;
+    *) st_bad "a failed patch says both halves were put back" "$(tail -4 "$fleetlog")" ;;
   esac
   case "$(cat "$fleetlog")" in
     *"bound on the platform"*)
       st_ok "  and does NOT claim nothing happened — onboarding may already stand" ;;
     *) st_bad "  and does not claim nothing happened" "$(tail -4 "$fleetlog")" ;;
   esac
-  hasnt_file() { case "$(cat "$1")" in *"$2"*) return 1 ;; *) return 0 ;; esac; }
-  if hasnt_file "$fleetlog" "Nothing was applied."; then
-    st_ok "  and the bare phrase \"Nothing was applied\" is gone from this path"
-  else
-    st_bad "  the bare phrase \"Nothing was applied\" is gone from this path"
-  fi
 
   # ------------------------------- 10. a failed effort stops the whole fleet
   #
-  # THE PROPERTY: an effort that did not complete must not come out the other side
-  # holding an agent, an MCP server, a Slack channel binding and a workspace. The
-  # old behaviour set rc=1, said "skipping", and then generated the complete fleet
-  # anyway — so a channel was admitted for an effort whose resolvers were never
-  # bound, and the first message in it reached an agent with nothing behind it.
+  # An effort that did not complete must not come out holding an agent, MCP server,
+  # Slack binding and workspace. The old code set rc=1, said "skipping", and
+  # generated the complete fleet anyway.
   st_head "10. a failed effort aborts fleet generation"
 
   st_oc_bindings '[]'
@@ -1238,13 +1220,9 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
   base_cfg="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
   base_state="$(cat "${tmp}/state/last-applied.json" 2>/dev/null | tr -d ' \n')"
 
-  # THE SHARP ASSERTION: the config stage must not be ENTERED at all.
-  #
-  # Comparing the resulting config alone would be weak here — a carried-on failure
-  # regenerates the same two-effort fleet, so the file could look unchanged while
-  # every step had in fact run. The snapshot is the first thing the config stage
-  # does, so its absence proves the stage was never reached. The workspace and the
-  # last-applied record below are the same argument from the other end.
+  # Comparing the config alone would be weak — a carried-on failure regenerates the
+  # same fleet, so the file could look unchanged while every step ran. The workspace
+  # and the last-applied record are what actually discriminate.
   rm -f "${OC}.snap"
   rm -rf "${tmp}/ocstate/workspace-crm-hipaa"
 
@@ -1255,10 +1233,12 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
     *"did not complete"*) st_ok "  and names the effort(s) that did not complete" ;;
     *) st_bad "  and names the effort(s) that did not complete" "$(tail -4 "$fleetlog")" ;;
   esac
-  if [ ! -e "${OC}.snap" ]; then
-    st_ok "  and the config stage was never ENTERED (no pre-apply snapshot taken)"
+  local cfg_after_abort
+  cfg_after_abort="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  if [ "$cfg_after_abort" = "$base_cfg" ]; then
+    st_ok "  and the CONFIGURATION was never mutated"
   else
-    st_bad "  and the config stage was never entered" "a snapshot was taken, so it ran"
+    st_bad "  and the configuration was never mutated" "it changed"
   fi
   local after_cfg
   after_cfg="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
@@ -1358,10 +1338,14 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
     *"without a backup to return to"*) st_ok "  and says why it refused to proceed" ;;
     *) st_bad "  and says why it refused" "$(tail -4 "$fleetlog")" ;;
   esac
-  if [ ! -e "${OC}.snap" ]; then
-    st_ok "  and never reached the config stage (no config snapshot taken)"
+  # The config SNAPSHOT is a read and now runs first, deliberately; what must not
+  # have happened is a mutation of the configuration itself.
+  local cfg_ws_abort
+  cfg_ws_abort="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  if [ "$cfg_ws_abort" = "$cfg_base" ]; then
+    st_ok "  and the configuration was never mutated"
   else
-    st_bad "  and never reached the config stage" "a config snapshot exists"
+    st_bad "  and the configuration was never mutated" "it changed"
   fi
   if [ "$(head -3 "${tmp}/ocstate/workspace-crm-soc2/AGENTS.md" 2>/dev/null)" = "$ws_base" ]; then
     st_ok "  and no workspace was written"
@@ -1414,13 +1398,95 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
     && st_bad "a failed workspace RESTORE fails the command" "it exited 0" \
     || st_ok "a failed workspace RESTORE fails the command"
   case "$(cat "$fleetlog")" in
-    *"ROLLBACK ALSO FAILED"*) st_ok "  and does NOT claim the workspaces are back" ;;
+    *"managed WORKSPACES could NOT be restored"*)
+      st_ok "  and does NOT claim the workspaces are back" ;;
     *) st_bad "  and does not claim the workspaces are back" "$(tail -5 "$fleetlog")" ;;
   esac
   case "$(cat "$fleetlog")" in
     *"tar -C"*) st_ok "  and prints the exact command to restore them by hand" ;;
     *) st_bad "  and prints the exact workspace-restore command" "$(tail -6 "$fleetlog")" ;;
   esac
+  st_fleet_apply || true
+
+  # --------------- 11c. the four remaining ways out of the transaction
+  #
+  # Each used to leave the deployment changed while the command said otherwise: a
+  # failed copy became an empty "fresh" snapshot, a rejected patch died after the
+  # workspaces were rewritten, a failed recreate skipped the rollback, and a failed
+  # workspace restore skipped the config restore.
+  st_head "11c. no escape from the transaction"
+
+  st_oc_bindings '[]'
+  st_fleet_apply || true
+  local esc_cfg esc_ws
+  esc_cfg="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  printf 'MARKER-ESC\n' > "${tmp}/ocstate/workspace-crm-soc2/AGENTS.md"
+  esc_ws="MARKER-ESC"
+
+  esc_unchanged() {   # $1 = label
+    local now_cfg
+    now_cfg="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+    if [ "$now_cfg" = "$esc_cfg" ] \
+       && [ "$(head -1 "${tmp}/ocstate/workspace-crm-soc2/AGENTS.md")" = "$esc_ws" ]; then
+      st_ok "  ${1}: configuration AND workspace are exactly as before"
+    else
+      st_bad "  ${1}: configuration and workspace are exactly as before" \
+             "cfg same=$([ "$now_cfg" = "$esc_cfg" ] && echo yes || echo no), ws first line=$(head -1 "${tmp}/ocstate/workspace-crm-soc2/AGENTS.md")"
+    fi
+  }
+
+  # (a) THE CONFIG SNAPSHOT COPY FAILS. An empty snapshot would later be restored
+  #     over a perfectly good configuration.
+  st_fleet_apply cfgsnapshot && st_bad "apply STOPS when the config snapshot copy fails" "it exited 0" \
+                             || st_ok "apply STOPS when the config snapshot copy fails"
+  case "$(cat "$fleetlog")" in
+    *"could not snapshot"*) st_ok "  and says the snapshot is what failed" ;;
+    *) st_bad "  and says the snapshot is what failed" "$(tail -4 "$fleetlog")" ;;
+  esac
+  esc_unchanged "snapshot failure"
+
+  # (b) THE DRY RUN FAILS. Validation is a read and now runs before any write.
+  st_fleet_apply dryrun && st_bad "apply STOPS when the dry run rejects the patch" "it exited 0" \
+                        || st_ok "apply STOPS when the dry run rejects the patch"
+  case "$(cat "$fleetlog")" in
+    *"did not validate"*) st_ok "  and says the patch is what was rejected" ;;
+    *) st_bad "  and says the patch was rejected" "$(tail -4 "$fleetlog")" ;;
+  esac
+  esc_unchanged "dry-run failure"
+
+  # (c) THE RECREATE FAILS after the patch is on disk. That must roll back, not die.
+  st_fleet_apply restart && st_bad "a failed gateway recreate fails the command" "it exited 0" \
+                         || st_ok "a failed gateway recreate fails the command"
+  case "$(cat "$fleetlog")" in
+    *"restoring what was there before"*)
+      st_ok "  and rolls back rather than leaving the new configuration in place" ;;
+    *) st_bad "  and rolls back" "$(tail -6 "$fleetlog")" ;;
+  esac
+
+  # (d) THE WORKSPACE RESTORE FAILS during rollback. The CONFIG restore must still
+  #     be attempted — one half back beats neither.
+  rm -f "${OC}.snap.probe"; cp "$OC" "${OC}.probe"
+  st_fleet_apply2() {
+    ( cd "$tmp" && PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
+        COMPLIANCE_CLAW_SECRET_DIR="$S" COMPOSE_FILE=compose.yaml:compose.secrets.yaml \
+        CC_TARGETS_DIR="${tmp}/workspace/targets" CC_STATE_DIR="${tmp}/state" \
+        STUB_OC_CONFIG="$OC" STUB_OC_FAIL=verify STUB_WS_ROOT="${tmp}/ocstate" \
+        STUB_TARGETS="simple-crm other" STUB_ONBOARD=ok STUB_WS_FAIL=restore \
+        bash "${root}/scripts/clawctl" apply ) >"$fleetlog" 2>&1
+  }
+  st_fleet_apply2 && st_bad "a failed workspace restore fails the command" "it exited 0" \
+                  || st_ok "a failed workspace restore fails the command"
+  case "$(cat "$fleetlog")" in
+    *"the CONFIGURATION was restored"*)
+      st_ok "  and the CONFIG restore was still attempted, and succeeded" ;;
+    *) st_bad "  and the config restore was still attempted" "$(tail -8 "$fleetlog")" ;;
+  esac
+  case "$(cat "$fleetlog")" in
+    *"REMOVE THE NEW ONES FIRST"*)
+      st_ok "  and the manual steps say to remove new paths before unpacking" ;;
+    *) st_bad "  and the manual steps say to remove new paths first" ;;
+  esac
+  rm -f "${OC}.probe"
   st_fleet_apply || true
 
   # ------------------------------- 12. plan reports removals

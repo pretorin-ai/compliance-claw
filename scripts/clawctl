@@ -731,32 +731,22 @@ print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))'
 # ---------------------------------------------------------------------------
 # TWO COMMAND PATHS, AND USING THE WRONG ONE IS A SILENT FAILURE.
 #
-#   oc_cli   `docker compose run --rm -T cli openclaw ...`
-#            Offline config work: seeding, reading and writing the shared config
-#            volume, `config patch --dry-run`, applying the patch. Works BEFORE
-#            any gateway container exists, which the first apply on a fresh
-#            deployment needs. `run` executes the image ENTRYPOINT, so the
-#            file-backed gateway token is loaded in-process — required, because
-#            the config carries "${OPENCLAW_GATEWAY_TOKEN}" and an unset ${VAR}
-#            makes the WHOLE config invalid.
+#   oc_cli   `run --rm -T cli openclaw ...` — offline config work, and the only
+#            path that works BEFORE a gateway container exists. `run` executes the
+#            entrypoint, so the file-backed gateway token is loaded in-process;
+#            without it the config's "${OPENCLAW_GATEWAY_TOKEN}" is unset and the
+#            WHOLE config is invalid.
 #
-#   oc_exec  `docker compose exec -T openclaw sh -c '...'`
-#            Anything that talks to the RUNNING gateway: health, agents,
-#            bindings, MCP. These reach it over 127.0.0.1:18789, and the `cli`
-#            service is a SEPARATE CONTAINER with nothing on its own loopback —
-#            there the command silently falls back to the embedded agent and dies
-#            on model resolution. scripts/smoke.sh carries the scar: a check
-#            written on the `cli` path "could therefore never have passed" and
-#            reported skip on every run for months.
+#   oc_exec  `exec -T openclaw sh -c '...'` — anything that talks to the RUNNING
+#            gateway. The `cli` service has its own empty loopback, so a
+#            gateway-bound command there silently falls back to the embedded agent;
+#            smoke.sh carries the scar of a check written that way that could never
+#            have passed and reported skip for months.
 #
-# `exec` is a child of the daemon, not of PID 1, so it inherits NONE of the
-# entrypoint's exports and the token has to be re-read inside the container. That
-# is the same idiom smoke.sh and docs/file-secrets.md already use, deliberately
-# reused rather than reinvented.
-#
-# NEVER `exec -e OPENCLAW_GATEWAY_TOKEN="$(cat ...)"`: that reads the secret on
-# the host and puts it in an argument list, visible to `ps` for the life of the
-# call. The value never crosses the docker CLI boundary.
+# `exec` is a child of the daemon, not PID 1, so it inherits none of the
+# entrypoint's exports and re-reads the token inside the container — the idiom
+# smoke.sh and docs/file-secrets.md already use. NEVER
+# `exec -e TOKEN="$(cat ...)"`: that puts the secret in host argv.
 oc_cli() {
   docker compose run --rm -T cli openclaw "$@" < /dev/null
 }
@@ -799,12 +789,35 @@ oc_config_read() {
 # describes. Restored by file copy rather than by `config patch`, because the
 # failure being recovered from may be a config the CLI cannot parse.
 OC_SNAPSHOT=""
+# AN EMPTY SNAPSHOT MEANS "THERE WAS NO CONFIG", NEVER "THE COPY FAILED".
+#
+# The old form was `cp ... || : > snapshot`, which turned any copy failure —
+# permissions, a full volume, a truncated read — into an empty file that the
+# rollback would then happily restore, wiping the configuration it was supposed
+# to protect. The two cases are now told apart explicitly: a missing source is a
+# fresh deployment and is fine; anything else stops the run.
 oc_config_snapshot() {
   OC_SNAPSHOT="${OC_CONFIG}.pre-apply.$(date -u +%Y%m%dT%H%M%SZ)"
-  docker compose run --rm -T cli sh -c \
-    "cp -p '${OC_CONFIG}' '${OC_SNAPSHOT}' 2>/dev/null || : > '${OC_SNAPSHOT}'" \
-    < /dev/null >/dev/null 2>&1 \
-    || die "could not snapshot ${OC_CONFIG}. Refusing to change it without a way back."
+  local out
+  out="$(docker compose run --rm -T cli sh -c "
+      if [ -e '${OC_CONFIG}' ]; then
+        cp -p '${OC_CONFIG}' '${OC_SNAPSHOT}' || exit 1
+      else
+        : > '${OC_SNAPSHOT}' || exit 1      # genuinely nothing to preserve yet
+      fi
+      # Prove the snapshot is readable and, when there was a source, non-empty.
+      [ -f '${OC_SNAPSHOT}' ] || exit 1
+      if [ -s '${OC_CONFIG}' ] && [ ! -s '${OC_SNAPSHOT}' ]; then exit 1; fi
+      printf 'CC_CFG_SNAPSHOT_OK\n'" < /dev/null 2>&1)" || true
+  case "$out" in
+    *CC_CFG_SNAPSHOT_OK*) ;;
+    *)
+      OC_SNAPSHOT=""
+      die "could not snapshot ${OC_CONFIG}:
+$(printf '%s' "$out" | tail -4 | sed 's/^/  /')
+  Nothing has been changed. Refusing to touch the configuration without a
+  verified copy to return to." ;;
+  esac
   log "  snapshot: ${OC_SNAPSHOT} (in the openclaw-state volume)"
 }
 
@@ -893,20 +906,10 @@ PY
   done
   managed="${managed}targets/README.md"$'\n'"AGENTS.md"
 
-  # THE CONTAINER SCRIPT, BUILT FIRST AND PIPED IN.
-  #
-  # Not a heredoc on the `docker compose run` line: a heredoc whose body falls
-  # outside the command substitution it belongs to leaves the child reading an
-  # EMPTY script, and `sh -s` with nothing on stdin exits 0 having done nothing.
-  # That is precisely how this first shipped — apply logged every workspace and
-  # wrote none, and the run reported success. Piping makes the script's extent
-  # unambiguous.
-  # WRITTEN TO A FILE BY A PLAIN HEREDOC, not captured in a command
-  # substitution. `$(cat <<'SH' ... SH)` looks equivalent and is not: bash closes
-  # the substitution at the first unbalanced ')' it finds while scanning, and this
-  # script contains one inside a `case` pattern — so the tail of the script got
-  # executed by clawctl itself instead of being captured. A file has no such
-  # ambiguity, and the redirection below makes the child's stdin explicit.
+  # WRITTEN TO A FILE, never captured in a command substitution: `$(cmd <<'SH' …)`
+  # closes at the first unbalanced ')' — this script has one in a `case` pattern —
+  # leaving the child an EMPTY script that exits 0 having done nothing. That is
+  # how this first shipped: every workspace logged, none written, success reported.
   local ws_script; ws_script="$(mktemp "${TMPDIR:-/tmp}/clawctl-ws.XXXXXX")"
   cat > "$ws_script" <<'SH'
 set -eu
@@ -1010,21 +1013,14 @@ $(printf '%s' "$ws_out" | tail -5 | sed 's/^/  /')"
 # ---------------------------------------------------------------------------
 # THE MANAGED WORKSPACES ARE PART OF THE TRANSACTION.
 #
-# They are written BEFORE the config is patched, so that the moment an agent
-# exists its instructions and target view already do. That ordering means a
-# rollback which restored only openclaw.json would leave every workspace holding
-# the NEW effort's AGENTS.md while the gateway had been put back to the old
-# fleet — the two halves of one change, half undone.
-#
-# ONLY WHAT WE MANAGE IS SAVED, and only for agents we are about to write. The
-# archive is built from each workspace's own .compliance-claw-managed manifest
-# plus the manifest file itself, so an operator's notes in the same directory are
-# neither copied nor, on restore, disturbed.
+# They are written before the config is patched, so a rollback restoring only
+# openclaw.json would leave every workspace describing a fleet the gateway no
+# longer has. Only managed paths are saved — from each workspace's own
+# .compliance-claw-managed manifest — so an operator's notes are neither copied
+# nor disturbed. tar rather than cp -r, because the target view is symlinks and a
+# copy that followed them would duplicate whole repositories into the volume.
 WS_SNAPSHOT=""
 
-# tar is used rather than cp -r because it preserves symlinks AS symlinks: the
-# target view is made of them, and a copy that followed them would duplicate
-# whole repositories into the state volume.
 workspace_snapshot() {
   local agents="$1"
   WS_SNAPSHOT="${OC_STATE}/.compliance-claw-ws.pre-apply.$(date -u +%Y%m%dT%H%M%SZ).tar"
@@ -1032,10 +1028,6 @@ workspace_snapshot() {
   # snapshot that could not be written must stop the run BEFORE any workspace or
   # any configuration is touched — not be shrugged off and discovered later, when
   # the only thing left to do is print manual recovery steps.
-  # THE SCRIPT GOES TO A FILE, not into a command substitution. `$(cmd <<'SH' ...)`
-  # closes at the first unbalanced ')' bash finds while scanning, and this script
-  # has one inside a `case` pattern — the tail then runs in clawctl's own shell.
-  # Same trap as write_agent_workspace; same fix.
   local script; script="$(mktemp "${TMPDIR:-/tmp}/clawctl-wssnap.XXXXXX")"
   cat > "$script" <<'SH'
 set -eu
@@ -1186,6 +1178,27 @@ PY
   return 0
 }
 
+# THE DRY RUN IS A SEPARATE STEP, RUN BEFORE ANYTHING IS MUTATED.
+#
+# It used to sit inside apply_patch, which runs after the workspaces have already
+# been rewritten — so a patch OpenClaw rejected left the workspaces changed and
+# died claiming nothing had been modified. Validation reads; it has no business
+# happening after the first write.
+validate_patch() {
+  local -a flags=()
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] && flags+=(--replace-path "$f")
+  done < "${GEN_DIR}/replace-paths.txt"
+
+  log "  validating the patch against OpenClaw's own schema (--dry-run)"
+  docker compose run --rm -T cli openclaw config patch --stdin --dry-run \
+    ${flags[@]+"${flags[@]}"} < "${GEN_DIR}/patch.json" >&2 \
+    || die "the generated configuration did not validate. Nothing has been changed:
+  no workspace was written and ${OC_CONFIG} was not modified. The patch is at
+  ${GEN_DIR}/patch.json."
+}
+
 apply_patch() {
   # THE --replace-path FLAGS, and only the ones this patch actually needs:
   # `openclaw config patch` refuses a --replace-path that matches nothing in the
@@ -1204,13 +1217,6 @@ apply_patch() {
     [ -n "$f" ] && flags+=(--replace-path "$f")
   done < "${GEN_DIR}/replace-paths.txt"
 
-  log "  validating the patch against OpenClaw's own schema (--dry-run)"
-  if ! docker compose run --rm -T cli openclaw config patch --stdin --dry-run \
-         ${flags[@]+"${flags[@]}"} < "${GEN_DIR}/patch.json" >&2; then
-    die "the generated configuration did not validate. NOTHING was applied and
-  ${OC_CONFIG} was not modified. The patch is at ${GEN_DIR}/patch.json."
-  fi
-
   log "  applying"
   if ! docker compose run --rm -T cli openclaw config patch --stdin \
          ${flags[@]+"${flags[@]}"} < "${GEN_DIR}/patch.json" >&2; then
@@ -1224,11 +1230,13 @@ apply_patch() {
 # alone may no-op, because what changed is inside a volume and compose cannot see
 # it. compose.yaml has no depends_on and `cli` is profile-gated, so this touches
 # exactly one service.
+# RETURNS FAILURE, NEVER DIES. Dying here skipped the rollback entirely: the new
+# configuration was already on disk, so the deployment was left holding it with no
+# attempt to put the old one back.
 restart_gateway() {
   log "  recreating the gateway once"
-  docker compose up -d --force-recreate openclaw >&2 \
-    || die "the gateway did not come up. The previous configuration is at
-  ${OC_SNAPSHOT} in the openclaw-state volume; see 'clawctl apply' output above."
+  docker compose up -d --force-recreate openclaw >&2 || return 1
+  return 0
 }
 
 # EVERY CHECK HERE GOES THROUGH THE GATEWAY CONTAINER. See oc_exec.
@@ -1279,45 +1287,64 @@ $(printf '%s' "$out" | tail -3 | sed 's/^/      /')"
 
 # THE ROLLBACK. By file copy, not by `config patch`: what is being recovered from
 # may be a configuration the CLI cannot even load.
+# PUT BOTH HALVES BACK. Returns non-zero when either failed, after printing exact
+# recovery steps — so no caller can report success on a partial restore.
+restore_both() {
+  local ws_ok=1 cfg_ok=1
+  if [ -n "${WS_AGENTS:-}" ]; then
+    workspace_restore "$WS_AGENTS" || ws_ok=0
+  fi
+  # ATTEMPTED UNCONDITIONALLY. Short-circuiting on the workspace result left the
+  # NEW configuration in place whenever the workspace restore failed; one half
+  # back is strictly better than neither.
+  oc_config_restore || cfg_ok=0
+  [ "$ws_ok" = 1 ] && [ "$cfg_ok" = 1 ] && return 0
+
+  printf '\n' >&2
+  warn "THE RESTORE DID NOT FULLY SUCCEED."
+  [ "$cfg_ok" = 1 ] && warn "  the CONFIGURATION was restored" \
+                    || warn "  the CONFIGURATION could NOT be restored"
+  [ "$ws_ok" = 1 ]  && warn "  the managed WORKSPACES were restored" \
+                    || warn "  the managed WORKSPACES could NOT be restored"
+  warn "This command will not pretend the deployment is in a known state."
+  warn "Recover it by hand:"
+  warn ""
+  warn "  1. Put the previous configuration back:"
+  warn "       docker compose run --rm -T cli cp '${OC_SNAPSHOT}' '${OC_CONFIG}'"
+  warn "  2. Put the managed agent workspaces back. REMOVE THE NEW ONES FIRST —"
+  warn "     unpacking alone leaves behind any path this run created that the"
+  warn "     snapshot does not contain, such as a symlink to a target the effort"
+  warn "     no longer declares:"
+  warn "       docker compose run --rm -T cli sh -c 'rm -rf ${OC_STATE}/workspace-*/targets ${OC_STATE}/workspace-*/AGENTS.md; tar -C ${OC_STATE} -xf ${WS_SNAPSHOT}'"
+  warn "  3. Recreate the gateway:"
+  warn "       docker compose up -d --force-recreate openclaw"
+  warn "  4. Confirm it is healthy:"
+  warn "       docker compose exec -T openclaw sh -c '"
+  warn "         OPENCLAW_GATEWAY_TOKEN=\"\$(cat ${OC_TOKEN_FILE})\" openclaw health'"
+  warn ""
+  warn "  If step 1 or 2 reports no such file, that snapshot was never written and"
+  warn "  what is in the volume is the only copy — inspect it before changing"
+  warn "  anything else."
+  return 1
+}
+
 rollback_apply() {
   warn "verification failed; restoring what was there before."
   warn "$VERIFY_DETAIL"
 
-  # BOTH HALVES. The managed workspaces were written before the patch, so putting
-  # only openclaw.json back would leave each agent's instructions and target view
-  # describing a fleet the gateway no longer has.
-  local ws_ok=1
-  if [ -n "${WS_AGENTS:-}" ]; then
-    workspace_restore "$WS_AGENTS" || ws_ok=0
-  fi
+  restore_both || return 1
 
-  if [ "$ws_ok" = 0 ] || ! oc_config_restore; then
-    printf '\n' >&2
-    warn "THE ROLLBACK ALSO FAILED. The deployment is in an unknown state and this"
-    warn "command will not pretend otherwise. Recover it by hand:"
-    warn ""
-    warn "  1. Put the previous configuration back:"
-    warn "       docker compose run --rm -T cli cp '${OC_SNAPSHOT}' '${OC_CONFIG}'"
-    warn "  2. Put the managed agent workspaces back:"
-    warn "       docker compose run --rm -T cli tar -C '${OC_STATE}' -xf '${WS_SNAPSHOT}'"
-    warn "  3. Recreate the gateway:"
+  if ! restart_gateway; then
+    warn "the configuration and workspaces were restored, but the gateway did not"
+    warn "  come back up. The files on disk are the previous ones; the running"
+    warn "  process is not. Bring it up by hand:"
     warn "       docker compose up -d --force-recreate openclaw"
-    warn "  4. Confirm it is healthy:"
-    warn "       docker compose exec -T openclaw sh -c '"
-    warn "         OPENCLAW_GATEWAY_TOKEN=\"\$(cat ${OC_TOKEN_FILE})\" openclaw health'"
-    warn ""
-    warn "  If step 1 or 2 reports no such file, that snapshot was never written and"
-    warn "  what is in the volume is the only copy — inspect it before changing"
-    warn "  anything else."
     return 1
   fi
 
-  restart_gateway
-  # A ROLLBACK IS NOT VERIFIED WITH THE FORWARD VERIFIER, and doing so was a real
-  # defect: that one compares the live config against the manifest of the change
-  # being undone, so a CORRECT rollback could only ever fail — and it failed with
-  # "the restored configuration did not verify either", which reads like the
-  # restore broke something. The question here is the opposite one: is it back?
+  # NOT THE FORWARD VERIFIER. That one compares the live config against the
+  # manifest of the change being undone, so a correct rollback could only fail.
+  # The question here is the opposite: is it back?
   if verify_rollback; then
     warn "the previous configuration and the managed workspaces are back, and the"
     warn "  gateway is healthy. None of the gateway-side change this run intended"
@@ -1651,6 +1678,14 @@ run_efforts() {
   while read -r _a; do [ -n "$_a" ] && ws_agents="${ws_agents} ${_a}"; done \
     < <(python3 "$PARSE_EFFORTS" agents "$EFFORTS_FILE" | cut -f2)
   WS_AGENTS="$ws_agents"
+
+  # EVERYTHING THAT CAN REFUSE, BEFORE ANYTHING THAT CAN CHANGE.
+  #
+  # Both snapshots and the schema validation only read. Running them first means a
+  # rejected patch or an unwritable backup stops the run with the deployment
+  # genuinely untouched, instead of after the workspaces have been rewritten.
+  oc_config_snapshot
+  validate_patch
   workspace_snapshot "$ws_agents"
 
   while IFS=$'\t' read -r effort agent channel server prefix cred; do
@@ -1681,26 +1716,29 @@ run_efforts() {
     fi
   done < <(python3 "$PARSE_EFFORTS" agents "$EFFORTS_FILE")
 
-  oc_config_snapshot
   if ! apply_patch; then
     warn "applying the configuration patch failed; restoring what was there before."
-    [ -n "${WS_AGENTS:-}" ] && { workspace_restore "$WS_AGENTS" \
-      || warn "the managed workspaces could not be restored from ${WS_SNAPSHOT}"; }
-    oc_config_restore || warn "the restore also failed; see ${OC_SNAPSHOT} in the volume."
-    die "the gateway configuration was not changed, and the managed workspaces were
-  put back. ${STATE_FILE} was not written. Pretorin onboarding runs before this
-  point, so any effort recorded as 'applied' above is bound on the platform; that
-  stands, and is idempotent."
+    restore_both || exit 1
+    die "the gateway configuration and the managed workspaces are back as they were,
+  and ${STATE_FILE} was not written. Pretorin onboarding runs before this point, so
+  any effort recorded as 'applied' above is bound on the platform; that stands, and
+  is idempotent."
   fi
 
-  restart_gateway
+  # A FAILED RECREATE IS A VERIFICATION FAILURE, not a reason to stop. The new
+  # configuration is already on disk here, so dying would leave it there with no
+  # attempt to put the old one back.
+  local restarted=1
+  restart_gateway || restarted=0
 
-  if verify_apply; then
+  if [ "$restarted" = 1 ] && verify_apply; then
     log "verified: agents, bindings and MCP servers match, and the configuration"
     log "  this deployment does not own is unchanged."
     write_state
     GEN_OK=1
   else
+    [ "$restarted" = 0 ] && VERIFY_DETAIL="the gateway did not come back up after
+      'docker compose up -d --force-recreate openclaw' (see its output above)."
     rollback_apply || exit 1
     exit 1
   fi
@@ -1885,17 +1923,21 @@ dm_apply() {
   fi
   plan_report
   oc_config_snapshot
+  validate_patch
   if ! apply_patch; then
-    warn "applying failed; restoring the previous configuration."
-    oc_config_restore || warn "the restore also failed; see ${OC_SNAPSHOT} in the volume."
-    die "nothing was changed."
+    warn "applying failed; restoring what was there before."
+    restore_both || exit 1
+    die "the gateway configuration and the managed workspaces are back as they were."
   fi
-  restart_gateway
-  if verify_apply; then
+  local restarted=1
+  restart_gateway || restarted=0
+  if [ "$restarted" = 1 ] && verify_apply; then
     log "verified."
     write_state
     GEN_OK=1
   else
+    [ "$restarted" = 0 ] && VERIFY_DETAIL="the gateway did not come back up after
+      'docker compose up -d --force-recreate openclaw' (see its output above)."
     rollback_apply || exit 1
     exit 1
   fi
