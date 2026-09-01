@@ -24,3 +24,12 @@ tamper/
 # relying on a developer's global gitignore, so a fresh clone is clean for
 # everyone rather than only for whoever happens to have the global rule.
 .claude/
+
+# The real effort configuration. Generated per host by `scripts/clawctl migrate`
+# from targets.yaml, and it names YOUR systems — so it is not committed.
+# efforts.example.yaml is the committed, documented shape.
+#
+# It holds no secret: credential_ref is a NAME, and the values live under
+# secrets/ (already ignored above). This line exists so a fresh clone gets the
+# example and produces its own, not so anything sensitive stays out.
+efforts.yaml

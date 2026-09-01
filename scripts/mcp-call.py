@@ -24,6 +24,7 @@ probe that the real runtime would fail.
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -37,6 +38,16 @@ import sys
 PRETORIN = "pretorin"
 CWD = "/opt/compliance-claw/no-repo"
 TIMEOUT_SECONDS = int(os.environ.get("MCP_CALL_TIMEOUT", "120"))
+
+# MCP_CALL_COMMAND overrides the server this client spawns.
+#
+# `scripts/clawctl validate` sets it to
+#     /opt/compliance-claw/pretorin-mcp-launch <effort>
+# so the probe runs through the REAL launcher — mount, credential ladder, scope
+# pin and all — instead of approximating it with a bare `pretorin mcp-serve` that
+# would inherit the container-wide default credential and prove nothing about the
+# effort. Unset, the behaviour is exactly what it was.
+SERVER_COMMAND = shlex.split(os.environ.get("MCP_CALL_COMMAND", "")) or [PRETORIN, "mcp-serve"]
 
 
 def fail(message, code=1):
@@ -61,7 +72,7 @@ def main(argv):
     signal.alarm(TIMEOUT_SECONDS)
 
     proc = subprocess.Popen(
-        [PRETORIN, "mcp-serve"],
+        SERVER_COMMAND,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

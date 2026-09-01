@@ -177,6 +177,62 @@ def parse(text):
     return validate(scope, targets)
 
 
+def validate_target(item):
+    """Validate ONE target dict in place. Raises ParseError; returns nothing.
+
+    EXTRACTED SO IT HAS EXACTLY ONE DEFINITION. scripts/parse-efforts.py imports
+    this function to validate the targets nested inside each effort, so the rules
+    below — path safety, https-only, the strict `private` boolean, the github.com
+    restriction — cannot drift between the two file formats. A second copy of
+    these rules is the failure this extraction exists to prevent: `private` in
+    particular has a dangerous direction (a private repo treated as public fails
+    with an auth error that reads like a network fault), and it must not be
+    possible for one format to be strict about it while the other is not.
+
+    Name uniqueness is NOT checked here: `targets.yaml` scopes names to one file,
+    while `efforts.yaml` scopes them to a global namespace shared across efforts
+    with an equal-definition exemption. That rule differs per format, so each
+    caller owns it.
+    """
+    line = item["_lineno"]
+    name = item["name"]
+    # name becomes ./workspace/targets/<name> on the host and
+    # /workspace/targets/<name> in the container, so it is path-critical.
+    if not NAME_RE.match(name):
+        raise ParseError(line, "target name '%s' must match [A-Za-z0-9._-]+" % name)
+    if name.startswith(".") or name in (".", ".."):
+        raise ParseError(line, "target name '%s' must not start with a dot" % name)
+    if "url" not in item:
+        raise ParseError(line, "target '%s' has no url" % name)
+    if not item["url"].startswith("https://"):
+        raise ParseError(
+            line,
+            "target '%s' url must start with https:// (SSH remotes are not supported)"
+            % name,
+        )
+
+    # Strict boolean. YAML would accept yes/on/True for `private`, and a value
+    # that quietly parses as "not true" is the dangerous direction: a private
+    # repo treated as public fails with an authentication error that looks
+    # like a network problem. Two spellings, nothing else.
+    raw = item.get("private", "false")
+    if raw not in ("true", "false"):
+        raise ParseError(
+            line,
+            "target '%s' private must be exactly 'true' or 'false', got '%s'"
+            % (name, raw),
+        )
+    item["private"] = raw
+    if raw == "true" and not item["url"].startswith(PRIVATE_URL_PREFIX):
+        raise ParseError(
+            line,
+            "target '%s' is private but its url is not on github.com; both"
+            " supported credentials — a GitHub App installation token on the"
+            " host, and the fine-grained PAT used for synchronization from"
+            " the container — only work for %s" % (name, PRIVATE_URL_PREFIX),
+        )
+
+
 def validate(scope, targets):
     for key in TOP_KEYS:
         if key not in scope:
@@ -188,44 +244,13 @@ def validate(scope, targets):
     for item in targets:
         line = item["_lineno"]
         name = item["name"]
-        # name becomes ./workspace/targets/<name> on the host and
-        # /workspace/targets/<name> in the container, so it is path-critical.
-        if not NAME_RE.match(name):
-            raise ParseError(line, "target name '%s' must match [A-Za-z0-9._-]+" % name)
-        if name.startswith(".") or name in (".", ".."):
-            raise ParseError(line, "target name '%s' must not start with a dot" % name)
+        # Duplicate detection BEFORE the shared rules, so the message an operator
+        # sees for two identically named targets names both lines rather than
+        # whichever per-target rule happens to trip first.
         if name in seen:
             raise ParseError(line, "duplicate target name '%s' (also on line %d)" % (name, seen[name]))
+        validate_target(item)
         seen[name] = line
-        if "url" not in item:
-            raise ParseError(line, "target '%s' has no url" % name)
-        if not item["url"].startswith("https://"):
-            raise ParseError(
-                line,
-                "target '%s' url must start with https:// (SSH remotes are not supported)"
-                % name,
-            )
-
-        # Strict boolean. YAML would accept yes/on/True for `private`, and a value
-        # that quietly parses as "not true" is the dangerous direction: a private
-        # repo treated as public fails with an authentication error that looks
-        # like a network problem. Two spellings, nothing else.
-        raw = item.get("private", "false")
-        if raw not in ("true", "false"):
-            raise ParseError(
-                line,
-                "target '%s' private must be exactly 'true' or 'false', got '%s'"
-                % (name, raw),
-            )
-        item["private"] = raw
-        if raw == "true" and not item["url"].startswith(PRIVATE_URL_PREFIX):
-            raise ParseError(
-                line,
-                "target '%s' is private but its url is not on github.com; both"
-                " supported credentials — a GitHub App installation token on the"
-                " host, and the fine-grained PAT used for synchronization from"
-                " the container — only work for %s" % (name, PRIVATE_URL_PREFIX),
-            )
     return scope, targets
 
 

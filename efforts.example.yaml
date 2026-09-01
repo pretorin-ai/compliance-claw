@@ -1,0 +1,83 @@
+# efforts.example.yaml — the multi-effort configuration format, documented.
+#
+# THIS FILE IS AN EXAMPLE AND IS NEVER READ BY ANYTHING. The real file is
+# efforts.yaml, which is gitignored because it names YOUR systems. Produce it
+# from your existing single-effort targets.yaml:
+#
+#   scripts/clawctl migrate --name crm-soc2
+#   scripts/clawctl validate
+#   scripts/clawctl plan
+#   scripts/clawctl apply
+#
+# WHAT AN EFFORT IS. One system + one framework. Pretorin keys preflight state
+# and the active recipe set on that pair, so the same system under two frameworks
+# is two separate compliance efforts, each with its own bound repositories, its
+# own recipe set, and its own credential. That is why `efforts:` is a list and
+# why system_id + framework_id must be unique across it.
+#
+# NO TOKEN EVER APPEARS HERE. `credential_ref` is a NAME. This file is safe to
+# commit; a real efforts.yaml is gitignored only because it names your systems,
+# not because it holds anything secret.
+
+efforts:
+  # ---------------------------------------------------------------------------
+  # Effort one. `credential_ref: default` is what `clawctl migrate` writes, and it
+  # resolves to the credential this deployment ALREADY HAS —
+  # secrets/runtime/pretorin-api-key. Nothing is copied and no second file is
+  # created, so a deployment migrating from single-effort needs no new secret at
+  # all. `default` is a RESERVED name: a file at secrets/runtime/pretorin/default
+  # would shadow the real one, so it is refused.
+  - name: crm-soc2
+    # THE CANONICAL SYSTEM UUID, never a friendly name. Pretorin resolves a
+    # write's target to a UUID before comparing it against the pinned scope, and
+    # the comparison is literal — so a name here refuses writes to the very system
+    # it names. Find yours with:
+    #   docker compose run --rm cli pretorin --json context list
+    system_id: 00000000-0000-0000-0000-000000000000
+    framework_id: soc2
+    credential_ref: default
+
+    # Exactly the semantics targets.yaml has always had. `name` becomes a
+    # directory name and a container path; `url` must be an https:// git remote;
+    # `ref` is an optional BRANCH (not a tag, not a SHA); `private: true` is a
+    # FLAG ONLY and never accompanies a credential.
+    targets:
+      - name: simple-crm
+        url: https://github.com/pretorin-ai/simple-crm.git
+        ref: main
+
+
+  # ---------------------------------------------------------------------------
+  # Effort two: THE SAME SYSTEM under a different framework. This is the case the
+  # whole format exists for.
+  #
+  # Note `simple-crm` appears in both efforts with an IDENTICAL definition. That
+  # is allowed and is the point: target names are a GLOBAL namespace, because
+  # every target is cloned to the one directory workspace/targets/<name> and
+  # Pretorin derives resolver names from the directory basename. One clone gets
+  # bound into both scopes. Two DIFFERENT definitions under one name is refused,
+  # naming both efforts and the field that differs — otherwise whichever effort
+  # synchronised last would silently decide what the other is reviewing.
+  - name: crm-hipaa
+    system_id: 00000000-0000-0000-0000-000000000000
+    framework_id: hipaa
+
+    # A SEPARATE credential for this effort. Create the file with:
+    #   scripts/clawctl credential add hipaa-key
+    # then paste the key into secrets/runtime/pretorin/hipaa-key.
+    #
+    # Use that command rather than creating the file by hand: Compose file secrets
+    # are bind mounts and cannot remap uid, so the file needs mode 0604 to be
+    # readable by the container's uid-1000 user. A hand-made 0600 file fails as a
+    # Pretorin AUTHENTICATION error that blames a key which is perfectly fine.
+    #
+    # ONE CREDENTIAL OR MANY IS YOUR CALL, and it is a real trade-off. One
+    # org-wide key is less to rotate and lets any effort read any system; a key
+    # per system limits the blast radius of a leak and is the only way to keep
+    # one effort's agent from reading another system's data. See docs/efforts.md.
+    credential_ref: hipaa-key
+
+    targets:
+      - name: simple-crm
+        url: https://github.com/pretorin-ai/simple-crm.git
+        ref: main

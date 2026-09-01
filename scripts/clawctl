@@ -1,0 +1,853 @@
+#!/usr/bin/env bash
+#
+# clawctl — the operator control command for multi-effort Compliance Claw.
+#
+#   scripts/clawctl validate        [--schema-only] [--effort NAME]
+#   scripts/clawctl migrate         [--name NAME]
+#   scripts/clawctl credential add  NAME
+#   scripts/clawctl plan            [--effort NAME]
+#   scripts/clawctl apply           [--effort NAME]
+#   scripts/clawctl --self-test
+#
+# An EFFORT is one system + framework pair with its own targets and its own named
+# credential. Pretorin keys preflight state and the active recipe set on that
+# pair, so the same system under two frameworks is two separate compliance
+# efforts. efforts.yaml declares them; this command validates, migrates and
+# applies them.
+#
+# ONE COMMAND, NOT A SCRIPT PER OPERATION. The sequence itself is not duplicated
+# either: `apply` drives scripts/onboard-lib.sh, the same file the legacy
+# scripts/onboard-targets.sh drives.
+#
+# STORED CLI CONTEXT IS NOT USED ANYWHERE ON THIS PATH. `pretorin context set` is
+# a single global and cannot describe more than one effort. Scope is pinned per
+# process with PRETORIN_SYSTEM_ID / PRETORIN_FRAMEWORK_ID, which override stored
+# context — measured against CLI 0.28.7, including the platform's cross-scope
+# write guard reading the environment rather than stored state, and ignoring a
+# caller-supplied allow_scope_override. See docs/plans/effort-config.md.
+#
+# CREDENTIALS ARE NAMED, NEVER INLINE. efforts.yaml carries a `credential_ref`
+# and no token ever appears in it. scripts/parse-efforts.py owns the one copy of
+# the name-to-file mapping; this script asks it rather than knowing it.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+EFFORTS_FILE="${CC_EFFORTS_FILE:-efforts.yaml}"
+TARGETS_FILE="${TARGETS_FILE:-targets.yaml}"
+PARSE_EFFORTS="scripts/parse-efforts.py"
+PARSE_TARGETS="scripts/parse-targets.py"
+SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
+# Where the clones live. Overridable for the same reason sync-targets.sh makes
+# its equivalent overridable: the self-test drives the real code against a
+# throwaway tree instead of re-implementing the check.
+TARGETS_DIR="${CC_TARGETS_DIR:-workspace/targets}"
+CREDENTIAL_DIR="${SECRET_DIR}/pretorin"
+LOCK_PATH="/home/node/.pretorin/.update.lock"
+AUDIT_PATH="/home/node/.pretorin/clawctl-audit.log"
+LAUNCHER="/opt/compliance-claw/pretorin-mcp-launch"
+MCP_CALL="/opt/compliance-claw/mcp-call.py"
+
+log()  { printf 'clawctl: %s\n' "$*"; }
+warn() { printf 'clawctl: WARNING — %s\n' "$*" >&2; }
+die()  { printf 'clawctl: ERROR — %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# COMPOSE_FILE: append the overlay, refuse the fork.
+#
+# Two different conditions, deliberately handled differently.
+#
+#   compose.efforts.yaml missing   A MECHANICAL OMISSION. That overlay only adds
+#                                  two read-only mounts: it defines no service
+#                                  behaviour, overrides nothing, and cannot
+#                                  remove anything. So it is appended and said
+#                                  out loud, using bootstrap.sh's idiom.
+#
+#   compose.secrets.yaml missing   A REAL FORK. Named per-effort credentials ARE
+#                                  the file-backed secret workflow; the legacy
+#                                  .env path can carry exactly one key by
+#                                  construction. Refused, with the export line.
+#
+# APPEND, NEVER REBUILD THE VARIABLE. bootstrap.sh carries a long comment about
+# why: an unconditional `export COMPOSE_FILE=a:b` there silently discarded the
+# operator's other overlays, and the deployment ended up with Slack credentials
+# and no Slack, permanently. COMPOSE_PATH_SEPARATOR is compose's own knob for
+# this; honour it rather than hardcoding a colon.
+# check_only=1 reports without changing anything: no COMPOSE_FILE rewrite, no
+# mkdir, no container. `plan` uses it so it cannot report success for a
+# configuration `apply` would reject on its first line.
+ensure_compose_stack() {
+  local check_only="${1:-0}"
+  local sep="${COMPOSE_PATH_SEPARATOR:-:}"
+  local current="${COMPOSE_FILE:-compose.yaml}"
+
+  case "${sep}${current}${sep}" in
+    *"${sep}compose.secrets.yaml${sep}"*) ;;
+    *)
+      die "this deployment is not on the file-backed credential path, and named
+  per-effort credentials only exist there. A .env deployment can carry exactly
+  one Pretorin key by construction, so there is nothing for a credential_ref to
+  name. Nothing was changed.
+
+  Switch to file-backed secrets (see docs/file-secrets.md), then:
+    export COMPOSE_FILE=compose.yaml${sep}compose.secrets.yaml${sep}compose.efforts.yaml" ;;
+  esac
+
+  case "${sep}${current}${sep}" in
+    *"${sep}compose.efforts.yaml${sep}"*)
+      COMPOSE_FILE="$current" ;;
+    *)
+      if [ "$check_only" = 1 ]; then
+        log "COMPOSE_FILE does not select compose.efforts.yaml; 'apply' would append it."
+        log "    export COMPOSE_FILE=${current}${sep}compose.efforts.yaml"
+        return 0
+      fi
+      COMPOSE_FILE="${current}${sep}compose.efforts.yaml"
+      log "COMPOSE_FILE did not select compose.efforts.yaml; appending it."
+      log "  That overlay only ADDS two read-only mounts, so appending cannot drop"
+      log "  anything. Persist it in your shell with:"
+      log "    export COMPOSE_FILE=${COMPOSE_FILE}" ;;
+  esac
+  export COMPOSE_FILE
+}
+
+# THE CREDENTIAL DIRECTORY IS MOUNTED WHOLE, SO IT NEEDS TRAVERSE FOR THE
+# CONTAINER USER — one level up from the file-mode footgun, and it hides on macOS.
+#
+# compose.secrets.yaml bind-mounts individual FILES, so the mode of the directory
+# above them never mattered. compose.efforts.yaml mounts the DIRECTORY, and a
+# 0700 directory owned by the host user cannot be traversed by the container's
+# uid-1000 user: every named credential inside it then reports "does not exist",
+# which reads like a missing file rather than a permission problem.
+#
+# Docker Desktop's file sharing masks this — it presents bind mounts as owned by
+# the container user, so 0700 works on macOS and fails on Linux. It was caught by
+# CI, not locally. `--x` (0701) is enough: the launcher OPENS a known path and
+# never enumerates the directory, so read is not granted.
+container_traversable_dir() {
+  local path="$1"
+  chmod 700 "$path"
+  if [ "$(id -u)" != 1000 ]; then
+    chmod 701 "$path"
+  fi
+}
+
+# Both bind sources must exist before any compose command, or `up`/`run` fails
+# with "bind source path does not exist" and the message names neither.
+ensure_mount_sources() {
+  [ -f "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} not found.
+  Convert your existing single-effort configuration with:
+    scripts/clawctl migrate"
+  mkdir -p "$CREDENTIAL_DIR"
+  container_traversable_dir "$CREDENTIAL_DIR" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# The lock.
+#
+# `apply` mutates the pretorin-state volume, and so does scripts/pretorin-update.sh
+# (which replaces the active CLI binary out from under a running sequence) and the
+# entrypoint's interrupted-update repair. Those already coordinate on ONE lock:
+# flock over /home/node/.pretorin/.update.lock, INSIDE the named volume.
+#
+# A host-side lock cannot see that: the volume has no stable host path. So the
+# lock holder lives in a container — a detached `cli` sidecar that takes the same
+# flock and waits. That puts `apply` in the one namespace that already governs
+# this volume, with no edit to the updater or the entrypoint.
+#
+# It also buys a property worth naming: entrypoint.sh probes this exact lock on
+# every container start, so for the whole apply window the interrupted-update
+# repair is suppressed — it cannot fire in the middle of our sequence.
+#
+# NO LOCK FILE DELETION, EVER. flock releases when the holding process dies, so
+# a killed sidecar frees the lock by itself. Removing the file would break that.
+LOCK_CID=""
+
+release_lock() {
+  [ -n "$LOCK_CID" ] || return 0
+  # `rm -f` kills it if running and removes it either way. flock releases when
+  # the holding process dies; the lock FILE is never touched.
+  docker rm -f "$LOCK_CID" >/dev/null 2>&1 || true
+  LOCK_CID=""
+}
+
+acquire_lock() {
+  local cid out i
+  # `sh -c` with a single-quoted body: the lock path is interpolated by us, never
+  # taken from operator input.
+  # NO --rm ON THE LOCK CONTAINER, DELIBERATELY.
+  #
+  # A busy sidecar echoes CLAWCTL_LOCK_BUSY and exits 3 immediately. With --rm,
+  # the container is gone before `docker logs` can be read, and the refusal came
+  # out as "the lock container exited before reporting" — technically true and
+  # useless, instead of naming the two things the holder could be. Keeping the
+  # container means its logs survive its exit; every path below removes it.
+  cid="$(docker compose run -d -T cli sh -c "
+      exec 9>'${LOCK_PATH}'
+      if ! flock -n 9; then echo CLAWCTL_LOCK_BUSY; exit 3; fi
+      echo CLAWCTL_LOCK_HELD
+      while true; do sleep 3600; done
+    " < /dev/null 2>/dev/null | tr -d '\r' | grep -E '^[0-9a-f]{12,}$' | tail -1 || true)"
+  [ -n "$cid" ] || die "could not start the lock container. Is the Docker daemon reachable,
+  and does 'docker compose run --rm -T cli true' work?"
+
+  for i in $(seq 1 40); do
+    out="$(docker logs "$cid" 2>&1 || true)"
+    case "$out" in
+      *CLAWCTL_LOCK_HELD*)
+        LOCK_CID="$cid"
+        trap 'release_lock' EXIT INT TERM
+        log "lock acquired (${LOCK_PATH} in the pretorin-state volume)"
+        return 0 ;;
+      *CLAWCTL_LOCK_BUSY*)
+        docker rm -f "$cid" >/dev/null 2>&1 || true
+        die "another operation already holds ${LOCK_PATH}.
+  flock records no holder identity, so this is one of exactly two things:
+    - another 'clawctl apply' is running
+    - a Pretorin CLI update is in flight (scripts/pretorin-update.sh)
+  Nothing was changed. Check the update side with:
+    scripts/pretorin-update.sh --status" ;;
+    esac
+    # It may have EXITED already — that is normal for the busy case. The loop
+    # re-reads its logs above, so only treat a gone-and-silent container as broken.
+    if ! docker inspect --format '{{.State.Running}}' "$cid" 2>/dev/null | grep -qx true; then
+      out="$(docker logs "$cid" 2>&1 || true)"
+      case "$out" in
+        *CLAWCTL_LOCK_HELD*|*CLAWCTL_LOCK_BUSY*) continue ;;
+      esac
+      docker rm -f "$cid" >/dev/null 2>&1 || true
+      die "the lock container exited without reporting. Check that this works:
+    docker compose run --rm -T cli true
+  Nothing was changed."
+    fi
+    sleep 0.5
+  done
+  docker rm -f "$cid" >/dev/null 2>&1 || true
+  die "timed out waiting for the lock container to report. Nothing was changed."
+}
+
+# ---------------------------------------------------------------------------
+# The audit record. Same shape and the same reasoning as the sync and CLI-update
+# records: append-only in the state volume AND echoed to stderr, so the container
+# logs hold a copy that survives the file.
+#
+# THE CREDENTIAL NAME, NEVER THE VALUE. scripts/test-effort-credentials.sh sweeps
+# this file for the canary to prove it.
+audit() {
+  local effort="$1" system="$2" framework="$3" credential="$4" targets="$5" outcome="$6"
+  local line
+  line="$(printf 'v=1 ts=%s effort=%s system=%s framework=%s credential=%s targets=%s outcome=%s requester=%s' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$effort" "$system" "$framework" "$credential" \
+    "$targets" "$outcome" "host:$(id -un 2>/dev/null || echo unknown)")"
+  # The stderr copy first, so it stands even if the volume write fails.
+  printf 'clawctl-audit: %s\n' "$line" >&2
+  # The line travels in the ENVIRONMENT, not argv: `ps` never carries it, and no
+  # quoting in it can break the command.
+  CC_AUDIT_LINE="$line" docker compose run --rm -T \
+    -e CC_AUDIT_LINE cli sh -c \
+    "umask 077; printf '%s\n' \"\$CC_AUDIT_LINE\" >> '${AUDIT_PATH}'" < /dev/null >/dev/null 2>&1 \
+    || warn "could not append to ${AUDIT_PATH} (the stderr copy above still stands)"
+}
+
+# ---------------------------------------------------------------------------
+# Shared reads from efforts.yaml.
+
+effort_names() { python3 "$PARSE_EFFORTS" efforts "$EFFORTS_FILE"; }
+
+selected_efforts() {
+  local want="${1:-}"
+  if [ -n "$want" ]; then
+    python3 "$PARSE_EFFORTS" scope "$want" "$EFFORTS_FILE" >/dev/null
+    printf '%s\n' "$want"
+  else
+    effort_names
+  fi
+}
+
+effort_targets() {
+  local effort="$1" name
+  while IFS=$'\t' read -r name _url _private _ref; do
+    [ -n "$name" ] && printf '%s\n' "$name"
+  done < <(python3 "$PARSE_EFFORTS" list "$effort" "$EFFORTS_FILE")
+}
+
+# GNU first, BSD second. On GNU coreutils `stat -f` means "filesystem status" and
+# SUCCEEDS, so a BSD-first chain never reaches its fallback and returns a
+# filesystem dump instead of a mode. Same ordering scar as bootstrap.sh.
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || echo ''; }
+
+# Compose file secrets are BIND MOUNTS and cannot remap uid or mode. The
+# container user is uid 1000; a host operator is usually not. So unless the host
+# uid IS 1000, the file needs the other-read bit or the container cannot read it
+# — and the symptom is a provider authentication error that blames the key.
+credential_mode_ok() {
+  local mode; mode="$(file_mode "$1")"
+  [ -n "$mode" ] || return 2
+  [ "$(id -u)" = 1000 ] && return 0
+  case "$mode" in *[4567]) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# migrate
+
+cmd_migrate() {
+  local want_name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) want_name="${2:-}"; shift 2 || die "--name needs a value" ;;
+      *) die "migrate: unknown option $1" ;;
+    esac
+  done
+
+  [ -f "$TARGETS_FILE" ] || die "${TARGETS_FILE} not found; there is nothing to migrate."
+  # Write-if-absent, the same idiom as every other seed in this repo. Migrating
+  # twice must not silently rewrite an operator's edits.
+  [ -e "$EFFORTS_FILE" ] && die "${EFFORTS_FILE} already exists; this deployment is
+  already migrated. Nothing was changed. Edit that file directly, or move it aside
+  first if you really want to regenerate it."
+
+  local system framework
+  IFS=$'\t' read -r system framework < <(python3 "$PARSE_TARGETS" scope "$TARGETS_FILE")
+
+  # targets.yaml accepts a system NAME or a UUID; efforts.yaml takes the UUID
+  # only, because the CLI compares a write's resolved target against the pinned
+  # scope literally, so a name there refuses writes to its own system.
+  case "$system" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-????-????-????-????????????) ;;
+    *)
+      die "${TARGETS_FILE} names the system as '${system}', which is not a UUID.
+  efforts.yaml requires the canonical system UUID: Pretorin resolves a write's
+  target to a UUID before comparing it against the pinned scope, and the
+  comparison is literal, so a name refuses writes to the very system it names.
+  Nothing was written. Find the UUID and put it in ${TARGETS_FILE} first:
+    docker compose run --rm cli pretorin --json context list" ;;
+  esac
+
+  # The effort name is a stable identifier for the effort and its agent. A UUID
+  # makes an unreadable one, and system_id is always a UUID here, so it is asked
+  # for rather than derived.
+  local name="$want_name"
+  if [ -z "$name" ]; then
+    die "an effort name is required: system_id is a UUID, so a derived name would be
+  '${system}-${framework}' — unreadable, and it becomes the stable identifier for
+  this effort and its agent. Nothing was written. Choose a short name:
+    scripts/clawctl migrate --name crm-${framework}"
+  fi
+  python3 - "$name" <<'PY' || die "effort name '$name' is not usable (see the message above)."
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("pe", os.path.join("scripts", "parse-efforts.py"))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+try:
+    m._check_token(sys.argv[1], "effort name", sys.argv[1], 0)
+except m.ParseError as exc:
+    sys.stderr.write("clawctl: ERROR — %s\n" % exc.message); raise SystemExit(1)
+PY
+
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/clawctl-migrate.XXXXXX")"
+  {
+    cat <<HDR
+# efforts.yaml — the compliance efforts this deployment serves.
+#
+# Generated by \`scripts/clawctl migrate\` from ${TARGETS_FILE}, which was left
+# untouched and is still what the running deployment reads. This file becomes
+# authoritative in a later release.
+#
+# An EFFORT is one system + framework pair. Pretorin keys preflight state and the
+# active recipe set on that pair, so the same system under two frameworks is two
+# separate compliance efforts, each with its own targets and its own credential.
+#
+# \`system_id\` is the canonical system UUID, never a friendly name.
+#
+# \`credential_ref\` is a NAME, never a token and never a path to one. This file is
+# safe to commit. \`default\` resolves to the credential this deployment already
+# had, secrets/runtime/pretorin-api-key. Add a new one with:
+#   scripts/clawctl credential add <name>
+#
+# Validate, preview and apply:
+#   scripts/clawctl validate
+#   scripts/clawctl plan
+#   scripts/clawctl apply
+efforts:
+  - name: ${name}
+    system_id: ${system}
+    framework_id: ${framework}
+    credential_ref: default
+    targets:
+HDR
+    local tname turl tprivate tref
+    while IFS=$'\t' read -r tname turl tprivate tref; do
+      [ -n "$tname" ] || continue
+      printf '      - name: %s\n        url: %s\n' "$tname" "$turl"
+      [ -n "$tref" ] && printf '        ref: %s\n' "$tref"
+      [ "$tprivate" = "true" ] && printf '        private: true\n'
+    done < <(python3 "$PARSE_TARGETS" list "$TARGETS_FILE")
+  } > "$tmp"
+
+  # Validate what was generated BEFORE putting it in place. A migrate that emits
+  # a file its own validator rejects is worse than one that refuses.
+  python3 "$PARSE_EFFORTS" validate "$tmp" \
+    || { rm -f "$tmp"; die "the generated file did not validate; nothing was written."; }
+  mv "$tmp" "$EFFORTS_FILE"
+  chmod 644 "$EFFORTS_FILE"
+
+  log "wrote ${EFFORTS_FILE}"
+  log "  effort:     ${name}"
+  log "  scope:      ${system} / ${framework}"
+  log "  credential: default -> ${SECRET_DIR}/pretorin-api-key (the one you already have)"
+  log "  targets:    $(effort_targets "$name" | tr '\n' ' ')"
+  log ""
+  log "${TARGETS_FILE} was NOT modified and is still what the running deployment reads."
+  log "Next:  scripts/clawctl validate"
+}
+
+# ---------------------------------------------------------------------------
+# credential add
+
+cmd_credential() {
+  [ "${1:-}" = "add" ] || die "usage: scripts/clawctl credential add <name>"
+  shift
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: scripts/clawctl credential add <name>"
+  [ "$#" -eq 1 ] || die "credential add takes exactly one name"
+
+  [ "$name" = "default" ] && die "'default' is RESERVED: it already names the credential this
+  deployment has, ${SECRET_DIR}/pretorin-api-key. A file at ${CREDENTIAL_DIR}/default
+  would shadow it with no way to tell which one a process read. Nothing was created.
+  Pick another name, or use credential_ref: default to point at the existing key."
+
+  python3 - "$name" <<'PY' || exit 1
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("pe", os.path.join("scripts", "parse-efforts.py"))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+try:
+    m._check_token(sys.argv[1], "credential_ref", sys.argv[1], 0)
+except m.ParseError as exc:
+    sys.stderr.write("clawctl: ERROR — %s\n" % exc.message); raise SystemExit(1)
+PY
+
+  mkdir -p "$CREDENTIAL_DIR"
+  container_traversable_dir "$CREDENTIAL_DIR"
+  local path="${CREDENTIAL_DIR}/${name}"
+
+  if [ -e "$path" ]; then
+    log "keeping ${path} (write-if-absent; the value was not touched)"
+  else
+    ( umask 077 && : > "$path" )
+    log "created ${path} (empty)"
+  fi
+
+  # THE MODE IS THE WHOLE POINT OF THIS SUBCOMMAND.
+  #
+  # Compose file secrets are bind mounts and cannot remap uid or mode. The
+  # container user is uid 1000. A hand-created 0600 file on a host where the
+  # operator is not uid 1000 is UNREADABLE inside the container, and the symptom
+  # is a Pretorin authentication error that blames the key — sending the operator
+  # to the platform to check a key that is perfectly fine. Same function, same
+  # reasoning, as container_readable_mode() in scripts/init-file-secrets.sh.
+  chmod 600 "$path"
+  if [ "$(id -u)" != 1000 ]; then
+    chmod 604 "$path"
+  fi
+  log "mode $(file_mode "$path") (file), $(file_mode "$CREDENTIAL_DIR") (directory)"
+  log "  both are needed: the file must be READABLE and the directory TRAVERSABLE"
+  log "  by the container's uid-1000 user. Compose bind mounts cannot remap uid."
+  log ""
+  log "PASTE THE PRETORIN API KEY INTO IT (this command never prints or reads a value):"
+  log "  ${path}"
+  log ""
+  log "Then reference it from an effort in ${EFFORTS_FILE}:"
+  log "    credential_ref: ${name}"
+  log "and check it:  scripts/clawctl validate"
+}
+
+# ---------------------------------------------------------------------------
+# validate
+#
+# COLLECT ALL, NEVER FAIL FAST. With N efforts, stopping at the first problem
+# means N edit-run cycles to find N problems. One run reports every effort as a
+# row and exits non-zero if any row failed.
+#
+# Short-circuit WITHIN a row, never ACROSS efforts: schema -> file -> mode ->
+# probe. A missing or wrong-mode credential is never probed, because probing it
+# produces a Pretorin authentication error that blames the key and sends the
+# operator to the platform to check something that is fine. THE MODE CHECK
+# PRECEDES THE PROBE for exactly that reason.
+
+require_launcher_in_image() {
+  docker compose run --rm -T cli test -x "$LAUNCHER" < /dev/null >/dev/null 2>&1 && return 0
+  die "the image this deployment runs does not contain ${LAUNCHER}.
+  The launcher and scripts/parse-efforts.py are new in this change and reach a
+  deployment only through an image release. Until that release exists, build
+  locally:
+    export COMPOSE_FILE=\$COMPOSE_FILE:compose.build.yaml
+    docker compose build
+  Nothing was changed."
+}
+
+cmd_validate() {
+  local schema_only=0 only_effort=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --schema-only) schema_only=1; shift ;;
+      --effort) only_effort="${2:-}"; shift 2 || die "--effort needs a value" ;;
+      -*) die "validate: unknown option $1" ;;
+      *) [ -f "$1" ] && { EFFORTS_FILE="$1"; shift; } || die "validate: unexpected argument $1" ;;
+    esac
+  done
+
+  [ -f "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} not found.
+  Convert your existing single-effort configuration with:
+    scripts/clawctl migrate"
+
+  # Schema is whole-file: a file that does not parse has no rows to report.
+  python3 "$PARSE_EFFORTS" validate "$EFFORTS_FILE" || exit 2
+  log "schema: ${EFFORTS_FILE} is valid"
+
+  # The reserved name must not be shadowed by a real file.
+  if [ -e "${CREDENTIAL_DIR}/default" ]; then
+    die "${CREDENTIAL_DIR}/default exists, and 'default' is RESERVED for the
+  credential this deployment already had (${SECRET_DIR}/pretorin-api-key). Two
+  files answering to one name means no way to tell which one a process read.
+  Remove or rename ${CREDENTIAL_DIR}/default."
+  fi
+
+  if [ "$schema_only" = 1 ]; then
+    log "--schema-only: no credential was read and no container was started."
+    return 0
+  fi
+
+  ensure_compose_stack
+  ensure_mount_sources
+  require_launcher_in_image
+
+  local failures=0 rows=0
+  printf '\n  %-22s %-7s %-11s %-7s %s\n' EFFORT SCHEMA CREDENTIAL MODE PROBE
+  printf '  %-22s %-7s %-11s %-7s %s\n' '----------------------' '-------' '-----------' '-------' '-----'
+
+  local effort system framework cred path
+  while read -r effort; do
+    [ -n "$effort" ] || continue
+    rows=$((rows + 1))
+    IFS=$'\t' read -r system framework cred < <(python3 "$PARSE_EFFORTS" scope "$effort" "$EFFORTS_FILE")
+    path="$(python3 "$PARSE_EFFORTS" credential-path "$effort" "$EFFORTS_FILE")"
+
+    local c_col m_col p_col detail=""
+    if [ ! -e "$path" ]; then
+      c_col=MISSING; m_col='-'; p_col='-'
+      detail="    ${effort}: credential '${cred}' has no file at ${path}
+      Create it:  scripts/clawctl credential add ${cred}"
+      failures=$((failures + 1))
+    elif [ ! -s "$path" ]; then
+      c_col=EMPTY; m_col='-'; p_col='-'
+      detail="    ${effort}: credential '${cred}' at ${path} is empty.
+      An empty file means 'not configured', not 'the empty key'. Paste the key into it."
+      failures=$((failures + 1))
+    elif ! credential_mode_ok "$path"; then
+      c_col=ok; m_col="$(file_mode "$path")"; p_col='-'
+      detail="    ${effort}: ${path} is mode $(file_mode "$path"), which is UNREADABLE by the
+      container's uid-1000 user. Compose file secrets are bind mounts and cannot
+      remap uid. This is NOT a key problem — do not go looking in Pretorin. Fix:
+        scripts/clawctl credential add ${cred}      (or: chmod 604 ${path})"
+      failures=$((failures + 1))
+    else
+      c_col=ok; m_col=ok
+      if probe_effort "$effort" "$system" "$framework"; then
+        p_col=ok
+      else
+        p_col=FAIL
+        detail="$PROBE_DETAIL"
+        failures=$((failures + 1))
+      fi
+    fi
+    printf '  %-22s %-7s %-11s %-7s %s\n' "$effort" ok "$c_col" "$m_col" "$p_col"
+    [ -n "$detail" ] && printf '%s\n' "$detail"
+  done < <(selected_efforts "$only_effort")
+
+  printf '\n'
+  if [ "$failures" -gt 0 ]; then
+    log "${rows} effort(s) checked, ${failures} with problems (see the rows above)."
+    exit 1
+  fi
+  log "${rows} effort(s) checked, all green."
+}
+
+# The READ probe, through the REAL chain: the mounted credential directory, the
+# launcher, the credential ladder, the scope pin, and a platform read.
+#
+# TWO CALLS, BECAUSE ONE IS NOT ENOUGH. check_context reports the scope this
+# process is pinned to, but it is NOT a platform-access probe: pinned to a system
+# UUID that does not exist it still answers "connected": true, and its
+# active_system.name lags from cached state while the id follows the pin. So the
+# scope assertion reads active_system.ID and active_framework_id and NEVER the
+# name, and a real scoped platform read has to succeed as well.
+# Measured on CLI 0.28.7 — docs/plans/effort-config.md, finding F1.
+PROBE_DETAIL=""
+probe_effort() {
+  local effort="$1" system="$2" framework="$3" out got_sys got_fw attached
+  PROBE_DETAIL=""
+
+  if ! out="$(docker compose run --rm -T -e MCP_CALL_COMMAND="${LAUNCHER} ${effort}" \
+               cli python3 "$MCP_CALL" check_context < /dev/null 2>&1)"; then
+    PROBE_DETAIL="    ${effort}: the MCP server would not start through the launcher.
+$(printf '%s' "$out" | grep -E 'pretorin-mcp-launch|mcp-call' | head -3 | sed 's/^/      /')"
+    return 1
+  fi
+  # The scope assertion reads the ID and the framework id, never
+  # active_system.name — the name lags from cached state and would make a
+  # wrong-system pin look correct. See finding F1.
+  read -r got_sys got_fw < <(printf '%s' "$out" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+start = raw.find("{")
+try:
+    d = json.loads(raw[start:]) if start >= 0 else {}
+except ValueError:
+    d = {}
+print("%s %s" % ((d.get("active_system") or {}).get("id", "-"),
+                 d.get("active_framework_id", "-")))' 2>/dev/null || echo "- -")
+
+  if [ "$got_sys" != "$system" ] || [ "$got_fw" != "$framework" ]; then
+    PROBE_DETAIL="    ${effort}: the MCP process is NOT pinned to this effort's scope.
+      declared: ${system} / ${framework}
+      reported: ${got_sys:-<none>} / ${got_fw:-<none>}
+      The launcher derives the pin from ${EFFORTS_FILE}; check the mount."
+    return 1
+  fi
+
+  # The scoped platform read. get_compliance_status IGNORES framework_id entirely
+  # — measured on 0.28.7, a nonsense framework returns the identical system-wide
+  # payload — so it proves the SYSTEM only. What it does carry is the system's
+  # ATTACHED frameworks, which is the pair check: the declared framework must be
+  # in that list. A framework that merely EXISTS is not enough; this key can see
+  # seven, of which two are attached to this system.
+  if ! out="$(docker compose run --rm -T -e MCP_CALL_COMMAND="${LAUNCHER} ${effort}" \
+               cli python3 "$MCP_CALL" get_compliance_status "{\"system_id\":\"${system}\"}" < /dev/null 2>&1)"; then
+    # THE PERMISSION MESSAGE. Never infer, report or modify what the key can do —
+    # name the effort, the credential, the scope, and what to look at in Pretorin.
+    PROBE_DETAIL="    ${effort}: pinned correctly, but the platform refused a READ of this scope.
+      effort:     ${effort}
+      credential: $(python3 "$PARSE_EFFORTS" scope "$effort" "$EFFORTS_FILE" | cut -f3)
+      scope:      system ${system} / framework ${framework}
+      platform said: $(printf '%s' "$out" | grep -iE 'error|denied|forbidden|not found|permission' | head -2 | tr '\n' ' ')
+      Check in Pretorin that THIS key is granted access to THIS system and
+      framework. Compliance Claw enforces nothing locally: the key's own scopes
+      are the authorization boundary, and this command never inspects or changes
+      them."
+    return 1
+  fi
+
+  # THE PAIR CHECK. Without it, `validate` is green for a framework that is not
+  # attached to this system — and every later command would run against a scope
+  # the platform does not have.
+  attached="$(printf '%s' "$out" | python3 -c '
+import json, sys
+raw = sys.stdin.read(); start = raw.find("{")
+try:
+    d = json.loads(raw[start:]) if start >= 0 else {}
+except ValueError:
+    d = {}
+print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))' 2>/dev/null || true)"
+
+  case " ${attached} " in
+    *" ${framework} "*) ;;
+    *)
+      PROBE_DETAIL="    ${effort}: system ${system} is reachable, but framework
+      '${framework}' is NOT attached to it.
+      attached here: ${attached:-<none reported>}
+      A framework that merely exists is not enough — it has to be on THIS system.
+      Attach it in Pretorin, or correct framework_id in ${EFFORTS_FILE}."
+      return 1 ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# plan / apply
+#
+# `plan` and `apply` cannot drift, by construction: both go through ol_pcli in
+# scripts/onboard-lib.sh, which RENDERS the command from the same arrays it then
+# executes. The printed line is not a description of the command; it is the
+# command, shell-quoted so it can be pasted back.
+#
+# `plan` starts ZERO containers, makes ZERO network calls, and reads ZERO
+# credential values. It does `stat` the resolved credential paths — existence
+# only, never a read — so the commonest failure surfaces before a long run.
+
+# shellcheck source=scripts/onboard-lib.sh
+. "${REPO_ROOT}/scripts/onboard-lib.sh"
+
+# Build the per-effort `docker compose run` flags. THE SCOPE PIN AND THE NAMED
+# CREDENTIAL, and nothing that carries a value: PRETORIN_API_KEY_FILE names a
+# path, the entrypoint reads it inside the container.
+#
+# There is no PRETORIN_API_KEY= blanking here and none is needed:
+# compose.secrets.yaml resets env_file, so no .env value reaches the container,
+# and ensure_compose_stack refuses to run without that overlay.
+effort_run_env() {
+  local system="$1" framework="$2" container_path="$3"
+  printf '%s\n' \
+    -e "PRETORIN_SYSTEM_ID=${system}" \
+    -e "PRETORIN_FRAMEWORK_ID=${framework}" \
+    -e "PRETORIN_API_KEY_FILE=${container_path}"
+}
+
+run_efforts() {
+  local dry="$1" only_effort="$2"
+  local effort system framework cred cpath hpath
+  local -a targets
+
+  [ -f "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} not found.
+  Convert your existing single-effort configuration with:
+    scripts/clawctl migrate"
+  python3 "$PARSE_EFFORTS" validate "$EFFORTS_FILE" || exit 2
+
+  if [ "$dry" = 1 ]; then
+    # SAME prerequisite checks as apply, none of the effects. The legacy-path
+    # refusal is identical; the overlay is reported rather than appended; the
+    # credential directory is reported rather than created. The one apply check
+    # that CANNOT run here is the launcher-in-image probe, because it needs a
+    # container — noted in the closing line rather than silently skipped.
+    ensure_compose_stack 1
+    [ -f "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} not found.
+  Convert your existing single-effort configuration with:
+    scripts/clawctl migrate"
+    [ -d "$CREDENTIAL_DIR" ] || log "note: ${CREDENTIAL_DIR} does not exist yet; 'apply' would create it."
+  else
+    ensure_compose_stack
+    ensure_mount_sources
+    require_launcher_in_image
+    acquire_lock
+  fi
+
+  local rc=0
+  while read -r effort; do
+    [ -n "$effort" ] || continue
+    IFS=$'\t' read -r system framework cred < <(python3 "$PARSE_EFFORTS" scope "$effort" "$EFFORTS_FILE")
+    cpath="$(python3 "$PARSE_EFFORTS" credential-path "$effort" "$EFFORTS_FILE" --container)"
+    hpath="$(python3 "$PARSE_EFFORTS" credential-path "$effort" "$EFFORTS_FILE")"
+    targets=()
+    while read -r t; do [ -n "$t" ] && targets+=("$t"); done < <(effort_targets "$effort")
+
+    printf '\n'
+    log "effort ${effort}"
+    log "  scope:      ${system} / ${framework}"
+    log "  credential: ${cred} -> ${hpath} (host) -> ${cpath} (container)"
+    log "  targets:    ${targets[*]}"
+
+    # Existence only. `plan` never opens a credential, and `apply` does not
+    # either — the entrypoint reads it inside the container.
+    if [ ! -s "$hpath" ]; then
+      if [ "$dry" = 1 ]; then
+        warn "  ${hpath} is missing or empty; 'apply' would fail here."
+        warn "    scripts/clawctl credential add ${cred}"
+      else
+        warn "effort ${effort}: ${hpath} is missing or empty. Skipping it."
+        warn "  scripts/clawctl credential add ${cred}"
+        audit "$effort" "$system" "$framework" "$cred" "${targets[*]}" "skipped-no-credential"
+        rc=1
+        continue
+      fi
+    fi
+
+    # The clones have to exist before anything is bound, or verify probes a path
+    # that is not there and every resolver comes back unreachable.
+    #
+    # EFFORT-AWARE CLONING IS NOT IN THIS RELEASE. bootstrap.sh clones from
+    # targets.yaml, which is still authoritative. A migrated effort and any effort
+    # sharing its repositories are already cloned; a genuinely new repository is
+    # not, and this refuses rather than binding a path that is not there.
+    local missing=""
+    for t in "${targets[@]}"; do
+      [ -d "${TARGETS_DIR}/${t}/.git" ] || missing="${missing} ${t}"
+    done
+    if [ -n "$missing" ]; then
+      if [ "$dry" = 1 ]; then
+        warn "  not cloned yet:${missing}"
+        warn "    Effort-aware cloning lands with the release that makes efforts.yaml"
+        warn "    authoritative. For now add them to ${TARGETS_FILE} and run scripts/bootstrap.sh."
+      else
+        warn "effort ${effort}: these targets are not cloned:${missing}"
+        warn "  Effort-aware cloning lands with the release that makes efforts.yaml"
+        warn "  authoritative. For now add them to ${TARGETS_FILE} and run"
+        warn "  scripts/bootstrap.sh. Skipping this effort; nothing was changed for it."
+        audit "$effort" "$system" "$framework" "$cred" "${targets[*]}" "skipped-not-cloned"
+        rc=1
+        continue
+      fi
+    fi
+
+    OL_SYSTEM_ID="$system"
+    OL_FRAMEWORK_ID="$framework"
+    OL_TARGETS=("${targets[@]}")
+    OL_LABEL="effort ${effort}"
+    OL_DRY_RUN="$dry"
+    OL_RUN_ENV=()
+    while read -r flag; do OL_RUN_ENV+=("$flag"); done \
+      < <(effort_run_env "$system" "$framework" "$cpath")
+
+    if [ "$dry" = 1 ]; then
+      ol_sweep; ol_bind; ol_verify; ol_provision; ol_assert
+      continue
+    fi
+
+    if ol_sweep && ol_bind && ol_verify && ol_provision && ol_assert; then
+      audit "$effort" "$system" "$framework" "$cred" "${targets[*]}" "applied"
+    else
+      warn "effort ${effort}: onboarding did not complete cleanly."
+      audit "$effort" "$system" "$framework" "$cred" "${targets[*]}" "failed"
+      rc=1
+    fi
+  done < <(selected_efforts "$only_effort")
+
+  if [ "$dry" = 1 ]; then
+    printf '\n'
+    log "plan only: no container was started, no network call was made, and no"
+    log "  credential value was read. Every line above is the command 'apply' runs."
+    log "  Not checked here (it needs a container): that the running image contains"
+    log "  ${LAUNCHER}. 'apply' and 'validate' check it."
+  fi
+  return "$rc"
+}
+
+cmd_plan() {
+  local only=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --effort) only="${2:-}"; shift 2 || die "--effort needs a value" ;;
+      *) die "plan: unknown option $1" ;;
+    esac
+  done
+  run_efforts 1 "$only"
+}
+
+cmd_apply() {
+  local only=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --effort) only="${2:-}"; shift 2 || die "--effort needs a value" ;;
+      *) die "apply: unknown option $1" ;;
+    esac
+  done
+  run_efforts 0 "$only" || exit 1
+  printf '\n'
+  log "done. If the gateway is running, its live sessions may still hold the previous"
+  log "  view (the preflight artifact carries a 3600s TTL):"
+  log "    docker compose restart openclaw"
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+
+usage() { sed -n '2,32p' "$0"; }
+
+case "${1:-}" in
+  '' | -h | --help) usage; exit 0 ;;
+  --self-test)  shift; . "${REPO_ROOT}/scripts/clawctl-selftest.sh"; clawctl_self_test "$@" ;;
+  validate)     shift; cmd_validate "$@" ;;
+  migrate)      shift; cmd_migrate "$@" ;;
+  credential)   shift; cmd_credential "$@" ;;
+  plan)         shift; cmd_plan "$@" ;;
+  apply)        shift; cmd_apply "$@" ;;
+  *) die "unknown subcommand '$1' (try: validate, migrate, credential, plan, apply)" ;;
+esac

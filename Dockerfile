@@ -286,6 +286,42 @@ COPY --chown=node:node plugins/target-sync /opt/compliance-claw/plugins/target-s
 # speaks to `pretorin mcp-serve`, which lives here.
 COPY scripts/mcp-call.py /opt/compliance-claw/
 
+# Multi-effort support. Same shape and the same reasoning as the target-sync
+# trio above: the implementation exists once and both the host and the image run
+# that one copy.
+#
+#   pretorin-mcp-launch  starts `pretorin mcp-serve` pinned to ONE effort. The
+#                        gateway process has one environment, so it cannot hand N
+#                        MCP children N different Pretorin keys, and writing key
+#                        VALUES into openclaw.json would put secrets in the state
+#                        volume. The launcher reads the effort's credential from
+#                        its mounted file at spawn time instead.
+#   parse-efforts.py     owns the effort schema AND the credential ladder (the
+#                        name -> file mapping, host and container). The launcher
+#                        calls it rather than reimplementing the table in bash,
+#                        so a security-relevant mapping has exactly one copy.
+#   parse-targets.py     already copied above, and parse-efforts.py loads it by
+#                        path to reuse validate_target(). Both must be in this
+#                        directory together.
+COPY scripts/parse-efforts.py /opt/compliance-claw/parse-efforts.py
+COPY scripts/pretorin-mcp-launch.sh /opt/compliance-claw/pretorin-mcp-launch
+
+# PYTHON3 IS INHERITED, NOT INSTALLED — SO ASSERT IT.
+#
+# The runtime stage adds no apt package: python3 comes from the OpenClaw base
+# image. Three things already depend on it at runtime (sync-targets.sh for
+# /target-sync, mcp-call.py, and now the MCP launcher), and the launcher is the
+# one that turns its absence into a security problem rather than an outage: a
+# child that cannot resolve its own per-effort credential must not fall back to
+# the container-wide default. It refuses at runtime, and this line means a base
+# image that ever drops python3 breaks the BUILD instead of production.
+#
+# Same reasoning as the tini assertion below, and the same shape.
+RUN python3 --version \
+ && python3 -c "import json, shlex, importlib.util" \
+ && chmod 0755 /opt/compliance-claw/pretorin-mcp-launch \
+                /opt/compliance-claw/parse-efforts.py
+
 # versions.env is the single source of truth for MODEL, and neither ENV nor FROM
 # can read a sourced file — so the substitution happens here, at build time. The
 # shipped template is therefore concrete and inspectable, and an unset MODEL
