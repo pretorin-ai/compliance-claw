@@ -646,6 +646,10 @@ has "sync registers its agent tool" 'target_sync' "$SINSPECT"
 hasnt "sync plugin passes OpenClaw file-safety checks" 'blocked plugin candidate' "$SINSPECT"
 has "config keeps the key as a substitution, not a value" '${PRETORIN_API_KEY}' "$CFG"
 has "config carries the MCP cwd fix" '/opt/compliance-claw/no-repo' "$CFG"
+# THE SEEDED COMMAND NAME MUST BE THE ONE THE SLACK APP REGISTERS. Slack rejects
+# an unregistered /foo before it reaches the gateway, so a mismatch here is
+# invisible in our logs and looks like the bot being down.
+has "config registers the /compliance-claw slash command" '"compliance-claw"' "$CFG"
 
 # The orphaned-allowlist trap: plugins.allow is exclusive, so a config that keeps
 # it after channels.slack is removed silently runs with seven bundled plugins gone

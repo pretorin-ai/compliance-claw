@@ -534,7 +534,16 @@ def build_patch(efforts, config, dm_bindings):
             "match": {"channel": "slack",
                       "peer": {"kind": "channel", "id": effort["slack_channel_id"]}},
         })
-        slack_channels[effort["slack_channel_id"]] = {"requireMention": True}
+        # THE CHANNEL IS THE TRUST BOUNDARY. Without `users`, OpenClaw refuses
+        # every slash command with "You are not authorized to use this command."
+        # "*" authorizes the members of THIS channel only: groupPolicy
+        # "allowlist" still serves no channel that is not generated here, DMs
+        # stay disabled, and /target-sync is still scoped to the effort the
+        # channel routes to. Membership of the Slack channel is the grant.
+        slack_channels[effort["slack_channel_id"]] = {
+            "requireMention": True,
+            "users": ["*"],
+        }
 
         mcp_servers[pe.mcp_server_name(name)] = {
             "command": LAUNCHER,
@@ -1125,6 +1134,18 @@ def self_test():
     check(sorted(patch["channels"]["slack"]["channels"])
           == sorted(_peer(b)["id"] for b in channel_bindings),
           "the Slack allowlist and the bindings name the same channels")
+
+    # WITHOUT `users`, OpenClaw refuses every slash command in the channel with
+    # "You are not authorized to use this command." The channel is the trust
+    # boundary: "*" is its members, and nothing widens which channels are served.
+    slack_entries = patch["channels"]["slack"]["channels"]
+    check(all(e.get("users") == ["*"] for e in slack_entries.values()),
+          "every admitted channel authorizes its own members for commands")
+    check(all(e.get("requireMention") is True for e in slack_entries.values()),
+          "and still answers only on an explicit mention")
+    check(patch["channels"]["slack"].get("groupPolicy") is None
+          and patch["channels"]["slack"].get("dmPolicy") == "disabled",
+          "while the patch widens nothing else: groupPolicy untouched, DMs disabled")
 
     check("dm" not in patch["channels"]["slack"],
           "channels.slack.dm.* is never written (no MPIM machinery)")

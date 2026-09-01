@@ -538,8 +538,8 @@ scripts/sync-targets.sh simple-crm    # host: one target
 and from Slack, once the gateway is running:
 
 ```
-/claw /target-sync all                # deterministic; bypasses the model
-/claw /target-sync simple-crm
+/compliance-claw /target-sync all                # deterministic; bypasses the model
+/compliance-claw /target-sync simple-crm
 @claw update the simple-crm target    # the target_sync tool, same wrapper
 ```
 
@@ -643,6 +643,8 @@ interchangeable, and the container tells you which set it is enforcing:
 4. Invite the bot to each effort's channel, right-click it -> Copy link
    -> the C... at the end of the URL -> that effort's slack_channel_id
       in efforts.yaml (NOT .env: one channel per effort)
+   Everyone in that channel can then run /compliance-claw ... in it, so channel
+   membership is the access control. Only configured channels are served.
 5. Supply the two tokens as secret files (recommended) or in .env (legacy). Then:
      docker compose down -v && scripts/bootstrap.sh
        && scripts/clawctl plan && scripts/clawctl apply && docker compose ps
@@ -837,8 +839,8 @@ scripts/pretorin-update.sh --dry-run    # say what would happen; change nothing
 From Slack, either route works and both run the same implementation:
 
 ```
-/claw /pretorin-update latest           deterministic; bypasses the model entirely
-/claw /pretorin-update status
+/compliance-claw /pretorin-update latest           deterministic; bypasses the model entirely
+/compliance-claw /pretorin-update status
 @Compliance Claw update Pretorin        conversational; goes through the model
 ```
 
@@ -1092,7 +1094,7 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
 | Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`. `--status` confirms which binary is active |
-| `/claw /pretorin-update` does nothing in Slack | `channels.slack.slashCommand` missing from an existing config | Never-clobber: the container warns. Re-seed, or set it by hand |
+| `/compliance-claw /pretorin-update` does nothing in Slack | `channels.slack.slashCommand` missing from an existing config | Never-clobber: the container warns. Re-seed, or set it by hand |
 
 Logs and state:
 

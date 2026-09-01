@@ -78,9 +78,15 @@ What containment does exist is real but partial, and is not a substitute:
 | `dmPolicy: "disabled"` | No DMs at all — no unattributed private sessions |
 | `groupPolicy: "allowlist"` + one channel ID | Only the channel you named is served |
 | `requireMention: true` | The agent answers only when explicitly addressed |
+| `users: ["*"]` per channel | Slash commands are authorized by **membership of that configured channel** — the channel is the trust boundary, not an individual allowlist. Anyone who can post in a served channel can run its commands |
 | `configWrites: false` | Slack traffic cannot rewrite the gateway config |
 | Socket Mode | Outbound only; no inbound port, no public URL |
 | Minimal manifest | 12 bot scopes instead of the recommended 23 |
+
+`users: ["*"]` is worth reading twice: it does **not** widen which channels are
+served — `groupPolicy: "allowlist"` still admits only the channels generated from
+`efforts.yaml`, and DMs stay disabled. It means that within an admitted channel,
+every member may run `/compliance-claw ...`. Control who is in the channel.
 
 One honest gap in that table: the manifest grants `im:history`, `im:read` and
 `im:write` because they are part of upstream's supported minimal scope set, while
@@ -184,7 +190,7 @@ and the image is still unsigned with its digest as the integrity control.
 ### The local plugins are audited paths, not security boundaries
 
 Two plugins expose one fixed action each, by two routes each. The command routes
-(`/claw /pretorin-update`, `/claw /target-sync`) bypass the model entirely and
+(`/compliance-claw /pretorin-update`, `/compliance-claw /target-sync`) bypass the model entirely and
 cannot be reached by a prompt-injected agent. The tool routes can be,
 deliberately, in this trusted-repository pilot, and each has a bounded blast
 radius:

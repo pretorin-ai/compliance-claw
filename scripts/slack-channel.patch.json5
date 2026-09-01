@@ -136,20 +136,21 @@
       // `/foo` before it ever reaches us. This single registered command wraps
       // the rest, so the deterministic route is:
       //
-      //     /claw /pretorin-update latest
-      //     /claw /pretorin-update 0.28.7
-      //     /claw /target-sync all
-      //     /claw /target-sync simple-crm
+      //     /compliance-claw /pretorin-update latest
+      //     /compliance-claw /pretorin-update 0.28.7
+      //     /compliance-claw /target-sync all
+      //     /compliance-claw /target-sync simple-crm
       //
-      // NO SLACK APP RE-IMPORT IS NEEDED. slack/app-manifest.json already
-      // declares /claw and already grants the `commands` bot scope; it was inert
-      // only because nothing enabled it. `ephemeral` keeps its default (true),
+      // THE NAME MUST MATCH WHAT THE SLACK APP REGISTERS. Slack rejects an
+      // unregistered `/foo` before it reaches the gateway, so this is not a free
+      // choice: the shipped app registers /compliance-claw, and
+      // slack/app-manifest.json declares the same. `ephemeral` keeps its default (true),
       // so the acknowledgement is visible just to the invoker while the outcome
       // — which changes the CLI for everyone — is delivered as a normal channel
       // message.
       slashCommand: {
         enabled: true,
-        name: "claw",
+        name: "compliance-claw",
       },
 
       // Only the channels listed below are served, and only on an explicit
@@ -167,7 +168,10 @@
       // value at the end of the URL.
       groupPolicy: "allowlist",
       channels: {
-        "@SLACK_CHANNEL_ID@": { requireMention: true },
+        // `users` is what authorizes slash commands; without it OpenClaw refuses
+        // every one. "*" means the members of this configured channel, which is
+        // the trust boundary — groupPolicy "allowlist" serves nowhere else.
+        "@SLACK_CHANNEL_ID@": { requireMention: true, users: ["*"] },
       },
     },
   },
