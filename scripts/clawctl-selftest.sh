@@ -6,19 +6,12 @@
 # intercepted by a stub on PATH that RECORDS its argv, so the tests can assert on
 # what clawctl would run rather than on what it says it would run.
 #
-# The three properties worth proving here:
-#
-#   1. migrate converts a real single-effort targets.yaml correctly, and refuses
-#      cleanly the second time.
-#   2. `plan` has NO side effects: not one docker invocation, and not one byte
-#      changed anywhere on disk.
-#   3. `apply` builds the right commands: the scope pin and the named credential
-#      on EVERY Pretorin invocation, `context set` on NONE of them, and each
-#      echoed line byte-identical to the argv actually issued.
-#
-# (3) is the one that would otherwise rot silently. A `plan` that drifts from
-# `apply` is worse than no plan, and the only defence that survives refactoring
-# is comparing the printed text against the recorded argv.
+# The three properties worth proving: migrate converts a real targets.yaml and
+# refuses cleanly the second time; `plan` has NO side effects (not one docker
+# invocation, not one byte changed); and `apply` builds the right commands — the
+# scope pin and named credential on EVERY Pretorin invocation, `context set` on
+# none, and each echoed line byte-identical to the argv issued. The last would
+# otherwise rot silently: a `plan` that drifts from `apply` is worse than none.
 
 # shellcheck shell=bash
 
@@ -41,14 +34,12 @@ st_write_stub_docker() {
 STUB_ATTACHED="\${STUB_ATTACHED:-}"
 # DRAIN STDIN, BECAUSE REAL \`docker compose run\` DOES.
 #
-# This is what makes the two-effort fixture meaningful. Compose attaches the
-# caller's stdin even with -T, so an unguarded call inside
+# Compose attaches the caller's stdin even with -T, so an unguarded call inside
 # \`while read ... done < <(...)\` eats the rest of the loop's input and every
-# later iteration is silently skipped. A stub that ignored stdin could never
-# reproduce that, and the first version of this file did not — it reported 38/38
-# with the bug deliberately reintroduced. Now it consumes stdin exactly as
-# compose does, so a missing \`< /dev/null\` makes the second effort vanish here
-# too.
+# later iteration is silently skipped. A stub ignoring stdin cannot reproduce
+# that — the first version of this file reported 38/38 with the bug deliberately
+# reintroduced. Consuming stdin as compose does makes a missing \`< /dev/null\`
+# lose the second effort here too.
 # THE AGENT-WORKSPACE SCRIPT ARRIVES ON STDIN AND IS EXECUTED FOR REAL, with
 # /home/node/.openclaw rewritten to STUB_WS_ROOT. A stub that only recorded argv
 # let a bug through where apply logged every workspace, wrote none, and exited 0.
@@ -195,13 +186,23 @@ case " \$* " in
     # recovery steps rather than a reassuring summary.
     [ "\${STUB_OC_FAIL}" = rollback ] && exit 1
     cp "\${STUB_OC_CONFIG}.snap" "\${STUB_OC_CONFIG}" 2>/dev/null || true; exit 0 ;;
-  # snapshot: the config-copy step, which now proves itself with a marker.
-  # STUB_OC_FAIL=cfgsnapshot makes the copy fail, which must stop the run before
-  # anything is mutated rather than yielding an empty "fresh deployment" snapshot.
+  # restore on a deployment that had NO config: the undo is a removal, not a copy.
+  *"rm -f '\${CFG_PATH}'"*)
+    [ "\${STUB_OC_FAIL}" = rollback ] && exit 1
+    rm -f "\${STUB_OC_CONFIG}"; exit 0 ;;
+  # snapshot: the config-copy step, which proves itself with a marker carrying
+  # whether a config existed at all. STUB_OC_FAIL=cfgsnapshot makes the copy fail,
+  # which must stop the run rather than yield an empty "fresh deployment" snapshot.
   *"cp -p '\${CFG_PATH}' '"*)
     [ "\${STUB_OC_FAIL}" = cfgsnapshot ] && exit 1
-    cp "\${STUB_OC_CONFIG}" "\${STUB_OC_CONFIG}.snap" 2>/dev/null || exit 1
-    echo CC_CFG_SNAPSHOT_OK; exit 0 ;;
+    if [ -e "\${STUB_OC_CONFIG}" ]; then
+      cp "\${STUB_OC_CONFIG}" "\${STUB_OC_CONFIG}.snap" 2>/dev/null || exit 1
+      echo "CC_CFG_SNAPSHOT_OK had=1"
+    else
+      : > "\${STUB_OC_CONFIG}.snap" || exit 1
+      echo "CC_CFG_SNAPSHOT_OK had=0"
+    fi
+    exit 0 ;;
   # reading the snapshot back (verify-rollback compares against it)
   *"cat '\${CFG_PATH}.pre-apply."*)
     cat "\${STUB_OC_CONFIG}.snap" 2>/dev/null || true; exit 0 ;;
@@ -623,11 +624,9 @@ SECOND
     # Printing a line that differs from what runs is the lie that makes `plan`
     # worthless, so that is the assertion.
     #
-    # NOT the reverse. ol_pcli_quiet issues reads it deliberately does not echo
-    # (`--json preflight show`, whose stdout is piped into the artifact
-    # analyser), exactly as the legacy onboard-targets.sh always has. Requiring
-    # every issued command to be echoed would fail that by design, and changing
-    # it would alter the legacy path's output.
+    # NOT the reverse: ol_pcli_quiet issues reads it deliberately does not echo
+    # (`--json preflight show`, piped into the artifact analyser), as the legacy
+    # onboard-targets.sh always has.
     local drift=0 echoed=0 line
     while IFS= read -r line; do
       line="${line#*\$ }"
@@ -762,8 +761,7 @@ SECOND
 
   # ------------------------------------------------- 7. the OpenClaw fleet
   #
-  # The properties this section exists for, in order of how badly they fail if
-  # they are wrong:
+  # The properties this section exists for, worst failure first:
   #
   #   - one agent per effort, each denying the OTHER efforts' MCP tools
   #   - exactly the declared Slack channels admitted AND bound, from one list
@@ -1179,15 +1177,18 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
     *"RESTORE DID NOT FULLY SUCCEED"*) st_ok "  and says plainly that the restore failed" ;;
     *) st_bad "  and says plainly that the restore failed" "$(tail -5 "$fleetlog")" ;;
   esac
+  # It names the snapshots and stops there. It deliberately does NOT hand over a
+  # command that removes or overwrites files in a volume holding operator notes.
   case "$(cat "$fleetlog")" in
-    *"docker compose run --rm -T cli cp"*)
-      st_ok "  and prints the exact command to restore the snapshot by hand" ;;
-    *) st_bad "  and prints the exact restore command" "$(tail -5 "$fleetlog")" ;;
+    *"configuration: /home/node/.openclaw/openclaw.json.pre-apply."*)
+      st_ok "  and names the exact configuration snapshot to recover from" ;;
+    *) st_bad "  and names the configuration snapshot" "$(tail -8 "$fleetlog")" ;;
   esac
   case "$(cat "$fleetlog")" in
-    *"up -d --force-recreate openclaw"*)
-      st_ok "  and the exact command to recreate the gateway" ;;
-    *) st_bad "  and the command to recreate the gateway" ;;
+    *"rm -rf"*|*"tar -"*)
+      st_bad "  and hands over no destructive command" \
+             "$(grep -nE 'rm -rf|tar -' "$fleetlog" | head -3)" ;;
+    *) st_ok "  and hands over no destructive command" ;;
   esac
   st_fleet_apply || true                # back to a good state
 
@@ -1403,8 +1404,9 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
     *) st_bad "  and does not claim the workspaces are back" "$(tail -5 "$fleetlog")" ;;
   esac
   case "$(cat "$fleetlog")" in
-    *"tar -C"*) st_ok "  and prints the exact command to restore them by hand" ;;
-    *) st_bad "  and prints the exact workspace-restore command" "$(tail -6 "$fleetlog")" ;;
+    *"workspaces:    /home/node/.openclaw/.compliance-claw-ws.pre-apply."*)
+      st_ok "  and names the exact workspace snapshot to recover from" ;;
+    *) st_bad "  and names the workspace snapshot" "$(tail -8 "$fleetlog")" ;;
   esac
   st_fleet_apply || true
 
@@ -1482,11 +1484,41 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
     *) st_bad "  and the config restore was still attempted" "$(tail -8 "$fleetlog")" ;;
   esac
   case "$(cat "$fleetlog")" in
-    *"REMOVE THE NEW ONES FIRST"*)
-      st_ok "  and the manual steps say to remove new paths before unpacking" ;;
-    *) st_bad "  and the manual steps say to remove new paths first" ;;
+    *"Both pre-apply snapshots are in the openclaw-state volume"*)
+      st_ok "  and names both snapshots so the operator can recover by hand" ;;
+    *) st_bad "  and names both snapshots" "$(tail -8 "$fleetlog")" ;;
+  esac
+  # NO DESTRUCTIVE COMMAND IS EVER PRINTED. The managed workspace paths sit beside
+  # operator notes and SOUL.md, so a wildcard remove aimed at them is one typo away
+  # from deleting the operator's own files.
+  case "$(cat "$fleetlog")" in
+    *"rm -rf"*|*"rm -f"*|*"tar -"*)
+      st_bad "  and prints no command that deletes or overwrites anything" \
+             "$(grep -nE 'rm -rf|rm -f|tar -' "$fleetlog" | head -3)" ;;
+    *) st_ok "  and prints no command that deletes or overwrites anything" ;;
   esac
   rm -f "${OC}.probe"
+  st_fleet_apply || true
+
+  # (e) ROLLBACK ON A DEPLOYMENT THAT HAD NO CONFIG. The snapshot of "nothing" is
+  #     an empty file; copying it back leaves a zero-byte openclaw.json that the
+  #     entrypoint's never-clobber rule then preserves forever. The honest undo is
+  #     to REMOVE what this run generated.
+  rm -f "$OC" "${OC}.snap" "${tmp}/state/last-applied.json"
+  st_fleet_apply verify && st_bad "a fresh-deployment apply that fails is rolled back" "it exited 0" \
+                        || st_ok "a fresh-deployment apply that fails is rolled back"
+  if [ -e "$OC" ]; then
+    st_bad "  and the generated configuration is REMOVED, not left empty" \
+           "openclaw.json still exists ($(wc -c < "$OC" | tr -d ' ') bytes)"
+  else
+    st_ok "  and the generated configuration is REMOVED, not left empty"
+  fi
+  case "$(cat "$fleetlog")" in
+    *"no configuration existed yet"*)
+      st_ok "  and the run said so up front rather than naming a snapshot to restore" ;;
+    *) st_bad "  and the run said no configuration existed yet" "$(head -12 "$fleetlog")" ;;
+  esac
+  # Put the fixture back for the sections that follow.
   st_fleet_apply || true
 
   # ------------------------------- 12. plan reports removals

@@ -1390,7 +1390,7 @@ usage() {
   cat <<'USAGE'
 usage: sync-targets.sh [all | <target-name> | --bootstrap | --self-test]
 
-  all              fast-forward every target declared in targets.yaml
+  all              fast-forward every target the selected effort declares
   <target-name>    fast-forward exactly that target
   --bootstrap      clone-or-update every target (host only; scripts/bootstrap.sh)
   --self-test      offline validation of the rules above; no network, no credentials
@@ -1399,8 +1399,14 @@ Synchronization is fast-forward only. It never resets, stashes, discards local
 changes, switches branches, deletes anything, or creates a clone. A target it
 cannot move safely is reported and left exactly as it is.
 
-Targets are declared in targets.yaml by the operator. Nothing here can add,
-remove, re-point or onboard one.
+Targets are declared in efforts.yaml by the operator, per effort. `all` and every
+name are scoped to the effort of the agent that asked: CC_EFFORT selects it, and
+with no effort selected `all` is the union across every declared effort. A target
+the effort does not declare is refused, not synchronized.
+
+Legacy single-effort deployments that have not run `scripts/clawctl migrate` yet
+still read targets.yaml. Nothing here can add, remove, re-point or onboard a
+target in either file.
 USAGE
 }
 

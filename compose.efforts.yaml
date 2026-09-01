@@ -14,9 +14,11 @@
 #   /etc/compliance-claw/efforts.yaml
 #       The effort declarations, read-only. scripts/pretorin-mcp-launch reads
 #       this to derive an effort's system, framework and credential NAME. It sits
-#       beside targets.yaml, which the gateway already mounts the same way for
-#       /target-sync, and for the same reason: the declaration of what exists is
-#       the whole of what a request can address.
+#       It REPLACES the targets.yaml mount the gateway used to carry, for the
+#       same reason that one existed: the declaration of what exists is the whole
+#       of what a request can address. /target-sync now reads this file and scopes
+#       every name to the asking agent's effort. targets.yaml is migration input
+#       only and is no longer mounted.
 #
 #       /etc/, deliberately NOT /opt/compliance-claw/: the `pretorin mcp-serve`
 #       child runs with cwd /opt/compliance-claw/no-repo and Pretorin derives
