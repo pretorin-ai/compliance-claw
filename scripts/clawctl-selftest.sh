@@ -1103,6 +1103,71 @@ json.dump(cfg, open(os.environ['CC_OC'], 'w'), indent=2, sort_keys=True)
 "
   st_dm_refuses "a wildcard in allowFrom" "A wildcard admits every Slack user"
 
+  # --- a DM command may not deploy an unapplied fleet change ----------------
+  #
+  # `dm allow`/`dm revoke` rebuild the WHOLE configuration from efforts.yaml, so
+  # without a guard they are a second route to production that skips the stable-
+  # scope check, target preparation and Pretorin onboarding.
+  st_oc_bindings '[]'
+  st_fleet_apply || true                     # a clean, recorded starting fleet
+
+  st_dm() {                                  # $1 = the dm arguments
+    ( cd "$tmp" && PATH="${bin}:$PATH" TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" \
+        COMPLIANCE_CLAW_SECRET_DIR="$S" COMPOSE_FILE=compose.yaml:compose.secrets.yaml \
+        CC_TARGETS_DIR="${tmp}/workspace/targets" CC_STATE_DIR="${tmp}/state" \
+        STUB_OC_CONFIG="$OC" STUB_WS_ROOT="${tmp}/ocstate" \
+        STUB_TARGETS="simple-crm other" STUB_ONBOARD=ok \
+        bash "${root}/scripts/clawctl" dm $1 ) >"$fleetlog" 2>&1
+  }
+
+  # An UNCHANGED fleet still allows the DM mutation — the guard must not simply
+  # break the feature.
+  if st_dm "allow U0FLEET01 --effort crm-soc2"; then
+    st_ok "an unchanged fleet still allows a DM mutation"
+  else
+    st_bad "an unchanged fleet still allows a DM mutation" "$(tail -5 "$fleetlog")"
+  fi
+
+  # Each drift case: edit efforts.yaml, do NOT apply, then try a DM command. The
+  # configuration and the recorded state must both come out untouched.
+  st_dm_drift() {                            # $1 = label, $2 = python edit of $E
+    local cfg_before state_before
+    cfg_before="$(cat "$OC")"; state_before="$(cat "${tmp}/state/last-applied.json")"
+    cp "$E" "${tmp}/efforts.restore.yaml"
+    CC_E="$E" python3 -c "$2"
+    st_dm "allow U0DRIFT01 --effort crm-soc2" \
+      && st_bad "a DM command refuses $1" "it exited 0" \
+      || st_ok "a DM command refuses $1"
+    case "$(cat "$fleetlog")" in
+      *"scripts/clawctl apply"*) st_ok "  and says to run 'scripts/clawctl apply' first" ;;
+      *) st_bad "  and says to run apply first" "$(tail -6 "$fleetlog")" ;;
+    esac
+    if [ "$(cat "$OC")" = "$cfg_before" ] \
+       && [ "$(cat "${tmp}/state/last-applied.json")" = "$state_before" ]; then
+      st_ok "  and the configuration AND the recorded state are untouched"
+    else
+      st_bad "  and the configuration and recorded state are untouched" \
+             "cfg changed=$([ "$(cat "$OC")" = "$cfg_before" ] && echo no || echo yes)"
+    fi
+    cp "${tmp}/efforts.restore.yaml" "$E"
+  }
+
+  st_dm_drift "a repointed system_id" '
+import os, re
+p = os.environ["CC_E"]; s = open(p).read()
+open(p, "w").write(re.sub(r"system_id: [0-9a-f-]+",
+                          "system_id: 99999999-1111-4222-8333-444444444444", s, count=1))'
+  st_dm_drift "a moved Slack channel" '
+import os, re
+p = os.environ["CC_E"]; s = open(p).read()
+open(p, "w").write(re.sub(r"slack_channel_id: C[A-Z0-9]+",
+                          "slack_channel_id: C0MOVED999", s, count=1))'
+  st_dm_drift "a target added to an effort" '
+import os
+p = os.environ["CC_E"]; s = open(p).read()
+open(p, "w").write(s.replace("    targets:\n",
+    "    targets:\n      - name: added-later\n        url: https://example.invalid/x.git\n", 1))'
+
   # ------------------------------------------- 9. --effort, and rollback
   st_head "9. refusals that protect the fleet"
 

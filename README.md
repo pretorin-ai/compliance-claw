@@ -103,13 +103,15 @@ vi secrets/runtime/openai-api-key         # matches the shipped default model
 #     effort's slack_channel_id in efforts.yaml)
 #  full checklist and per-service delivery matrix: docs/file-secrets.md
 
-# 5. start the gateway
-docker compose up -d             # http://127.0.0.1:18789
-
-# 6. onboard every effort with Pretorin and generate the agents, Slack bindings
-#    and per-effort MCP servers (idempotent; safe to re-run)
+# 5. onboard every effort with Pretorin and generate the agents, Slack bindings
+#    and per-effort MCP servers (idempotent; safe to re-run). apply works with no
+#    gateway container yet and brings one up on the result, so do NOT `up -d`
+#    first — that would only mean apply immediately recreating it.
 scripts/clawctl plan             # shows the whole change; starts no containers
 scripts/clawctl apply
+
+# 6. the gateway is now running on http://127.0.0.1:18789
+docker compose ps
 
 # anything one-off, in the same image with the same mounts:
 docker compose run --rm cli pretorin --json context show
@@ -504,9 +506,11 @@ scripts/clawctl dm allow U0123ABCDEF --effort crm-soc2   # optional; DMs are off
 `default` resolves to the key this deployment already has, so migrating creates no
 new secret file.
 
-**`efforts.yaml` is the runtime authority.** `targets.yaml` survives only as input
-to `clawctl migrate`; nothing reads it at runtime and it is no longer mounted into
-any container.
+**`efforts.yaml` is the runtime authority.** Once it exists, every target name is
+resolved and scoped through it. `targets.yaml` survives as input to
+`clawctl migrate` and as the legacy fallback: it stays mounted read-only in the
+gateway so a deployment that has not migrated yet still has a working
+`/target-sync`, and it is ignored entirely once `efforts.yaml` is present.
 
 **What separates one effort from another, and what does not.** Each agent's tool
 policy denies every other effort's Pretorin tools, and its instructions state a
@@ -618,8 +622,17 @@ the state volume, so a file it can edit is not evidence on its own.
 
 ## Slack
 
-Optional. Leave the three Slack variables empty and Slack is simply not used — the
+Optional. Leave the Slack credentials empty and Slack is simply not used — the
 config is then byte-identical to a Slack-less deployment.
+
+**Two variables, or three, depending on which path you are on.** They are not
+interchangeable, and the container tells you which set it is enforcing:
+
+| | multi-effort (`efforts.yaml` present) | legacy single-effort |
+|---|---|---|
+| required | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID` |
+| which channels are served | each effort's `slack_channel_id`, written by `clawctl apply` | the single `SLACK_CHANNEL_ID` |
+| `SLACK_CHANNEL_ID` if set anyway | **ignored**, and the container says so — one owner per field | it *is* the configuration |
 
 ```
 1. api.slack.com/apps/new -> Create New App -> From a manifest
@@ -1008,8 +1021,9 @@ template-version message says nothing about Slack:
 compliance-claw: WARNING — Slack credentials are supplied but NOT in this volume's config.
 ```
 
-That means all three Slack variables are set and the existing config predates
-them. It names both fixes.
+That means the Slack credentials this deployment requires — both tokens on the
+multi-effort path, all three variables on the legacy one — are set while the
+existing config predates them. It names both fixes.
 
 ## Resetting
 
@@ -1036,7 +1050,9 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | Gateway exits 78 `Missing config` | Config was never seeded | `docker compose down -v` then bootstrap |
 | Slack never connects | Credentials added after the first `up` | Look for the Slack-specific warning; `down -v` and re-bootstrap |
 | Slack connects, bot never answers | Channel **name** instead of ID, or bot not invited | Use the `C...` ID; invite the bot; mention it explicitly |
-| `Slack is only partially configured` | 1 or 2 of the 3 variables set | All three are required together |
+| `Slack is only partially configured` (multi-effort) | one of the **two** tokens set | Both tokens are required together; the channels come from `efforts.yaml` |
+| `Slack is only partially configured` (legacy) | 1 or 2 of the **three** variables set | All three are required together |
+| `SLACK_CHANNEL_ID is set but IGNORED` | `.env` still carries it while `efforts.yaml` exists | Remove it from `.env`; `clawctl apply` owns the channel allowlist |
 | `slack_channel_id ... is not a Slack channel id` | A name or a URL was used in `efforts.yaml` | Right-click channel → Copy link → the `C...` value |
 | `slack_channel_id ... is a DM conversation id` | A `D...` id was used as an effort's home | Use the channel's `C...` id; DMs are `clawctl dm allow` |
 | `slack_channel_id ... is a legacy G id` | A `G...` id is ambiguous (private channel vs MPIM) | Use the channel's `C...` id |

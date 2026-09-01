@@ -13,8 +13,8 @@ declares them; `scripts/clawctl` validates, migrates and applies them.
 > **`efforts.yaml` is the runtime authority.** Each effort gets its own OpenClaw
 > agent — its own workspace, sessions, memory, instructions, Pretorin MCP server
 > and Slack channel — inside one gateway and one Slack app. `targets.yaml`
-> survives only as input to `clawctl migrate`; nothing reads it at runtime and it
-> is no longer mounted into any container.
+> survives as input to `clawctl migrate` and as the legacy fallback for a
+> deployment that has not migrated; once `efforts.yaml` exists it is ignored.
 
 ---
 
@@ -33,6 +33,7 @@ efforts:
   - name: crm-soc2
     system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411
     framework_id: soc2
+    slack_channel_id: C0123ABCDEF
     credential_ref: default
     targets:
       - name: simple-crm
@@ -42,12 +43,18 @@ efforts:
   - name: crm-hipaa                                  # NEW
     system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411  # the same system, by UUID
     framework_id: hipaa                              # a different framework
+    slack_channel_id: C0456GHIJKL                    # ITS OWN channel, required
     credential_ref: hipaa-key                        # its own credential
     targets:
       - name: simple-crm                             # the SAME repository
         url: https://github.com/pretorin-ai/simple-crm.git
         ref: main
 ```
+
+`slack_channel_id` is **required and unique across efforts** — it is the whole of
+how a message reaches this agent rather than another. Use the channel's `C` id
+(open the channel → right-click → *Copy link*); a `D` conversation id or a
+`#name` is refused, because neither can route.
 
 `system_id` is the **canonical UUID**, never a friendly system name. Pretorin
 resolves a write's target to a UUID before comparing it against the pinned scope,
@@ -200,8 +207,9 @@ scripts/clawctl apply
 **What is preserved.** `targets.yaml` is **not modified**. Every target carries
 over verbatim — name, url, ref and the `private` flag. The scope becomes effort
 #1, and its `credential_ref` is `default`, so **no secret is copied and no new
-file is created**. After this, `targets.yaml` is inert: nothing reads it at
-runtime and it is no longer mounted into any container.
+file is created**. After this, `targets.yaml` is inert: it stays mounted
+read-only for deployments that have not migrated, and the runtime prefers
+`efforts.yaml` wherever both exist.
 
 **Why `--slack-channel-id` is required.** It is how messages reach this effort's
 agent, and there is nothing in `targets.yaml` to derive it from. A placeholder

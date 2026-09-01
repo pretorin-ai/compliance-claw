@@ -156,13 +156,20 @@ services:
       # deliberately out of scope for the pilot.
       - ./workspace/targets:/var/lib/compliance-claw/targets:rw
       #
-      # THE DECLARATION OF WHICH REPOSITORIES EXIST IS NO LONGER MOUNTED HERE.
-      # It moved to efforts.yaml, which compose.efforts.yaml mounts read-only at
-      # /etc/compliance-claw/efforts.yaml on BOTH services. targets.yaml survives
-      # only as input to `scripts/clawctl migrate`, which runs on the host, so
-      # nothing in a container reads it any more.
+      # THE LEGACY DECLARATION OF WHICH REPOSITORIES EXIST. Read-only, and this
+      # base file is exactly the legacy single-effort deployment: no efforts.yaml,
+      # no overlay. /target-sync runs INSIDE the gateway and validates every
+      # requested name against a mounted declaration file, so without this mount
+      # a legacy deployment's /target-sync fails on every request with an
+      # unreadable target list. It stays until a deployment migrates.
       #
-      # The mount lives in that OVERLAY rather than here because efforts.yaml is
+      # THE MULTI-EFFORT RUNTIME DOES NOT READ IT. compose.efforts.yaml adds
+      # efforts.yaml beside it, and sync-targets.sh prefers efforts.yaml whenever
+      # it is present or an effort is selected — so once migrated, every name is
+      # scoped to one effort and this file is inert.
+      - ./targets.yaml:/etc/compliance-claw/targets.yaml:ro
+      #
+      # efforts.yaml is mounted by that OVERLAY rather than here because it is
       # gitignored — it names your systems — and compose resolves every bind
       # source at `up` time, so naming it in the base file would make a fresh
       # clone fail with "bind source path does not exist" before anything could

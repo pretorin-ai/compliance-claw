@@ -399,8 +399,8 @@ PY
 # untouched. THIS file is what the deployment reads: \`scripts/clawctl apply\`
 # builds one OpenClaw agent per effort from it — workspace, sessions, memory,
 # instructions, Pretorin MCP server and Slack channel binding — and clones every
-# repository any effort declares. ${TARGETS_FILE} is now migration input only and
-# is no longer mounted into any container.
+# repository any effort declares. ${TARGETS_FILE} is now ignored at runtime; it
+# stays mounted read-only only so an unmigrated deployment keeps /target-sync.
 #
 # An EFFORT is one system + framework pair. Pretorin keys preflight state and the
 # active recipe set on that pair, so the same system under two frameworks is two
@@ -1411,6 +1411,8 @@ json.dump({
     "directBindings": manifest["directBindings"],
     "mcpServers": manifest["mcpServers"],
     "dmPolicy": manifest["dmPolicy"],
+    "targetsByEffort": manifest["targetsByEffort"],
+    "fleetFingerprint": manifest["fleetFingerprint"],
 }, open(1, "w"), indent=2, sort_keys=True)
 PY
   mv "$tmp" "$STATE_FILE"
@@ -1612,16 +1614,11 @@ run_efforts() {
   # --- STOP HERE IF ANY EFFORT FAILED --------------------------------------
   #
   # The fleet is generated from the WHOLE of efforts.yaml, so carrying on past a
-  # failed effort does not "skip" it — it gives that effort an agent, an MCP
-  # server, a Slack channel binding and a workspace, while the run reports it as
-  # skipped. A channel would then be admitted for an effort whose Pretorin
-  # resolvers were never bound, and the first message in it would be answered by
-  # an agent with nothing behind it.
-  #
-  # Generating only the efforts that succeeded is NOT the alternative: an agents
-  # list and a bindings array are replaced wholesale, so a partial fleet removes
-  # the working agents too. Whole or nothing is the only coherent choice, and
-  # nothing is the safe half.
+  # failed effort would still give it an agent, an MCP server, a channel binding
+  # and a workspace while reporting it skipped — a channel admitted for an effort
+  # whose Pretorin resolvers were never bound. Generating only the efforts that
+  # succeeded is not the alternative either: agents.list and bindings are replaced
+  # wholesale, so a partial fleet removes the working agents too.
   if [ "$dry" != 1 ] && [ -n "$FAILED_EFFORTS" ]; then
     printf '\n' >&2
     die "these effort(s) did not complete:${FAILED_EFFORTS}
@@ -1850,13 +1847,12 @@ cmd_apply() {
 # cannot represent two efforts, and there is deliberately no conversational way
 # to switch between them.
 #
-# WHY THIS EXISTS ALONGSIDE THE CONTROL UI. The UI can create the same binding —
-# through its generic config editor — but a working DM is THREE coupled fields:
-# the exact direct-peer binding, dmPolicy, and allowFrom. Getting only the first
-# right is the common case, and the failure mode is silent: an admitted user with
-# no binding falls through every routing tier to the DEFAULT agent. So `apply`
-# derives dmPolicy and allowFrom from the bindings, and this command writes the
-# binding correctly in the first place. Either route is preserved by the other.
+# WHY THIS EXISTS ALONGSIDE THE CONTROL UI. The UI can create the same binding
+# through its generic config editor, but a working DM is THREE coupled fields —
+# the direct-peer binding, dmPolicy and allowFrom — and getting only the first
+# right fails silently: an admitted user with no binding falls through every
+# routing tier to the DEFAULT agent. `apply` derives the other two from the
+# bindings; this command writes the binding right in the first place.
 cmd_dm() {
   local action="${1:-}"
   shift || true
@@ -1913,10 +1909,92 @@ PY
 # One binding changes, then the SAME generate/dry-run/apply/recreate/verify/
 # rollback sequence `apply` runs. A DM edit is a configuration change like any
 # other and gets the same safety, rather than a shortcut that skips verification.
+# A DM COMMAND MAY NOT DEPLOY A FLEET CHANGE.
+#
+# `dm allow`/`dm revoke` regenerate and apply the COMPLETE configuration from
+# efforts.yaml — the only way to write a bindings array without destroying what it
+# does not name. That makes them a second route to production for any unapplied
+# edit (a repointed system_id, a new effort, a moved channel, a target added or
+# dropped), skipping the stable-scope check, target cloning and Pretorin
+# onboarding that apply does around the patch: the agent would come up with a
+# workspace built for the OLD scope.
+#
+# So a DM mutation is allowed only when the fleet on disk is the fleet last
+# applied. One hash over efforts.yaml's scope, channel, credential and target
+# names (openclaw-patch.py: fleet_fingerprint). DM bindings are deliberately not
+# in it, since changing those is the point.
+require_applied_fleet() {
+  local want have
+  want="$(python3 "$PATCH_TOOL" fingerprint --efforts "$EFFORTS_FILE" 2>/dev/null || true)"
+  have=""
+  [ -f "$STATE_FILE" ] && have="$(python3 -c "
+import json,sys
+try: print(json.load(open(sys.argv[1])).get('fleetFingerprint') or '')
+except Exception: print('')" "$STATE_FILE" 2>/dev/null || true)"
+
+  [ -n "$want" ] && [ "$want" = "$have" ] && return 0
+
+  local why
+  if [ -z "$have" ]; then
+    why="this deployment has no record of a successful 'apply'"
+  else
+    why="${EFFORTS_FILE} no longer matches the fleet that was last applied"
+  fi
+  die "refusing to change DM access: ${why}.
+
+  A DM command rebuilds the WHOLE configuration from ${EFFORTS_FILE}, so running
+  one now would deploy that pending change without cloning its targets, without
+  onboarding it to Pretorin, and without the check that an effort's system or
+  framework has not been repointed under an existing name. An agent would come up
+  with a workspace built for the previous scope.
+
+  Run this first, review what it reports, and then re-run the DM command:
+    scripts/clawctl apply
+
+  Nothing has been changed: no configuration, no workspace, no recorded state.
+$(fleet_drift_detail)"
+}
+
+# What differs, so the operator does not have to diff two files by hand. Read-only.
+fleet_drift_detail() {
+  [ -f "$STATE_FILE" ] || return 0
+  CC_STATE="$STATE_FILE" CC_EFFORTS="$EFFORTS_FILE" CC_PE="$PARSE_EFFORTS" \
+    python3 - <<'DRIFT' 2>/dev/null || true
+import importlib.util, json, os, sys
+try:
+    state = json.load(open(os.environ["CC_STATE"]))
+    spec = importlib.util.spec_from_file_location("pe", os.environ["CC_PE"])
+    pe = importlib.util.module_from_spec(spec); spec.loader.exec_module(pe)
+    efforts = pe.load(os.environ["CC_EFFORTS"])
+except Exception:
+    raise SystemExit(0)
+was = state.get("efforts") or {}
+now = {e["name"]: e for e in efforts}
+wt = state.get("targetsByEffort") or {}
+nt = {e["name"]: [t["name"] for t in e["targets"]] for e in efforts}
+lines = []
+for name in sorted(set(was) | set(now)):
+    if name not in was:
+        lines.append("    + effort %s is declared but has never been applied" % name)
+    elif name not in now:
+        lines.append("    - effort %s was applied but is no longer declared" % name)
+    else:
+        for field in ("system_id", "framework_id", "slack_channel_id", "credential_ref"):
+            if was[name].get(field) != now[name].get(field):
+                lines.append("    ~ effort %s: %s changed" % (name, field))
+        if sorted(wt.get(name) or []) != sorted(nt.get(name) or []):
+            lines.append("    ~ effort %s: its target list changed" % name)
+if lines:
+    print("\n  What changed since the last apply:")
+    print("\n".join(lines))
+DRIFT
+}
+
 dm_apply() {
   local add="$1" remove="$2"
   [ -f "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} not found."
   python3 "$PARSE_EFFORTS" validate "$EFFORTS_FILE" || exit 2
+  require_applied_fleet
   ensure_compose_stack
   ensure_mount_sources
   acquire_lock

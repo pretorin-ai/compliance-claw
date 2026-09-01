@@ -72,6 +72,7 @@ never writes channels.slack.dm.*.
 """
 
 import argparse
+import hashlib
 import json
 import importlib.util
 import os
@@ -471,6 +472,26 @@ def build_agent(effort):
     }
 
 
+def fleet_fingerprint(efforts):
+    """A stable hash of the non-DM fleet: scope, channel, credential and targets.
+
+    Sorted and canonical so that reordering efforts.yaml, or reformatting it, is
+    not a change. Target ORDER within an effort is not meaningful either, so the
+    names are sorted too.
+    """
+    canonical = [
+        {"name": e["name"],
+         "system_id": e["system_id"],
+         "framework_id": e["framework_id"],
+         "slack_channel_id": e["slack_channel_id"],
+         "credential_ref": e["credential_ref"],
+         "targets": sorted(t["name"] for t in e["targets"])}
+        for e in sorted(efforts, key=lambda e: e["name"])
+    ]
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def build_patch(efforts, config, dm_bindings):
     agents = []
     bindings = []
@@ -572,6 +593,14 @@ def build_patch(efforts, config, dm_bindings):
                        for e in efforts},
         "targetsByEffort": {e["name"]: [t["name"] for t in e["targets"]]
                             for e in efforts},
+        # THE FLEET FINGERPRINT — every part of the deployment that is NOT a DM.
+        # `clawctl dm` regenerates and applies the whole fleet, so an unapplied
+        # edit to efforts.yaml would otherwise reach the gateway through a DM
+        # command, skipping the stable-scope check, target preparation and
+        # Pretorin onboarding that `apply` does. dm refuses unless this matches
+        # the last successful apply. Derived from efforts.yaml only: identical
+        # input gives an identical hash on any machine.
+        "fleetFingerprint": fleet_fingerprint(efforts),
         "preservedPaths": list(PRESERVED_PATHS),
         "replacePaths": resolve_replace_paths(patch),
     }
@@ -1010,6 +1039,8 @@ def self_test():
     check(load_config_text('{"a":1}')["a"] == 1, "json5: strict JSON still parses")
 
     patch, manifest = _gen(TWO_EFFORTS)
+    check(len(manifest["fleetFingerprint"]) == 64,
+          "the manifest carries a fleet fingerprint")
     agents = patch["agents"]["list"]
     servers = patch["mcp"]["servers"]
 
@@ -1322,6 +1353,9 @@ def main(argv):
     gen.add_argument("--dm-add", default="")
     gen.add_argument("--dm-remove", default="")
 
+    fp = sub.add_parser("fingerprint")
+    fp.add_argument("--efforts", required=True)
+
     rb = sub.add_parser("verify-rollback")
     rb.add_argument("--config", required=True)
     rb.add_argument("--snapshot", required=True)
@@ -1342,6 +1376,9 @@ def main(argv):
     try:
         if args.mode == "generate":
             return cmd_generate(args)
+        if args.mode == "fingerprint":
+            sys.stdout.write(fleet_fingerprint(pe.load(args.efforts)) + "\n")
+            return 0
         if args.mode == "verify-rollback":
             return cmd_verify_rollback(args)
         return cmd_verify(args)

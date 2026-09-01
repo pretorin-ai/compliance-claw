@@ -894,13 +894,15 @@ assert mc["/workspace/targets"].get("read_only"), "cli assessment mount is not r
 assert "/var/lib/compliance-claw/targets" in mo, "openclaw lacks the maintenance mount"
 assert not mo["/var/lib/compliance-claw/targets"].get("read_only"), "maintenance mount is not writable"
 assert "/var/lib/compliance-claw/targets" not in mc, "cli must not get the maintenance mount"
-# targets.yaml IS NO LONGER MOUNTED ANYWHERE. efforts.yaml replaced it as the
-# declaration of which repositories exist, and compose.efforts.yaml mounts that
-# on both services. targets.yaml survives only as input to `clawctl migrate`,
-# which runs on the host — so a container that still received it would be reading
-# a file nothing is allowed to act on.
-assert "/etc/compliance-claw/targets.yaml" not in mo, \
-    "openclaw still mounts targets.yaml; efforts.yaml is the runtime authority"
+# THE LEGACY SINGLE-EFFORT PATH IS STILL SERVED. /target-sync runs inside the
+# gateway and validates every requested name against a mounted declaration file,
+# so a deployment that has not run `clawctl migrate` needs targets.yaml there or
+# every request fails on an unreadable target list. Read-only, gateway only: a
+# one-off command runner has no use for it.
+assert "/etc/compliance-claw/targets.yaml" in mo, \
+    "openclaw lacks targets.yaml; legacy /target-sync cannot resolve any name"
+assert mo["/etc/compliance-claw/targets.yaml"].get("read_only"), \
+    "targets.yaml must be mounted read-only"
 assert "/etc/compliance-claw/targets.yaml" not in mc, "cli must not get targets.yaml"
 # The gateway keeps the state volumes it had before this feature: a restated
 # volumes list that dropped one would come up broken in a way no other row here
@@ -1096,8 +1098,19 @@ if [ "$GATEWAY_STARTED" = 1 ] || docker compose ps --status running --services 2
      docker compose exec -T openclaw test -r /etc/compliance-claw/efforts.yaml
   notok "gateway: efforts.yaml is read-only" \
         docker compose exec -T openclaw sh -c 'echo x >> /etc/compliance-claw/efforts.yaml'
-  notok "gateway: targets.yaml is NOT mounted (efforts.yaml replaced it)" \
-        docker compose exec -T openclaw test -e /etc/compliance-claw/targets.yaml
+  # LEGACY SUPPORT, PROVED INSIDE THE CONTAINER. targets.yaml is still there and
+  # still read-only, so a deployment that has not migrated keeps a working
+  # /target-sync — but efforts.yaml above is what this deployment actually uses.
+  ok "gateway: legacy targets.yaml is still mounted for unmigrated deployments" \
+     docker compose exec -T openclaw test -r /etc/compliance-claw/targets.yaml
+  notok "gateway: legacy targets.yaml is read-only" \
+        docker compose exec -T openclaw sh -c 'echo x >> /etc/compliance-claw/targets.yaml'
+  # AND IT IS NOT WHAT SCOPES A REQUEST. With efforts.yaml present the wrapper
+  # selects it, so a target that exists only in targets.yaml is still refused.
+  ok "gateway: efforts.yaml, not targets.yaml, is what a request is scoped to" \
+     docker compose exec -T openclaw sh -c '
+       /opt/compliance-claw/sync-targets.sh no-such-target 2>&1 |
+         grep -q "/etc/compliance-claw/efforts.yaml"'
   docker compose exec -T openclaw rm -f /workspace/targets/.smoke-assess-canary >/dev/null 2>&1 || true
 
   # THE INPUT CONTRACT, INSIDE THE REAL CONTAINER. The self-test proves the rules;

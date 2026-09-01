@@ -4,8 +4,7 @@
 # efforts.yaml, which is gitignored because it names YOUR systems. Produce it
 # from your existing single-effort targets.yaml:
 #
-#   scripts/clawctl migrate --name crm-soc2
-#   # then add a slack_channel_id to each effort (migrate cannot guess it)
+#   scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 #   scripts/clawctl validate
 #   scripts/clawctl plan
 #   scripts/clawctl apply
@@ -23,8 +22,9 @@
 # THIS FILE IS THE RUNTIME AUTHORITY. `scripts/clawctl apply` generates one
 # OpenClaw agent per effort from it — its own workspace, sessions, memory,
 # instructions, Pretorin MCP server and Slack binding — and clones every
-# repository any effort declares. targets.yaml survives only as input to
-# `clawctl migrate` and is no longer read or mounted at runtime.
+# repository any effort declares. targets.yaml survives as input to
+# `clawctl migrate` and as the legacy fallback for a deployment that has not
+# migrated; once this file exists, nothing reads targets.yaml.
 
 efforts:
   # ---------------------------------------------------------------------------

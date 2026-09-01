@@ -230,8 +230,10 @@ classify_request() {
 #
 #   neither                  targets.yaml. LEGACY, and reachable only before
 #                            `clawctl migrate` has run. efforts.yaml is the
-#                            runtime authority; targets.yaml survives as migration
-#                            input and is no longer mounted into any container.
+#                            runtime authority wherever it exists; compose.yaml
+#                            keeps targets.yaml mounted read-only in the gateway
+#                            so this branch still resolves names on an unmigrated
+#                            deployment.
 #
 # The output shape is identical in all three: name/url/private/ref, tab
 # separated. That contract is why this is a small change rather than a rewrite.
@@ -677,7 +679,18 @@ mode_sync() {
     exit 1
   fi
 
-  [ -f "$(target_source)" ] || die "$(target_source) not found. It is mounted read-only into the gateway; check that compose.efforts.yaml is in COMPOSE_FILE."
+  # NAME THE RIGHT OVERLAY. efforts.yaml comes from compose.efforts.yaml;
+  # targets.yaml comes from the base compose.yaml, which every deployment has —
+  # so a missing one of those is a mount problem, not a missing overlay.
+  case "$(target_source)" in
+    *efforts.yaml) [ -f "$(target_source)" ] || die "$(target_source) not found. It is mounted
+  read-only into the gateway by compose.efforts.yaml; check that overlay is in COMPOSE_FILE:
+    export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml" ;;
+    *) [ -f "$(target_source)" ] || die "$(target_source) not found. compose.yaml mounts it
+  read-only into the gateway for deployments that have not run 'clawctl migrate' yet.
+  If this deployment HAS migrated, efforts.yaml is missing instead — add
+  compose.efforts.yaml to COMPOSE_FILE." ;;
+  esac
   [ -d "$TARGETS_DIR" ] || die "${TARGETS_DIR} not found. It is the maintenance mount of the target directory; check compose.yaml."
 
   # BEFORE the membership test, and its failure is fatal. Without the list there
@@ -1317,6 +1330,24 @@ EFF
     *"credential=pat"*) st_ok "  and the credential SOURCE, never a value" ;;
     *) st_bad "  and the credential SOURCE, never a value" "$audit_line" ;;
   esac
+
+  # THE LEGACY SINGLE-EFFORT PATH, WHICH IS STILL SUPPORTED. A deployment that
+  # has not run `clawctl migrate` has no efforts.yaml, and /target-sync inside the
+  # gateway must still resolve names — against targets.yaml, from the mount
+  # compose.yaml keeps for exactly this case.
+  EFFORT=""; SLACK_CHANNEL=""
+  local legacy_efforts="${EFFORTS_FILE}"
+  EFFORTS_FILE="${ST_TMP}/absent-efforts.yaml"; rm -f "$EFFORTS_FILE"
+  case "$(target_source)" in
+    *targets.yaml) st_ok "with no efforts.yaml the legacy targets.yaml is selected" ;;
+    *) st_bad "with no efforts.yaml the legacy targets.yaml is selected" "$(target_source)" ;;
+  esac
+  if load_target_list && [ -s "$TARGET_LIST_FILE" ]; then
+    st_ok "  and it still yields a usable target list"
+  else
+    st_bad "  and it still yields a usable target list" "the list was empty"
+  fi
+  EFFORTS_FILE="$legacy_efforts"
 
   EFFORT="$saved_effort"; SLACK_CHANNEL=""
   PARSE="$saved_parse"; TARGETS_FILE="$saved_file"; EFFORTS_FILE="$saved_efforts"
