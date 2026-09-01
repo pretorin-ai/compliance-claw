@@ -1335,19 +1335,33 @@ EFF
   # has not run `clawctl migrate` has no efforts.yaml, and /target-sync inside the
   # gateway must still resolve names — against targets.yaml, from the mount
   # compose.yaml keeps for exactly this case.
+  # EVERY INPUT EXPLICIT. The image copy has no targets.yaml on disk anywhere, so a
+  # row that leaned on the ambient default passed on a host checkout and failed in
+  # the image — which is the deployment this branch actually serves.
   EFFORT=""; SLACK_CHANNEL=""
-  local legacy_efforts="${EFFORTS_FILE}"
+  local legacy_efforts="${EFFORTS_FILE}" legacy_targets="${TARGETS_FILE}" legacy_parse="${PARSE}"
   EFFORTS_FILE="${ST_TMP}/absent-efforts.yaml"; rm -f "$EFFORTS_FILE"
+  TARGETS_FILE="${ST_TMP}/legacy-targets.yaml"
+  PARSE="$saved_parse"
+  cat > "$TARGETS_FILE" <<'LEGACY'
+system_id: 22222222-2222-4222-8222-222222222222
+framework_id: soc2
+
+targets:
+  - name: legacy-repo
+    url: https://github.com/pretorin-ai/legacy-repo.git
+    ref: main
+LEGACY
   case "$(target_source)" in
-    *targets.yaml) st_ok "with no efforts.yaml the legacy targets.yaml is selected" ;;
+    *legacy-targets.yaml) st_ok "with no efforts.yaml the legacy targets.yaml is selected" ;;
     *) st_bad "with no efforts.yaml the legacy targets.yaml is selected" "$(target_source)" ;;
   esac
-  if load_target_list && [ -s "$TARGET_LIST_FILE" ]; then
-    st_ok "  and it still yields a usable target list"
+  if load_target_list && [ "$(cut -f1 < "$TARGET_LIST_FILE")" = "legacy-repo" ]; then
+    st_ok "  and it still yields that file's targets"
   else
-    st_bad "  and it still yields a usable target list" "the list was empty"
+    st_bad "  and it still yields that file's targets" "$(cut -f1 < "$TARGET_LIST_FILE" | tr '\n' ' ')"
   fi
-  EFFORTS_FILE="$legacy_efforts"
+  EFFORTS_FILE="$legacy_efforts"; TARGETS_FILE="$legacy_targets"; PARSE="$legacy_parse"
 
   EFFORT="$saved_effort"; SLACK_CHANNEL=""
   PARSE="$saved_parse"; TARGETS_FILE="$saved_file"; EFFORTS_FILE="$saved_efforts"
