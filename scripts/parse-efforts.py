@@ -112,10 +112,11 @@ HOST_CREDENTIAL_SUBDIR = "pretorin"
 
 # --- token rules -----------------------------------------------------------
 
-# Canonical 8-4-4-4-12. Case-insensitive on input; compared case-insensitively
-# for duplicate detection, and passed through verbatim otherwise.
-UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-                     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# Canonical 8-4-4-4-12, LOWERCASE ONLY. Pretorin's canonical form is lowercase and
+# the pinned system is compared literally, so an uppercase UUID recreates exactly
+# the write-refusal a friendly name causes. Passed through verbatim.
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                     r"[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def _check_system_uuid(value, owner, lineno):
@@ -147,6 +148,8 @@ def _check_system_uuid(value, owner, lineno):
             " it against the pinned scope, and the comparison is literal — so a"
             " name here refuses writes to the very system it names. Find the UUID"
             " with:  docker compose run --rm cli pretorin --json context list"
+            " (lowercase; Pretorin's canonical form is lowercase and the comparison"
+            " is literal, so an uppercase UUID fails the same way a name does)"
             % (value, owner),
         )
 
@@ -395,7 +398,7 @@ def validate(efforts):
         # One preflight artifact is keyed on system+framework. Two efforts on the
         # same pair are the same compliance effort wearing two names, and they
         # would sweep and bind over each other's resolvers forever.
-        pair = (effort["system_id"].lower(), effort["framework_id"])
+        pair = (effort["system_id"], effort["framework_id"])
         if pair in seen_pairs:
             other, other_line = seen_pairs[pair]
             raise ParseError(
@@ -578,6 +581,8 @@ CASES = [
     ("FRIENDLY NAME as system_id", _e(sys_="Fathom"), "must be the canonical system UUID"),
     ("almost-a-uuid (too short)", _e(sys_="11111111-1111-4111-8111-11111111111"), "must be the canonical system UUID"),
     ("uuid with wrong separators", _e(sys_="11111111_1111_4111_8111_111111111111"), "must be the canonical system UUID"),
+    ("UPPERCASE uuid", _e(sys_="11111111-1111-4111-8111-11111111111A"), "must be the canonical system UUID"),
+    ("mixed-case uuid", _e(sys_="11111111-1111-4111-8111-11111111111a".replace("a", "A", 1)), "must be the canonical system UUID"),
     # --- the global target namespace ---
     ("shared target, CONFLICTING url", SHARED % ("", "https://example.com/DIFFERENT.git", ""), "conflicts with target"),
     ("shared target, CONFLICTING ref", SHARED % ("        ref: main\n", "https://example.com/a.git", "        ref: develop\n"), "conflicts with target"),
@@ -663,27 +668,6 @@ def self_test():
     # The whole point of the exemption: this file has two efforts naming one target.
     checks.append((efforts[1]["targets"][0]["name"] == "simple-crm",
                    "SHARED target with an IDENTICAL definition is ACCEPTED"))
-
-    # An UPPERCASE UUID is still a UUID, and two spellings of one UUID are still
-    # one system — the pair check compares case-insensitively.
-    try:
-        parse(_e(sys_=UUID_A.upper()))
-        checks.append((True, "an uppercase UUID is accepted"))
-    except ParseError as exc:
-        checks.append((False, "an uppercase UUID is accepted (%s)" % exc.message))
-    _dup = ("efforts:\n"
-            "  - name: a\n    system_id: " + UUID_A + "\n    framework_id: f\n"
-            "    credential_ref: default\n    targets:\n      - name: t1\n"
-            "        url: https://example.com/a.git\n"
-            "  - name: b\n    system_id: " + UUID_A.upper() + "\n    framework_id: f\n"
-            "    credential_ref: default\n    targets:\n      - name: t2\n"
-            "        url: https://example.com/a.git\n")
-    try:
-        parse(_dup)
-        checks.append((False, "the same UUID in two cases is caught as a duplicate pair"))
-    except ParseError as exc:
-        checks.append(("same system_id + framework_id" in exc.message,
-                       "the same UUID in two cases is caught as a duplicate pair"))
 
     # The credential ladder, both modes, both rungs.
     checks += [

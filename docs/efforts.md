@@ -247,4 +247,3 @@ can address the agent, and the agent acts with the deployment's credential — n
 with the requesting user's permissions. There is no per-user authorization in the
 pilot. Keep an effort's channel membership to the people who should be able to act
 in that compliance scope.
-

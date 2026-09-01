@@ -27,8 +27,8 @@ was [onboard-targets.sh:286](../../scripts/onboard-targets.sh#L286)'s
 
 **Conditions.** Pretorin CLI **0.28.7** (the `PRETORIN_VERSION` pin), the active
 binary at `/home/node/.pretorin/bin/pretorin`. Image
-`0.3.2@sha256:e63bacb…`. File-backed credential path. The deployment key
-(`4HBTslGu…4TRQ`, `platform.pretorin.com`) — **write-enabled**, established the
+`0.3.2@sha256:e63bacb…`. File-backed credential path, against
+`platform.pretorin.com`. The deployment key is **write-enabled**, established the
 hard way during a later probe (see *Correction*, below), not read-only as this
 document first recorded. Two scopes visible to the key, both
 on system `13c1f44e-…` ("Fathom"): **`soc2`** and **`hipaa`** — the same system
@@ -86,11 +86,10 @@ An agent cannot talk its way out of its own scope pin by setting the flag.
 
 This document originally described the probe key as read-only. It is not. A later
 probe for the friendly-name issue ran `create_risk` twice with the pin and the
-target ALIGNED, and both **succeeded**, creating real records on Fathom / soc2:
-`03f9ea1b-fd0c-4d89-9721-016991ab4e00` and
-`9942495b-04cc-4442-9d84-81e2cd782d8f`, both titled
-`scope-name probe - do not action`. No MCP delete tool exists (`update_risk` is
-the only mutator), so they must be removed in the Pretorin UI.
+target ALIGNED, and both **succeeded**, creating two real records on the probe
+system, both titled `scope-name probe - do not action`. No MCP delete tool exists
+(`update_risk` is the only mutator), so they must be removed in the Pretorin UI.
+Their ids were reported to the operator directly rather than committed here.
 
 That is exactly what [smoke.sh](../../scripts/smoke.sh)'s `WRITE_POSTURE=unstated`
 rule exists to prevent, and it was defeated by treating "read-only key" as
