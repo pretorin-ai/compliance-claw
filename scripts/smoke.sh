@@ -71,6 +71,19 @@ USAGE
   shift
 done
 
+# ISOLATION, BEFORE ANY DOCKER COMMAND. compose.yaml pins `name: compliance-claw`,
+# so a run without its own project name attaches to the live deployment — and this
+# suite writes to the volumes it attaches to (audit rows, a scratch preflight
+# artifact, the template marker). There is deliberately no override.
+case "${COMPOSE_PROJECT_NAME:-}" in
+  "" | compliance-claw )
+    printf 'smoke: ERROR — this suite writes to the volumes it runs against, so it\n' >&2
+    printf '  needs a disposable Compose project, not the live "compliance-claw":\n' >&2
+    printf '    COMPOSE_PROJECT_NAME=cc-smoke CC_TEST_PORT=18990 bash scripts/smoke.sh --no-creds\n' >&2
+    printf '    COMPOSE_PROJECT_NAME=cc-smoke docker compose down -v\n' >&2
+    exit 2 ;;
+esac
+
 PASS=0; FAIL=0; SKIP=0; WARN=0
 FAILED_CHECKS=()
 
@@ -121,21 +134,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
-IFS=$'\t' read -r SYSTEM_ID FRAMEWORK_ID < <(python3 scripts/parse-targets.py scope)
+# WHICH FILE DESCRIBES THIS DEPLOYMENT. efforts.yaml is the runtime authority;
+# targets.yaml survives only as input to `clawctl migrate` and is not mounted
+# anywhere. Reading the wrong one here would make every target-shaped row below
+# assert against repositories the deployment does not actually serve.
+EFFORTS_FILE_SMOKE="${CC_EFFORTS_FILE:-efforts.yaml}"
 TARGET_NAMES=()
 PRIVATE_NAMES=()
 # name/url/private/ref — private before ref, because tab is IFS whitespace and an
 # absent ref would otherwise collapse the fields. See parse-targets.py.
-while IFS=$'\t' read -r n _u p _r; do
-  [ -n "$n" ] || continue
-  TARGET_NAMES+=("$n")
-  [ "$p" = "true" ] && PRIVATE_NAMES+=("$n")
-done < <(python3 scripts/parse-targets.py list)
+if [ -f "$EFFORTS_FILE_SMOKE" ]; then
+  EFFORT_NAMES=()
+  while read -r e; do [ -n "$e" ] && EFFORT_NAMES+=("$e"); done \
+    < <(python3 scripts/parse-efforts.py efforts "$EFFORTS_FILE_SMOKE")
+  IFS=$'\t' read -r SYSTEM_ID FRAMEWORK_ID _ \
+    < <(python3 scripts/parse-efforts.py scope "${EFFORT_NAMES[0]}" "$EFFORTS_FILE_SMOKE")
+  while IFS=$'\t' read -r n _u p _r; do
+    [ -n "$n" ] || continue
+    TARGET_NAMES+=("$n")
+    [ "$p" = "true" ] && PRIVATE_NAMES+=("$n")
+  done < <(python3 scripts/parse-efforts.py targets-all "$EFFORTS_FILE_SMOKE")
+else
+  EFFORT_NAMES=()
+  IFS=$'\t' read -r SYSTEM_ID FRAMEWORK_ID < <(python3 scripts/parse-targets.py scope)
+  while IFS=$'\t' read -r n _u p _r; do
+    [ -n "$n" ] || continue
+    TARGET_NAMES+=("$n")
+    [ "$p" = "true" ] && PRIVATE_NAMES+=("$n")
+  done < <(python3 scripts/parse-targets.py list)
+fi
 FIRST_TARGET="${TARGET_NAMES[0]}"
+
+# The same four fields (name/url/private/ref) from whichever file is authoritative,
+# so a fixture built here describes the repositories this deployment actually has.
+smoke_target_list() {
+  if [ -f "$EFFORTS_FILE_SMOKE" ]; then
+    python3 scripts/parse-efforts.py targets-all "$EFFORTS_FILE_SMOKE"
+  else
+    python3 scripts/parse-targets.py list
+  fi
+}
 
 printf '\033[1mcompliance-claw smoke test\033[0m\n'
 printf 'repo:    %s\n' "$REPO_ROOT"
 printf 'scope:   %s / %s\n' "$SYSTEM_ID" "$FRAMEWORK_ID"
+printf 'efforts: %s\n' "${EFFORT_NAMES[*]:-<none: legacy targets.yaml>}"
 printf 'targets: %s\n' "${TARGET_NAMES[*]}"
 printf 'private: %s\n' "${PRIVATE_NAMES[*]:-<none>}"
 # compose.yaml pulls by default. Anything here that re-runs bootstrap therefore
@@ -257,6 +300,12 @@ ok "the parser ships beside it (name validation, not YAML in bash)" \
 # hiding: a broken target list reported as a clean run, and one timeout wedging
 # synchronization for good.
 SYNC_BROKEN_PARSER="$(mktemp -d "${TMPDIR:-/tmp}/cc-sync-parser.XXXXXX")"
+# POINT THE EFFORTS DISPATCH AT NOTHING, so these cases exercise the LEGACY
+# targets.yaml branch they were written for. sync-targets.sh now prefers
+# efforts.yaml, so without this the checkout's own efforts.yaml is picked up, the
+# substituted broken parser is never reached, and the case silently asserts on a
+# perfectly healthy run.
+SYNC_NO_EFFORTS="${SYNC_BROKEN_PARSER}/absent-efforts.yaml"
 printf 'import sys\nsys.stderr.write("simulated parser failure\\n")\nraise SystemExit(2)\n' \
   > "${SYNC_BROKEN_PARSER}/broken.py"
 mkdir -p "${SYNC_BROKEN_PARSER}/targets"
@@ -264,21 +313,22 @@ printf 'system_id: s\nframework_id: f\ntargets:\n  - name: demo\n    url: https:
   > "${SYNC_BROKEN_PARSER}/targets.yaml"
 sync_broken() {
   CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+  CC_EFFORTS_FILE="$SYNC_NO_EFFORTS" \
   CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" \
   CC_PARSE_TARGETS="${SYNC_BROKEN_PARSER}/broken.py" \
   bash scripts/sync-targets.sh "$1" 2>/dev/null
 }
 for req in all demo; do
   notok "an unreadable target list fails the run (${req})" bash -c \
-    "CC_TARGETS_FILE='${SYNC_BROKEN_PARSER}/targets.yaml' CC_TARGETS_DIR='${SYNC_BROKEN_PARSER}/targets' CC_PARSE_TARGETS='${SYNC_BROKEN_PARSER}/broken.py' bash scripts/sync-targets.sh ${req}"
+    "CC_TARGETS_FILE='${SYNC_BROKEN_PARSER}/targets.yaml' CC_EFFORTS_FILE='${SYNC_NO_EFFORTS}' CC_TARGETS_DIR='${SYNC_BROKEN_PARSER}/targets' CC_PARSE_TARGETS='${SYNC_BROKEN_PARSER}/broken.py' bash scripts/sync-targets.sh ${req}"
 done
 BROKEN_OUT="$(sync_broken all || true)"
 has  "  and says so, rather than reporting a clean run" "targets_unreadable" "$BROKEN_OUT"
 hasnt "  and never claims overall=ok"                   "overall=ok"        "$BROKEN_OUT"
 BROKEN_ONE="$(sync_broken demo || true)"
-hasnt "  and never blames the requested name for it" "is not declared in targets.yaml" "$BROKEN_ONE"
+hasnt "  and never blames the requested name for it" "is not declared in" "$BROKEN_ONE"
 notok "bootstrap mode also refuses an unreadable list" bash -c \
-  "CC_TARGETS_FILE='${SYNC_BROKEN_PARSER}/targets.yaml' CC_TARGETS_DIR='${SYNC_BROKEN_PARSER}/targets' CC_PARSE_TARGETS='${SYNC_BROKEN_PARSER}/broken.py' bash scripts/sync-targets.sh --bootstrap"
+  "CC_TARGETS_FILE='${SYNC_BROKEN_PARSER}/targets.yaml' CC_EFFORTS_FILE='${SYNC_NO_EFFORTS}' CC_TARGETS_DIR='${SYNC_BROKEN_PARSER}/targets' CC_PARSE_TARGETS='${SYNC_BROKEN_PARSER}/broken.py' bash scripts/sync-targets.sh --bootstrap"
 
 # The exact state a SIGKILLed wrapper leaves: a lock naming a pid in this
 # namespace that no longer exists. It used to answer "already running" forever.
@@ -288,7 +338,7 @@ SYNC_LOCK_NS="$( [ -r /proc/sys/kernel/random/boot_id ] \
 mkdir -p "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock"
 printf 'pid=4194304 ns=%s ts=2026-01-01T00:00:00Z route=timeout\n' "$SYNC_LOCK_NS" \
   > "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock/owner"
-WEDGED="$(CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+WEDGED="$(CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" CC_EFFORTS_FILE="$SYNC_NO_EFFORTS" \
   CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" bash scripts/sync-targets.sh all 2>&1 || true)"
 hasnt "a lock left by a dead owner does not wedge sync forever" "sync_already_running" "$WEDGED"
 has   "  and the reclaim is announced, not silent"              "reclaiming a stale lock" "$WEDGED"
@@ -300,7 +350,7 @@ has   "  and the reclaim is announced, not silent"              "reclaiming a st
 mkdir -p "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock"
 printf 'pid=%s ns=%s ts=2026-01-01T00:00:00Z route=live\n' "$$" "$SYNC_LOCK_NS" \
   > "${SYNC_BROKEN_PARSER}/targets/.target-sync.lock/owner"
-LIVE="$(CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" \
+LIVE="$(CC_TARGETS_FILE="${SYNC_BROKEN_PARSER}/targets.yaml" CC_EFFORTS_FILE="$SYNC_NO_EFFORTS" \
   CC_TARGETS_DIR="${SYNC_BROKEN_PARSER}/targets" bash scripts/sync-targets.sh all 2>/dev/null || true)"
 has "a lock held by a LIVE process is still respected" "sync_already_running" "$LIVE"
 rm -rf "$SYNC_BROKEN_PARSER"
@@ -378,6 +428,26 @@ if bash "$0" --nonsense-argument >/dev/null 2>&1; then
   fail "an unknown argument is refused" "it was accepted, so a typo could silently select a posture"
 else
   pass "an unknown argument is refused rather than defaulting"
+fi
+
+head2 "A3c2. the seeded slash command is the one the Slack app registers"
+# Slack rejects an unregistered /foo BEFORE it reaches the gateway, so a mismatch
+# between these two files is invisible in our logs and looks like the bot being
+# down. Static, so it runs with no credentials and no Slack profile.
+SEED_CMD="$(python3 -c '
+import re
+s = open("scripts/slack-channel.patch.json5").read()
+m = re.search(r"slashCommand:\s*\{[^}]*name:\s*\"([^\"]+)\"", s)
+print(m.group(1) if m else "")' 2>/dev/null)"
+APP_CMD="$(python3 -c '
+import json
+c = json.load(open("slack/app-manifest.json"))["features"]["slash_commands"]
+print(c[0]["command"].lstrip("/") if c else "")' 2>/dev/null)"
+if [ -n "$SEED_CMD" ] && [ "$SEED_CMD" = "$APP_CMD" ]; then
+  pass "the seeded slashCommand name matches the manifest's command (/${SEED_CMD})"
+else
+  fail "the seeded slashCommand name matches the manifest's command" \
+       "seed='${SEED_CMD}' manifest='${APP_CMD}' — Slack would reject it unsent"
 fi
 
 head2 "A3d. no operator message is executed instead of printed"
@@ -610,10 +680,29 @@ else
   fail "plugins.allow and channels.slack are both-or-neither" \
        "allow=${HAS_ALLOW} slack=${HAS_CHAN} — an orphaned exclusive allowlist trims the bundled plugins for nothing"
 fi
-AG="$(val cat /home/node/.openclaw/workspace/AGENTS.md)"
-has "AGENTS.md seeded" "Review targets" "$AG"
-has "AGENTS.md requires target selection" "state which target" "$AG"
-has "AGENTS.md requires provenance" "commit SHA" "$AG"
+# THE TEMPLATE, NOT A SEEDED COPY. The entrypoint no longer writes AGENTS.md into
+# the default workspace: with multi-effort there is no single agent to write
+# instructions for, and `scripts/clawctl apply` renders one per effort into that
+# effort's own workspace. Seeding the raw template would install a file full of
+# unsubstituted @PLACEHOLDERS@ claiming a scope no agent has.
+#
+# So what is asserted here is that the template SHIPS and still carries the
+# clauses every generated copy depends on. Whether a workspace has an AGENTS.md
+# is now an apply-time question, covered by clawctl's own self-test.
+AG="$(val cat /opt/compliance-claw/agents-md.template)"
+has "the AGENTS.md template ships in the image" "Review targets" "$AG"
+has "  it requires target selection" "state which target" "$AG"
+has "  it requires evidence provenance" "commit SHA" "$AG"
+has "  it pins the effort identity" "@EFFORT@" "$AG"
+has "  it refuses conversational context switching" "cannot" "$AG"
+has "  it redirects to the right channel via the mounted efforts.yaml" \
+    "/etc/compliance-claw/efforts.yaml" "$AG"
+# THE HONESTY CLAUSE. An agent that described its own routing as a security
+# guarantee would be wrong, and the instructions say so explicitly.
+has "  it never claims prompt routing is a security boundary" \
+    "Do not describe this as a security guarantee" "$AG"
+notok "the entrypoint does NOT seed a placeholder AGENTS.md into the workspace" \
+      docker compose exec -T openclaw grep -q '@EFFORT@' /home/node/.openclaw/workspace/AGENTS.md
 SHIPPED="$(val cat /opt/compliance-claw/config-template.version | tr -d '\n')"
 STAMP_BACKUP="$(val cat /home/node/.openclaw/.compliance-claw-templates | tr -d '\n')"
 if [ "$STAMP_BACKUP" = "$SHIPPED" ]; then
@@ -621,6 +710,64 @@ if [ "$STAMP_BACKUP" = "$SHIPPED" ]; then
 else
   fail "template marker written and current" "marker='${STAMP_BACKUP}' shipped='${SHIPPED}'"
 fi
+
+head2 "A4e. per-agent tool isolation, decided by OpenClaw itself"
+# THE ASSERTION THAT MATTERS FOR MULTI-EFFORT, AND THE ONE EASIEST TO FAKE.
+#
+# Checking that the generated config CONTAINS a deny string proves only that we
+# wrote a string. What has to be true is that OpenClaw, given that policy, refuses
+# another effort's Pretorin tools and still allows this effort's own and the
+# built-ins. So this asks OpenClaw's OWN matcher, imported out of the image, with
+# exactly the policy scripts/openclaw-patch.py generates.
+#
+# The module is selected by SHAPE rather than by filename: upstream ships more
+# than one build under hashed names, and picking by name grabbed the wrong one.
+# If no matcher is found the row SKIPs loudly rather than passing silently.
+POLICY_OUT="$(docker compose run --rm -T cli sh -c 'cat > /tmp/p.mjs && node /tmp/p.mjs' <<'PROBE' 2>&1 || true
+import { readdirSync } from "node:fs";
+const dir = "/app/dist";
+let fn = null;
+for (const f of readdirSync(dir).filter((f) => f.startsWith("tool-policy-match-"))) {
+  const m = await import(`${dir}/${f}`);
+  for (const v of Object.values(m)) {
+    if (typeof v === "function" && v.length === 2) {
+      try {
+        if (v("read", { deny: ["read"] }) === false && v("read", {}) === true) { fn = v; break; }
+      } catch {}
+    }
+  }
+  if (fn) break;
+}
+if (!fn) { console.log("SKIP"); process.exit(0); }
+const A = { deny: ["pretorin-eff-b__*"] };
+const B = { deny: ["pretorin-eff-a__*"] };
+const cases = [
+  ["own-tool-allowed",   A, "pretorin-eff-a__check_context", true],
+  ["other-tool-denied",  A, "pretorin-eff-b__check_context", false],
+  ["other-tool-denied2", A, "pretorin-eff-b__start_task",    false],
+  ["mirror-allowed",     B, "pretorin-eff-b__check_context", true],
+  ["mirror-denied",      B, "pretorin-eff-a__check_context", false],
+  ["builtin-kept",       A, "read",                          true],
+  ["target-sync-kept",   A, "target_sync",                   true],
+];
+let bad = 0;
+for (const [label, policy, tool, want] of cases) {
+  if (fn(tool, policy) !== want) { bad++; console.log("BAD " + label); }
+}
+console.log(bad ? "FAILED" : "ALLPASS");
+PROBE
+)"
+case "$POLICY_OUT" in
+  *ALLPASS*)
+    pass "OpenClaw's own matcher denies another effort's Pretorin tools"
+    pass "  and still allows this effort's own tools and the built-ins" ;;
+  *SKIP*)
+    skip "per-agent tool isolation (OpenClaw's matcher module was not found)" \
+         "upstream moved it; the generated policy is unverified by this row" ;;
+  *)
+    fail "OpenClaw's own matcher denies another effort's Pretorin tools" \
+         "$(printf '%s' "$POLICY_OUT" | tail -4)" ;;
+esac
 
 head2 "A4b. the published image version agrees with versions.env"
 V_REPO="$(awk -F= '/^IMAGE_REPO=/{print $2}' versions.env)"
@@ -768,10 +915,10 @@ for name,svc in d.items():
     assert "GITHUB_READONLY_PAT" not in env, f"{name} has a direct PAT value"
     assert "GITHUB_READONLY_PAT_FILE" not in env, \
         f"{name} exports the PAT as an environment variable; it must stay file-only"
-# MOUNT POSTURE, ASSERTED IN BOTH DIRECTIONS. The writable maintenance alias and
-# targets.yaml belong to the gateway alone, and the assessment mount must stay
-# read-only on BOTH — a YAML merge key replaces a volumes list rather than
-# appending to it, so this is exactly the mistake that ships silently.
+# MOUNT POSTURE, ASSERTED IN BOTH DIRECTIONS. The writable maintenance alias
+# belongs to the gateway alone, and the assessment mount must stay read-only on
+# BOTH — a YAML merge key replaces a volumes list rather than appending to it, so
+# this is exactly the mistake that ships silently.
 def mounts(svc):
     return {v["target"]: v for v in d[svc].get("volumes",[])}
 mo, mc = mounts("openclaw"), mounts("cli")
@@ -780,8 +927,15 @@ assert mc["/workspace/targets"].get("read_only"), "cli assessment mount is not r
 assert "/var/lib/compliance-claw/targets" in mo, "openclaw lacks the maintenance mount"
 assert not mo["/var/lib/compliance-claw/targets"].get("read_only"), "maintenance mount is not writable"
 assert "/var/lib/compliance-claw/targets" not in mc, "cli must not get the maintenance mount"
-assert "/etc/compliance-claw/targets.yaml" in mo, "openclaw lacks targets.yaml"
-assert mo["/etc/compliance-claw/targets.yaml"].get("read_only"), "targets.yaml is not read-only"
+# THE LEGACY SINGLE-EFFORT PATH IS STILL SERVED. /target-sync runs inside the
+# gateway and validates every requested name against a mounted declaration file,
+# so a deployment that has not run `clawctl migrate` needs targets.yaml there or
+# every request fails on an unreadable target list. Read-only, gateway only: a
+# one-off command runner has no use for it.
+assert "/etc/compliance-claw/targets.yaml" in mo, \
+    "openclaw lacks targets.yaml; legacy /target-sync cannot resolve any name"
+assert mo["/etc/compliance-claw/targets.yaml"].get("read_only"), \
+    "targets.yaml must be mounted read-only"
 assert "/etc/compliance-claw/targets.yaml" not in mc, "cli must not get targets.yaml"
 # The gateway keeps the state volumes it had before this feature: a restated
 # volumes list that dropped one would come up broken in a way no other row here
@@ -970,10 +1124,26 @@ if [ "$GATEWAY_STARTED" = 1 ] || docker compose ps --status running --services 2
   else
     fail "gateway: the maintenance alias is mounted" "/var/lib/compliance-claw/targets is absent"
   fi
-  ok "gateway: targets.yaml is mounted for name validation" \
+  # efforts.yaml, NOT targets.yaml. It is the declaration of which repositories
+  # exist and which effort each belongs to, so it is both the name validator and
+  # the scope: a request can only address what its own effort declares.
+  ok "gateway: efforts.yaml is mounted for name validation" \
+     docker compose exec -T openclaw test -r /etc/compliance-claw/efforts.yaml
+  notok "gateway: efforts.yaml is read-only" \
+        docker compose exec -T openclaw sh -c 'echo x >> /etc/compliance-claw/efforts.yaml'
+  # LEGACY SUPPORT, PROVED INSIDE THE CONTAINER. targets.yaml is still there and
+  # still read-only, so a deployment that has not migrated keeps a working
+  # /target-sync — but efforts.yaml above is what this deployment actually uses.
+  ok "gateway: legacy targets.yaml is still mounted for unmigrated deployments" \
      docker compose exec -T openclaw test -r /etc/compliance-claw/targets.yaml
-  notok "gateway: targets.yaml is read-only" \
+  notok "gateway: legacy targets.yaml is read-only" \
         docker compose exec -T openclaw sh -c 'echo x >> /etc/compliance-claw/targets.yaml'
+  # AND IT IS NOT WHAT SCOPES A REQUEST. With efforts.yaml present the wrapper
+  # selects it, so a target that exists only in targets.yaml is still refused.
+  ok "gateway: efforts.yaml, not targets.yaml, is what a request is scoped to" \
+     docker compose exec -T openclaw sh -c '
+       /opt/compliance-claw/sync-targets.sh no-such-target 2>&1 |
+         grep -q "/etc/compliance-claw/efforts.yaml"'
   docker compose exec -T openclaw rm -f /workspace/targets/.smoke-assess-canary >/dev/null 2>&1 || true
 
   # THE INPUT CONTRACT, INSIDE THE REAL CONTAINER. The self-test proves the rules;
@@ -984,8 +1154,8 @@ if [ "$GATEWAY_STARTED" = 1 ] || docker compose ps --status running --services 2
           docker compose exec -T openclaw /opt/compliance-claw/sync-targets.sh "$bad_req"
   done
   SYNC_REFUSAL="$(docker compose exec -T openclaw /opt/compliance-claw/sync-targets.sh no-such-target 2>/dev/null || true)"
-  has "gateway: the refusal names targets.yaml as the only source of names" \
-      "not declared in targets.yaml" "$SYNC_REFUSAL"
+  has "gateway: the refusal names efforts.yaml as the only source of names" \
+      "not declared in /etc/compliance-claw/efforts.yaml" "$SYNC_REFUSAL"
   has "gateway: the refusal is machine-readable" "invalid_target" "$SYNC_REFUSAL"
 else
   skip "gateway mount and sync-refusal checks" "the gateway is not running"
@@ -1064,7 +1234,7 @@ SCRATCH_YAML="$(mktemp "${TMPDIR:-/tmp}/smoke-targets.XXXXXX")"
     printf '  - name: %s\n    url: %s\n' "$n" "$u"
     [ "$p" = "true" ] && printf '    private: true\n'
     [ -n "$r" ] && printf '    ref: %s\n' "$r"
-  done < <(python3 scripts/parse-targets.py list)
+  done < <(smoke_target_list)
 } > "$SCRATCH_YAML"
 
 # Pollute exactly the way the CWD bug would: a bare `preflight init` with no
@@ -1110,17 +1280,29 @@ mkdir -p workspace/targets/smoke-mismatch
 SCRATCH_CLONES+=("workspace/targets/smoke-mismatch" "workspace/targets/smoke-broken")
 git -C workspace/targets/smoke-mismatch init -q . >/dev/null 2>&1
 git -C workspace/targets/smoke-mismatch remote add origin https://example.invalid/other.git
-printf 'system_id: %s\nframework_id: %s\ntargets:\n  - name: smoke-mismatch\n    url: https://example.invalid/expected.git\n' \
-  "$SCRATCH_SYS" "$SCRATCH_FW" > "$NEG_YAML"
-OUT="$(TARGETS_FILE="$NEG_YAML" bash scripts/bootstrap.sh 2>&1)"; RC=$?
+# AN EFFORTS FIXTURE, because efforts.yaml is what bootstrap now reads. A
+# targets.yaml fixture here would be ignored, bootstrap would clone the real
+# deployment's repositories instead, and the assertions below would be checking a
+# refusal that came from somewhere else entirely.
+# A CANONICAL UUID, not SCRATCH_SYS. efforts.yaml refuses a friendly system name
+# outright — Pretorin compares a write's resolved target against the pinned scope
+# literally, so a name there rejects writes to the very system it names. The value
+# is never used against a platform here; it only has to satisfy the schema so the
+# run reaches the clone logic these rows are actually about.
+NEG_UUID="00000000-0000-4000-8000-00000000dead"
+neg_efforts() {
+  printf 'efforts:\n  - name: smoke-neg\n    system_id: %s\n    framework_id: %s\n    credential_ref: default\n    slack_channel_id: C0SMOKENEG\n    targets:\n      - name: %s\n        url: %s\n' \
+    "$NEG_UUID" "$SCRATCH_FW" "$1" "$2" > "$NEG_YAML"
+}
+neg_efforts smoke-mismatch https://example.invalid/expected.git
+OUT="$(CC_EFFORTS_FILE="$NEG_YAML" bash scripts/bootstrap.sh 2>&1)"; RC=$?
 [ "$RC" != 0 ] && pass "bootstrap refuses a clone whose origin differs" \
   || fail "bootstrap refuses a clone whose origin differs"
 has "the refusal names both URLs" "on disk:" "$OUT"
 
 mkdir -p workspace/targets/smoke-broken   # a directory that is not a repo
-printf 'system_id: %s\nframework_id: %s\ntargets:\n  - name: smoke-broken\n    url: https://example.invalid/x.git\n' \
-  "$SCRATCH_SYS" "$SCRATCH_FW" > "$NEG_YAML"
-OUT="$(TARGETS_FILE="$NEG_YAML" bash scripts/bootstrap.sh 2>&1)"; RC=$?
+neg_efforts smoke-broken https://example.invalid/x.git
+OUT="$(CC_EFFORTS_FILE="$NEG_YAML" bash scripts/bootstrap.sh 2>&1)"; RC=$?
 [ "$RC" != 0 ] && pass "bootstrap refuses a broken/partial clone" \
   || fail "bootstrap refuses a broken/partial clone"
 has "the refusal explains it will not delete" "remove it yourself" "$OUT"
@@ -1225,9 +1407,13 @@ head2 "A11. private targets refuse rather than prompt (negative paths)"
 # Mirrors A9's shape: the interesting behaviour of the private path is its
 # refusals, and all three of them are reachable with no credentials at all.
 PRIV_YAML="$(mktemp "${TMPDIR:-/tmp}/smoke-priv.XXXXXX")"
+# AN EFFORTS FIXTURE, because bootstrap reads efforts.yaml now. A targets.yaml
+# fixture here would simply be ignored: bootstrap would fall through to the real
+# efforts.yaml and every row below would be asserting on a refusal that came from
+# somewhere else — or on no refusal at all, if that file declares nothing private.
 priv_yaml() {
-  printf 'system_id: %s\nframework_id: %s\ntargets:\n  - name: smoke-private\n    url: %s\n    private: true\n' \
-    "$SCRATCH_SYS" "$SCRATCH_FW" "${1:-https://github.com/pretorin-ai/does-not-exist.git}" > "$PRIV_YAML"
+  printf 'efforts:\n  - name: smoke-priv\n    system_id: %s\n    framework_id: %s\n    credential_ref: default\n    slack_channel_id: C0SMOKEPRIV\n    targets:\n      - name: smoke-private\n        url: %s\n        private: true\n' \
+    "$NEG_UUID" "$SCRATCH_FW" "${1:-https://github.com/pretorin-ai/does-not-exist.git}" > "$PRIV_YAML"
 }
 
 # THE CREDENTIAL LADDER IS TESTED WITH AN EMPTY SECRET DIRECTORY, deliberately.
@@ -1237,7 +1423,7 @@ NOCRED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/smoke-nocred.XXXXXX")"
 
 # 1. private target, no GitHub App and no PAT: refuse, naming both fixes.
 priv_yaml
-OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+OUT="$(CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
 [ "$RC" != 0 ] && pass "bootstrap refuses a private target with no credential at all" \
@@ -1247,7 +1433,7 @@ has "the refusal also names the PAT file" "github-readonly-pat" "$OUT"
 hasnt "the refusal does not hang on a credential prompt" "Username for" "$OUT"
 
 # 2. App id present, key file missing.
-OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
+OUT="$(CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
        GITHUB_APP_PRIVATE_KEY_FILE=secrets/definitely-not-here.pem \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
@@ -1255,13 +1441,47 @@ OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
   || fail "bootstrap refuses a private target with a missing key file" "it succeeded"
 has "the refusal names the key path" "definitely-not-here.pem" "$OUT"
 
+# 2b. CLONE-ONLY, AND THE PRIVATE TARGET IS ALREADY CLONED.
+#
+# `clawctl apply` runs bootstrap this way: make missing clones exist, touch
+# nothing that already does. A credential is therefore only needed for a clone
+# that has to happen — demanding one for a private target already on disk would
+# refuse an operation that contacts no network at all, on exactly the deployments
+# where every private target is already present. Found by running it.
+CLONE_ONLY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/smoke-cloneonly.XXXXXX")"
+mkdir -p "${CLONE_ONLY_DIR}/targets/smoke-private"
+git -C "${CLONE_ONLY_DIR}/targets/smoke-private" init -q . >/dev/null 2>&1
+git -C "${CLONE_ONLY_DIR}/targets/smoke-private" remote add origin \
+  https://github.com/pretorin-ai/does-not-exist.git
+priv_yaml
+OUT="$(CC_CLONE_ONLY=1 CC_TARGETS_DIR="${CLONE_ONLY_DIR}/targets" \
+       CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+       COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
+       bash scripts/bootstrap.sh --targets-only 2>&1)"; RC=$?
+[ "$RC" = 0 ] && pass "clone-only needs NO credential when the private target is already cloned" \
+  || fail "clone-only needs no credential when the private target is already cloned" \
+         "$(printf '%s' "$OUT" | tail -3)"
+hasnt "  and it does not fetch the existing clone" "updating smoke-private" "$OUT"
+has   "  it says the clone was left where it is" "left at its current commit" "$OUT"
+
+# ...and the credential is STILL required when the clone is genuinely missing,
+# so the exemption above cannot become a way to skip the ladder.
+rm -rf "${CLONE_ONLY_DIR}/targets/smoke-private"
+OUT="$(CC_CLONE_ONLY=1 CC_TARGETS_DIR="${CLONE_ONLY_DIR}/targets" \
+       CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+       COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
+       bash scripts/bootstrap.sh --targets-only 2>&1)"; RC=$?
+[ "$RC" != 0 ] && pass "  but a MISSING private clone still demands a credential" \
+  || fail "  but a missing private clone still demands a credential" "it succeeded"
+rm -rf "$CLONE_ONLY_DIR"
+
 # 2b. NO SILENT DOWNGRADE. An App that is configured but broken must NOT fall
 #     through to the PAT, even when a perfectly good PAT is sitting right there.
 #     An operator who set up an App expects the App; quietly substituting a
 #     longer-lived personal credential is the kind of downgrade nobody notices.
 printf '%s' 'CANARY-PAT-SHOULD-NOT-BE-USED' > "${NOCRED_DIR}/github-readonly-pat"
 chmod 600 "${NOCRED_DIR}/github-readonly-pat"
-OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
+OUT="$(CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
        GITHUB_APP_PRIVATE_KEY_FILE=secrets/definitely-not-here.pem \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
@@ -1274,7 +1494,7 @@ hasnt "  and no token value was printed" "CANARY-PAT-SHOULD-NOT-BE-USED" "$OUT"
 # 2c. NO App, PAT present: the pilot path is taken, said out loud, and the value
 #     is never printed. The clone still fails (the repository does not exist and
 #     the token is fake) — what is asserted here is WHICH credential was chosen.
-OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+OUT="$(CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
 has   "with no App, a present PAT is used for private targets" "fine-grained PAT from" "$OUT"

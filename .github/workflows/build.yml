@@ -35,11 +35,22 @@ jobs:
 
     # compose.yaml pulls the published image by default, which is wrong for CI:
     # the point here is to test the code in this commit, not whatever was last
-    # released. The overlay adds the build section back. COMPOSE_FILE is docker
-    # compose's own mechanism, so bootstrap.sh, onboard-targets.sh and smoke.sh
-    # all inherit it without a CI-specific flag.
+    # released. The build overlay adds the build section back. COMPOSE_FILE is
+    # docker compose's own mechanism, so bootstrap.sh and smoke.sh all inherit it
+    # without a CI-specific flag.
+    #
+    # compose.efforts.yaml IS REQUIRED, not optional. efforts.yaml is what the
+    # deployment reads, and that overlay is what mounts it into the gateway —
+    # compose.yaml deliberately does not, because the file is gitignored and a
+    # base-file bind mount would fail `up` on a fresh clone before anything could
+    # explain why. Without it here the gateway comes up with no declaration of
+    # which repositories exist, and /target-sync can address nothing.
+    #
+    # A disposable project name: compose.yaml pins `name: compliance-claw`, and
+    # smoke.sh writes to the volumes it attaches to, so it refuses that name.
     env:
-      COMPOSE_FILE: compose.yaml:compose.build.yaml
+      COMPOSE_FILE: compose.yaml:compose.build.yaml:compose.efforts.yaml
+      COMPOSE_PROJECT_NAME: cc-ci
 
     steps:
       # Pinned to a commit: a tag is mutable, and this is the step that fetches
@@ -74,10 +85,35 @@ jobs:
           fi
           echo "targets.yaml is credential-free, as required."
 
+      # efforts.yaml IS THE RUNTIME AUTHORITY AND IS GITIGNORED, so CI has none —
+      # it names YOUR systems. It is produced here the same way an operator
+      # produces one, from the committed targets.yaml, which keeps CI on the
+      # documented path instead of a shortcut that could rot unnoticed.
+      #
+      # The channel id is a throwaway: CI has no Slack app, nothing routes, and
+      # `migrate` refuses to invent one precisely because a placeholder that
+      # validates and routes nowhere is the failure that looks like a broken bot.
+      # Here there is no bot to break, and the id has to satisfy the schema.
+      - name: Convert targets.yaml into efforts.yaml (the documented migration)
+        run: |
+          set -euo pipefail
+          scripts/clawctl migrate --name ci-effort --slack-channel-id C0000000CI
+          python3 scripts/parse-efforts.py validate efforts.yaml
+          # BOTH BIND SOURCES MUST EXIST BEFORE ANY COMPOSE COMMAND. Compose
+          # resolves every bind source at `up`/`run` time and a missing one fails
+          # the whole command naming neither the file nor the fix.
+          # compose.efforts.yaml mounts efforts.yaml (just created) and the
+          # per-effort credential DIRECTORY, which is gitignored and so never
+          # exists on a fresh checkout. `scripts/clawctl` creates it for an
+          # operator; CI never runs apply, so it is created here.
+          mkdir -p secrets/runtime/pretorin
+          echo "efforts.yaml generated from targets.yaml and valid."
+
       # Runs the documented operator path rather than a CI-only shortcut, so a
       # break in bootstrap.sh fails here instead of on someone's laptop. It
-      # clones the public target from targets.yaml, writes a throwaway .env with
-      # a generated gateway token (PRETORIN_API_KEY stays empty), and builds.
+      # clones the public target declared in efforts.yaml, writes a throwaway
+      # .env with a generated gateway token (PRETORIN_API_KEY stays empty), and
+      # builds.
       - name: Bootstrap (write .env, clone targets, build image)
         run: bash scripts/bootstrap.sh --build
 
@@ -131,6 +167,15 @@ jobs:
       - name: Effort schema, injection rules and the credential ladder (offline)
         run: python3 scripts/parse-efforts.py --self-test
 
+      # Same position and same reasoning again. This one owns the OpenClaw
+      # configuration this deployment generates, so its rejection table covers
+      # the failures that would be invisible until Slack behaved oddly: a DM
+      # admitted with no binding (which routes to the DEFAULT agent), one user
+      # bound to two efforts, a binding to an agent that no longer exists, and a
+      # patch naming a config path this deployment does not own.
+      - name: OpenClaw patch generation and its refusals (offline)
+        run: python3 scripts/openclaw-patch.py --self-test
+
       # The committed example must stay valid and credential-free, for the same
       # two readers the targets.yaml guard above exists for: a fresh clone with
       # nothing but a Pretorin key, and CI, which holds none.
@@ -152,13 +197,21 @@ jobs:
       # this asserts what clawctl WOULD run rather than what it says it would:
       # migrate correctness and idempotence, `plan` starting zero containers and
       # changing zero bytes, the scope pin and named credential on every Pretorin
-      # invocation, `context set` on none of them, and each echoed line
-      # byte-identical to the argv issued.
+      # invocation, `context set` on none of them, each echoed line byte-identical
+      # to the argv issued, and — new with multi-agent — that every gateway-bound
+      # verification goes through `compose exec -T openclaw` rather than the `cli`
+      # container, which cannot reach the gateway and would report a dead check as
+      # a skip forever.
       - name: clawctl behaviour (offline, stub docker, no credentials)
         run: bash scripts/clawctl --self-test
 
       - name: Smoke test (no-credential section only)
-        run: bash scripts/smoke.sh --no-creds
+        run: |
+          # The guard must stop an unnamed run before the suite starts.
+          if env -u COMPOSE_PROJECT_NAME bash scripts/smoke.sh --no-creds; then
+            echo "smoke ran without a disposable project name"; exit 1
+          fi
+          bash scripts/smoke.sh --no-creds
 
       # smoke.sh's A4d asserts the file-secret OVERLAY renders correctly, which is
       # a static compose-config check. It cannot prove the other half of the

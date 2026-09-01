@@ -49,7 +49,9 @@ remain trusted, as they are with every bind mount.
 
 Only non-secret deployment settings are interpolated from `.env` in this mode:
 
-- `SLACK_CHANNEL_ID`
+- `SLACK_CHANNEL_ID` — **legacy single-effort only.** Once `efforts.yaml` exists,
+  each effort carries its own `slack_channel_id` and this variable is ignored (the
+  container says so on start).
 - target and model selection performed by their existing configuration flows
 
 Host-side GitHub App identifiers and its private-key path may remain in `.env`
@@ -65,15 +67,22 @@ points here rather than restating it, so the two cannot drift.
 | --- | --- | --- | --- |
 | `pretorin-api-key` | `PRETORIN_API_KEY` | for any platform access | `openclaw`, `cli` |
 | `openclaw-gateway-token` | `OPENCLAW_GATEWAY_TOKEN` | **yes** — the gateway exits 1 without it | `openclaw` only |
-| `slack-app-token` | `SLACK_APP_TOKEN` | only for Slack (all three together) | `openclaw`, `cli` |
-| `slack-bot-token` | `SLACK_BOT_TOKEN` | only for Slack | `openclaw`, `cli` |
+| `slack-app-token` | `SLACK_APP_TOKEN` | only for Slack — **both tokens together** | `openclaw`, `cli` |
+| `slack-bot-token` | `SLACK_BOT_TOKEN` | only for Slack — **both tokens together** | `openclaw`, `cli` |
 | `openai-api-key` | `OPENAI_API_KEY` | **exactly one** model key | `openclaw` only |
 | `anthropic-api-key` | `ANTHROPIC_API_KEY` | **exactly one** model key | `openclaw` only |
 | `github-readonly-pat` | *(none — see below)* | only to sync a **private** target from Slack | `openclaw` only |
 
-`SLACK_CHANNEL_ID` is the third Slack value and is **not** a secret — it stays in
-`.env`, along with the host-side GitHub App identifiers and private-key path,
-which the overlay does not forward into either container.
+**Slack needs two files here, not three.** On the multi-effort path those two
+tokens are the whole of what this table owns: which channels are served comes from
+each effort's `slack_channel_id` in `efforts.yaml`, which `scripts/clawctl apply`
+writes into the gateway configuration. `SLACK_CHANNEL_ID` is **legacy
+single-effort only** — it is not a secret and stays in `.env`, and setting it
+alongside an `efforts.yaml` is ignored with a message rather than honoured, so
+there is exactly one owner of the channel allowlist.
+
+The host-side GitHub App identifiers and private-key path also stay in `.env`;
+the overlay does not forward them into either container.
 
 An empty optional file means that provider is simply not configured. The gateway
 token is the one that fails closed.
@@ -141,9 +150,9 @@ it on every start, so the config carries a `${OPENAI_REQUEST_ADAPTER}` marker
 rather than a baked value.
 
 That indirection is load-bearing. Deciding the adapter when the config is *seeded*
-does not work: the documented order runs `scripts/onboard-targets.sh` before
-`docker compose up`, which seeds from the `cli` service — and `cli` deliberately
-has no model key. A seed-time choice was therefore made by a container that could
+does not work: the documented order runs `scripts/clawctl apply` before the
+gateway exists, which seeds from the `cli` service — and `cli` deliberately has no
+model key. A seed-time choice was therefore made by a container that could
 not see the credential, and never-clobber then locked the wrong value in for the
 life of the volume. Resolving per process removes the dependency instead of
 widening the credential's reach.

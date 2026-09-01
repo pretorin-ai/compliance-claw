@@ -81,10 +81,14 @@ provenance — see "Verifying what you pulled".
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
 
 # 1. select the file-backed credential path (recommended, and what Azure needs)
-export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
+export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
 
-# 2. declare what you are reviewing, and for which compliance scope
-vi targets.yaml                  # system_id, framework_id, one or more targets
+# 2. declare what you are reviewing, for which compliance scope, and where it
+#    lives in Slack. efforts.yaml is what the deployment reads.
+cp efforts.example.yaml efforts.yaml
+vi efforts.yaml                  # system_id, framework_id, slack_channel_id, targets
+#    Already have a single-effort targets.yaml? Convert it instead:
+#    scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 
 # 3. clone the targets, PULL the released image, create the secret files
 scripts/bootstrap.sh             # generates the gateway token; writes NO secret to .env
@@ -94,18 +98,24 @@ vi secrets/runtime/pretorin-api-key
 vi secrets/runtime/openai-api-key         # matches the shipped default model
 # OR use anthropic-api-key, then select an Anthropic model before first use:
 # docker compose run --rm cli openclaw models set anthropic/<model>
-#  optional: slack-app-token, slack-bot-token  (+ SLACK_CHANNEL_ID in .env)
+#  optional: slack-app-token, slack-bot-token
+#    (SLACK_CHANNEL_ID is NOT needed: which channels are served comes from each
+#     effort's slack_channel_id in efforts.yaml)
 #  full checklist and per-service delivery matrix: docs/file-secrets.md
 
-# 5. register the targets with Pretorin (idempotent; safe to re-run)
-scripts/onboard-targets.sh
+# 5. onboard every effort with Pretorin and generate the agents, Slack bindings
+#    and per-effort MCP servers (idempotent; safe to re-run). apply works with no
+#    gateway container yet and brings one up on the result, so do NOT `up -d`
+#    first — that would only mean apply immediately recreating it.
+scripts/clawctl plan             # shows the whole change; starts no containers
+scripts/clawctl apply
 
-# 6. start the gateway
-docker compose up -d             # http://127.0.0.1:18789
+# 6. the gateway is now running on http://127.0.0.1:18789
+docker compose ps
 
 # anything one-off, in the same image with the same mounts:
 docker compose run --rm cli pretorin --json context show
-docker compose exec openclaw openclaw agent --agent main -m "..."
+docker compose exec openclaw openclaw agent --agent <effort-name> -m "..."
 ```
 
 **Keep `COMPOSE_FILE` exported for every later command.** It is how compose knows
@@ -123,9 +133,13 @@ Pretorin key there:
 ```sh
 scripts/bootstrap.sh
 vi .env                          # PRETORIN_API_KEY=...  (+ Slack, + GitHub App)
-scripts/onboard-targets.sh
+scripts/onboard-targets.sh       # LEGACY single-effort onboarding
 docker compose up -d
 ```
+
+> **Legacy.** This path serves one effort and cannot build per-effort agents:
+> `scripts/clawctl` needs the file-backed credential path. The quickstart above is
+> the supported route.
 
 The cost is that compose's `env_file` hands every value in `.env` to the container
 **and to `docker inspect`**, so anyone who can query the daemon can read them. To
@@ -147,10 +161,11 @@ Two ordering rules, both of which bite silently if ignored:
 
 - **Slack credentials must be in place before the first `up`** — in
   `secrets/runtime/slack-{app,bot}-token` on the recommended path, or in `.env` on
-  the legacy one, plus `SLACK_CHANNEL_ID` in `.env` either way (it is not a
-  secret). The config is seeded once and never overwritten, so adding them later
-  does nothing until you reset — the container warns explicitly when it sees
-  exactly that situation.
+  the legacy one. Which channels are served comes from each effort's
+  `slack_channel_id` in `efforts.yaml`, not from `.env`. The Slack half of the
+  config is seeded once and never overwritten, so adding the tokens later does
+  nothing until you reset — the container warns explicitly when it sees exactly
+  that situation.
 - **Onboard before `up`.** Onboarding writes host-local Pretorin state, and a
   running gateway keeps a per-session `pretorin mcp-serve` child that can serve
   the older view (the preflight artifact carries a 3600-second TTL). If you do
@@ -167,7 +182,7 @@ Two ordering rules, both of which bite silently if ignored:
 Check what you bound at any time, read-only:
 
 ```sh
-scripts/onboard-targets.sh --verify-only
+scripts/clawctl validate         # per-effort rows: credential, mode, live probe
 ```
 
 `code_repository` reporting **`degraded`** there is expected, not a failure: the
@@ -259,7 +274,13 @@ scripts/bootstrap.sh --build
 it up with no extra flags. A local build is tagged `compliance-claw:local` so it
 cannot be mistaken for the published image in `docker images`.
 
-## `targets.yaml`
+## `targets.yaml` (legacy — see `efforts.yaml` above)
+
+> This is the single-effort format. It is still the shape `scripts/clawctl
+> migrate` reads, and the per-target rules below are unchanged in `efforts.yaml`,
+> but **nothing reads this file at runtime any more** and it is not mounted into
+> any container. A multi-effort deployment declares the same targets under each
+> effort in `efforts.yaml`.
 
 ```yaml
 system_id: 7b74d8f3-d77c-49e4-8792-c372dd154d38   # UUID or system name
@@ -306,7 +327,7 @@ Nothing to configure. Any `https://` remote that clones anonymously works.
 ### Private repositories
 
 `private: true` is a flag only — **no token, no credential and no path to one ever
-appears in `targets.yaml`**, which is committed.
+appears in the declaration**, in either format.
 
 The supported path is a **read-only GitHub App**. Creating one on an organisation
 requires **organisation owner** permission; a member cannot do it. If you are not
@@ -374,12 +395,12 @@ account, in which case bootstrap lists the candidates and asks you to pick.
 
 #### 8. Declare the target and run (operator)
 
-Uncomment the private block in `targets.yaml` — the committed file ships it
-commented out so a clone with no App still works — then:
+Add the target with `private: true` to the relevant effort in `efforts.yaml`
+(`efforts.example.yaml` documents the shape), then:
 
 ```sh
 scripts/bootstrap.sh        # mints the token, clones, deletes the token
-scripts/onboard-targets.sh  # registers it with Pretorin like any other target
+scripts/clawctl apply       # registers it with Pretorin like any other target
 ```
 
 Bootstrap mints an installation token scoped to `contents:read` on exactly the
@@ -452,30 +473,51 @@ silently substituting a longer-lived credential.
 
 ## Multiple compliance efforts
 
-`targets.yaml` describes **one** system and framework. One deployment can serve
-several — an **effort** is one system + one framework, with its own targets and
-its own named Pretorin credential. That pairing is Pretorin's own: preflight state
-and the active recipe set are keyed on system + framework, so the same system
-under SOC 2 and under HIPAA is two separate compliance efforts.
+One deployment serves several. An **effort** is one system + one framework, with
+its own targets, its own named Pretorin credential and its own Slack channel. That
+pairing is Pretorin's own: preflight state and the active recipe set are keyed on
+system + framework, so the same system under SOC 2 and under HIPAA is two separate
+compliance efforts.
+
+```text
+One VM
+└── one OpenClaw gateway, one Slack app
+    ├── #soc2   (C0AAA…) → agent crm-soc2   → MCP pretorin-crm-soc2   → SOC 2 scope
+    └── #hipaa  (C0BBB…) → agent crm-hipaa  → MCP pretorin-crm-hipaa  → HIPAA scope
+```
+
+Each agent gets its own workspace, sessions, memory, generated `AGENTS.md`, and a
+repository view containing only its own targets. Every Pretorin MCP server runs
+the **same** persistent CLI binary, so one `pretorin-update` moves the version for
+every agent at once.
 
 Efforts are declared in `efforts.yaml` and driven by one command:
 
 ```sh
-scripts/clawctl migrate --name crm-soc2   # convert targets.yaml; it is NOT modified
+scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 scripts/clawctl credential add hipaa-key  # a per-effort key file, correct mode
 scripts/clawctl validate                  # every effort, one table, one run
-scripts/clawctl plan                      # the exact commands; starts no containers
-scripts/clawctl apply                     # onboard each effort, scope-pinned
+scripts/clawctl plan                      # the whole change; starts no containers
+scripts/clawctl apply                     # onboard, generate, verify, or roll back
+scripts/clawctl dm allow U0123ABCDEF --effort crm-soc2   # optional; DMs are off
 ```
 
 `credential_ref` is a **name**, never a token, so `efforts.yaml` holds no secret.
 `default` resolves to the key this deployment already has, so migrating creates no
 new secret file.
 
-**`targets.yaml` is still what the running deployment reads.** This release adds
-the format, the control command and the per-effort credential mechanism; a later
-one makes `efforts.yaml` authoritative and generates an agent and a Slack channel
-per effort.
+**`efforts.yaml` is the runtime authority.** Once it exists, every target name is
+resolved and scoped through it. `targets.yaml` survives as input to
+`clawctl migrate` and as the legacy fallback: it stays mounted read-only in the
+gateway so a deployment that has not migrated yet still has a working
+`/target-sync`, and it is ignored entirely once `efforts.yaml` is present.
+
+**What separates one effort from another, and what does not.** Each agent's tool
+policy denies every other effort's Pretorin tools, and its instructions state a
+fixed scope and refuse to switch. That is a tool-visibility and prompt boundary,
+not a process or filesystem one — tool execution is unsandboxed and `mcp.servers`
+is gateway-wide. The enforced boundary is the Pretorin key's own server-side
+scopes and the platform's cross-scope write guard.
 
 Full guide, including how to add a second effort, what you choose when you mint
 each token, and the one-key-or-many trade-off:
@@ -496,8 +538,8 @@ scripts/sync-targets.sh simple-crm    # host: one target
 and from Slack, once the gateway is running:
 
 ```
-/claw /target-sync all                # deterministic; bypasses the model
-/claw /target-sync simple-crm
+/compliance-claw /target-sync all                # deterministic; bypasses the model
+/compliance-claw /target-sync simple-crm
 @claw update the simple-crm target    # the target_sync tool, same wrapper
 ```
 
@@ -520,12 +562,13 @@ is, with a message naming the remedy:
 | `detached_refused` | HEAD is not on a branch |
 | `no_upstream_refused` | the branch does not track `origin/<branch>` |
 | `branch_mismatch_refused` | checked out on a branch other than `ref` |
-| `origin_mismatch_refused` | the clone tracks a different remote than `targets.yaml` |
+| `origin_mismatch_refused` | the clone tracks a different remote than `efforts.yaml` declares |
 | `diverged_refused` | local commits the remote lacks, or upstream rewrote history |
 | `missing_clone` | not cloned yet — run `scripts/bootstrap.sh` |
 | `auth_failed` | the remote refused the credential |
-| `invalid_target` | not declared in `targets.yaml`, or a malformed request |
-| `targets_unreadable` | `targets.yaml` could not be parsed — nothing was examined |
+| `invalid_target` | not declared at all, or a malformed request |
+| `out_of_effort` | a real target, but not one this effort declares — ask in that effort's channel |
+| `targets_unreadable` | `efforts.yaml` could not be parsed — nothing was examined |
 | `sync_already_running` | another sync holds the global lock |
 
 A lock left behind by a killed process is reclaimed automatically once its owner
@@ -536,11 +579,15 @@ is never taken — clear that by hand with `rmdir` on the path the message names
 `all` processes targets one at a time, keeps going after a failure, reports every
 target, and exits non-zero if any failed.
 
-**What it cannot do.** Only `all` or the name of a target already declared in
-`targets.yaml` is accepted — no URL, ref, path, flag or shell fragment is
-expressible on any route. Adding, removing, re-pointing or onboarding a target
-stays an operator action on the host: edit `targets.yaml`, then run
-`scripts/bootstrap.sh` and `scripts/onboard-targets.sh`.
+**What it cannot do.** Only `all` or the name of a target declared **for the
+calling agent's own effort** is accepted — no URL, ref, path, flag or shell
+fragment is expressible on any route, and `all` means all of that effort's
+targets, never every repository on the deployment. A target belonging to another
+effort is refused by name. Which effort is calling comes from the OpenClaw agent
+id, which the host resolves from the routed session before the tool runs, so a
+prompt cannot name a different one. Adding, removing, re-pointing or onboarding a
+target stays an operator action on the host: edit `efforts.yaml`, then run
+`scripts/clawctl apply`.
 
 Ordinary synchronization does **not** re-run onboarding and does **not** restart
 the gateway. Source resolvers bind paths rather than commits, and
@@ -575,8 +622,17 @@ the state volume, so a file it can edit is not evidence on its own.
 
 ## Slack
 
-Optional. Leave the three Slack variables empty and Slack is simply not used — the
+Optional. Leave the Slack credentials empty and Slack is simply not used — the
 config is then byte-identical to a Slack-less deployment.
+
+**Two variables, or three, depending on which path you are on.** They are not
+interchangeable, and the container tells you which set it is enforcing:
+
+| | multi-effort (`efforts.yaml` present) | legacy single-effort |
+|---|---|---|
+| required | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID` |
+| which channels are served | each effort's `slack_channel_id`, written by `clawctl apply` | the single `SLACK_CHANNEL_ID` |
+| `SLACK_CHANNEL_ID` if set anyway | **ignored**, and the container says so — one owner per field | it *is* the configuration |
 
 ```
 1. api.slack.com/apps/new -> Create New App -> From a manifest
@@ -584,12 +640,14 @@ config is then byte-identical to a Slack-less deployment.
 2. Basic Information -> App-Level Tokens -> Generate Token and Scopes
    -> add connections:write            -> SLACK_APP_TOKEN   (xapp-...)
 3. Install App -> Install to Workspace -> SLACK_BOT_TOKEN   (xoxb-...)
-4. Invite the bot to ONE channel, right-click it -> Copy link
-   -> the C... at the end of the URL   -> SLACK_CHANNEL_ID  (C...)
-5. Supply the two tokens as secret files (recommended) or in .env (legacy), and
-   SLACK_CHANNEL_ID in .env either way. Then:
+4. Invite the bot to each effort's channel, right-click it -> Copy link
+   -> the C... at the end of the URL -> that effort's slack_channel_id
+      in efforts.yaml (NOT .env: one channel per effort)
+   Everyone in that channel can then run /compliance-claw ... in it, so channel
+   membership is the access control. Only configured channels are served.
+5. Supply the two tokens as secret files (recommended) or in .env (legacy). Then:
      docker compose down -v && scripts/bootstrap.sh
-       && scripts/onboard-targets.sh && docker compose up -d
+       && scripts/clawctl plan && scripts/clawctl apply && docker compose ps
 ```
 
 For a **new** app, import the manifest rather than assembling scopes by hand — that
@@ -602,8 +660,8 @@ reactions, pins, group DMs, `emoji:read` and `usergroups:read`.
 **You do not need to create another one.** Any app with Socket Mode enabled, an
 app-level token carrying `connections:write`, and a bot token works: supply its
 two tokens the same way as any other secret (files on the recommended path, `.env`
-on the legacy one) with `SLACK_CHANNEL_ID` in `.env`, and the rest of this section
-applies unchanged. The manifest is
+on the legacy one), put each effort's channel id in `efforts.yaml`, and the rest of
+this section applies unchanged. The manifest is
 the reproducible path for a *new* app, not a requirement for an existing one.
 
 Two things to know when reusing an older app. It probably carries the broader
@@ -618,14 +676,26 @@ and a message can be answered by whichever Claw happened to receive it.
 The **image** contains the pinned Slack plugin and the logic that generates the
 Slack configuration. It contains **no Slack credentials**, and no channel id.
 
-`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` are deployment-time
-values. On the recommended path the two tokens come from mounted secret files and
-only the non-secret channel ID stays in `.env`; the legacy path puts all three in
-`.env`. None is baked into the image. The tokens are never written into the
-state-volume config; the channel ID is written there as the allowlist key.
+`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are deployment-time values. **How many
+values Slack needs depends on which path you are on:**
 
-- On a **fresh** OpenClaw volume, Slack is configured **automatically** when all
-  three are present — no manual JSON, no plugin editing.
+| | multi-effort (`efforts.yaml` present) | legacy single-effort |
+|---|---|---|
+| credentials | the **two** tokens | the two tokens **and** `SLACK_CHANNEL_ID` |
+| where the channels come from | each effort's `slack_channel_id` in `efforts.yaml`, written into the config by `clawctl apply` | `SLACK_CHANNEL_ID` in `.env`, written by the entrypoint |
+| `SLACK_CHANNEL_ID` in `.env` | **ignored**, and the container says so | required |
+
+On the recommended path the tokens come from mounted secret files rather than
+`.env`; on the legacy path every value is in `.env`. None is baked into the image.
+The tokens are never written into the state-volume config; channel ids are, as the
+allowlist keys.
+
+- On a **fresh** OpenClaw volume, Slack is configured **automatically** once the
+  credentials that path requires are present — the two tokens on the multi-effort
+  path, all three values on the legacy one. No manual JSON, no plugin editing. The
+  multi-effort seed writes the Slack half with an **empty** channel allowlist and
+  `dmPolicy: "disabled"`; `clawctl apply` fills in the channels, so a deployment
+  that never runs it stays closed rather than open.
 - An **existing** config volume is **never overwritten**. Adding the Slack
   variables to a volume that was previously Slack-less does nothing on its own; the
   container detects exactly that and prints the two ways forward — the documented
@@ -695,7 +765,7 @@ It needs a TTY, so run it yourself rather than from a script. Check it took with
 `openclaw models auth list` — but only an actual turn proves it reaches the model:
 
 ```sh
-docker compose exec openclaw openclaw agent --agent main -m "Reply with exactly: OK"
+docker compose exec openclaw openclaw agent --agent <effort-name> -m "Reply with exactly: OK"
 ```
 
 ### Changing the model on an existing deployment
@@ -769,8 +839,8 @@ scripts/pretorin-update.sh --dry-run    # say what would happen; change nothing
 From Slack, either route works and both run the same implementation:
 
 ```
-/claw /pretorin-update latest           deterministic; bypasses the model entirely
-/claw /pretorin-update status
+/compliance-claw /pretorin-update latest           deterministic; bypasses the model entirely
+/compliance-claw /pretorin-update status
 @Compliance Claw update Pretorin        conversational; goes through the model
 ```
 
@@ -837,9 +907,16 @@ agent's write path, which is why the record is written twice.
 
 ## Testing
 
+`smoke.sh` writes to the volumes it runs against, so it requires a **disposable
+Compose project** and refuses the live `compliance-claw` name.
+
 ```sh
-scripts/smoke.sh              # Section A always; Section B if a key authenticates
-scripts/smoke.sh --no-creds   # Section A only — exactly what CI runs
+# Section A always; Section B if a key authenticates.
+COMPOSE_PROJECT_NAME=cc-smoke CC_TEST_PORT=18990 scripts/smoke.sh
+# Section A only — exactly what CI runs.
+COMPOSE_PROJECT_NAME=cc-smoke CC_TEST_PORT=18990 scripts/smoke.sh --no-creds
+COMPOSE_PROJECT_NAME=cc-smoke docker compose down -v   # remove it afterwards
+
 python3 scripts/parse-targets.py --self-test
 bash scripts/sync-targets.sh --self-test   # target sync: rules, outcomes, lock, leak canary
 scripts/pretorin-update.sh --self-test     # CLI updater input rules
@@ -862,7 +939,7 @@ The two `--self-test` gates need no network, no credentials and no containers.
 Slack routes call — so it is evidence about the code that actually runs.
 
 Section A needs no credentials at all: versions, the Pretorin MCP surface, the
-`targets.yaml` parser, the target-sync rules and mount matrix, gateway startup
+the declaration parsers, the target-sync rules and mount matrix, gateway startup
 and the plugin profile, config and
 `AGENTS.md` seeding, mount posture, the stale-template warning, the CWD fix,
 secret containment for every secret class, the private-target refusals, and proof
@@ -917,8 +994,8 @@ does **not** roll the CLI backwards: the volume keeps whatever version it has.
 The CLI moves in exactly one way, `scripts/pretorin-update.sh`.
 
 Re-run
-`scripts/onboard-targets.sh` only after `down -v`, or when `targets.yaml` changes;
-it is idempotent either way.
+`scripts/clawctl apply` only after `down -v`, or when `efforts.yaml` changes; it
+is idempotent either way.
 
 `smoke.sh` also reports this state on its own:
 
@@ -965,8 +1042,9 @@ template-version message says nothing about Slack:
 compliance-claw: WARNING — Slack credentials are supplied but NOT in this volume's config.
 ```
 
-That means all three Slack variables are set and the existing config predates
-them. It names both fixes.
+That means the Slack credentials this deployment requires — both tokens on the
+multi-effort path, all three variables on the legacy one — are set while the
+existing config predates them. It names both fixes.
 
 ## Resetting
 
@@ -980,7 +1058,7 @@ Pretorin state volume (active context, preflight resolvers, active recipe set). 
 does **not** touch the bind-mounted target repositories under `workspace/targets`,
 and it does not touch `.env`.
 
-Recovery is re-running `scripts/bootstrap.sh` and `scripts/onboard-targets.sh`;
+Recovery is re-running `scripts/bootstrap.sh` and `scripts/clawctl apply`;
 both are idempotent. `docker compose down` without `-v` keeps everything.
 
 ## Troubleshooting
@@ -993,26 +1071,30 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | Gateway exits 78 `Missing config` | Config was never seeded | `docker compose down -v` then bootstrap |
 | Slack never connects | Credentials added after the first `up` | Look for the Slack-specific warning; `down -v` and re-bootstrap |
 | Slack connects, bot never answers | Channel **name** instead of ID, or bot not invited | Use the `C...` ID; invite the bot; mention it explicitly |
-| `Slack is only partially configured` | 1 or 2 of the 3 variables set | All three are required together |
-| `SLACK_CHANNEL_ID is not a Slack channel id` | A name or a URL was used | Right-click channel → Copy link → the `C...` value |
+| `Slack is only partially configured` (multi-effort) | one of the **two** tokens set | Both tokens are required together; the channels come from `efforts.yaml` |
+| `Slack is only partially configured` (legacy) | 1 or 2 of the **three** variables set | All three are required together |
+| `SLACK_CHANNEL_ID is set but IGNORED` | `.env` still carries it while `efforts.yaml` exists | Remove it from `.env`; `clawctl apply` owns the channel allowlist |
+| `slack_channel_id ... is not a Slack channel id` | A name or a URL was used in `efforts.yaml` | Right-click channel → Copy link → the `C...` value |
+| `slack_channel_id ... is a DM conversation id` | A `D...` id was used as an effort's home | Use the channel's `C...` id; DMs are `clawctl dm allow` |
+| `slack_channel_id ... is a legacy G id` | A `G...` id is ambiguous (private channel vs MPIM) | Use the channel's `C...` id |
 | `GITHUB_APP_ID is not set` on a private target | No App configured | Follow "Private repositories", or drop `private: true` |
-| `/target-sync` says `missing_clone` | The target was added to `targets.yaml` but never cloned | `scripts/bootstrap.sh` on the host — sync never clones |
+| `/target-sync` says `missing_clone` | The target was added to `efforts.yaml` but never cloned | `scripts/clawctl apply` on the host — sync never clones |
 | `/target-sync` says `dirty_refused` | Something wrote into the clone | `git -C workspace/targets/<name> status`; resolve it yourself, sync will not |
 | `/target-sync` says `diverged_refused` | Upstream force-pushed, or the clone has local commits | `git -C workspace/targets/<name> log --oneline <branch> ^origin/<branch>` |
 | `/target-sync` says `auth_failed` on a private target | No usable credential in the container | Put a fine-grained PAT in `secrets/runtime/github-readonly-pat` and use `compose.secrets.yaml` |
 | `up` fails with `bind source path does not exist: …/github-readonly-pat` | Upgraded without creating the new secret file | `scripts/init-file-secrets.sh` — or use `scripts/update.sh`, which does it before stopping anything |
 | `the GitHub App installation does not include:` | App not installed on that repo | Add it on the linked installation page |
 | `exists but is not the root of a git repository` | Interrupted clone | Inspect, then `rm -rf` that directory yourself and re-run |
-| `tracks a different remote` | `targets.yaml` URL changed | Fix the URL, or move the directory aside |
+| `tracks a different remote` | the declared URL changed | Fix the URL, or move the directory aside |
 | `code_repository` is `degraded` | Expected | Needs a platform Connected Source; future work |
 | `Missing required scopes: write` | Read-only key, write tool | Correct behaviour — see "Read-only vs write-enabled" |
 | `Scope is not approved with a confirmed scale yet` | Platform prerequisite | Approve scope setup on platform.pretorin.com |
-| Agent answers with no sources bound | Framework switched in chat | One scope per deployment; re-run onboarding for another |
+| Agent answers with no sources bound | Wrong channel for the effort | Each agent serves one effort and refuses to switch; ask in that effort's own channel |
 | `plugins list` shows 10 plugins instead of 3 | Slack not configured | Expected; the two profiles are documented above |
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
 | Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`. `--status` confirms which binary is active |
-| `/claw /pretorin-update` does nothing in Slack | `channels.slack.slashCommand` missing from an existing config | Never-clobber: the container warns. Re-seed, or set it by hand |
+| `/compliance-claw /pretorin-update` does nothing in Slack | `channels.slack.slashCommand` missing from an existing config | Never-clobber: the container warns. Re-seed, or set it by hand |
 
 Logs and state:
 
@@ -1020,7 +1102,8 @@ Logs and state:
 docker compose logs -f openclaw
 docker compose run --rm cli openclaw doctor
 docker compose run --rm cli openclaw plugins inspect slack
-scripts/onboard-targets.sh --verify-only
+scripts/clawctl validate                 # the efforts, credentials and channels
+scripts/onboard-targets.sh --verify-only # LEGACY single-effort deployments only
 ```
 
 ## Releasing

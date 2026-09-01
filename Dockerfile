@@ -188,7 +188,8 @@ ENV OPENAI_REQUEST_ADAPTER="openai-chatgpt-responses"
 #   /var/lib/compliance-claw/targets   the WRITABLE maintenance alias of the same
 #                                      host directory /workspace/targets exposes
 #                                      read-only. Gateway service only.
-#   /etc/compliance-claw               where targets.yaml is mounted read-only.
+#   /etc/compliance-claw               where efforts.yaml is mounted read-only
+#                                     (targets.yaml on legacy deployments).
 #                                      NOT under /opt/compliance-claw, because the
 #                                      `pretorin mcp-serve` child's cwd sentinel
 #                                      lives there and Pretorin derives host-local
@@ -215,9 +216,10 @@ RUN install -d -o node -g node /opt/compliance-claw/no-repo \
       'directory must contain nothing that looks like a repository or a document' \
       'set. Do not add files here, and do not point it at a real repository.' \
       '' \
-      'Repositories under review are declared in targets.yaml, bind-mounted' \
-      'read-only at /workspace/targets, and bound explicitly by' \
-      'scripts/onboard-targets.sh.' \
+      'Repositories under review are declared per effort in efforts.yaml,' \
+      'bind-mounted read-only at /workspace/targets, and bound to a Pretorin' \
+      'scope by scripts/clawctl apply. (Legacy single-effort deployments' \
+      'declare them in targets.yaml and bind with onboard-targets.sh.)' \
       > /opt/compliance-claw/no-repo/README-DO-NOT-ADD-FILES.txt \
  && chown node:node /opt/compliance-claw/no-repo/README-DO-NOT-ADD-FILES.txt
 
@@ -266,9 +268,11 @@ COPY --chown=node:node plugins/pretorin-update /opt/compliance-claw/plugins/pret
 #                        input rules, the global lock, the credential handling and
 #                        the audit trail exist once rather than twice.
 #   parse-targets.py     the wrapper validates a requested name against the
-#                        MOUNTED targets.yaml rather than re-parsing YAML in bash,
-#                        so this is needed in the image too. Same parser, same
-#                        rules, same self-test as the host uses.
+#                        MOUNTED declaration file rather than re-parsing YAML in
+#                        bash. parse-efforts.py (copied above) reads efforts.yaml
+#                        and scopes the name to one effort; this one reads the
+#                        legacy targets.yaml. Same rules, same self-tests as the
+#                        host uses.
 #   plugins/target-sync  one command (/target-sync, which bypasses the LLM) and
 #                        one narrowly typed agent tool, both calling the wrapper.
 #

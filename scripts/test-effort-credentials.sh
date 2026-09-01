@@ -70,6 +70,7 @@ efforts:
     system_id: 11111111-1111-4111-8111-111111111111
     framework_id: hipaa
     credential_ref: hipaa-key
+    slack_channel_id: C0CRED001
     targets:
       - name: t
         url: https://example.com/t.git
@@ -77,6 +78,7 @@ efforts:
     system_id: 22222222-2222-4222-8222-222222222222
     framework_id: soc2
     credential_ref: default
+    slack_channel_id: C0CRED002
     targets:
       - name: t
         url: https://example.com/t.git
@@ -84,6 +86,7 @@ efforts:
     system_id: 33333333-3333-4333-8333-333333333333
     framework_id: cmmc
     credential_ref: no-such-key
+    slack_channel_id: C0CRED003
     targets:
       - name: t
         url: https://example.com/t.git
@@ -91,6 +94,7 @@ efforts:
     system_id: 44444444-4444-4444-8444-444444444444
     framework_id: soc2
     credential_ref: empty-key
+    slack_channel_id: C0CRED004
     targets:
       - name: t
         url: https://example.com/t.git

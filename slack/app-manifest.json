@@ -28,9 +28,9 @@
     "socket_mode_enabled means the gateway dials OUT to slack.com. There is no",
     "request_url and no public endpoint, so the gateway port stays loopback-only.",
     "",
-    "The /claw slash command is enabled by channels.slack.slashCommand in",
+    "The /compliance-claw slash command is enabled by channels.slack.slashCommand in",
     "scripts/slack-channel.patch.json5, which wraps gateway commands:",
-    "  /claw /pretorin-update latest",
+    "  /compliance-claw /pretorin-update latest",
     "The `commands` bot scope below is already granted, so enabling it needs NO",
     "re-import of this manifest. (channels.slack.commands.native is a DIFFERENT",
     "mechanism - one native Slack command per gateway command - and stays off.)",
@@ -71,7 +71,7 @@
     },
     "slash_commands": [
       {
-        "command": "/claw",
+        "command": "/compliance-claw",
         "description": "Send a message to Compliance Claw",
         "should_escape": false
       }

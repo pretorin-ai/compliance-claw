@@ -1,7 +1,7 @@
 {
   "id": "target-sync",
   "name": "Review Target Synchronizer",
-  "description": "Fast-forward the review target repositories declared in targets.yaml, from Slack or a conversation.",
+  "description": "Fast-forward the review target repositories declared for this effort, from Slack or a conversation.",
   "version": "1.0.0",
 
   // TRUE, and it matters. With false the gateway reads this manifest and then
@@ -33,7 +33,7 @@
   },
 
   // Required field. Empty and closed: this plugin takes no configuration — WHICH
-  // repositories exist is targets.yaml's business and nothing else's, and
+  // repositories exist is efforts.yaml's business and nothing else's, and
   // additionalProperties:false means a stray plugins.entries key is rejected at
   // config-read time rather than ignored at runtime.
   "configSchema": {

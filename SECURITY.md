@@ -78,9 +78,15 @@ What containment does exist is real but partial, and is not a substitute:
 | `dmPolicy: "disabled"` | No DMs at all — no unattributed private sessions |
 | `groupPolicy: "allowlist"` + one channel ID | Only the channel you named is served |
 | `requireMention: true` | The agent answers only when explicitly addressed |
+| `users: ["*"]` per channel | Slash commands are authorized by **membership of that configured channel** — the channel is the trust boundary, not an individual allowlist. Anyone who can post in a served channel can run its commands |
 | `configWrites: false` | Slack traffic cannot rewrite the gateway config |
 | Socket Mode | Outbound only; no inbound port, no public URL |
 | Minimal manifest | 12 bot scopes instead of the recommended 23 |
+
+`users: ["*"]` is worth reading twice: it does **not** widen which channels are
+served — `groupPolicy: "allowlist"` still admits only the channels generated from
+`efforts.yaml`, and DMs stay disabled. It means that within an admitted channel,
+every member may run `/compliance-claw ...`. Control who is in the channel.
 
 One honest gap in that table: the manifest grants `im:history`, `im:read` and
 `im:write` because they are part of upstream's supported minimal scope set, while
@@ -184,7 +190,7 @@ and the image is still unsigned with its digest as the integrity control.
 ### The local plugins are audited paths, not security boundaries
 
 Two plugins expose one fixed action each, by two routes each. The command routes
-(`/claw /pretorin-update`, `/claw /target-sync`) bypass the model entirely and
+(`/compliance-claw /pretorin-update`, `/compliance-claw /target-sync`) bypass the model entirely and
 cannot be reached by a prompt-injected agent. The tool routes can be,
 deliberately, in this trusted-repository pilot, and each has a bounded blast
 radius:
@@ -192,11 +198,14 @@ radius:
 - `pretorin_update` — *which signed Pretorin version installs*. No command, path
   or URL is expressible.
 - `target_sync` — *which already-declared target fast-forwards*. Only `all` or a
-  name present in the mounted `targets.yaml` is accepted; no URL, ref, path, flag
-  or shell fragment is expressible; nothing can add, remove, re-point or onboard
-  a target; and the operation itself is fast-forward-only, so it cannot reset,
-  discard local changes, switch branches or delete anything. A target that cannot
-  move safely is reported and left alone.
+  name declared for **the calling agent's own effort** in the mounted
+  `efforts.yaml` is accepted; no URL, ref, path, flag or shell fragment is
+  expressible; nothing can add, remove, re-point or onboard a target; and the
+  operation itself is fast-forward-only, so it cannot reset, discard local
+  changes, switch branches or delete anything. A target that cannot move safely
+  is reported and left alone. Which effort is calling comes from the OpenClaw
+  agent id, which the host resolves from the routed session before the tool runs
+  — it is not a parameter, so a prompt cannot name a different effort.
 
 The writable maintenance mount that synchronization needs is on the gateway
 service only, at a path distinct from the read-only assessment mount. **That is
@@ -211,6 +220,40 @@ rewrite the audit file afterwards. What the updater provides is a *narrow,
 identity-bearing, audited path for the supported routes* — and it adds no
 LLM-reachable capability that `exec` did not already provide. Closing that gap is
 ledger item 4.
+
+### Separating one effort from another — say it plainly
+
+One deployment now serves several compliance efforts, each with its own Slack
+channel, OpenClaw agent, workspace, sessions, memory and Pretorin MCP server.
+**That separation is a tool-visibility and prompt boundary, not an enforced
+one**, and the generated instructions tell each agent to say so rather than imply
+otherwise.
+
+What it actually consists of:
+
+- Each agent's tool policy **denies** every other effort's Pretorin MCP tool
+  prefix, so another effort's tools are not in its catalogue and a call to one is
+  refused. This is real and is enforced by OpenClaw, but `mcp.servers` is
+  **gateway-wide**: the isolation is in the policy, not in the process.
+- Each agent's workspace holds a `targets/` view of only its own repositories.
+  Tool execution is unsandboxed and runs as the same uid, so an absolute path
+  still reaches another effort's clone. The view is a scoping aid.
+- Each Pretorin MCP child is started by a launcher that pins
+  `PRETORIN_SYSTEM_ID` / `PRETORIN_FRAMEWORK_ID` from the read-only mounted
+  `efforts.yaml` and loads that effort's own credential file. It fails closed
+  rather than inheriting the container-wide key.
+
+**The enforced boundary is the Pretorin API key.** Its server-side scopes, and
+the platform's cross-scope write guard reading the pinned environment, are what
+actually stop one effort's agent writing into another's scope. A single
+organization-wide key therefore still permits cross-system *reads*; a key per
+system is the operator's option for hard platform isolation, and `credential_ref`
+exists to make that a per-effort choice.
+
+**Slack authorization is per channel, not per user.** Every member of an effort's
+channel has that effort's full authority, and an authorized DM has the authority
+of the one effort it is bound to. Keep channel membership to the people who
+should be able to act in that compliance scope.
 
 ## What the POC does NOT protect against
 
@@ -232,9 +275,10 @@ ledger item 4.
   writable maintenance mount are both reachable by a prompt-injected agent.
 - **Any Slack channel member.** Everyone in the allowlisted channel has the same
   authority. There is no per-user policy and no attribution.
-- **A hostile operator.** Anyone who can edit `.env`, `targets.yaml` or the state
+- **A hostile operator.** Anyone who can edit `.env`, `efforts.yaml` or the state
   volume controls the deployment. There is no separation of duties.
-- **Multi-tenancy of any kind.** One key, one scope, one channel, one operator.
+- **Multi-tenancy of any kind.** Several efforts now share one gateway, one
+  container and one uid. See the boundary statement below.
 - **Prompt injection.** Content in a reviewed repository reaches the model. A
   crafted file can influence what the agent says and which tools it calls. The
   read-only key is what bounds the damage, which is the main reason it is the

@@ -63,8 +63,15 @@ const EXIT_BUSY = 3;
  * it. The gateway's own environment holds PRETORIN_API_KEY and a model provider
  * key, and none of that has any business being visible to git, to a credential
  * helper, or to anything a reviewed repository could influence.
+ *
+ * CC_EFFORT IS WHAT SCOPES THE REQUEST, and it is on this list for the same
+ * reason the requester is: it comes from the HOST. The agent id is resolved by
+ * OpenClaw from the routed session before the handler or the tool factory ever
+ * runs, so a model cannot name a different effort than the channel it is
+ * answering in — the most it can do is name a target, which the wrapper then
+ * refuses because it is not in this effort's list.
  */
-function runWrapper(arg, { requester, route }) {
+function runWrapper(arg, { requester, route, effort, channel }) {
   return new Promise((resolve) => {
     const args = arg === undefined || arg === null || arg === "" ? [] : [String(arg)];
     let child;
@@ -84,6 +91,11 @@ function runWrapper(arg, { requester, route }) {
           HOME: "/home/node",
           CC_SYNC_REQUESTER: requester || "unavailable",
           CC_SYNC_ROUTE: route || "unknown",
+          // Empty means "no effort in scope", which the wrapper reads as the
+          // whole declared set. That is only reachable from the host CLI; every
+          // route through this plugin carries an agent id.
+          CC_EFFORT: effort || "",
+          CC_SLACK_CHANNEL: channel || "",
         },
       });
     } catch (err) {
@@ -274,8 +286,8 @@ async function deliver(api, target, text) {
 }
 
 /** Shared by both routes so they cannot drift in what they promise. */
-async function performSync(api, { arg, requester, route, target }) {
-  const res = await runWrapper(arg, { requester, route });
+async function performSync(api, { arg, requester, route, target, effort, channel }) {
+  const res = await runWrapper(arg, { requester, route, effort, channel });
   const text = report(res);
   if (target) await deliver(api, target, text);
   return text;
@@ -283,13 +295,14 @@ async function performSync(api, { arg, requester, route, target }) {
 
 const USAGE =
   "Usage: `/target-sync all` | `/target-sync <target-name>`\n" +
-  "Fast-forwards repositories already declared in targets.yaml. It never adds, " +
-  "removes or re-points a target, and never discards local changes.";
+  "Fast-forwards the repositories declared for this channel's effort. `all` means " +
+  "all of them. It never adds, removes or re-points a target, and never discards " +
+  "local changes.";
 
 export default {
   id: "target-sync",
   name: "Review Target Synchronizer",
-  description: "Fast-forward the review target repositories declared in targets.yaml.",
+  description: "Fast-forward the review target repositories declared for this effort.",
 
   // MUST be synchronous. The loader rejects a promise-returning register with
   // "plugin register must be synchronous".
@@ -309,10 +322,13 @@ export default {
             "`/target-sync all` and `/target-sync <name>` are operator commands that " +
             "bypass the model; the target_sync tool does the same thing " +
             "conversationally, so a request like \"update the simple-crm target\" " +
-            "should call it. Only repositories already declared in targets.yaml can " +
-            "be synchronized — adding one is an operator action on the host, so say " +
-            "so rather than attempting it. Never claim a target moved unless the tool " +
-            "reported the outcome 'updated', and quote the commit SHAs it returned.",
+            "should call it. Only repositories declared for THIS effort can be " +
+            "synchronized, and `all` means all of this effort's targets — a target " +
+            "belonging to another effort is refused, and the answer is to ask in that " +
+            "effort's channel rather than to retry. Adding a target is an operator " +
+            "action on the host, so say so rather than attempting it. Never claim a " +
+            "target moved unless the tool reported the outcome 'updated', and quote " +
+            "the commit SHAs it returned.",
           surfaces: ["openclaw_main"],
         },
       ],
@@ -334,7 +350,13 @@ export default {
         // Ack now, work later. A blocking handler would hold the plugin command
         // registry lock for the whole fetch, which would also block the command
         // an operator reaches for when a sync looks stuck.
-        void performSync(api, { arg, requester, route: "command", target }).catch(() => {});
+        // ctx.agentId is populated by core from the routed session, alongside the
+        // sender identity it already gates on. Neither is expressible in the
+        // command's arguments.
+        void performSync(api, {
+          arg, requester, route: "command", target,
+          effort: ctx.agentId, channel: ctx.channelId,
+        }).catch(() => {});
 
         const what = arg === "all" ? "every declared target" : `target '${arg}'`;
         return {
@@ -355,12 +377,13 @@ export default {
         name: "target_sync",
         label: "Synchronize review targets",
         description:
-          "Bring review target repositories under /workspace/targets up to date with " +
-          "their remotes, fast-forward only. Accepts 'all', or the name of a single " +
-          "target already declared in targets.yaml. It cannot add, remove, re-point or " +
-          "onboard a target, cannot switch branches, and cannot discard local changes: " +
-          "a target that cannot fast-forward safely is reported and left alone. " +
-          "Nothing else is configurable.",
+          "Bring this effort's review target repositories under /workspace/targets up " +
+          "to date with their remotes, fast-forward only. Accepts 'all' — meaning all " +
+          "of THIS effort's targets — or the name of a single target declared for this " +
+          "effort. A target belonging to a different effort is refused. It cannot add, " +
+          "remove, re-point or onboard a target, cannot switch branches, and cannot " +
+          "discard local changes: a target that cannot fast-forward safely is reported " +
+          "and left alone. Nothing else is configurable.",
         parameters: {
           type: "object",
           additionalProperties: false,
@@ -369,9 +392,9 @@ export default {
             target: {
               type: "string",
               description:
-                "'all' for every declared target, or the exact name of one target from " +
-                "targets.yaml (for example 'simple-crm'). Not a URL, not a branch, not a " +
-                "path — any other value is refused.",
+                "'all' for every target declared for this effort, or the exact name of " +
+                "one of them (for example 'simple-crm'). Not a URL, not a branch, not a " +
+                "path — any other value is refused, as is a target from another effort.",
             },
           },
         },
@@ -397,6 +420,12 @@ export default {
             requester,
             route: "tool",
             target: target.channel ? target : null,
+            // Closed over from the FACTORY context, which the host populates by
+            // resolving the agent from the session key. The per-call context
+            // carries no identity at all, so this is the only place it can come
+            // from — and that is exactly why the model cannot influence it.
+            effort: toolContext?.agentId,
+            channel: delivery.to ?? toolContext?.currentChannelId,
           });
           return { content: [{ type: "text", text }] };
         },

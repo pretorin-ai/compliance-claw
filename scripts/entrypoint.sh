@@ -35,6 +35,9 @@ SLACK_PATCH="${TEMPLATES}/slack-channel.patch.json5"
 # node startup, which matters because this script runs for every `cli`
 # invocation too, of which scripts/smoke.sh makes dozens.
 SLACK_MARKER="/opt/compliance-claw/plugins/slack"
+# The effort declarations, mounted read-only by compose.efforts.yaml. Its presence
+# is how this script knows whether `clawctl` owns the Slack channel allowlist.
+EFFORTS_FILE="/etc/compliance-claw/efforts.yaml"
 
 # --- The Pretorin CLI: an immutable seed, and the one active copy ----------
 #
@@ -120,9 +123,9 @@ unset secret_name
 # load time, so this is a per-container decision made fresh on every start rather
 # than a value baked into the volume.
 #
-# WHY NOT DECIDE IT WHEN SEEDING. The documented order runs onboard-targets.sh
-# before `up`, which seeds the config from the `cli` service — and `cli` is
-# deliberately not given a model key. A seed-time choice was therefore made by a
+# WHY NOT DECIDE IT WHEN SEEDING. The documented order runs `clawctl apply`
+# before a gateway exists, which seeds the config from the `cli` service — and
+# `cli` is deliberately not given a model key. A seed-time choice was therefore made by a
 # container that could not see the credential, and never-clobber locked the wrong
 # answer in for good. Per-process resolution removes the dependency instead of
 # moving the secret.
@@ -263,9 +266,38 @@ fi
 # written to a file, and never placed in the config. OpenClaw picks them up from
 # the environment on its own.
 SLACK_CHANNEL_ID="$(printf '%s' "${SLACK_CHANNEL_ID:-}" | tr -d '[:space:]')"
+
+# WHO OWNS THE CHANNEL ALLOWLIST.
+#
+# With efforts.yaml present, `scripts/clawctl apply` owns channels.slack.channels
+# — it generates one entry per effort from the same list it generates the
+# bindings from, so the two cannot drift. This script then seeds the Slack HALF
+# that clawctl does not own (socket mode, the plugin allowlist, dmPolicy,
+# slashCommand, groupPolicy) with an EMPTY channel map and no allowFrom.
+#
+# Empty plus groupPolicy "allowlist" means no channel is served and no DM is
+# admitted until `apply` runs. That is the right fail-closed default: a
+# deployment that has been started but not applied should answer nowhere, rather
+# than answering in whichever channel happened to be in .env.
+#
+# SLACK_CHANNEL_ID therefore becomes OPTIONAL here, and is ignored when it is set:
+# one owner per field, and .env is not it.
+SLACK_EFFORTS_OWNED=0
+if [ -r "$EFFORTS_FILE" ]; then
+  SLACK_EFFORTS_OWNED=1
+  if [ -n "$SLACK_CHANNEL_ID" ]; then
+    echo "compliance-claw: SLACK_CHANNEL_ID is set but IGNORED — efforts.yaml is present," >&2
+    echo "  so 'scripts/clawctl apply' owns the Slack channel allowlist. Remove it from" >&2
+    echo "  .env to avoid the impression that it configures anything." >&2
+  fi
+  SLACK_CHANNEL_ID=""
+fi
+
 SLACK_PRESENT=0
 SLACK_MISSING=""
-for v in SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_CHANNEL_ID; do
+SLACK_REQUIRED="SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_CHANNEL_ID"
+[ "$SLACK_EFFORTS_OWNED" = 1 ] && SLACK_REQUIRED="SLACK_BOT_TOKEN SLACK_APP_TOKEN"
+for v in $SLACK_REQUIRED; do
   eval "val=\${${v}:-}"
   if [ -n "$val" ]; then
     SLACK_PRESENT=$((SLACK_PRESENT + 1))
@@ -274,12 +306,37 @@ for v in SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_CHANNEL_ID; do
   fi
 done
 unset val
-# 3 = configured, 1-2 = partially configured (warn), 0 = Slack not in use (silent).
+# All present = configured, some = partially configured (warn), none = Slack not
+# in use (silent). The count depends on whether the channel id is still required.
 SLACK_SET=0
-[ "$SLACK_PRESENT" = 3 ] && SLACK_SET=1
+SLACK_NEEDED=3
+[ "$SLACK_EFFORTS_OWNED" = 1 ] && SLACK_NEEDED=2
+[ "$SLACK_PRESENT" = "$SLACK_NEEDED" ] && SLACK_SET=1
 
 # Seeds Slack into a freshly written config. Never called on an existing one.
 seed_slack() {
+  # WITH efforts.yaml, THERE IS NO CHANNEL TO INTERPOLATE. The placeholder is
+  # replaced by nothing, leaving `channels: {}` — an empty allowlist that
+  # `clawctl apply` then fills from efforts.yaml. Nothing operator-supplied
+  # reaches the patch text on this path at all, so the validation below has
+  # nothing to validate and is skipped rather than fed an empty string.
+  if [ "$SLACK_EFFORTS_OWNED" = 1 ]; then
+    RENDERED="$(mktemp "${TMPDIR:-/tmp}/slack-patch.XXXXXX")"
+    # Drop the whole placeholder LINE, so the map is `{}` rather than a map with
+    # an empty key — which is a real key and would be a routing rule for a
+    # channel named "".
+    grep -v '@SLACK_CHANNEL_ID@' "$SLACK_PATCH" > "$RENDERED"
+    if grep -q '@SLACK_CHANNEL_ID@' "$RENDERED"; then
+      echo "compliance-claw: ERROR — the Slack patch still holds a placeholder." >&2
+      rm -f "$RENDERED"
+      return 1
+    fi
+    seed_slack_apply "$RENDERED" || return 1
+    echo "compliance-claw: Slack configured (socket mode, DMs disabled, NO channels yet —" >&2
+    echo "  run 'scripts/clawctl apply' to admit each effort's channel)" >&2
+    return 0
+  fi
+
   # The channel id becomes a JSON KEY, which is why it cannot be a ${VAR}
   # substitution and has to be interpolated by hand. Validate before
   # interpolating: this is the only operator-supplied value in this script that
@@ -317,6 +374,15 @@ seed_slack() {
     return 1
   fi
 
+  seed_slack_apply "$RENDERED" || return 1
+  echo "compliance-claw: Slack configured (socket mode, channel ${SLACK_CHANNEL_ID}, mention-only, DMs disabled)" >&2
+  return 0
+}
+
+# The half both paths share: validate, apply, prove it landed. Takes the rendered
+# patch and always removes it.
+seed_slack_apply() {
+  local rendered="$1"
   # Gate two. --dry-run validates the merged result against OpenClaw's own config
   # schema and exits non-zero on anything it does not accept, so a value that
   # survived the character check but still produces an invalid config is refused
@@ -325,18 +391,18 @@ seed_slack() {
   # stdout is redirected to stderr throughout: `openclaw config patch` prints
   # boxed status output, and this script also runs for the `cli` service, where
   # anything on stdout corrupts `openclaw ... --json` for the caller.
-  if ! openclaw config patch --file "$RENDERED" --dry-run >&2 2>&1; then
+  if ! openclaw config patch --file "$rendered" --dry-run >&2 2>&1; then
     echo "compliance-claw: ERROR — the Slack config patch failed validation." >&2
     echo "  ${CONFIG} was seeded WITHOUT Slack and was not modified further." >&2
-    rm -f "$RENDERED"
+    rm -f "$rendered"
     return 1
   fi
-  if ! openclaw config patch --file "$RENDERED" >&2 2>&1; then
+  if ! openclaw config patch --file "$rendered" >&2 2>&1; then
     echo "compliance-claw: ERROR — applying the Slack config patch failed." >&2
-    rm -f "$RENDERED"
+    rm -f "$rendered"
     return 1
   fi
-  rm -f "$RENDERED"
+  rm -f "$rendered"
 
   # Assert rather than assume. A patch that reports success but leaves no trace
   # would reproduce exactly the silent no-Slack failure this phase exists to
@@ -346,7 +412,6 @@ seed_slack() {
     echo "  reference ${SLACK_MARKER}. Refusing to report success." >&2
     return 1
   fi
-  echo "compliance-claw: Slack configured (socket mode, channel ${SLACK_CHANNEL_ID}, mention-only, DMs disabled)" >&2
   return 0
 }
 
@@ -388,7 +453,7 @@ if [ -e "$CONFIG" ]; then
     echo "                             # AND all Pretorin onboarding state (active" >&2
     echo "                             # context, preflight resolvers, active recipes)." >&2
     echo "                             # Bind-mounted target repos are NOT touched." >&2
-    echo "    scripts/bootstrap.sh && scripts/onboard-targets.sh   # both idempotent" >&2
+    echo "    scripts/bootstrap.sh && scripts/clawctl apply        # both idempotent" >&2
     echo "  After merging the template by hand: echo ${SHIPPED} > ${STAMP}" >&2
   fi
 
@@ -406,12 +471,19 @@ if [ -e "$CONFIG" ]; then
     echo "  and does not load the Slack plugin, so the agent will never appear in Slack." >&2
     echo "  Nothing was overwritten. Two ways forward:" >&2
     echo "    1. Reset (destroys BOTH volumes, keeps workspace/targets):" >&2
-    echo "         docker compose down -v && scripts/bootstrap.sh && scripts/onboard-targets.sh" >&2
+    echo "         docker compose down -v && scripts/bootstrap.sh && scripts/clawctl apply" >&2
     echo "    2. Apply the Slack patch to the existing config by hand:" >&2
-    echo "         docker compose run --rm cli bash -c \\" >&2
-    echo "           'sed \"s|@SLACK_CHANNEL_ID@|\$SLACK_CHANNEL_ID|\" ${SLACK_PATCH} > /tmp/p.json5 \\" >&2
-    echo "            && openclaw config patch --file /tmp/p.json5'" >&2
-    echo "       then restart the gateway: docker compose restart openclaw" >&2
+    if [ "$SLACK_EFFORTS_OWNED" = 1 ]; then
+      echo "         docker compose run --rm cli bash -c \\" >&2
+      echo "           'grep -v @SLACK_CHANNEL_ID@ ${SLACK_PATCH} > /tmp/p.json5 \\" >&2
+      echo "            && openclaw config patch --file /tmp/p.json5'" >&2
+      echo "       then admit each effort's channel:  scripts/clawctl apply" >&2
+    else
+      echo "         docker compose run --rm cli bash -c \\" >&2
+      echo "           'sed \"s|@SLACK_CHANNEL_ID@|\$SLACK_CHANNEL_ID|\" ${SLACK_PATCH} > /tmp/p.json5 \\" >&2
+      echo "            && openclaw config patch --file /tmp/p.json5'" >&2
+      echo "       then restart the gateway: docker compose restart openclaw" >&2
+    fi
   fi
 
   # A third drift case, and the worst-behaved of the three: an existing config
@@ -466,8 +538,15 @@ else
     # here would leave the operator debugging a bot that never speaks.
     echo "compliance-claw: WARNING — Slack is only partially configured; it was NOT enabled." >&2
     echo "  Missing:${SLACK_MISSING}" >&2
-    echo "  All three of SLACK_BOT_TOKEN, SLACK_APP_TOKEN and SLACK_CHANNEL_ID are" >&2
-    echo "  required together. See .env.example or docs/file-secrets.md." >&2
+    if [ "$SLACK_EFFORTS_OWNED" = 1 ]; then
+      echo "  Both SLACK_BOT_TOKEN and SLACK_APP_TOKEN are required together." >&2
+      echo "  (SLACK_CHANNEL_ID is NOT one of them any more: which channels are served" >&2
+      echo "   comes from each effort's slack_channel_id in efforts.yaml.)" >&2
+    else
+      echo "  All three of SLACK_BOT_TOKEN, SLACK_APP_TOKEN and SLACK_CHANNEL_ID are" >&2
+      echo "  required together." >&2
+    fi
+    echo "  See .env.example or docs/file-secrets.md." >&2
     echo "  Fix the selected secret source, then reset the config: docker compose down -v" >&2
   fi
 
@@ -481,11 +560,24 @@ fi
 # 0700 matches the mode OpenClaw itself uses for the workspace, so a seeded
 # workspace is indistinguishable from a bootstrapped one.
 install -d -m 0700 "$WORKSPACE"
+
+# AGENTS.md IS NO LONGER SEEDED HERE, and that is the multi-effort change.
+#
+# There is no longer one agent to write instructions for. `scripts/clawctl apply`
+# generates one per effort, into that effort's own workspace, from
+# scripts/agents-md.template — filling in the effort's system, framework, Slack
+# channel, repositories and MCP tool prefix. Seeding the raw template into the
+# DEFAULT workspace would install a file full of unsubstituted @PLACEHOLDERS@ and
+# claim a scope no agent actually has.
+#
+# So between `up` and the first `apply`, this workspace has no AGENTS.md. That is
+# correct rather than missing: at that point no effort is wired up, no Slack
+# channel is admitted, and there is nothing for an agent to be told.
 if [ -e "${WORKSPACE}/AGENTS.md" ]; then
   echo "compliance-claw: ${WORKSPACE}/AGENTS.md exists, keeping it" >&2
-else
-  echo "compliance-claw: seeding ${WORKSPACE}/AGENTS.md" >&2
-  install -m 0600 "${TEMPLATES}/agents-md.template" "${WORKSPACE}/AGENTS.md"
+elif [ "$IS_GATEWAY" = 1 ]; then
+  echo "compliance-claw: no AGENTS.md here; per-effort instructions are written by" >&2
+  echo "  'scripts/clawctl apply' into each effort's own workspace." >&2
 fi
 
 # The base image's entrypoint, restated. `exec` matters: without it tini would

@@ -2,7 +2,8 @@
 #
 #   docker login ghcr.io                      # the package is not public
 #   scripts/bootstrap.sh                      # .env, clone targets, PULL the image
-#   scripts/onboard-targets.sh                # register targets with Pretorin
+#   scripts/clawctl migrate                   # targets.yaml -> efforts.yaml (once)
+#   scripts/clawctl apply                     # agents, bindings, Pretorin binding
 #   docker compose up -d                      # gateway on http://127.0.0.1:18789
 #   docker compose run --rm cli pretorin version
 #
@@ -36,7 +37,8 @@
 # (config, sessions, agent workspace, custom AGENTS.md) AND the Pretorin state
 # volume (active context, preflight resolvers, active recipe set). It does NOT
 # touch the bind-mounted target repositories under workspace/targets. Recovery is
-# re-running bootstrap.sh and onboard-targets.sh; both are idempotent.
+# re-running bootstrap.sh and `scripts/clawctl apply`; both are idempotent.
+# (Legacy single-effort deployments re-run onboard-targets.sh instead.)
 
 name: compliance-claw
 
@@ -58,14 +60,15 @@ x-mounts:
   openclaw-state: &vol-openclaw-state "openclaw-state:/home/node/.openclaw"
   # Pretorin's own state — active context, preflight source resolvers, active
   # recipe set — which lives OUTSIDE ~/.openclaw. It needs its own volume, and
-  # it must be mounted on BOTH services: scripts/onboard-targets.sh writes it
-  # from a one-off `run --rm cli` container, and the gateway's per-session
+  # it must be mounted on BOTH services: `scripts/clawctl apply` writes it from
+  # a one-off `run --rm cli` container, and the gateway's per-session
   # `pretorin mcp-serve` children are what read it back. Without this, every
   # onboarding run would evaporate with the container that performed it.
   pretorin-state: &vol-pretorin-state "pretorin-state:/home/node/.pretorin"
   # The PARENT of every review target, mounted read-only — the agent reviews
-  # code, it never edits it. No repo is named here or in the image: targets.yaml
-  # declares them and scripts/bootstrap.sh clones them into this directory.
+  # code, it never edits it. No repo is named here or in the image: efforts.yaml
+  # declares them per effort (targets.yaml on legacy deployments) and
+  # scripts/bootstrap.sh clones them into this directory.
   #
   # THIS MOUNT STAYS READ-ONLY, ON BOTH SERVICES. Target synchronization needs a
   # writable view of the same data and gets one on the gateway only, at a
@@ -152,15 +155,26 @@ services:
       # A real boundary is a separate container with its own uid; that is
       # deliberately out of scope for the pilot.
       - ./workspace/targets:/var/lib/compliance-claw/targets:rw
-      # The declaration of WHICH repositories exist, read-only. The wrapper
-      # refuses any name that is not in this file, so this file is the whole of
-      # what a Slack request can address.
       #
-      # /etc/, deliberately NOT /opt/compliance-claw/: the `pretorin mcp-serve`
-      # child runs with cwd /opt/compliance-claw/no-repo and Pretorin derives
-      # host-local source resolvers from the current directory, so nothing
-      # repository-shaped or target-shaped may appear in that tree.
+      # THE LEGACY DECLARATION OF WHICH REPOSITORIES EXIST. Read-only, and this
+      # base file is exactly the legacy single-effort deployment: no efforts.yaml,
+      # no overlay. /target-sync runs INSIDE the gateway and validates every
+      # requested name against a mounted declaration file, so without this mount
+      # a legacy deployment's /target-sync fails on every request with an
+      # unreadable target list. It stays until a deployment migrates.
+      #
+      # THE MULTI-EFFORT RUNTIME DOES NOT READ IT. compose.efforts.yaml adds
+      # efforts.yaml beside it, and sync-targets.sh prefers efforts.yaml whenever
+      # it is present or an effort is selected — so once migrated, every name is
+      # scoped to one effort and this file is inert.
       - ./targets.yaml:/etc/compliance-claw/targets.yaml:ro
+      #
+      # efforts.yaml is mounted by that OVERLAY rather than here because it is
+      # gitignored — it names your systems — and compose resolves every bind
+      # source at `up` time, so naming it in the base file would make a fresh
+      # clone fail with "bind source path does not exist" before anything could
+      # explain why. scripts/bootstrap.sh creates it first; scripts/clawctl
+      # refuses with a named fix if it is missing.
 
     ports:
       # Never "18789:18789" — a bare port publishes on 0.0.0.0 and exposes the

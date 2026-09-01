@@ -3,11 +3,16 @@
 # clawctl — the operator control command for multi-effort Compliance Claw.
 #
 #   scripts/clawctl validate        [--schema-only] [--effort NAME]
-#   scripts/clawctl migrate         [--name NAME]
+#   scripts/clawctl migrate         --name NAME --slack-channel-id C...
 #   scripts/clawctl credential add  NAME
-#   scripts/clawctl plan            [--effort NAME]
-#   scripts/clawctl apply           [--effort NAME]
+#   scripts/clawctl plan
+#   scripts/clawctl apply
+#   scripts/clawctl dm allow U... --effort NAME | dm revoke U... | dm list
 #   scripts/clawctl --self-test
+#
+# `plan` and `apply` always generate the COMPLETE fleet from efforts.yaml and
+# therefore take no --effort: a partial generation would emit an agents.list and
+# a bindings array containing one effort, which removes every other agent.
 #
 # An EFFORT is one system + framework pair with its own targets and its own named
 # credential. Pretorin keys preflight state and the active recipe set on that
@@ -48,6 +53,25 @@ LOCK_PATH="/home/node/.pretorin/.update.lock"
 AUDIT_PATH="/home/node/.pretorin/clawctl-audit.log"
 LAUNCHER="/opt/compliance-claw/pretorin-mcp-launch"
 MCP_CALL="/opt/compliance-claw/mcp-call.py"
+PATCH_TOOL="scripts/openclaw-patch.py"
+AGENTS_TEMPLATE="scripts/agents-md.template"
+
+# The OpenClaw config, inside the state volume both services mount.
+OC_CONFIG="/home/node/.openclaw/openclaw.json"
+OC_STATE="/home/node/.openclaw"
+# The gateway token, as a PATH. compose.secrets.yaml mounts it; an `exec`'d
+# process re-reads it from here because it inherits none of PID 1's exports.
+OC_TOKEN_FILE="/run/secrets/openclaw_gateway_token"
+
+# THE LAST-APPLIED RECORD, ON THE HOST.
+#
+# Host-side, not in a volume, because `plan` reads it and `plan` starts no
+# container. workspace/ is already gitignored. It holds no credential value and no
+# credential path — effort names, ids, channels and the applied timestamp — and it
+# is written ONLY after verification passes, so a failed apply never leaves a
+# record claiming otherwise.
+STATE_DIR="${CC_STATE_DIR:-workspace/.compliance-claw}"
+STATE_FILE="${STATE_DIR}/last-applied.json"
 
 log()  { printf 'clawctl: %s\n' "$*"; }
 warn() { printf 'clawctl: WARNING — %s\n' "$*" >&2; }
@@ -56,27 +80,16 @@ die()  { printf 'clawctl: ERROR — %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # COMPOSE_FILE: append the overlay, refuse the fork.
 #
-# Two different conditions, deliberately handled differently.
+# compose.efforts.yaml missing is a mechanical omission — that overlay only adds
+# two read-only mounts — so it is appended and said out loud. compose.secrets.yaml
+# missing is a real fork: named per-effort credentials ARE the file-backed secret
+# workflow and the .env path carries exactly one key, so it is refused.
 #
-#   compose.efforts.yaml missing   A MECHANICAL OMISSION. That overlay only adds
-#                                  two read-only mounts: it defines no service
-#                                  behaviour, overrides nothing, and cannot
-#                                  remove anything. So it is appended and said
-#                                  out loud, using bootstrap.sh's idiom.
-#
-#   compose.secrets.yaml missing   A REAL FORK. Named per-effort credentials ARE
-#                                  the file-backed secret workflow; the legacy
-#                                  .env path can carry exactly one key by
-#                                  construction. Refused, with the export line.
-#
-# APPEND, NEVER REBUILD THE VARIABLE. bootstrap.sh carries a long comment about
-# why: an unconditional `export COMPOSE_FILE=a:b` there silently discarded the
-# operator's other overlays, and the deployment ended up with Slack credentials
-# and no Slack, permanently. COMPOSE_PATH_SEPARATOR is compose's own knob for
-# this; honour it rather than hardcoding a colon.
-# check_only=1 reports without changing anything: no COMPOSE_FILE rewrite, no
-# mkdir, no container. `plan` uses it so it cannot report success for a
-# configuration `apply` would reject on its first line.
+# APPEND, NEVER REBUILD THE VARIABLE. An unconditional `export COMPOSE_FILE=a:b`
+# in bootstrap.sh once discarded the operator's other overlays, leaving Slack
+# credentials and no Slack. Honour COMPOSE_PATH_SEPARATOR rather than a colon.
+# check_only=1 reports without changing anything, so `plan` cannot report success
+# for a configuration `apply` would reject on its first line.
 ensure_compose_stack() {
   local check_only="${1:-0}"
   local sep="${COMPOSE_PATH_SEPARATOR:-:}"
@@ -156,13 +169,24 @@ ensure_mount_sources() {
 # flock and waits. That puts `apply` in the one namespace that already governs
 # this volume, with no edit to the updater or the entrypoint.
 #
-# It also buys a property worth naming: entrypoint.sh probes this exact lock on
-# every container start, so for the whole apply window the interrupted-update
-# repair is suppressed — it cannot fire in the middle of our sequence.
-#
-# NO LOCK FILE DELETION, EVER. flock releases when the holding process dies, so
-# a killed sidecar frees the lock by itself. Removing the file would break that.
+# entrypoint.sh probes this same lock on every container start, so the
+# interrupted-update repair cannot fire mid-sequence. NO LOCK FILE DELETION,
+# EVER: flock releases when the holder dies; removing the file would break that.
 LOCK_CID=""
+# Generated patch/manifest, removed on every exit path. Named here so the trap
+# can reach it before generate_patch has ever run.
+GEN_DIR=""
+
+# REMOVED ONLY ON A SUCCESSFUL APPLY. `plan`'s whole output is the patch it would
+# use, and every failure message names patch.json as something to look at — so on
+# either of those the directory stays and its path has already been printed.
+GEN_OK=0
+cleanup_gen_dir() {
+  [ "$GEN_OK" = 1 ] && [ -n "$GEN_DIR" ] && rm -rf "$GEN_DIR"
+  return 0
+}
+
+trap 'cleanup_gen_dir' EXIT INT TERM
 
 release_lock() {
   [ -n "$LOCK_CID" ] || return 0
@@ -197,7 +221,7 @@ acquire_lock() {
     case "$out" in
       *CLAWCTL_LOCK_HELD*)
         LOCK_CID="$cid"
-        trap 'release_lock' EXIT INT TERM
+        trap 'release_lock; cleanup_gen_dir' EXIT INT TERM
         log "lock acquired (${LOCK_PATH} in the pretorin-state volume)"
         return 0 ;;
       *CLAWCTL_LOCK_BUSY*)
@@ -292,10 +316,11 @@ credential_mode_ok() {
 # migrate
 
 cmd_migrate() {
-  local want_name=""
+  local want_name="" want_channel=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) want_name="${2:-}"; shift 2 || die "--name needs a value" ;;
+      --slack-channel-id) want_channel="${2:-}"; shift 2 || die "--slack-channel-id needs a value" ;;
       *) die "migrate: unknown option $1" ;;
     esac
   done
@@ -344,14 +369,38 @@ except m.ParseError as exc:
     sys.stderr.write("clawctl: ERROR — %s\n" % exc.message); raise SystemExit(1)
 PY
 
+  # THE CHANNEL IS ASKED FOR, NOT GUESSED. It is the whole of an effort's routing
+  # — a message in that channel reaches this effort's agent and no other — and
+  # nothing in targets.yaml or the environment can supply it. Writing a
+  # placeholder would produce a file that validates and routes nowhere.
+  if [ -z "$want_channel" ]; then
+    die "a Slack channel id is required: it is how messages reach this effort's agent,
+  and there is nothing in ${TARGETS_FILE} to derive it from. Nothing was written.
+  Open the channel in Slack -> right-click -> Copy link; the C... value at the end
+  of the URL is the id. Then:
+    scripts/clawctl migrate --name ${name} --slack-channel-id C0123ABCDEF"
+  fi
+  python3 - "$want_channel" "$name" <<'PY' || die "that Slack channel id is not usable (see the message above)."
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("pe", os.path.join("scripts", "parse-efforts.py"))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+try:
+    m._check_slack_channel_id(sys.argv[1], sys.argv[2], 0)
+except m.ParseError as exc:
+    sys.stderr.write("clawctl: ERROR — %s\n" % exc.message); raise SystemExit(1)
+PY
+
   local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/clawctl-migrate.XXXXXX")"
   {
     cat <<HDR
 # efforts.yaml — the compliance efforts this deployment serves.
 #
 # Generated by \`scripts/clawctl migrate\` from ${TARGETS_FILE}, which was left
-# untouched and is still what the running deployment reads. This file becomes
-# authoritative in a later release.
+# untouched. THIS file is what the deployment reads: \`scripts/clawctl apply\`
+# builds one OpenClaw agent per effort from it — workspace, sessions, memory,
+# instructions, Pretorin MCP server and Slack channel binding — and clones every
+# repository any effort declares. ${TARGETS_FILE} is now ignored at runtime; it
+# stays mounted read-only only so an unmigrated deployment keeps /target-sync.
 #
 # An EFFORT is one system + framework pair. Pretorin keys preflight state and the
 # active recipe set on that pair, so the same system under two frameworks is two
@@ -373,6 +422,7 @@ efforts:
     system_id: ${system}
     framework_id: ${framework}
     credential_ref: default
+    slack_channel_id: ${want_channel}
     targets:
 HDR
     local tname turl tprivate tref
@@ -395,9 +445,11 @@ HDR
   log "  effort:     ${name}"
   log "  scope:      ${system} / ${framework}"
   log "  credential: default -> ${SECRET_DIR}/pretorin-api-key (the one you already have)"
+  log "  channel:    ${want_channel}"
   log "  targets:    $(effort_targets "$name" | tr '\n' ' ')"
   log ""
-  log "${TARGETS_FILE} was NOT modified and is still what the running deployment reads."
+  log "${TARGETS_FILE} was NOT modified. It is migration input only from here on:"
+  log "  ${EFFORTS_FILE} is what the deployment reads, and nothing mounts ${TARGETS_FILE}."
   log "Next:  scripts/clawctl validate"
 }
 
@@ -663,6 +715,120 @@ print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))'
 }
 
 # ---------------------------------------------------------------------------
+# TWO COMMAND PATHS, AND USING THE WRONG ONE IS A SILENT FAILURE.
+#
+#   oc_cli   `run --rm -T cli openclaw ...` — offline config work, and the only
+#            path that works BEFORE a gateway container exists. `run` executes the
+#            entrypoint, so the file-backed gateway token is loaded in-process;
+#            without it the config's "${OPENCLAW_GATEWAY_TOKEN}" is unset and the
+#            WHOLE config is invalid.
+#
+#   oc_exec  `exec -T openclaw sh -c '...'` — anything that talks to the RUNNING
+#            gateway. `cli` has its own empty loopback, so a gateway-bound command
+#            there silently falls back to the embedded agent; smoke.sh carries the
+#            scar of a check written that way that reported skip for months.
+#
+# `exec` is a child of the daemon, not PID 1, so it inherits none of the
+# entrypoint's exports and re-reads the token inside the container — the idiom
+# smoke.sh and docs/file-secrets.md already use. NEVER
+# `exec -e TOKEN="$(cat ...)"`: that puts the secret in host argv.
+oc_cli() {
+  docker compose run --rm -T cli openclaw "$@" < /dev/null
+}
+
+# The token reload, verbatim, as a prelude to every exec'd command. The -z guard
+# makes it a no-op on the legacy .env path, where env_file already supplied it.
+OC_EXEC_PRELUDE='
+  if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ] && [ -r '"'${OC_TOKEN_FILE}'"' ]; then
+    OPENCLAW_GATEWAY_TOKEN="$(cat '"'${OC_TOKEN_FILE}'"')"
+    export OPENCLAW_GATEWAY_TOKEN
+  fi
+'
+
+oc_exec() {
+  docker compose exec -T openclaw sh -c "${OC_EXEC_PRELUDE} $*" < /dev/null
+}
+
+# A verification failure that is really an unresolved token must never be read as
+# anything else. It presented once as "no model key" and sent the investigation
+# to the wrong place entirely; this keeps it a named case.
+oc_token_failure() {
+  case "$1" in
+    *GatewaySecretRefUnavailable* | *"secret reference but is unavailable"*) return 0 ;;
+  esac
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# The OpenClaw config, read and written through the volume.
+
+# Copy the live config out to a host file. Empty file when there is none yet,
+# which is the fresh-deployment case rather than an error.
+oc_config_read() {
+  local dest="$1"
+  docker compose run --rm -T cli sh -c "cat '${OC_CONFIG}' 2>/dev/null || true" \
+    < /dev/null > "$dest" 2>/dev/null || : > "$dest"
+}
+
+# The pre-apply snapshot, kept INSIDE the state volume next to the config it
+# describes. Restored by file copy rather than by `config patch`, because the
+# failure being recovered from may be a config the CLI cannot parse.
+OC_SNAPSHOT=""
+# Whether a config existed BEFORE this run. "no config" and "the copy failed"
+# both used to look like an empty snapshot; restoring that empty file over a
+# real config was the worse of the two failures, so they are told apart here and
+# the answer decides what rollback means (see oc_config_restore).
+OC_HAD_CONFIG=0
+oc_config_snapshot() {
+  OC_SNAPSHOT="${OC_CONFIG}.pre-apply.$(date -u +%Y%m%dT%H%M%SZ)"
+  OC_HAD_CONFIG=0
+  local out
+  out="$(docker compose run --rm -T cli sh -c "
+      if [ -e '${OC_CONFIG}' ]; then
+        cp -p '${OC_CONFIG}' '${OC_SNAPSHOT}' || exit 1
+        [ -f '${OC_SNAPSHOT}' ] || exit 1
+        # A source with content must produce a snapshot with content.
+        if [ -s '${OC_CONFIG}' ] && [ ! -s '${OC_SNAPSHOT}' ]; then exit 1; fi
+        printf 'CC_CFG_SNAPSHOT_OK had=1\n'
+      else
+        : > '${OC_SNAPSHOT}' || exit 1
+        [ -f '${OC_SNAPSHOT}' ] || exit 1
+        printf 'CC_CFG_SNAPSHOT_OK had=0\n'
+      fi" < /dev/null 2>&1)" || true
+  case "$out" in
+    *"CC_CFG_SNAPSHOT_OK had=1"*) OC_HAD_CONFIG=1 ;;
+    *"CC_CFG_SNAPSHOT_OK had=0"*) OC_HAD_CONFIG=0 ;;
+    *)
+      OC_SNAPSHOT=""
+      die "could not snapshot ${OC_CONFIG}:
+$(printf '%s' "$out" | tail -4 | sed 's/^/  /')
+  Nothing has been changed. Refusing to touch the configuration without a
+  verified copy to return to." ;;
+  esac
+  if [ "$OC_HAD_CONFIG" = 1 ]; then
+    log "  snapshot: ${OC_SNAPSHOT} (in the openclaw-state volume)"
+  else
+    log "  no configuration existed yet; rollback would remove the generated one"
+  fi
+}
+
+# Undo the config half. On a deployment that HAD a config, that is restoring the
+# snapshot. On a fresh one there is nothing to restore and the honest undo is to
+# REMOVE what this run generated — copying the empty snapshot back would leave a
+# zero-byte openclaw.json, which the entrypoint's never-clobber rule then
+# preserves forever, and the deployment can no longer seed itself.
+oc_config_restore() {
+  [ -n "$OC_SNAPSHOT" ] || return 1
+  if [ "$OC_HAD_CONFIG" = 1 ]; then
+    docker compose run --rm -T cli sh -c "cp -p '${OC_SNAPSHOT}' '${OC_CONFIG}'" \
+      < /dev/null >/dev/null 2>&1
+  else
+    docker compose run --rm -T cli sh -c "rm -f '${OC_CONFIG}'; [ ! -e '${OC_CONFIG}' ]" \
+      < /dev/null >/dev/null 2>&1
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # plan / apply
 #
 # `plan` and `apply` cannot drift, by construction: both go through ol_pcli in
@@ -677,6 +843,621 @@ print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))'
 # shellcheck source=scripts/onboard-lib.sh
 . "${REPO_ROOT}/scripts/onboard-lib.sh"
 
+# ---------------------------------------------------------------------------
+# The managed agent workspace.
+#
+# Each effort's agent gets a workspace holding a generated AGENTS.md and a
+# `targets/` view of symlinks to exactly that effort's clones. The clones stay
+# shared and single at /workspace/targets/<name>, so the view duplicates nothing.
+#
+# IT IS A SCOPING AID, NOT A BOUNDARY, and the generated files say so: tools run
+# unsandboxed as the same uid, so an absolute path still reaches another effort's
+# clone. What it buys is that the ordinary path resolves only to its own effort.
+#
+# MANAGED MEANS TRACKED. Every path created is listed in .compliance-claw-managed
+# and only paths from the PREVIOUS list absent from the new one are removed;
+# operator notes, agent files and SOUL.md are never touched, no clone is ever
+# removed. Built in a staging directory and moved into place, so a failure
+# part-way leaves the previous view intact.
+write_agent_workspace() {
+  local effort="$1" agent="$2" system="$3" framework="$4" channel="$5" prefix="$6"
+  shift 6
+  local targets=("$@")
+  local ws="${OC_STATE}/workspace-${agent}"
+
+  # AGENTS.md is rendered on the HOST from the template, then delivered on stdin.
+  # Rendering it in the container would mean either mounting the template or
+  # embedding it in a command line; this way the only thing crossing the boundary
+  # is the finished text.
+  local rendered target_lines=""
+  for t in ${targets[@]+"${targets[@]}"}; do
+    target_lines="${target_lines}  - \`${t}\` — /workspace/targets/${t}"$'\n'
+  done
+  rendered="$(TPL="$AGENTS_TEMPLATE" EFFORT="$effort" SYSTEM="$system" \
+                FRAMEWORK="$framework" CHANNEL="$channel" MCP_PREFIX="$prefix" \
+                TARGET_LINES="$target_lines" python3 - <<'PY'
+import os, sys
+text = open(os.environ["TPL"]).read()
+for key in ("EFFORT", "SYSTEM", "FRAMEWORK", "CHANNEL", "MCP_PREFIX", "TARGET_LINES"):
+    text = text.replace("@%s@" % key, os.environ[key].rstrip("\n"))
+# ASSERT THE SUBSTITUTION LANDED. A template placeholder that survives into a
+# generated AGENTS.md would tell the agent its effort is literally "@EFFORT@",
+# and nothing downstream would notice.
+if "@EFFORT@" in text or "@TARGET_LINES@" in text:
+    sys.stderr.write("clawctl: ERROR - AGENTS.md still holds a placeholder\n")
+    raise SystemExit(1)
+sys.stdout.write(text)
+PY
+              )" || die "could not render AGENTS.md for effort '${effort}'."
+
+  # The list of managed paths, and the staging build, in one shell inside the
+  # container. `sh -s` takes the script on stdin; the target names arrive as
+  # positional arguments, never interpolated into the script body.
+  # The record of what THIS tool created, newline-delimited. The next apply reads
+  # it to remove only the entries it no longer creates, which is what keeps an
+  # operator's own files in this workspace safe.
+  local managed=""
+  for t in ${targets[@]+"${targets[@]}"}; do
+    managed="${managed}targets/${t}"$'\n'
+  done
+  managed="${managed}targets/README.md"$'\n'"AGENTS.md"
+
+  # WRITTEN TO A FILE, never captured in a command substitution: `$(cmd <<'SH' …)`
+  # closes at the first unbalanced ')' — this script has one in a `case` pattern —
+  # leaving the child an EMPTY script that exits 0 having done nothing. That is
+  # how this first shipped: every workspace logged, none written, success reported.
+  local ws_script; ws_script="$(mktemp "${TMPDIR:-/tmp}/clawctl-ws.XXXXXX")"
+  cat > "$ws_script" <<'SH'
+set -eu
+WS="$1"; shift
+NEW="${WS}/.compliance-claw.new"
+MANIFEST="${WS}/.compliance-claw-managed"
+
+mkdir -p "$WS"
+rm -rf "$NEW"
+mkdir -p "${NEW}/targets"
+
+printf '%s' "$CC_AGENTS_MD" > "${NEW}/AGENTS.md"
+
+{
+  printf '# Review targets for this effort\n\n'
+  printf 'Generated by scripts/clawctl apply. These are the only repositories\n'
+  printf 'this effort declares, and they are mounted read-only.\n\n'
+  printf 'A SCOPING AID, NOT A SANDBOX: tool execution here is unsandboxed, so an\n'
+  printf 'absolute path can still reach another effort clone. Staying inside these\n'
+  printf 'is a requirement of the work, not something the filesystem enforces.\n\n'
+  for t in "$@"; do
+    printf -- '- %s -> /workspace/targets/%s\n' "$t" "$t"
+  done
+} > "${NEW}/targets/README.md"
+
+for t in "$@"; do
+  ln -s "/workspace/targets/${t}" "${NEW}/targets/${t}"
+done
+
+# REFUSE A COLLISION RATHER THAN WIN IT. A path under targets/ may be replaced
+# only when it is absent, or when the PREVIOUS manifest records it as ours. An
+# operator file that happens to share a target's name is not ours to overwrite,
+# and silently replacing it would destroy their work to make room for a symlink.
+for t in "$@"; do
+  [ -e "${WS}/targets/${t}" ] || [ -L "${WS}/targets/${t}" ] || continue
+  if [ -f "$MANIFEST" ] && grep -qxF "targets/${t}" "$MANIFEST"; then
+    continue                                   # ours from last time; replaceable
+  fi
+  printf 'CC_WORKSPACE_COLLISION %s\n' "${WS}/targets/${t}"
+  exit 1
+done
+
+# REMOVE ONLY WHAT WE CREATED LAST TIME AND NO LONGER CREATE. The old manifest is
+# the record of that; an operator file that happens to share a name is never in
+# it and is therefore never touched.
+if [ -f "$MANIFEST" ]; then
+  while IFS= read -r old; do
+    [ -n "$old" ] || continue
+    case "$old" in /*|*..*) continue ;; esac          # never escape the workspace
+    [ -e "${NEW}/${old}" ] && continue                 # still ours
+    [ -L "${WS}/${old}" ] || [ -f "${WS}/${old}" ] || continue
+    rm -f "${WS}/${old}"
+  done < "$MANIFEST"
+fi
+
+# Move the staged view into place entry by entry, so everything in the workspace
+# that is not ours survives untouched.
+mkdir -p "${WS}/targets"
+mv -f "${NEW}/AGENTS.md" "${WS}/AGENTS.md"
+mv -f "${NEW}/targets/README.md" "${WS}/targets/README.md"
+for t in "$@"; do
+  rm -f "${WS}/targets/${t}"
+  mv -f "${NEW}/targets/${t}" "${WS}/targets/${t}"
+done
+rm -rf "$NEW"
+
+printf '%s\n' "$CC_MANAGED" > "$MANIFEST"
+chmod 0600 "${WS}/AGENTS.md" "$MANIFEST"
+# PROVE IT, rather than trusting exit 0. An empty or unread script would also
+# exit 0, so the caller checks for this marker instead of the status alone.
+printf 'CC_WORKSPACE_WRITTEN %s\n' "$WS"
+SH
+
+  local ws_out
+  ws_out="$(CC_AGENTS_MD="$rendered" CC_MANAGED="$managed" \
+      docker compose run --rm -T -e CC_AGENTS_MD -e CC_MANAGED \
+        cli sh -s -- "$ws" ${targets[@]+"${targets[@]}"} < "$ws_script" 2>&1)" || true
+  rm -f "$ws_script"
+  case "$ws_out" in
+    *"CC_WORKSPACE_WRITTEN ${ws}"*) WS_FAIL_MSG=""; return 0 ;;
+    *"CC_WORKSPACE_COLLISION "*)
+      WS_FAIL_MSG="effort '${effort}' wants a target view at
+    $(printf '%s' "$ws_out" | sed -n 's/.*CC_WORKSPACE_COLLISION //p' | head -1)
+  but something is already there that this tool did not create. It is left
+  exactly as it is: an operator file that happens to share a target's name is
+  not ours to replace.
+
+  The gateway is unchanged: no agent, Slack binding, MCP server or workspace was
+  created or changed, and ${STATE_FILE} was not written. Pretorin onboarding runs
+  BEFORE this point, so any effort the audit above records as 'applied' has had
+  its resolvers bound on the platform; that stands, and is idempotent.
+
+  Move or rename that path, or rename the target in ${EFFORTS_FILE}, then re-run."
+      return 1 ;;
+    *) WS_FAIL_MSG="could not write the agent workspace for effort '${effort}'.
+$(printf '%s' "$ws_out" | tail -5 | sed 's/^/  /')"
+      return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# THE MANAGED WORKSPACES ARE PART OF THE TRANSACTION.
+#
+# They are written before the config is patched, so a rollback restoring only
+# openclaw.json would leave every workspace describing a fleet the gateway no
+# longer has. Only managed paths are saved — from each workspace's own
+# .compliance-claw-managed manifest — so an operator's notes are neither copied
+# nor disturbed. tar rather than cp -r, because the target view is symlinks and a
+# copy that followed them would duplicate whole repositories into the volume.
+WS_SNAPSHOT=""
+
+workspace_snapshot() {
+  local agents="$1"
+  WS_SNAPSHOT="${OC_STATE}/.compliance-claw-ws.pre-apply.$(date -u +%Y%m%dT%H%M%SZ).tar"
+  # FAIL CLOSED. Without a verified backup there is nothing to roll back to, so a
+  # snapshot that could not be written must stop the run BEFORE any workspace or
+  # any configuration is touched — not be shrugged off and discovered later, when
+  # the only thing left to do is print manual recovery steps.
+  local script; script="$(mktemp "${TMPDIR:-/tmp}/clawctl-wssnap.XXXXXX")"
+  cat > "$script" <<'SH'
+set -eu
+ROOT="$1"; OUT="$2"
+# The state directory always exists in the container; creating it costs nothing
+# and keeps the archive path writable wherever this script is pointed.
+mkdir -p "$ROOT"
+LIST="$(mktemp)"
+for a in $CC_WS_AGENTS; do
+  WS="${ROOT}/workspace-${a}"
+  M="${WS}/.compliance-claw-managed"
+  [ -f "$M" ] || continue
+  printf '%s
+' "workspace-${a}/.compliance-claw-managed" >> "$LIST"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    case "$rel" in /*|*..*) continue ;; esac
+    # -e is false for a symlink whose target is not reachable from here, so -L
+    # is tested too: the target view is entirely symlinks.
+    if [ -e "${WS}/${rel}" ] || [ -L "${WS}/${rel}" ]; then
+      printf '%s
+' "workspace-${a}/${rel}" >> "$LIST"
+    fi
+  done < "$M"
+done
+if [ -s "$LIST" ]; then
+  tar -C "$ROOT" -cf "$OUT" -T "$LIST"
+else
+  : > "$OUT"          # nothing managed yet: an empty archive is a valid "before"
+fi
+rm -f "$LIST"
+# PROVE THE ARCHIVE EXISTS, rather than trusting exit 0. An empty archive is a
+# legitimate "there was nothing managed yet"; a MISSING one is not.
+[ -f "$OUT" ] && printf 'CC_WS_SNAPSHOT_OK %s\n' "$OUT"
+SH
+  local out
+  out="$(CC_WS_AGENTS="$agents" docker compose run --rm -T -e CC_WS_AGENTS cli \
+          sh -s -- "$OC_STATE" "$WS_SNAPSHOT" < "$script" 2>&1)" || true
+  rm -f "$script"
+  case "$out" in
+    *"CC_WS_SNAPSHOT_OK ${WS_SNAPSHOT}"*)
+      log "  workspace snapshot: ${WS_SNAPSHOT}" ;;
+    *)
+      WS_SNAPSHOT=""
+      die "the managed-workspace snapshot reported success but produced no archive.
+  Nothing was changed. Refusing to proceed without a backup to return to." ;;
+  esac
+  return 0
+}
+
+# Restore is deliberately NOT a wipe-and-extract. Paths managed by the run being
+# undone are removed first (they may not exist in the archive), then the archive
+# is unpacked over the top. Anything the archive does not mention is untouched.
+# Returns non-zero when the workspaces could NOT be put back. The caller must not
+# report a successful rollback in that case: half a restore is not a restore.
+workspace_restore() {
+  local agents="$1"
+  [ -n "$WS_SNAPSHOT" ] || return 1
+  local script; script="$(mktemp "${TMPDIR:-/tmp}/clawctl-wsrest.XXXXXX")"
+  cat > "$script" <<'SH'
+set -eu
+ROOT="$1"; ARCHIVE="$2"
+for a in $CC_WS_AGENTS; do
+  WS="${ROOT}/workspace-${a}"
+  M="${WS}/.compliance-claw-managed"
+  [ -f "$M" ] || continue
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    case "$rel" in /*|*..*) continue ;; esac
+    rm -f "${WS}/${rel}"
+  done < "$M"
+  rm -f "$M"
+done
+[ -s "$ARCHIVE" ] && tar -C "$ROOT" -xf "$ARCHIVE"
+printf 'CC_WS_RESTORED\n'
+SH
+  local out
+  out="$(CC_WS_AGENTS="$agents" docker compose run --rm -T -e CC_WS_AGENTS cli \
+          sh -s -- "$OC_STATE" "$WS_SNAPSHOT" < "$script" 2>&1)" || true
+  rm -f "$script"
+  case "$out" in *CC_WS_RESTORED*) return 0 ;; esac
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# The OpenClaw configuration stage: generate, dry-run, apply, recreate, verify,
+# and on failure put back exactly what was there.
+
+# Generate the patch from efforts.yaml plus the LIVE bindings, and report what it
+# would do. Used by `plan` (generation only) and by `apply`.
+#
+# THE LIVE CONFIG IS READ HERE, not earlier: operator DM bindings are preserved
+# by carrying the current ones forward, so they have to be read as late as
+# possible. It narrows, but does not close, the window in which a Control UI edit
+# could be overwritten — the UI writes through the gateway RPC with a base-hash
+# guard, this path writes the file directly with none, and the flock does not
+# cover the UI. Hence the warning printed by both plan and apply.
+generate_patch() {
+  local dm_add="${1:-}" dm_remove="${2:-}" offline="${3:-0}"
+  GEN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/clawctl-gen.XXXXXX")"
+  local live="${GEN_DIR}/live-config.json"
+
+  if [ "$offline" = 1 ]; then
+    # `plan` STARTS NO CONTAINER, and that guarantee is worth more than a
+    # perfectly current view. So instead of reading the config out of the volume,
+    # it reconstructs the parts it needs from the host-side last-applied record —
+    # which is precisely why that record lives on the host and not in the volume.
+    #
+    # What this costs: a DM binding an operator added in the Control UI SINCE the
+    # last apply is not visible to plan. It is still preserved by apply, which
+    # does read the live config. plan_report says so rather than implying the list
+    # is current.
+    CC_STATE="$STATE_FILE" python3 - > "$live" <<'PY'
+import json, os
+state = {}
+path = os.environ.get("CC_STATE", "")
+if path and os.path.exists(path):
+    try:
+        state = json.load(open(path))
+    except ValueError:
+        state = {}
+direct = state.get("directBindings") or {}
+bindings = [{"agentId": agent,
+             "match": {"channel": "slack", "peer": {"kind": "direct", "id": user}},
+             "session": {"dmScope": "per-channel-peer"}}
+            for user, agent in sorted(direct.items())]
+config = {"bindings": bindings}
+if direct:
+    config["channels"] = {"slack": {"allowFrom": sorted(direct)}}
+# THE MCP SERVERS FROM THE LAST APPLY, as placeholders. Deactivation is decided by
+# comparing what exists against what efforts.yaml now declares — so without these,
+# an effort the operator has just DELETED shows no "- mcp ... (deactivated)" line
+# and plan under-reports exactly the change most worth seeing before applying it.
+# The values are never read; only the key set matters here.
+servers = {name: {} for name in (state.get("mcpServers") or [])}
+if servers:
+    config["mcp"] = {"servers": servers}
+json.dump(config, open(1, "w"))
+PY
+  else
+    oc_config_read "$live"
+  fi
+
+  local -a args=(generate --efforts "$EFFORTS_FILE" --config "$live" --out-dir "$GEN_DIR")
+  [ -n "$dm_add" ] && args+=(--dm-add "$dm_add")
+  [ -n "$dm_remove" ] && args+=(--dm-remove "$dm_remove")
+  python3 "$PATCH_TOOL" "${args[@]}" >/dev/null || return 1
+  return 0
+}
+
+# THE DRY RUN IS A SEPARATE STEP, RUN BEFORE ANYTHING IS MUTATED.
+#
+# It used to sit inside apply_patch, which runs after the workspaces have already
+# been rewritten — so a patch OpenClaw rejected left the workspaces changed and
+# died claiming nothing had been modified. Validation reads; it has no business
+# happening after the first write.
+validate_patch() {
+  local -a flags=()
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] && flags+=(--replace-path "$f")
+  done < "${GEN_DIR}/replace-paths.txt"
+
+  log "  validating the patch against OpenClaw's own schema (--dry-run)"
+  docker compose run --rm -T cli openclaw config patch --stdin --dry-run \
+    ${flags[@]+"${flags[@]}"} < "${GEN_DIR}/patch.json" >&2 \
+    || die "the generated configuration did not validate. Nothing has been changed:
+  no workspace was written and ${OC_CONFIG} was not modified. The patch is at
+  ${GEN_DIR}/patch.json."
+}
+
+apply_patch() {
+  # THE --replace-path FLAGS, and only the ones this patch actually needs:
+  # `openclaw config patch` refuses a --replace-path that matches nothing in the
+  # input, so a fixed list fails every deployment with no DM users configured.
+  # openclaw-patch.py decides which apply and writes them out one per line.
+  #
+  # Worth being precise about what these do and do not buy. They state our intent
+  # to replace an array wholesale, and OpenClaw's gateway RPC path requires them
+  # when it detects a shrinking array. The CLI path performs NO such check — a
+  # patch there replaces an array silently. So what actually protects the arrays
+  # we own is that they are generated complete, from efforts.yaml plus the
+  # classified live bindings, and verified afterwards.
+  local -a flags=()
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] && flags+=(--replace-path "$f")
+  done < "${GEN_DIR}/replace-paths.txt"
+
+  log "  applying"
+  if ! docker compose run --rm -T cli openclaw config patch --stdin \
+         ${flags[@]+"${flags[@]}"} < "${GEN_DIR}/patch.json" >&2; then
+    return 1
+  fi
+  return 0
+}
+
+# ONE DETERMINISTIC CREATE-OR-RECREATE. `restart` cannot create a container that
+# does not exist yet, which is the first apply on a fresh deployment; `up -d`
+# alone may no-op, because what changed is inside a volume and compose cannot see
+# it. compose.yaml has no depends_on and `cli` is profile-gated, so this touches
+# exactly one service.
+# RETURNS FAILURE, NEVER DIES. Dying here skipped the rollback entirely: the new
+# configuration was already on disk, so the deployment was left holding it with no
+# attempt to put the old one back.
+restart_gateway() {
+  log "  recreating the gateway once"
+  docker compose up -d --force-recreate openclaw >&2 || return 1
+  return 0
+}
+
+# EVERY CHECK HERE GOES THROUGH THE GATEWAY CONTAINER. See oc_exec.
+VERIFY_DETAIL=""
+verify_apply() {
+  local tries="${1:-12}" i out
+  VERIFY_DETAIL=""
+
+  for i in $(seq 1 "$tries"); do
+    if out="$(oc_exec openclaw health 2>&1)"; then
+      break
+    fi
+    if oc_token_failure "$out"; then
+      VERIFY_DETAIL="the gateway token did not resolve in the exec path.
+      This is NOT a missing model key and NOT a bad token: an exec'd process is a
+      child of the docker daemon, not of PID 1, so it inherits none of the
+      entrypoint's exports and has to re-read ${OC_TOKEN_FILE} itself."
+      return 1
+    fi
+    [ "$i" = "$tries" ] && {
+      VERIFY_DETAIL="the gateway did not report healthy after ${tries} attempts:
+$(printf '%s' "$out" | tail -3 | sed 's/^/      /')"
+      return 1
+    }
+    sleep 2
+  done
+
+  oc_exec openclaw agents list --bindings --json > "${GEN_DIR}/agents.json" 2>/dev/null || true
+  oc_exec openclaw mcp list --json > "${GEN_DIR}/mcp.json" 2>/dev/null || true
+
+  local after="${GEN_DIR}/after-config.json"
+  oc_config_read "$after"
+  local before="${GEN_DIR}/before-config.json"
+  docker compose run --rm -T cli sh -c "cat '${OC_SNAPSHOT}' 2>/dev/null || true" \
+    < /dev/null > "$before" 2>/dev/null || : > "$before"
+
+  if ! out="$(python3 "$PATCH_TOOL" verify \
+        --manifest "${GEN_DIR}/manifest.json" \
+        --config "$after" \
+        --snapshot "$before" \
+        --agents-json "${GEN_DIR}/agents.json" \
+        --mcp-json "${GEN_DIR}/mcp.json" 2>&1)"; then
+    VERIFY_DETAIL="$(printf '%s' "$out" | sed 's/^/      /')"
+    return 1
+  fi
+  return 0
+}
+
+# THE ONE RECOVERY MESSAGE, used by every partial-failure path.
+#
+# It names the snapshots and stops. It deliberately prints NO command that
+# deletes anything: the managed workspaces sit beside operator notes, agent
+# files and SOUL.md in the same directories, and a wildcard remove aimed at the
+# managed paths is one typo or one unexpected layout away from taking those with
+# it. An operator reading their own volume is slower and cannot do that.
+manual_recovery_note() {
+  warn "This command will not pretend the deployment is in a known state, and it"
+  warn "will not try to repair it with a command that deletes files."
+  warn ""
+  warn "Both pre-apply snapshots are in the openclaw-state volume:"
+  [ -n "${OC_SNAPSHOT:-}" ] && warn "  configuration: ${OC_SNAPSHOT}" \
+                           || warn "  configuration: none was written"
+  [ -n "${WS_SNAPSHOT:-}" ] && warn "  workspaces:    ${WS_SNAPSHOT}" \
+                           || warn "  workspaces:    none was written"
+  warn ""
+  warn "Inspect them before changing anything else:"
+  warn "  docker compose run --rm -T cli sh -c 'ls -la ${OC_STATE}'"
+  warn ""
+  warn "Recover by hand from those files, then recreate the gateway and confirm"
+  warn "it is healthy. A snapshot reported as missing was never written, so what"
+  warn "is in the volume now is the only copy of that half — do not overwrite it."
+}
+
+# THE ROLLBACK. By file copy, not by `config patch`: what is being recovered from
+# may be a configuration the CLI cannot even load.
+# PUT BOTH HALVES BACK. Returns non-zero when either failed, after printing exact
+# recovery steps — so no caller can report success on a partial restore.
+restore_both() {
+  local ws_ok=1 cfg_ok=1
+  if [ -n "${WS_AGENTS:-}" ]; then
+    workspace_restore "$WS_AGENTS" || ws_ok=0
+  fi
+  # ATTEMPTED UNCONDITIONALLY. Short-circuiting on the workspace result left the
+  # NEW configuration in place whenever the workspace restore failed; one half
+  # back is strictly better than neither.
+  oc_config_restore || cfg_ok=0
+  [ "$ws_ok" = 1 ] && [ "$cfg_ok" = 1 ] && return 0
+
+  printf '\n' >&2
+  warn "THE RESTORE DID NOT FULLY SUCCEED."
+  [ "$cfg_ok" = 1 ] && warn "  the CONFIGURATION was restored" \
+                    || warn "  the CONFIGURATION could NOT be restored"
+  [ "$ws_ok" = 1 ]  && warn "  the managed WORKSPACES were restored" \
+                    || warn "  the managed WORKSPACES could NOT be restored"
+  manual_recovery_note
+  return 1
+}
+
+rollback_apply() {
+  warn "verification failed; restoring what was there before."
+  warn "$VERIFY_DETAIL"
+
+  restore_both || return 1
+
+  if ! restart_gateway; then
+    warn "the configuration and workspaces were restored, but the gateway did not"
+    warn "  come back up. The files on disk are the previous ones; the running"
+    warn "  process is not. Bring it up by hand:"
+    warn "       docker compose up -d --force-recreate openclaw"
+    return 1
+  fi
+
+  # NOT THE FORWARD VERIFIER. That one compares the live config against the
+  # manifest of the change being undone, so a correct rollback could only fail.
+  # The question here is the opposite: is it back?
+  if verify_rollback; then
+    warn "the previous configuration and the managed workspaces are back, and the"
+    warn "  gateway is healthy. None of the gateway-side change this run intended"
+    warn "  was applied."
+    warn "  Pretorin onboarding is NOT part of this rollback: any effort the audit"
+    warn "  above records as 'applied' has had its resolvers bound on the platform,"
+    warn "  and that stands. Those operations are idempotent."
+    return 0
+  fi
+  warn "the restore did not put things back:"
+  warn "$VERIFY_DETAIL"
+  warn "Recover by hand:  docker compose up -d --force-recreate openclaw"
+  return 1
+}
+
+# Is it back? Health, plus a whole-document comparison against the snapshot.
+verify_rollback() {
+  local tries=8 i out
+  VERIFY_DETAIL=""
+  for i in $(seq 1 "$tries"); do
+    if out="$(oc_exec openclaw health 2>&1)"; then break; fi
+    if oc_token_failure "$out"; then
+      VERIFY_DETAIL="the gateway token did not resolve in the exec path (see above)."
+      return 1
+    fi
+    [ "$i" = "$tries" ] && {
+      VERIFY_DETAIL="the restored gateway did not report healthy after ${tries} attempts:
+$(printf '%s' "$out" | tail -3 | sed 's/^/      /')"
+      return 1
+    }
+    sleep 2
+  done
+
+  local after="${GEN_DIR}/rollback-config.json" before="${GEN_DIR}/rollback-snapshot.json"
+  oc_config_read "$after"
+  docker compose run --rm -T cli sh -c "cat '${OC_SNAPSHOT}' 2>/dev/null || true" \
+    < /dev/null > "$before" 2>/dev/null || : > "$before"
+  if ! out="$(python3 "$PATCH_TOOL" verify-rollback \
+        --config "$after" --snapshot "$before" 2>&1)"; then
+    VERIFY_DETAIL="$(printf '%s' "$out" | sed 's/^/      /')"
+    return 1
+  fi
+  return 0
+}
+
+# The last-applied record. Written ONLY after verification passes.
+write_state() {
+  mkdir -p "$STATE_DIR"
+  local tmp; tmp="$(mktemp "${STATE_DIR}/.state.XXXXXX")"
+  CC_MANIFEST="${GEN_DIR}/manifest.json" python3 - > "$tmp" <<'PY'
+import json, os, time
+manifest = json.load(open(os.environ["CC_MANIFEST"]))
+# A SUBSET, DELIBERATELY. Only what the next plan/apply has to compare against —
+# no credential value, no credential path, no token.
+json.dump({
+    "version": 1,
+    "appliedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "efforts": manifest["efforts"],
+    "agents": manifest["agents"],
+    "channelBindings": manifest["channelBindings"],
+    "directBindings": manifest["directBindings"],
+    "mcpServers": manifest["mcpServers"],
+    "dmPolicy": manifest["dmPolicy"],
+    "targetsByEffort": manifest["targetsByEffort"],
+    "fleetFingerprint": manifest["fleetFingerprint"],
+}, open(1, "w"), indent=2, sort_keys=True)
+PY
+  mv "$tmp" "$STATE_FILE"
+  chmod 0644 "$STATE_FILE"
+  log "recorded ${STATE_FILE}"
+}
+
+# THE IMMUTABILITY CHECK. An effort name is the stable identity of an agent, its
+# workspace, its sessions and its memory. Repointing that name at a different
+# system or framework would silently hand one effort's accumulated context to
+# another scope, which no amount of later correction undoes.
+check_scope_mutations() {
+  [ -f "$STATE_FILE" ] || return 0
+  local out
+  if ! out="$(CC_STATE="$STATE_FILE" CC_EFFORTS="$EFFORTS_FILE" python3 - <<'PY'
+import json, os, sys, importlib.util
+spec = importlib.util.spec_from_file_location("pe", os.path.join("scripts", "parse-efforts.py"))
+pe = importlib.util.module_from_spec(spec); spec.loader.exec_module(pe)
+state = json.load(open(os.environ["CC_STATE"]))
+previous = state.get("efforts", {})
+problems = []
+for effort in pe.load(os.environ["CC_EFFORTS"]):
+    was = previous.get(effort["name"])
+    if not was:
+        continue
+    for key, label in (("system_id", "system"), ("framework_id", "framework")):
+        if was.get(key) and was[key] != effort[key]:
+            problems.append(
+                "effort '%s' changed its %s from %s to %s. The name is the stable"
+                " identity of an agent, its workspace, its sessions and its memory,"
+                " so repointing it hands one effort's accumulated context to a"
+                " different scope. Add a NEW effort with a new name instead, and"
+                " remove this one if it is finished."
+                % (effort["name"], label, was[key], effort[key]))
+if problems:
+    for p in problems:
+        sys.stderr.write("  - %s\n" % p)
+    raise SystemExit(1)
+PY
+  )"; then
+    die "refusing to apply:
+${out}"
+  fi
+}
+
 # Build the per-effort `docker compose run` flags. THE SCOPE PIN AND THE NAMED
 # CREDENTIAL, and nothing that carries a value: PRETORIN_API_KEY_FILE names a
 # path, the entrypoint reads it inside the container.
@@ -690,6 +1471,31 @@ effort_run_env() {
     -e "PRETORIN_SYSTEM_ID=${system}" \
     -e "PRETORIN_FRAMEWORK_ID=${framework}" \
     -e "PRETORIN_API_KEY_FILE=${container_path}"
+}
+
+# THE CLONE STEP, WHICH IS bootstrap.sh's AND NOT THIS FILE'S.
+#
+# `--targets-only` runs exactly bootstrap's step 3: the private-target sweep, the
+# GitHub-App-preferred / fail-closed / PAT-fallback / refuse ladder, the App token
+# mint, and the handoff to sync-targets.sh. Re-deciding any of that here would be
+# a second copy of a security-relevant rule, and the direction two copies drift is
+# "one of them quietly downgrades the credential".
+#
+# CC_CLONE_ONLY=1 is the one thing apply adds: make missing clones exist, and
+# leave every existing clone at the commit it is on. Configuring efforts must not
+# also move the code those efforts are reviewing — that would change what every
+# open review cites, and the operator asked for neither. Moving a target stays an
+# explicit /target-sync.
+clone_missing_targets() {
+  log "cloning any target declared in ${EFFORTS_FILE} that is not present yet"
+  # TARGETS_DIR is passed through for the same reason clawctl makes it
+  # overridable at all: the self-test drives this real code against a throwaway
+  # tree rather than re-implementing what it does.
+  CC_CLONE_ONLY=1 CC_EFFORTS_FILE="$EFFORTS_FILE" CC_TARGETS_DIR="$TARGETS_DIR" \
+    bash scripts/bootstrap.sh --targets-only >&2 \
+    || die "could not prepare the target repositories; see the messages above.
+  This runs before any Pretorin onboarding and before any gateway change, so
+  nothing at all has happened yet."
 }
 
 run_efforts() {
@@ -718,9 +1524,15 @@ run_efforts() {
     ensure_mount_sources
     require_launcher_in_image
     acquire_lock
+    check_scope_mutations
+    clone_missing_targets
   fi
 
   local rc=0
+  # WHICH efforts failed, not merely that one did. The fleet is generated from the
+  # WHOLE of efforts.yaml, so a single failure has to stop the generation rather
+  # than be carried past it — see the abort below.
+  FAILED_EFFORTS=""
   while read -r effort; do
     [ -n "$effort" ] || continue
     IFS=$'\t' read -r system framework cred < <(python3 "$PARSE_EFFORTS" scope "$effort" "$EFFORTS_FILE")
@@ -745,7 +1557,7 @@ run_efforts() {
         warn "effort ${effort}: ${hpath} is missing or empty. Skipping it."
         warn "  scripts/clawctl credential add ${cred}"
         audit "$effort" "$system" "$framework" "$cred" "${targets[*]}" "skipped-no-credential"
-        rc=1
+        rc=1; FAILED_EFFORTS="${FAILED_EFFORTS} ${effort}(no credential)"
         continue
       fi
     fi
@@ -753,10 +1565,10 @@ run_efforts() {
     # The clones have to exist before anything is bound, or verify probes a path
     # that is not there and every resolver comes back unreachable.
     #
-    # EFFORT-AWARE CLONING IS NOT IN THIS RELEASE. bootstrap.sh clones from
-    # targets.yaml, which is still authoritative. A migrated effort and any effort
-    # sharing its repositories are already cloned; a genuinely new repository is
-    # not, and this refuses rather than binding a path that is not there.
+    # By now clone_missing_targets has run, so anything still absent is a real
+    # failure rather than a not-yet. Refuse the effort instead of binding a path
+    # that is not there: every resolver would come back unreachable and the
+    # diagnosis would point at Pretorin.
     local missing=""
     for t in "${targets[@]}"; do
       [ -d "${TARGETS_DIR}/${t}/.git" ] || missing="${missing} ${t}"
@@ -764,15 +1576,14 @@ run_efforts() {
     if [ -n "$missing" ]; then
       if [ "$dry" = 1 ]; then
         warn "  not cloned yet:${missing}"
-        warn "    Effort-aware cloning lands with the release that makes efforts.yaml"
-        warn "    authoritative. For now add them to ${TARGETS_FILE} and run scripts/bootstrap.sh."
+        warn "    'apply' clones these first (scripts/bootstrap.sh --targets-only)."
       else
-        warn "effort ${effort}: these targets are not cloned:${missing}"
-        warn "  Effort-aware cloning lands with the release that makes efforts.yaml"
-        warn "  authoritative. For now add them to ${TARGETS_FILE} and run"
-        warn "  scripts/bootstrap.sh. Skipping this effort; nothing was changed for it."
+        warn "effort ${effort}: these targets are still not cloned:${missing}"
+        warn "  Cloning ran and did not produce them, so this is a real failure — check"
+        warn "  the messages above for a credential or network problem. Skipping this"
+        warn "  effort; nothing was changed for it."
         audit "$effort" "$system" "$framework" "$cred" "${targets[*]}" "skipped-not-cloned"
-        rc=1
+        rc=1; FAILED_EFFORTS="${FAILED_EFFORTS} ${effort}(not cloned)"
         continue
       fi
     fi
@@ -796,50 +1607,428 @@ run_efforts() {
     else
       warn "effort ${effort}: onboarding did not complete cleanly."
       audit "$effort" "$system" "$framework" "$cred" "${targets[*]}" "failed"
-      rc=1
+      rc=1; FAILED_EFFORTS="${FAILED_EFFORTS} ${effort}(onboarding failed)"
     fi
   done < <(selected_efforts "$only_effort")
 
+  # --- STOP HERE IF ANY EFFORT FAILED --------------------------------------
+  #
+  # The fleet is generated from the WHOLE of efforts.yaml, so carrying on past a
+  # failed effort would still give it an agent, an MCP server, a channel binding
+  # and a workspace while reporting it skipped — a channel admitted for an effort
+  # whose Pretorin resolvers were never bound. Generating only the efforts that
+  # succeeded is not the alternative either: agents.list and bindings are replaced
+  # wholesale, so a partial fleet removes the working agents too.
+  if [ "$dry" != 1 ] && [ -n "$FAILED_EFFORTS" ]; then
+    printf '\n' >&2
+    die "these effort(s) did not complete:${FAILED_EFFORTS}
+  The OpenClaw configuration was NOT generated and NOT applied: no agent, Slack
+  binding, MCP server or workspace was created or changed, and ${STATE_FILE}
+  was not written. The gateway is exactly as it was.
+
+  WHAT MAY ALREADY HAVE HAPPENED. Efforts are onboarded to Pretorin one at a
+  time, before any of this, so an effort listed as 'applied' in the audit above
+  HAS had its resolvers swept, bound and provisioned on the platform. Those are
+  idempotent and re-running fixes nothing that is not already right — but they
+  are real, and this command will not pretend otherwise.
+
+  Fix the effort(s) named above and re-run:
+    scripts/clawctl validate      # per-effort rows, including the credential probe
+    scripts/clawctl apply"
+  fi
+
+  # --- the OpenClaw configuration -----------------------------------------
+  #
+  # AFTER onboarding, not before. The agents this generates point at Pretorin MCP
+  # servers scoped to efforts whose resolvers have to exist first, or the first
+  # turn in a freshly bound channel answers about nothing.
+  printf '\n'
+  log "OpenClaw configuration"
+  if ! generate_patch "" "" "$dry"; then
+    die "the OpenClaw configuration could not be generated (see above).
+
+  The gateway is unchanged: no agent, Slack binding, MCP server or workspace was
+  created or changed, and ${STATE_FILE} was not written. Pretorin onboarding runs
+  BEFORE this point, so any effort the audit above records as 'applied' has had
+  its resolvers bound on the platform; that stands, and is idempotent."
+  fi
+  log "  patch:    ${GEN_DIR}/patch.json"
+  log "  manifest: ${GEN_DIR}/manifest.json"
+
   if [ "$dry" = 1 ]; then
+    CC_PLAN_FROM_STATE=1 plan_report
     printf '\n'
     log "plan only: no container was started, no network call was made, and no"
     log "  credential value was read. Every line above is the command 'apply' runs."
     log "  Not checked here (it needs a container): that the running image contains"
     log "  ${LAUNCHER}. 'apply' and 'validate' check it."
+    log ""
+    log "Do not edit configuration in the OpenClaw Control UI while 'apply' runs."
+    log "  The UI writes through the gateway RPC, which carries a base-hash guard;"
+    log "  this command writes the file directly and has none, and the lock it takes"
+    log "  does not cover the UI."
+    return "$rc"
   fi
+
+  # The managed workspaces. Written before the patch, so the moment an agent
+  # exists in the configuration its instructions and its target view are already
+  # there — and snapshotted first, so a rollback can put both halves back.
+  local agent channel server prefix
+  local ws_agents=""
+  while read -r _a; do [ -n "$_a" ] && ws_agents="${ws_agents} ${_a}"; done \
+    < <(python3 "$PARSE_EFFORTS" agents "$EFFORTS_FILE" | cut -f2)
+  WS_AGENTS="$ws_agents"
+
+  # EVERYTHING THAT CAN REFUSE, BEFORE ANYTHING THAT CAN CHANGE.
+  #
+  # Both snapshots and the schema validation only read. Running them first means a
+  # rejected patch or an unwritable backup stops the run with the deployment
+  # genuinely untouched, instead of after the workspaces have been rewritten.
+  oc_config_snapshot
+  validate_patch
+  workspace_snapshot "$ws_agents"
+
+  while IFS=$'\t' read -r effort agent channel server prefix cred; do
+    [ -n "$effort" ] || continue
+    IFS=$'\t' read -r system framework _ < <(python3 "$PARSE_EFFORTS" scope "$effort" "$EFFORTS_FILE")
+    targets=()
+    while read -r t; do [ -n "$t" ] && targets+=("$t"); done < <(effort_targets "$effort")
+    log "  workspace: ${OC_STATE}/workspace-${agent}"
+    # A FAILURE HERE IS NOT LOCAL TO ONE EFFORT. Workspaces are written one at a
+    # time, so a collision on the second effort would otherwise leave the first
+    # one already rewritten with no way back — the run would exit "unchanged"
+    # having changed something. Put every workspace back before failing.
+    if ! write_agent_workspace "$effort" "$agent" "$system" "$framework" "$channel" \
+           "$prefix" ${targets[@]+"${targets[@]}"}; then
+      if workspace_restore "$ws_agents"; then
+        die "${WS_FAIL_MSG}
+
+  The workspaces written before this point were restored, and the gateway
+  configuration was never touched. ${STATE_FILE} was not written."
+      fi
+      warn "${WS_FAIL_MSG}"
+      warn ""
+      warn "RESTORING THE EARLIER WORKSPACES ALSO FAILED. The gateway configuration"
+      warn "was never touched, so the deployment still serves the previous fleet — but"
+      warn "the managed workspace files may be a mixture of old and new."
+      manual_recovery_note
+      exit 1
+    fi
+  done < <(python3 "$PARSE_EFFORTS" agents "$EFFORTS_FILE")
+
+  if ! apply_patch; then
+    warn "applying the configuration patch failed; restoring what was there before."
+    restore_both || exit 1
+    die "the gateway configuration and the managed workspaces are back as they were,
+  and ${STATE_FILE} was not written. Pretorin onboarding runs before this point, so
+  any effort recorded as 'applied' above is bound on the platform; that stands, and
+  is idempotent."
+  fi
+
+  # A FAILED RECREATE IS A VERIFICATION FAILURE, not a reason to stop. The new
+  # configuration is already on disk here, so dying would leave it there with no
+  # attempt to put the old one back.
+  local restarted=1
+  restart_gateway || restarted=0
+
+  if [ "$restarted" = 1 ] && verify_apply; then
+    log "verified: agents, bindings and MCP servers match, and the configuration"
+    log "  this deployment does not own is unchanged."
+    write_state
+    GEN_OK=1
+  else
+    [ "$restarted" = 0 ] && VERIFY_DETAIL="the gateway did not come back up after
+      'docker compose up -d --force-recreate openclaw' (see its output above)."
+    rollback_apply || exit 1
+    exit 1
+  fi
+
   return "$rc"
 }
 
+# What `plan` shows beyond the Pretorin commands: the fleet-level change.
+plan_report() {
+  CC_MANIFEST="${GEN_DIR}/manifest.json" CC_STATE="$STATE_FILE" python3 - <<'PY'
+import json, os
+manifest = json.load(open(os.environ["CC_MANIFEST"]))
+state = {}
+path = os.environ.get("CC_STATE", "")
+if path and os.path.exists(path):
+    try:
+        state = json.load(open(path))
+    except ValueError:
+        state = {}
+
+was_agents = set(state.get("agents") or [])
+now_agents = set(manifest["agents"])
+p = lambda s: print("clawctl:   %s" % s)
+
+print("clawctl: fleet")
+for a in sorted(now_agents - was_agents):
+    p("+ agent %s" % a)
+for a in sorted(now_agents & was_agents):
+    p("  agent %s (unchanged)" % a)
+# Removal is non-destructive: the wiring goes, the state stays.
+for a in sorted(was_agents - now_agents):
+    p("- agent %s  (binding, MCP entry and channel allowlist entry removed;"
+      " workspace, memory, credential and clones KEPT)" % a)
+
+for channel, agent in sorted(manifest["channelBindings"].items()):
+    p("  channel %s -> %s" % (channel, agent))
+for server in manifest["mcpServers"]:
+    p("  mcp %s" % server)
+for server in manifest["deactivatedMcpServers"]:
+    p("- mcp %s (deactivated)" % server)
+
+p("  dmPolicy %s" % manifest["dmPolicy"])
+for user, agent in sorted(manifest["directBindings"].items()):
+    p("  DM %s -> %s (operator-managed, preserved)" % (user, agent))
+
+p("  config paths replaced wholesale: %s" % ", ".join(manifest["replacePaths"]))
+p("  config preserved untouched: %s" % ", ".join(manifest["preservedPaths"]))
+if os.environ.get("CC_PLAN_FROM_STATE") == "1":
+    p("")
+    p("DM bindings above are as of the last apply, read from the host-side record")
+    p("  rather than from the running gateway — plan starts no container. One added")
+    p("  in the Control UI since then is not listed here, and IS preserved by apply.")
+PY
+}
+
+# --effort IS REFUSED ON BOTH, AND THAT IS A CORRECTNESS RULE.
+#
+# agents.list and bindings are ARRAYS, and a patch replaces an array rather than
+# merging into it. Generating them from one effort therefore emits a fleet
+# containing only that effort — which DELETES every other agent, its Slack
+# binding and its MCP server. The flag used to mean "restrict the Pretorin
+# onboarding loop", which was harmless when this command only touched Pretorin;
+# now that it writes the gateway configuration, the same flag would be a
+# fleet-wide deletion wearing the word "one".
+refuse_effort_flag() {
+  local verb="$1" name="$2"
+  die "'${verb}' always generates the COMPLETE fleet from ${EFFORTS_FILE}.
+  --effort ${name} would emit an agents.list and a bindings array containing only
+  that effort, which REMOVES every other agent, its Slack binding and its MCP
+  server. Nothing was changed.
+
+  Run it without --effort:
+    scripts/clawctl ${verb}
+  To check one effort in isolation (read-only, no configuration is generated):
+    scripts/clawctl validate --effort ${name}"
+}
+
 cmd_plan() {
-  local only=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --effort) only="${2:-}"; shift 2 || die "--effort needs a value" ;;
+      --effort) refuse_effort_flag plan "${2:-<name>}" ;;
       *) die "plan: unknown option $1" ;;
     esac
   done
-  run_efforts 1 "$only"
+  run_efforts 1 ""
 }
 
 cmd_apply() {
-  local only=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --effort) only="${2:-}"; shift 2 || die "--effort needs a value" ;;
+      --effort) refuse_effort_flag apply "${2:-<name>}" ;;
       *) die "apply: unknown option $1" ;;
     esac
   done
-  run_efforts 0 "$only" || exit 1
+  run_efforts 0 "" || exit 1
   printf '\n'
-  log "done. If the gateway is running, its live sessions may still hold the previous"
-  log "  view (the preflight artifact carries a 3600s TTL):"
-  log "    docker compose restart openclaw"
+  log "done. Each effort now has its own agent, workspace, instructions, Pretorin"
+  log "  MCP server and Slack channel binding."
+}
+
+# ---------------------------------------------------------------------------
+# dm — optional, operator-configured Slack DMs.
+#
+# DMs are OFF by default and stay off until an operator binds a user. One Slack
+# user binds to exactly one effort: with a single Slack app, one user-to-bot DM
+# cannot represent two efforts, and there is deliberately no conversational way
+# to switch between them.
+#
+# WHY THIS EXISTS ALONGSIDE THE CONTROL UI. The UI can create the same binding
+# through its generic config editor, but a working DM is THREE coupled fields —
+# the direct-peer binding, dmPolicy and allowFrom — and getting only the first
+# right fails silently: an admitted user with no binding falls through every
+# routing tier to the DEFAULT agent. `apply` derives the other two from the
+# bindings; this command writes the binding right in the first place.
+cmd_dm() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    list)
+      [ $# -eq 0 ] || die "usage: scripts/clawctl dm list"
+      ensure_compose_stack
+      local live; live="$(mktemp "${TMPDIR:-/tmp}/clawctl-live.XXXXXX")"
+      oc_config_read "$live"
+      CC_LIVE="$live" python3 - <<'PY'
+import json, os
+try:
+    cfg = json.load(open(os.environ["CC_LIVE"]))
+except (ValueError, OSError):
+    cfg = {}
+rows = [(b["match"]["peer"]["id"], b.get("agentId"))
+        for b in (cfg.get("bindings") or [])
+        if isinstance(b, dict)
+        and (b.get("match") or {}).get("channel") == "slack"
+        and ((b.get("match") or {}).get("peer") or {}).get("kind") == "direct"]
+if not rows:
+    print("clawctl: no Slack DM is authorized; dmPolicy is 'disabled'.")
+else:
+    print("clawctl: %d Slack user(s) may DM this deployment:" % len(rows))
+    for user, agent in sorted(rows):
+        print("           %s -> effort %s" % (user, agent))
+PY
+      rm -f "$live" ;;
+    allow)
+      local user="${1:-}" effort=""
+      shift || true
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --effort) effort="${2:-}"; shift 2 || die "--effort needs a value" ;;
+          *) die "dm allow: unknown option $1" ;;
+        esac
+      done
+      [ -n "$user" ] && [ -n "$effort" ] \
+        || die "usage: scripts/clawctl dm allow <SLACK-USER-ID> --effort <name>
+
+  The SLACK USER ID (U...), not the DM conversation id (D...): routing matches on
+  who sent the message, so a D id can never match and the DM would fall through
+  to the default agent. Find it in Slack: click the person -> View full profile
+  -> More (...) -> Copy member ID."
+      dm_apply "$user:$effort" "" ;;
+    revoke)
+      local user="${1:-}"
+      [ -n "$user" ] && [ $# -eq 1 ] || die "usage: scripts/clawctl dm revoke <SLACK-USER-ID>"
+      dm_apply "" "$user" ;;
+    *) die "usage: scripts/clawctl dm allow <U...> --effort <name> | dm revoke <U...> | dm list" ;;
+  esac
+}
+
+# One binding changes, then the SAME generate/dry-run/apply/recreate/verify/
+# rollback sequence `apply` runs. A DM edit is a configuration change like any
+# other and gets the same safety, rather than a shortcut that skips verification.
+# A DM COMMAND MAY NOT DEPLOY A FLEET CHANGE.
+#
+# `dm allow`/`dm revoke` regenerate and apply the COMPLETE configuration from
+# efforts.yaml — the only way to write a bindings array without destroying what it
+# does not name. That makes them a second route to production for any unapplied
+# edit (a repointed system_id, a new effort, a moved channel, a target added or
+# dropped), skipping the stable-scope check, target cloning and Pretorin
+# onboarding that apply does around the patch: the agent would come up with a
+# workspace built for the OLD scope.
+#
+# So a DM mutation is allowed only when the fleet on disk is the fleet last
+# applied. One hash over efforts.yaml's scope, channel, credential and each
+# target's complete normalized definition — name, url, ref, private
+# (openclaw-patch.py: fleet_fingerprint). DM bindings are deliberately not in it,
+# since changing those is the point.
+require_applied_fleet() {
+  local want have
+  want="$(python3 "$PATCH_TOOL" fingerprint --efforts "$EFFORTS_FILE" 2>/dev/null || true)"
+  have=""
+  [ -f "$STATE_FILE" ] && have="$(python3 -c "
+import json,sys
+try: print(json.load(open(sys.argv[1])).get('fleetFingerprint') or '')
+except Exception: print('')" "$STATE_FILE" 2>/dev/null || true)"
+
+  [ -n "$want" ] && [ "$want" = "$have" ] && return 0
+
+  local why
+  if [ -z "$have" ]; then
+    why="this deployment has no record of a successful 'apply'"
+  else
+    why="${EFFORTS_FILE} no longer matches the fleet that was last applied"
+  fi
+  die "refusing to change DM access: ${why}.
+
+  A DM command rebuilds the WHOLE configuration from ${EFFORTS_FILE}, so running
+  one now would deploy that pending change without cloning its targets, without
+  onboarding it to Pretorin, and without the check that an effort's system or
+  framework has not been repointed under an existing name. An agent would come up
+  with a workspace built for the previous scope.
+
+  Run this first, review what it reports, and then re-run the DM command:
+    scripts/clawctl apply
+
+  Nothing has been changed: no configuration, no workspace, no recorded state.
+$(fleet_drift_detail)"
+}
+
+# What differs, so the operator does not have to diff two files by hand. Read-only.
+fleet_drift_detail() {
+  [ -f "$STATE_FILE" ] || return 0
+  CC_STATE="$STATE_FILE" CC_EFFORTS="$EFFORTS_FILE" CC_PE="$PARSE_EFFORTS" \
+    python3 - <<'DRIFT' 2>/dev/null || true
+import importlib.util, json, os, sys
+try:
+    state = json.load(open(os.environ["CC_STATE"]))
+    spec = importlib.util.spec_from_file_location("pe", os.environ["CC_PE"])
+    pe = importlib.util.module_from_spec(spec); spec.loader.exec_module(pe)
+    efforts = pe.load(os.environ["CC_EFFORTS"])
+except Exception:
+    raise SystemExit(0)
+was = state.get("efforts") or {}
+now = {e["name"]: e for e in efforts}
+wt = state.get("targetsByEffort") or {}
+nt = {e["name"]: [t["name"] for t in e["targets"]] for e in efforts}
+lines = []
+for name in sorted(set(was) | set(now)):
+    if name not in was:
+        lines.append("    + effort %s is declared but has never been applied" % name)
+    elif name not in now:
+        lines.append("    - effort %s was applied but is no longer declared" % name)
+    else:
+        for field in ("system_id", "framework_id", "slack_channel_id", "credential_ref"):
+            if was[name].get(field) != now[name].get(field):
+                lines.append("    ~ effort %s: %s changed" % (name, field))
+        if sorted(wt.get(name) or []) != sorted(nt.get(name) or []):
+            lines.append("    ~ effort %s: its target list changed" % name)
+if lines:
+    print("\n  What changed since the last apply:")
+    print("\n".join(lines))
+DRIFT
+}
+
+dm_apply() {
+  local add="$1" remove="$2"
+  [ -f "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} not found."
+  python3 "$PARSE_EFFORTS" validate "$EFFORTS_FILE" || exit 2
+  require_applied_fleet
+  ensure_compose_stack
+  ensure_mount_sources
+  acquire_lock
+
+  if ! generate_patch "$add" "$remove"; then
+    die "nothing was changed."
+  fi
+  plan_report
+  oc_config_snapshot
+  validate_patch
+  if ! apply_patch; then
+    warn "applying failed; restoring what was there before."
+    restore_both || exit 1
+    die "the gateway configuration and the managed workspaces are back as they were."
+  fi
+  local restarted=1
+  restart_gateway || restarted=0
+  if [ "$restarted" = 1 ] && verify_apply; then
+    log "verified."
+    write_state
+    GEN_OK=1
+  else
+    [ "$restarted" = 0 ] && VERIFY_DETAIL="the gateway did not come back up after
+      'docker compose up -d --force-recreate openclaw' (see its output above)."
+    rollback_apply || exit 1
+    exit 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
 # dispatch
 
-usage() { sed -n '2,32p' "$0"; }
+usage() { sed -n '2,40p' "$0"; }
 
 case "${1:-}" in
   '' | -h | --help) usage; exit 0 ;;
@@ -849,5 +2038,6 @@ case "${1:-}" in
   credential)   shift; cmd_credential "$@" ;;
   plan)         shift; cmd_plan "$@" ;;
   apply)        shift; cmd_apply "$@" ;;
-  *) die "unknown subcommand '$1' (try: validate, migrate, credential, plan, apply)" ;;
+  dm)           shift; cmd_dm "$@" ;;
+  *) die "unknown subcommand '$1' (try: validate, migrate, credential, plan, apply, dm)" ;;
 esac

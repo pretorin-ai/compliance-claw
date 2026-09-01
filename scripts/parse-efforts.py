@@ -5,6 +5,8 @@
     parse-efforts.py efforts          [FILE]        -> "<effort>" per line
     parse-efforts.py scope    EFFORT  [FILE]        -> "<system>\\t<framework>\\t<credential_ref>"
     parse-efforts.py list     EFFORT  [FILE]        -> "<name>\\t<url>\\t<private>\\t<ref>"
+    parse-efforts.py targets-all      [FILE]        -> the same, deduped across every effort
+    parse-efforts.py agents           [FILE]        -> "<effort>\\t<agent>\\t<channel>\\t<mcp>\\t<prefix>\\t<ref>"
     parse-efforts.py credentials      [FILE]        -> "<effort>\\t<ref>\\t<host_path>\\t<container_path>"
     parse-efforts.py credential-path EFFORT [FILE] [--container]
     parse-efforts.py --self-test
@@ -44,6 +46,7 @@ The subset:
         system_id: <scalar>
         framework_id: <scalar>
         credential_ref: <scalar>
+        slack_channel_id: <scalar>
         targets:
           - name: <scalar>
             url: <scalar>
@@ -88,8 +91,10 @@ pt = _load_parse_targets()
 ParseError = pt.ParseError
 _scalar = pt._scalar
 
-EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref", "targets")
-REQUIRED_EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref")
+EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref",
+               "slack_channel_id", "targets")
+REQUIRED_EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref",
+                        "slack_channel_id")
 # Keys whose value may legally be empty on its own line, because their content
 # is the indented block beneath them.
 BLOCK_KEYS = ("targets",)
@@ -186,6 +191,131 @@ def _check_token(value, what, owner, lineno):
             lineno,
             "%s '%s' (effort '%s') must not start with a dot" % (what, value, owner),
         )
+
+
+# --- the Slack channel id --------------------------------------------------
+
+# C ONLY, AND THE TWO REJECTIONS BELOW ARE WHY.
+#
+# A Slack id's first letter is its conversation kind, and the kinds are admitted
+# and routed differently:
+#
+#   C   public or (modern) private channel  -> peer kind "channel"
+#   G   LEGACY private channel, OR a multi-person DM (MPIM)
+#   D   a one-to-one DM conversation
+#
+# D is refused because an effort's home is a channel and DM access is configured
+# against the Slack USER id instead (scripts/clawctl dm).
+#
+# G is refused because it is AMBIGUOUS and the two readings need different
+# configuration. Measured in the pinned Slack plugin: an MPIM is admitted by
+# channels.slack.dm.groupEnabled (default false) plus dm.groupChannels, and a
+# routing binding selects an agent only AFTER admission — so a binding alone can
+# never make an MPIM work. Telling the two apart needs a live Slack lookup, which
+# nothing on the validation path has: `clawctl plan` guarantees zero network, and
+# the first `clawctl apply` runs before any gateway exists. Refusing beats
+# half-configuring something that silently never routes.
+SLACK_CHANNEL_RE = re.compile(r"^C[A-Z0-9]{6,}$")
+
+
+def _check_slack_channel_id(value, owner, lineno):
+    if not value:
+        raise ParseError(
+            lineno, "slack_channel_id for effort '%s' is empty" % owner)
+    if value.startswith("#"):
+        raise ParseError(
+            lineno,
+            "slack_channel_id '%s' (effort '%s') is a channel NAME. The value"
+            " becomes a key in the Slack channel allowlist, and a name-based key"
+            " silently never routes under groupPolicy 'allowlist' — which is"
+            " indistinguishable from the bot being broken. Open the channel ->"
+            " right-click -> Copy link, and use the C value at the end of the URL."
+            % (value, owner),
+        )
+    if value.startswith("D"):
+        raise ParseError(
+            lineno,
+            "slack_channel_id '%s' (effort '%s') is a DM conversation id. An"
+            " effort's canonical home is a channel, and DM access is configured"
+            " separately against the Slack USER id (U...) — see"
+            " 'scripts/clawctl dm --help'. Use the channel's C id."
+            % (value, owner),
+        )
+    if value.startswith("G"):
+        raise ParseError(
+            lineno,
+            "slack_channel_id '%s' (effort '%s') is a legacy G id. Slack uses G for"
+            " both legacy private channels and multi-person DMs, and the two are"
+            " admitted and routed differently — an MPIM additionally needs"
+            " channels.slack.dm.groupEnabled, which this deployment does not set."
+            " Nothing here can tell them apart without a live Slack lookup, so a G"
+            " id is refused rather than half-configured. Modern private channels"
+            " have C ids: open the channel -> right-click -> Copy link, and use the"
+            " C value. If your workspace only issues G ids for this channel, this"
+            " release cannot serve it." % (value, owner),
+        )
+    if not SLACK_CHANNEL_RE.match(value):
+        raise ParseError(
+            lineno,
+            "slack_channel_id '%s' (effort '%s') is not a Slack channel id."
+            " Expected a stable id such as C0123ABCDEF: 'C' followed by at least"
+            " six characters, uppercase A-Z and 0-9 only."
+            % (value, owner),
+        )
+
+
+# --- derived identifiers ---------------------------------------------------
+#
+# ONE EFFORT PRODUCES THREE NAMES, AND ALL THREE ARE DERIVED HERE so that
+# clawctl, the patch generator and the launcher cannot disagree about them.
+#
+#   agent id          == the effort name
+#   MCP server name   == "pretorin-<effort>"
+#   MCP tool prefix   == what OpenClaw makes of that server name
+#
+# THE TOOL PREFIX IS THE ONE THAT BITES. Each agent's tool policy denies every
+# OTHER effort's MCP tools by their prefix glob, so a prefix that is not what we
+# think it is points a deny rule at the wrong server — which reads as isolation
+# while providing none. OpenClaw's sanitizer (agent-bundle-mcp-names) is
+# reproduced below EXACTLY, and the two rules it implies are enforced as schema
+# errors rather than discovered in production:
+#
+#   1. the prefix is truncated at 30 characters
+#      "pretorin-fedramp-moderate-authorization-boundary"
+#        -> "pretorin-fedramp-moderate-auth"
+#   2. two server names that sanitize to the same prefix get a "-2" suffix
+#      "a.b" and "a-b" both sanitize to "pretorin-a-b"; the second silently
+#      becomes "pretorin-a-b-2"
+MCP_SERVER_PREFIX = "pretorin-"
+# OpenClaw's TOOL_NAME_MAX_PREFIX.
+MCP_PREFIX_MAX = 30
+MAX_EFFORT_NAME = MCP_PREFIX_MAX - len(MCP_SERVER_PREFIX)   # 21
+_MCP_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def agent_id(effort_name):
+    """The OpenClaw agent id for an effort. Deliberately identical to the effort
+    name: it appears in session keys, workspace paths and audit lines, and a
+    second naming scheme would be one more thing to keep in step."""
+    return effort_name
+
+
+def mcp_server_name(effort_name):
+    """The mcp.servers key for an effort."""
+    return MCP_SERVER_PREFIX + effort_name
+
+
+def mcp_tool_prefix(server_name):
+    """What OpenClaw will call this server's tools, as `<prefix>__<tool>`.
+
+    A transcription of sanitizeToolFragment/sanitizeServerName from the pinned
+    OpenClaw, minus the duplicate-suffix loop — validate() refuses duplicates
+    outright rather than letting the suffix happen.
+    """
+    normalized = _MCP_UNSAFE_RE.sub("-", server_name.strip()) or "mcp"
+    if not re.match(r"^[A-Za-z]", normalized):
+        normalized = "mcp-" + normalized
+    return normalized[:MCP_PREFIX_MAX]
 
 
 # --- the credential ladder (ONE definition) --------------------------------
@@ -371,6 +501,9 @@ def validate(efforts):
 
     seen_effort_names = {}
     seen_pairs = {}
+    seen_channels = {}
+    # sanitized MCP tool prefix -> (effort name, lineno)
+    seen_prefixes = {}
     # target name -> (identity tuple, effort name, lineno)
     seen_targets = {}
 
@@ -387,6 +520,36 @@ def validate(efforts):
                 "duplicate effort name '%s' (also on line %d)" % (name, seen_effort_names[name]))
         seen_effort_names[name] = line
 
+        # THE TWO PREFIX RULES. See mcp_tool_prefix() for why getting either one
+        # wrong points an agent's deny glob at the wrong MCP server — isolation
+        # that looks configured and is not.
+        if len(name) > MAX_EFFORT_NAME:
+            raise ParseError(
+                line,
+                "effort name '%s' is %d characters; the maximum is %d. The name"
+                " becomes the MCP server '%s', whose model-facing tool prefix"
+                " OpenClaw truncates at %d characters — so a longer name produces"
+                " '%s', and the per-agent tool policy that denies other efforts'"
+                " tools by prefix would then point at the wrong server. Shorten it."
+                % (name, len(name), MAX_EFFORT_NAME, mcp_server_name(name),
+                   MCP_PREFIX_MAX, mcp_tool_prefix(mcp_server_name(name))),
+            )
+        prefix = mcp_tool_prefix(mcp_server_name(name))
+        if prefix in seen_prefixes:
+            other, other_line = seen_prefixes[prefix]
+            raise ParseError(
+                line,
+                "effort '%s' and effort '%s' (line %d) both produce the MCP tool"
+                " prefix '%s'. OpenClaw replaces every character outside"
+                " [A-Za-z0-9_-] with '-' when it names an MCP server's tools, so"
+                " names differing only in those characters collide — and the"
+                " second one silently becomes '%s-2', leaving the per-agent tool"
+                " policy denying a server that no longer answers to that name."
+                " Rename one of them."
+                % (name, other, other_line, prefix, prefix),
+            )
+        seen_prefixes[prefix] = (name, line)
+
         for key in REQUIRED_EFFORT_KEYS:
             if key not in effort:
                 raise ParseError(line, "effort '%s' has no %s" % (name, key))
@@ -394,6 +557,25 @@ def validate(efforts):
         _check_system_uuid(effort["system_id"], name, line)
         _check_token(effort["framework_id"], "framework_id", name, line)
         _check_token(effort["credential_ref"], "credential_ref", name, line)
+        _check_slack_channel_id(effort["slack_channel_id"], name, line)
+
+        # ONE CHANNEL ROUTES TO ONE AGENT. The channel id is both an allowlist key
+        # and a binding's peer id; two efforts claiming it would produce two
+        # bindings in the same match tier, where OpenClaw takes the first in config
+        # order and the other effort silently never answers in its own channel.
+        channel = effort["slack_channel_id"]
+        if channel in seen_channels:
+            other, other_line = seen_channels[channel]
+            raise ParseError(
+                line,
+                "effort '%s' and effort '%s' (line %d) both declare"
+                " slack_channel_id '%s'. One channel binds to exactly one agent:"
+                " two bindings on one peer land in the same match tier, the first"
+                " in config order wins, and the other effort would never answer"
+                " anywhere. Give each effort its own channel."
+                % (name, other, other_line, channel),
+            )
+        seen_channels[channel] = (name, line)
 
         # One preflight artifact is keyed on system+framework. Two efforts on the
         # same pair are the same compliance effort wearing two names, and they
@@ -481,6 +663,27 @@ def load(path):
         raise SystemExit(2)
 
 
+def union_targets(efforts):
+    """Every target any effort declares, once, in declaration order.
+
+    Returns (name, url, private, ref) tuples in `list`'s field order. Sharing a
+    repository between efforts is a first-class case — the same code under SOC 2
+    and under HIPAA — and it must produce ONE clone at workspace/targets/<name>.
+    validate() has already refused two DIFFERENT definitions under one name, so
+    the first occurrence is the agreed definition rather than an arbitrary winner.
+    """
+    seen = set()
+    out = []
+    for effort in efforts:
+        for item in effort["targets"]:
+            if item["name"] in seen:
+                continue
+            seen.add(item["name"])
+            out.append((item["name"], item["url"], item["private"],
+                        item.get("ref", "")))
+    return out
+
+
 def find_effort(efforts, name):
     for effort in efforts:
         if effort["name"] == name:
@@ -505,6 +708,7 @@ efforts:
     system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411
     framework_id: soc2
     credential_ref: default
+    slack_channel_id: C0SOC2AAA
     targets:
       - name: simple-crm
         url: https://example.com/a.git
@@ -517,6 +721,7 @@ efforts:
     system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411
     framework_id: hipaa
     credential_ref: hipaa-key
+    slack_channel_id: C0HIPAABB
     targets:
       # SAME name, IDENTICAL definition -> one clone, bound into both scopes.
       - name: simple-crm
@@ -524,21 +729,23 @@ efforts:
         ref: main
 """
 
-E = "efforts:\n  - name: %s\n    system_id: %s\n    framework_id: %s\n    credential_ref: %s\n    targets:\n      - name: t\n        url: https://example.com/a.git\n"
+E = "efforts:\n  - name: %s\n    system_id: %s\n    framework_id: %s\n    credential_ref: %s\n    slack_channel_id: %s\n    targets:\n      - name: t\n        url: https://example.com/a.git\n"
 
 
 UUID_A = "11111111-1111-4111-8111-111111111111"
 UUID_B = "22222222-2222-4222-8222-222222222222"
 
 
-def _e(name="a", sys_=UUID_A, fw="f", cred="default"):
-    return E % (name, sys_, fw, cred)
+def _e(name="a", sys_=UUID_A, fw="f", cred="default", chan="C0000001"):
+    return E % (name, sys_, fw, cred, chan)
 
 
 SHARED = ("efforts:\n"
           "  - name: one\n    system_id: " + UUID_A + "\n    framework_id: f1\n    credential_ref: default\n"
+          "    slack_channel_id: C0000011\n"
           "    targets:\n      - name: t\n        url: https://example.com/a.git\n%s"
           "  - name: two\n    system_id: " + UUID_A + "\n    framework_id: f2\n    credential_ref: default\n"
+          "    slack_channel_id: C0000012\n"
           "    targets:\n      - name: t\n        url: %s\n%s")
 
 CASES = [
@@ -546,18 +753,18 @@ CASES = [
     ("unknown top-level key", "nope: 1\nefforts:\n  - name: a\n", "unknown top-level key"),
     ("targets.yaml key at top level", "system_id: a\nefforts:\n  - name: a\n", "clawctl migrate"),
     ("targets: at top level", "targets:\n  - name: a\n", "clawctl migrate"),
-    ("duplicate efforts key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\nefforts:\n", "duplicate key 'efforts'"),
+    ("duplicate efforts key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000101\n    targets:\n      - name: t\n        url: https://e/r.git\nefforts:\n", "duplicate key 'efforts'"),
     ("no efforts", "efforts:\n", "no efforts defined"),
     ("indented line before efforts:", "  stray: 1\nefforts:\n", "before 'efforts:'"),
     ("duplicate effort name", _e("a") + _e("a").replace("efforts:\n", ""), "duplicate effort name"),
     ("duplicate system+framework pair",
-     "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t1\n        url: https://e/r.git\n"
-     "  - name: b\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t2\n        url: https://e/r.git\n",
+     "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000102\n    targets:\n      - name: t1\n        url: https://e/r.git\n"
+     "  - name: b\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000103\n    targets:\n      - name: t2\n        url: https://e/r.git\n",
      "same system_id + framework_id"),
-    ("missing system_id", "efforts:\n  - name: a\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no system_id"),
-    ("missing framework_id", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no framework_id"),
-    ("missing credential_ref", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no credential_ref"),
-    ("effort with no targets", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n", "has no targets"),
+    ("missing system_id", "efforts:\n  - name: a\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000104\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no system_id"),
+    ("missing framework_id", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    credential_ref: c\n    slack_channel_id: C0000105\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no framework_id"),
+    ("missing credential_ref", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    slack_channel_id: C0000106\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no credential_ref"),
+    ("effort with no targets", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000117\n", "has no targets"),
     # --- injection shapes ---
     ("command substitution in name", _e(name="$(whoami)"), "must match"),
     ("backtick in name", _e(name="a`id`"), "must match"),
@@ -576,7 +783,7 @@ CASES = [
     ("leading dash credential_ref", _e(cred="-c"), "must not start with '-'"),
     ("leading dot effort name", _e(name=".hidden"), "must not start with a dot"),
     ("leading dot credential_ref", _e(cred=".ssh"), "must not start with a dot"),
-    ("empty value", "efforts:\n  - name: a\n    system_id:\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "empty value"),
+    ("empty value", "efforts:\n  - name: a\n    system_id:\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000107\n    targets:\n      - name: t\n        url: https://e/r.git\n", "empty value"),
     # --- system_id must be a UUID, never a friendly name ---
     ("FRIENDLY NAME as system_id", _e(sys_="Fathom"), "must be the canonical system UUID"),
     ("almost-a-uuid (too short)", _e(sys_="11111111-1111-4111-8111-11111111111"), "must be the canonical system UUID"),
@@ -587,25 +794,53 @@ CASES = [
     ("shared target, CONFLICTING url", SHARED % ("", "https://example.com/DIFFERENT.git", ""), "conflicts with target"),
     ("shared target, CONFLICTING ref", SHARED % ("        ref: main\n", "https://example.com/a.git", "        ref: develop\n"), "conflicts with target"),
     ("shared target, CONFLICTING private", SHARED % ("", "https://github.com/o/t.git", "        private: true\n"), "conflicts with target"),
-    ("duplicate target within one effort", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n      - name: t\n        url: https://e/r.git\n", "duplicate target name 't' within effort"),
+    ("duplicate target within one effort", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000108\n    targets:\n      - name: t\n        url: https://e/r.git\n      - name: t\n        url: https://e/r.git\n", "duplicate target name 't' within effort"),
     # `connections:` is NOT part of this schema; it must read as an unknown key
     # rather than being silently tolerated for a future release.
     ("connections is not a key yet", _e() + "    connections: []\n", "unknown effort key"),
+    # --- the Slack channel id ---
+    #
+    # C ONLY. The two interesting rejections are D and G, and they are separate
+    # cases because they are separate mistakes with separate remedies.
+    ("slack_channel_id missing",
+     "efforts:\n  - name: a\n    system_id: " + UUID_A + "\n    framework_id: f\n    credential_ref: c\n"
+     "    targets:\n      - name: t\n        url: https://e/r.git\n", "has no slack_channel_id"),
+    ("slack_channel_id is a DM id", _e(chan="D0123ABCDEF"), "is a DM conversation id"),
+    ("slack_channel_id is a legacy G id", _e(chan="G0123ABCDEF"), "is a legacy G id"),
+    ("slack_channel_id is a channel NAME", _e(chan="#compliance"), "is a channel NAME"),
+    ("slack_channel_id lowercase", _e(chan="C0123abcdef"), "is not a Slack channel id"),
+    ("slack_channel_id too short", _e(chan="C0123"), "is not a Slack channel id"),
+    ("slack_channel_id wrong prefix", _e(chan="X0123ABCDEF"), "is not a Slack channel id"),
+    ("duplicate slack_channel_id across efforts",
+     _e("one", fw="f1", chan="C0000777") + _e("two", fw="f2", chan="C0000777").replace("efforts:\n", ""),
+     "both declare"),
+
+    # --- derived MCP identifiers ---
+    #
+    # Both of these are silent-misrouting bugs if they get through: the per-agent
+    # tool policy denies other efforts by MCP tool prefix, so a truncated or
+    # suffixed prefix denies a server that is not the one it names.
+    ("effort name too long for the MCP tool prefix",
+     _e(name="fedramp-moderate-authorization"), "the maximum is 21"),
+    ("effort names colliding after MCP sanitization",
+     _e("a.b", fw="f1", chan="C0000801") + _e("a-b", fw="f2", chan="C0000802").replace("efforts:\n", ""),
+     "both produce the MCP tool prefix"),
+
     # --- structure ---
     ("unknown effort key", _e() + "    region: us\n", "unknown effort key"),
-    ("unknown target key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n        branch: main\n", "unknown target key"),
-    ("duplicate effort key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    system_id: t\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://e/r.git\n", "duplicate key 'system_id'"),
+    ("unknown target key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000109\n    targets:\n      - name: t\n        url: https://e/r.git\n        branch: main\n", "unknown target key"),
+    ("duplicate effort key", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    system_id: t\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000110\n    targets:\n      - name: t\n        url: https://e/r.git\n", "duplicate key 'system_id'"),
     ("duplicate targets key", _e() + "    targets:\n      - name: u\n        url: https://e/r.git\n", "duplicate key 'targets'"),
     ("targets with inline value", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets: nope\n", "indented list, not an inline value"),
     ("effort not starting with - name", "efforts:\n  - system_id: 11111111-1111-4111-8111-111111111111\n    name: a\n", "each effort must start with '- name:'"),
-    ("target not starting with - name", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - url: https://e/r.git\n", "each target must start with '- name:'"),
+    ("target not starting with - name", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000111\n    targets:\n      - url: https://e/r.git\n", "each target must start with '- name:'"),
     ("bare dash", "efforts:\n  -\n", "expected '- name: <value>'"),
     # --- target rules inherited from parse-targets.py (must NOT drift) ---
-    ("non-https url", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: git@github.com:o/r.git\n", "must start with https://"),
-    ("missing url", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        ref: main\n", "has no url"),
-    ("private: yes", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://github.com/o/r.git\n        private: yes\n", "must be exactly 'true' or 'false'"),
-    ("private on a non-github host", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: t\n        url: https://gitlab.com/o/r.git\n        private: true\n", "only work for https://github.com/"),
-    ("target name traversal", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    targets:\n      - name: ../etc\n        url: https://e/r.git\n", "must match"),
+    ("non-https url", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000112\n    targets:\n      - name: t\n        url: git@github.com:o/r.git\n", "must start with https://"),
+    ("missing url", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000113\n    targets:\n      - name: t\n        ref: main\n", "has no url"),
+    ("private: yes", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000114\n    targets:\n      - name: t\n        url: https://github.com/o/r.git\n        private: yes\n", "must be exactly 'true' or 'false'"),
+    ("private on a non-github host", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000115\n    targets:\n      - name: t\n        url: https://gitlab.com/o/r.git\n        private: true\n", "only work for https://github.com/"),
+    ("target name traversal", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000116\n    targets:\n      - name: ../etc\n        url: https://e/r.git\n", "must match"),
 ]
 
 
@@ -620,7 +855,7 @@ def _shell_reads_list_correctly():
     """
     import subprocess
     text = ("efforts:\n  - name: e\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n"
-            "    credential_ref: default\n    targets:\n"
+            "    credential_ref: default\n    slack_channel_id: C0000042\n    targets:\n"
             "      - name: p\n        url: https://github.com/o/p.git\n        private: true\n"
             "      - name: q\n        url: https://github.com/o/q.git\n        ref: main\n")
     efforts = parse(text)
@@ -668,6 +903,31 @@ def self_test():
     # The whole point of the exemption: this file has two efforts naming one target.
     checks.append((efforts[1]["targets"][0]["name"] == "simple-crm",
                    "SHARED target with an IDENTICAL definition is ACCEPTED"))
+
+    # The derived identifiers, and the sanitizer transcription that the two
+    # schema rules above depend on being correct.
+    checks += [
+        (agent_id("crm-soc2") == "crm-soc2", "derived: agent id is the effort name"),
+        (mcp_server_name("crm-soc2") == "pretorin-crm-soc2", "derived: MCP server name"),
+        (mcp_tool_prefix("pretorin-crm-soc2") == "pretorin-crm-soc2",
+         "derived: a short name passes through the sanitizer unchanged"),
+        (mcp_tool_prefix("pretorin-a.b") == "pretorin-a-b",
+         "derived: '.' becomes '-' (this is why a.b and a-b collide)"),
+        (mcp_tool_prefix("pretorin-fedramp-moderate-authorization-boundary")
+         == "pretorin-fedramp-moderate-auth",
+         "derived: the prefix truncates at 30 characters"),
+        (len(MCP_SERVER_PREFIX) + MAX_EFFORT_NAME == MCP_PREFIX_MAX,
+         "derived: the name limit is exactly what fits in the prefix"),
+    ]
+
+    # The union: one clone per name, first definition wins, `list` field order.
+    union = union_targets(efforts)
+    checks += [
+        ([t[0] for t in union] == ["simple-crm", "secret-repo"],
+         "targets-all: SHARED target appears ONCE across two efforts"),
+        (union[1][2] == "true", "targets-all: keeps `private` in the third field"),
+        (union[0][3] == "main", "targets-all: keeps `ref` in the fourth field"),
+    ]
 
     # The credential ladder, both modes, both rungs.
     checks += [
@@ -722,7 +982,7 @@ def main(argv):
     mode = args[0]
 
     default_file = os.path.join(REPO_ROOT, "efforts.yaml")
-    if mode in ("validate", "efforts", "credentials"):
+    if mode in ("validate", "efforts", "credentials", "targets-all", "agents"):
         path = args[1] if len(args) > 1 else default_file
         effort_name = None
     elif mode in ("scope", "list", "credential-path"):
@@ -734,7 +994,7 @@ def main(argv):
     else:
         sys.stderr.write(
             "parse-efforts: unknown mode '%s' (expected validate / efforts / scope /"
-            " list / credentials / credential-path)\n" % mode)
+            " list / targets-all / agents / credentials / credential-path)\n" % mode)
         return 2
 
     efforts = load(path)
@@ -750,6 +1010,26 @@ def main(argv):
             ref = effort["credential_ref"]
             print("%s\t%s\t%s\t%s" % (
                 effort["name"], ref, host_credential_path(ref), container_credential_path(ref)))
+        return 0
+    if mode == "targets-all":
+        # THE UNION, DEDUPED, in the same four-field shape `list` emits — so every
+        # existing shell reader takes it unchanged. This is what makes efforts.yaml
+        # authoritative for cloning: bootstrap needs every repository any effort
+        # declares, exactly once. validate() has already refused two different
+        # definitions under one name, so first-wins here is not a choice between
+        # rivals; it is the one agreed definition.
+        for name, url, private, ref in union_targets(efforts):
+            print("%s\t%s\t%s\t%s" % (name, url, private, ref))
+        return 0
+    if mode == "agents":
+        # One row per effort: everything downstream needs to generate an agent,
+        # a binding and an MCP server, derived HERE so nothing re-derives it.
+        for effort in efforts:
+            name = effort["name"]
+            server = mcp_server_name(name)
+            print("%s\t%s\t%s\t%s\t%s\t%s" % (
+                name, agent_id(name), effort["slack_channel_id"],
+                server, mcp_tool_prefix(server), effort["credential_ref"]))
         return 0
 
     effort = find_effort(efforts, effort_name)

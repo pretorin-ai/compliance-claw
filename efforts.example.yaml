@@ -4,7 +4,7 @@
 # efforts.yaml, which is gitignored because it names YOUR systems. Produce it
 # from your existing single-effort targets.yaml:
 #
-#   scripts/clawctl migrate --name crm-soc2
+#   scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 #   scripts/clawctl validate
 #   scripts/clawctl plan
 #   scripts/clawctl apply
@@ -18,6 +18,13 @@
 # NO TOKEN EVER APPEARS HERE. `credential_ref` is a NAME. This file is safe to
 # commit; a real efforts.yaml is gitignored only because it names your systems,
 # not because it holds anything secret.
+#
+# THIS FILE IS THE RUNTIME AUTHORITY. `scripts/clawctl apply` generates one
+# OpenClaw agent per effort from it — its own workspace, sessions, memory,
+# instructions, Pretorin MCP server and Slack binding — and clones every
+# repository any effort declares. targets.yaml survives as input to
+# `clawctl migrate` and as the legacy fallback for a deployment that has not
+# migrated; once this file exists, nothing reads targets.yaml.
 
 efforts:
   # ---------------------------------------------------------------------------
@@ -36,6 +43,25 @@ efforts:
     system_id: 00000000-0000-0000-0000-000000000000
     framework_id: soc2
     credential_ref: default
+
+    # THE SLACK CHANNEL THIS EFFORT LIVES IN, and the whole of its routing.
+    # One channel, one agent, one effort: a message here reaches an agent that is
+    # pinned to this system + framework and can see only this effort's
+    # repositories and only this effort's Pretorin MCP server.
+    #
+    # A STABLE ID, NEVER A NAME. Open the channel in Slack -> right-click ->
+    # Copy link -> the C... value at the end of the URL. A name-based key such as
+    # "#compliance" silently never routes, which looks exactly like the bot being
+    # broken.
+    #
+    # C ONLY. A D id is a DM conversation and is refused — DM access is
+    # configured separately, against a Slack USER id:
+    #   scripts/clawctl dm allow U0123ABCDEF --effort crm-soc2
+    # A legacy G id is also refused, because Slack uses G for both legacy private
+    # channels and multi-person DMs, and telling them apart needs a live Slack
+    # lookup that offline validation cannot make. Modern private channels have C
+    # ids.
+    slack_channel_id: C0123ABCDEF
 
     # Exactly the semantics targets.yaml has always had. `name` becomes a
     # directory name and a container path; `url` must be an https:// git remote;
@@ -61,6 +87,12 @@ efforts:
   - name: crm-hipaa
     system_id: 00000000-0000-0000-0000-000000000000
     framework_id: hipaa
+
+    # A DIFFERENT CHANNEL. Two efforts may not share one: a channel binds to
+    # exactly one agent, and two bindings on one channel land in the same match
+    # tier, where the first in config order silently wins and the other effort
+    # never answers anywhere.
+    slack_channel_id: C0456DEFABC
 
     # A SEPARATE credential for this effort. Create the file with:
     #   scripts/clawctl credential add hipaa-key
