@@ -4,9 +4,10 @@
 #
 #   pretorin-mcp-launch <effort-name>
 #
-# Installed in the image as /opt/compliance-claw/pretorin-mcp-launch. A later
-# release points each per-effort mcp.servers.<name>.command at it; this release
-# ships and tests the mechanism.
+# Installed in the image as /opt/compliance-claw/pretorin-mcp-launch, and it is
+# what every per-effort mcp.servers.pretorin-<effort>.command points at:
+# `scripts/clawctl apply` generates one such server per effort, each invoking this
+# same binary with a different effort name.
 #
 # WHY THIS EXISTS AT ALL.
 #

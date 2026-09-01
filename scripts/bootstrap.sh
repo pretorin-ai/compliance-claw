@@ -590,21 +590,26 @@ if [ "$FILE_SECRETS" = 1 ]; then
        ${SECRET_DIR}/pretorin-api-key
        ${SECRET_DIR}/openai-api-key   OR   ${SECRET_DIR}/anthropic-api-key
      The gateway token was generated for you. Checklist: docs/file-secrets.md
-  2. scripts/onboard-targets.sh                 # register targets with Pretorin
-  3. docker compose up -d                       # gateway on http://127.0.0.1:18789"
-  SLACK_HINT="in ${SECRET_DIR}/slack-app-token and slack-bot-token, plus SLACK_CHANNEL_ID in .env,"
+  2. docker compose up -d                       # gateway on http://127.0.0.1:18789
+  3. scripts/clawctl plan                       # the whole change, no containers
+  4. scripts/clawctl apply                      # onboard each effort, then build
+                                                # its agent, MCP server and Slack
+                                                # channel binding"
+  SLACK_HINT="in ${SECRET_DIR}/slack-app-token and slack-bot-token (which channels are served comes from efforts.yaml, not .env),"
 else
   NEXT_STEPS="  1. put a PRETORIN_API_KEY in .env             (see .env.example)
      A read-only key is sufficient for everything here; a write-enabled key is
      also supported. The key's own scopes decide, not any setting in this repo.
-  2. scripts/onboard-targets.sh                 # register targets with Pretorin
-  3. docker compose up -d                       # gateway on http://127.0.0.1:18789
+  2. docker compose up -d                       # gateway on http://127.0.0.1:18789
+  3. scripts/onboard-targets.sh                 # LEGACY single-effort onboarding
 
-  This is the LEGACY credential path: values in .env reach \`docker inspect\`. The
-  recommended path mounts them as files instead —
-    export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
+  This is the LEGACY credential path: values in .env reach \`docker inspect\`, and
+  \`scripts/clawctl\` (which builds the per-effort agents) requires the file-backed
+  path. The recommended route mounts secrets as files instead —
+    export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
     scripts/init-file-secrets.sh    # migrates what is already in .env
-  See docs/file-secrets.md."
+    scripts/clawctl apply
+  See docs/file-secrets.md and docs/efforts.md."
   SLACK_HINT="and SLACK_CHANNEL_ID in .env,"
 fi
 

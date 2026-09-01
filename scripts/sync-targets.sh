@@ -8,6 +8,12 @@
 #   the target_sync agent tool        all|<name>    model-visible, same wrapper
 #   scripts/sync-targets.sh --self-test             offline, no network, no creds
 #
+# SCOPE. `all` means all of the CALLING EFFORT's targets, never every repository
+# on the deployment: CC_EFFORT selects the effort, and the plugin sets it from the
+# OpenClaw agent id the host resolved — not from anything a model wrote. Unset (the
+# host CLI) means the deduped union across every effort, which is what cloning
+# needs.
+#
 # There is deliberately no second copy of the fetch/fast-forward logic anywhere,
 # and --self-test drives THESE functions rather than a re-implementation of them.
 #

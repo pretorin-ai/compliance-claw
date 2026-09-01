@@ -113,7 +113,7 @@ scripts/clawctl apply
 
 # anything one-off, in the same image with the same mounts:
 docker compose run --rm cli pretorin --json context show
-docker compose exec openclaw openclaw agent --agent main -m "..."
+docker compose exec openclaw openclaw agent --agent <effort-name> -m "..."
 ```
 
 **Keep `COMPOSE_FILE` exported for every later command.** It is how compose knows
@@ -131,9 +131,13 @@ Pretorin key there:
 ```sh
 scripts/bootstrap.sh
 vi .env                          # PRETORIN_API_KEY=...  (+ Slack, + GitHub App)
-scripts/onboard-targets.sh
+scripts/onboard-targets.sh       # LEGACY single-effort onboarding
 docker compose up -d
 ```
+
+> **Legacy.** This path serves one effort and cannot build per-effort agents:
+> `scripts/clawctl` needs the file-backed credential path. The quickstart above is
+> the supported route.
 
 The cost is that compose's `env_file` hands every value in `.env` to the container
 **and to `docker inspect`**, so anyone who can query the daemon can read them. To
@@ -155,10 +159,11 @@ Two ordering rules, both of which bite silently if ignored:
 
 - **Slack credentials must be in place before the first `up`** — in
   `secrets/runtime/slack-{app,bot}-token` on the recommended path, or in `.env` on
-  the legacy one, plus `SLACK_CHANNEL_ID` in `.env` either way (it is not a
-  secret). The config is seeded once and never overwritten, so adding them later
-  does nothing until you reset — the container warns explicitly when it sees
-  exactly that situation.
+  the legacy one. Which channels are served comes from each effort's
+  `slack_channel_id` in `efforts.yaml`, not from `.env`. The Slack half of the
+  config is seeded once and never overwritten, so adding the tokens later does
+  nothing until you reset — the container warns explicitly when it sees exactly
+  that situation.
 - **Onboard before `up`.** Onboarding writes host-local Pretorin state, and a
   running gateway keeps a per-session `pretorin mcp-serve` child that can serve
   the older view (the preflight artifact carries a 3600-second TTL). If you do
@@ -175,7 +180,7 @@ Two ordering rules, both of which bite silently if ignored:
 Check what you bound at any time, read-only:
 
 ```sh
-scripts/onboard-targets.sh --verify-only
+scripts/clawctl validate         # per-effort rows: credential, mode, live probe
 ```
 
 `code_repository` reporting **`degraded`** there is expected, not a failure: the
@@ -622,12 +627,12 @@ config is then byte-identical to a Slack-less deployment.
 2. Basic Information -> App-Level Tokens -> Generate Token and Scopes
    -> add connections:write            -> SLACK_APP_TOKEN   (xapp-...)
 3. Install App -> Install to Workspace -> SLACK_BOT_TOKEN   (xoxb-...)
-4. Invite the bot to ONE channel, right-click it -> Copy link
-   -> the C... at the end of the URL   -> SLACK_CHANNEL_ID  (C...)
-5. Supply the two tokens as secret files (recommended) or in .env (legacy), and
-   SLACK_CHANNEL_ID in .env either way. Then:
+4. Invite the bot to each effort's channel, right-click it -> Copy link
+   -> the C... at the end of the URL -> that effort's slack_channel_id
+      in efforts.yaml (NOT .env: one channel per effort)
+5. Supply the two tokens as secret files (recommended) or in .env (legacy). Then:
      docker compose down -v && scripts/bootstrap.sh
-       && scripts/onboard-targets.sh && docker compose up -d
+       && docker compose up -d && scripts/clawctl apply
 ```
 
 For a **new** app, import the manifest rather than assembling scopes by hand — that
@@ -640,8 +645,8 @@ reactions, pins, group DMs, `emoji:read` and `usergroups:read`.
 **You do not need to create another one.** Any app with Socket Mode enabled, an
 app-level token carrying `connections:write`, and a bot token works: supply its
 two tokens the same way as any other secret (files on the recommended path, `.env`
-on the legacy one) with `SLACK_CHANNEL_ID` in `.env`, and the rest of this section
-applies unchanged. The manifest is
+on the legacy one), put each effort's channel id in `efforts.yaml`, and the rest of
+this section applies unchanged. The manifest is
 the reproducible path for a *new* app, not a requirement for an existing one.
 
 Two things to know when reusing an older app. It probably carries the broader
@@ -656,7 +661,7 @@ and a message can be answered by whichever Claw happened to receive it.
 The **image** contains the pinned Slack plugin and the logic that generates the
 Slack configuration. It contains **no Slack credentials**, and no channel id.
 
-`SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` are deployment-time
+`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are deployment-time
 values. On the recommended path the two tokens come from mounted secret files and
 only the non-secret channel ID stays in `.env`; the legacy path puts all three in
 `.env`. None is baked into the image. The tokens are never written into the
@@ -733,7 +738,7 @@ It needs a TTY, so run it yourself rather than from a script. Check it took with
 `openclaw models auth list` — but only an actual turn proves it reaches the model:
 
 ```sh
-docker compose exec openclaw openclaw agent --agent main -m "Reply with exactly: OK"
+docker compose exec openclaw openclaw agent --agent <effort-name> -m "Reply with exactly: OK"
 ```
 
 ### Changing the model on an existing deployment
@@ -1018,7 +1023,7 @@ Pretorin state volume (active context, preflight resolvers, active recipe set). 
 does **not** touch the bind-mounted target repositories under `workspace/targets`,
 and it does not touch `.env`.
 
-Recovery is re-running `scripts/bootstrap.sh` and `scripts/onboard-targets.sh`;
+Recovery is re-running `scripts/bootstrap.sh` and `scripts/clawctl apply`;
 both are idempotent. `docker compose down` without `-v` keeps everything.
 
 ## Troubleshooting
@@ -1032,7 +1037,9 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | Slack never connects | Credentials added after the first `up` | Look for the Slack-specific warning; `down -v` and re-bootstrap |
 | Slack connects, bot never answers | Channel **name** instead of ID, or bot not invited | Use the `C...` ID; invite the bot; mention it explicitly |
 | `Slack is only partially configured` | 1 or 2 of the 3 variables set | All three are required together |
-| `SLACK_CHANNEL_ID is not a Slack channel id` | A name or a URL was used | Right-click channel → Copy link → the `C...` value |
+| `slack_channel_id ... is not a Slack channel id` | A name or a URL was used in `efforts.yaml` | Right-click channel → Copy link → the `C...` value |
+| `slack_channel_id ... is a DM conversation id` | A `D...` id was used as an effort's home | Use the channel's `C...` id; DMs are `clawctl dm allow` |
+| `slack_channel_id ... is a legacy G id` | A `G...` id is ambiguous (private channel vs MPIM) | Use the channel's `C...` id |
 | `GITHUB_APP_ID is not set` on a private target | No App configured | Follow "Private repositories", or drop `private: true` |
 | `/target-sync` says `missing_clone` | The target was added to `efforts.yaml` but never cloned | `scripts/clawctl apply` on the host — sync never clones |
 | `/target-sync` says `dirty_refused` | Something wrote into the clone | `git -C workspace/targets/<name> status`; resolve it yourself, sync will not |

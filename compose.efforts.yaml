@@ -50,8 +50,8 @@
 #
 # WHY BOTH SERVICES. `cli` runs the one-off commands `clawctl` issues, so it needs
 # the credentials to authenticate as the right effort. `openclaw` runs the
-# per-session `pretorin mcp-serve` children that a later release will launch
-# through pretorin-mcp-launch, so it needs the same two mounts. A mount present
+# per-session `pretorin mcp-serve` children, one per effort, which it launches
+# through pretorin-mcp-launch — so it needs the same two mounts. A mount present
 # on only one of them is the drift the anchors in compose.yaml exist to prevent.
 
 x-effort-mounts: &effort-mounts

@@ -6,6 +6,7 @@ that applying it did what it said.
                                [--dm-add USER:EFFORT] [--dm-remove USER]
     openclaw-patch.py verify   --manifest FILE --config FILE --snapshot FILE
                                [--agents-json FILE] [--mcp-json FILE]
+    openclaw-patch.py verify-rollback --config FILE --snapshot FILE
     openclaw-patch.py --self-test
 
 HOST-ONLY. Nothing in the image runs this, which is why the Dockerfile does not
@@ -716,10 +717,28 @@ def cmd_verify(args):
     if live_agents != manifest["agents"]:
         problems.append("agents.list is %r, expected %r" % (live_agents, manifest["agents"]))
 
-    live_servers = sorted(k for k in (get_path(config, "mcp.servers") or {}))
-    if live_servers != sorted(manifest["mcpServers"]):
-        problems.append("mcp.servers is %r, expected %r"
-                        % (live_servers, sorted(manifest["mcpServers"])))
+    # MCP SERVERS, CHECKED THREE WAYS — and deliberately NOT as an equality on the
+    # whole key set. This deployment owns the `pretorin-<effort>` entries and
+    # nothing else: an operator with their own MCP server configured would have
+    # had a perfectly correct apply reported as a verification failure, and the
+    # patch preserves that server precisely so it can survive.
+    live_servers = get_path(config, "mcp.servers") or {}
+    missing = [srv for srv in manifest["mcpServers"] if srv not in live_servers]
+    if missing:
+        problems.append("mcp.servers is missing the expected server(s) %r" % missing)
+    still_there = [srv for srv in manifest["deactivatedMcpServers"] if srv in live_servers]
+    if still_there:
+        problems.append("mcp.servers still holds the deactivated server(s) %r" % still_there)
+    if snapshot is not None:
+        owned = set(manifest["mcpServers"]) | set(manifest["deactivatedMcpServers"])
+        was = {k: v for k, v in (get_path(snapshot, "mcp.servers") or {}).items()
+               if k not in owned}
+        now = {k: v for k, v in live_servers.items() if k not in owned}
+        if was != now:
+            problems.append(
+                "an MCP server this deployment does not own changed:\n"
+                "      before: %s\n      after:  %s"
+                % (json.dumps(was, sort_keys=True), json.dumps(now, sort_keys=True)))
 
     channel_bindings = {}
     direct_bindings = {}
@@ -791,6 +810,48 @@ def cmd_verify(args):
         return 1
     sys.stderr.write("openclaw-patch: verification passed\n")
     return 0
+
+
+# --- rollback verification -------------------------------------------------
+#
+# A ROLLBACK CANNOT BE CHECKED WITH THE NORMAL VERIFIER, and running it there was
+# a real defect: that verifier compares the live config against the manifest of
+# the change we were trying to make. After a restore the change is precisely what
+# is NOT there, so for any real change it could only fail — and the failure would
+# be reported as "the restored configuration did not verify either", which reads
+# like the rollback broke something when in fact it worked.
+#
+# The question after a restore is a different one: is the configuration back to
+# what it was? That is a whole-document comparison against the snapshot, not a
+# manifest check.
+def cmd_verify_rollback(args):
+    with open(args.config) as handle:
+        after = load_config_text(handle.read())
+    with open(args.snapshot) as handle:
+        before = load_config_text(handle.read())
+
+    # `meta` is OpenClaw's own bookkeeping — it stamps lastTouchedVersion and
+    # lastTouchedAt on every write, including the one that restored the file — so
+    # comparing it would fail every successful rollback.
+    after_cmp = {k: v for k, v in after.items() if k != "meta"}
+    before_cmp = {k: v for k, v in before.items() if k != "meta"}
+
+    if after_cmp == before_cmp:
+        sys.stderr.write("openclaw-patch: rollback verified — the configuration is"
+                         " byte-for-byte the pre-apply state (ignoring meta)\n")
+        return 0
+
+    sys.stderr.write("openclaw-patch: ROLLBACK VERIFICATION FAILED — the restored"
+                     " configuration is not the pre-apply state.\n")
+    for key in sorted(set(before_cmp) | set(after_cmp)):
+        b, a = before_cmp.get(key), after_cmp.get(key)
+        if b != a:
+            sys.stderr.write("    - %s differs:\n"
+                             "      before: %s\n      after:  %s\n"
+                             % (key,
+                                json.dumps(b, sort_keys=True)[:400],
+                                json.dumps(a, sort_keys=True)[:400]))
+    return 1
 
 
 def _collect_ids(blob, keys):
@@ -1145,6 +1206,99 @@ def self_test():
     check(migrated["mcp"]["servers"]["pretorin"] is None,
           "the single-effort 'pretorin' MCP server is retired with a null")
 
+    # --- verification: what we own, and what we must NOT require ------------
+    #
+    # These drive cmd_verify/cmd_verify_rollback through real files, because both
+    # bugs they cover were in the comparison itself rather than in generation.
+    import tempfile
+
+    def _verify(cfg, manifest_obj, snap=None):
+        d = tempfile.mkdtemp()
+        mf = os.path.join(d, "m.json"); cf = os.path.join(d, "c.json")
+        sf = os.path.join(d, "s.json")
+        json.dump(manifest_obj, open(mf, "w"))
+        json.dump(cfg, open(cf, "w"))
+        if snap is not None:
+            json.dump(snap, open(sf, "w"))
+        args = argparse.Namespace(manifest=mf, config=cf,
+                                  snapshot=sf if snap is not None else "",
+                                  agents_json="", mcp_json="")
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cmd_verify(args)
+        return rc, err.getvalue()
+
+    applied, applied_manifest = _gen(TWO_EFFORTS)
+    # A configuration in the state the patch would leave, PLUS an MCP server the
+    # operator owns and this deployment must never require to be absent.
+    live = {
+        "agents": {"list": applied["agents"]["list"]},
+        "bindings": applied["bindings"],
+        "channels": {"slack": applied["channels"]["slack"]},
+        "mcp": {"servers": {k: v for k, v in applied["mcp"]["servers"].items()
+                            if v is not None}},
+        "gateway": {"port": 18789},
+    }
+    live["mcp"]["servers"]["operator-owned"] = {"command": "/usr/local/bin/thing"}
+    snap = {"gateway": {"port": 18789},
+            "mcp": {"servers": {"operator-owned": {"command": "/usr/local/bin/thing"}}}}
+    rc, out = _verify(live, applied_manifest, snap)
+    check(rc == 0, "verify PASSES with an unrelated MCP server present "
+                   "(it must not require equality on the whole key set)")
+    if rc != 0:
+        print("      " + out.strip().replace("\n", "\n      "))
+
+    # ...and it must still notice one of OURS going missing.
+    broken = json.loads(json.dumps(live))
+    del broken["mcp"]["servers"]["pretorin-crm-hipaa"]
+    rc, out = _verify(broken, applied_manifest, snap)
+    check(rc == 1 and "missing the expected server" in out,
+          "verify FAILS when one of our own MCP servers is missing")
+
+    # ...and when an unrelated one is altered, which the old equality check could
+    # not distinguish from our own churn.
+    touched = json.loads(json.dumps(live))
+    touched["mcp"]["servers"]["operator-owned"] = {"command": "/tmp/hijacked"}
+    rc, out = _verify(touched, applied_manifest, snap)
+    check(rc == 1 and "does not own changed" in out,
+          "verify FAILS when an MCP server we do NOT own was altered")
+
+    # --- rollback verification ----------------------------------------------
+    def _verify_rollback(cfg, snap):
+        d = tempfile.mkdtemp()
+        cf = os.path.join(d, "c.json"); sf = os.path.join(d, "s.json")
+        json.dump(cfg, open(cf, "w")); json.dump(snap, open(sf, "w"))
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cmd_verify_rollback(argparse.Namespace(config=cf, snapshot=sf))
+        return rc, err.getvalue()
+
+    pre = {"gateway": {"port": 18789}, "mcp": {"servers": {"pretorin": {}}}}
+    restored = json.loads(json.dumps(pre))
+    restored["meta"] = {"lastTouchedAt": "now"}   # OpenClaw stamps this on the restore
+    rc, out = _verify_rollback(restored, pre)
+    check(rc == 0, "rollback verification PASSES when the config is back to the snapshot")
+    check(rc == 0 and "meta" in restored and "meta" not in pre,
+          "  and it passed DESPITE OpenClaw stamping a meta block on the restore")
+
+    # THE DISCRIMINATOR. The old code ran the FORWARD verifier here, which compares
+    # against the manifest of the change being rolled back — so a correct rollback
+    # was always reported as a failure.
+    rc, _ = _verify(restored, applied_manifest, pre)
+    check(rc == 1, "  (the forward verifier would REJECT a correct rollback — "
+                   "which is why rollback needs its own check)")
+
+    half = json.loads(json.dumps(pre))
+    half["meta"] = {"lastTouchedAt": "now"}
+    half["mcp"]["servers"]["pretorin-crm-soc2"] = {"command": "/x"}
+    rc, out = _verify_rollback(half, pre)
+    check(rc == 1 and "not the pre-apply state" in out,
+          "rollback verification FAILS when the restore left the new state behind")
+    check("- mcp differs" in out and "- meta differs" not in out,
+          "  and it names the real difference without blaming meta")
+
     # --- no secret material anywhere in the output ---
     # The manifest names the credential REF (a name, e.g. "default"), which is
     # what efforts.yaml already carries in the clear. What must never appear is a
@@ -1179,6 +1333,10 @@ def main(argv):
     gen.add_argument("--dm-add", default="")
     gen.add_argument("--dm-remove", default="")
 
+    rb = sub.add_parser("verify-rollback")
+    rb.add_argument("--config", required=True)
+    rb.add_argument("--snapshot", required=True)
+
     ver = sub.add_parser("verify")
     ver.add_argument("--manifest", required=True)
     ver.add_argument("--config", required=True)
@@ -1195,6 +1353,8 @@ def main(argv):
     try:
         if args.mode == "generate":
             return cmd_generate(args)
+        if args.mode == "verify-rollback":
+            return cmd_verify_rollback(args)
         return cmd_verify(args)
     except PatchError as exc:
         sys.stderr.write("openclaw-patch: ERROR — %s\n" % exc)

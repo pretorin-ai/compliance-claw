@@ -453,7 +453,7 @@ if [ -e "$CONFIG" ]; then
     echo "                             # AND all Pretorin onboarding state (active" >&2
     echo "                             # context, preflight resolvers, active recipes)." >&2
     echo "                             # Bind-mounted target repos are NOT touched." >&2
-    echo "    scripts/bootstrap.sh && scripts/onboard-targets.sh   # both idempotent" >&2
+    echo "    scripts/bootstrap.sh && scripts/clawctl apply        # both idempotent" >&2
     echo "  After merging the template by hand: echo ${SHIPPED} > ${STAMP}" >&2
   fi
 
@@ -471,7 +471,7 @@ if [ -e "$CONFIG" ]; then
     echo "  and does not load the Slack plugin, so the agent will never appear in Slack." >&2
     echo "  Nothing was overwritten. Two ways forward:" >&2
     echo "    1. Reset (destroys BOTH volumes, keeps workspace/targets):" >&2
-    echo "         docker compose down -v && scripts/bootstrap.sh && scripts/onboard-targets.sh" >&2
+    echo "         docker compose down -v && scripts/bootstrap.sh && scripts/clawctl apply" >&2
     echo "    2. Apply the Slack patch to the existing config by hand:" >&2
     if [ "$SLACK_EFFORTS_OWNED" = 1 ]; then
       echo "         docker compose run --rm cli bash -c \\" >&2
