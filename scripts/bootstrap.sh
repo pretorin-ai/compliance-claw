@@ -257,7 +257,7 @@ prepare_targets() {
       - Fine-grained PAT (internal pilot): put a selected-repositories,
         Contents: Read-only token in ${PAT_FILE}
         (create the file with scripts/init-file-secrets.sh, then paste the value).
-      - Or drop 'private: true' from targets.yaml if the repository is public."
+      - Or drop 'private: true' from ${EFFORTS_FILE} if the repository is public."
     fi
   fi
 
@@ -322,9 +322,25 @@ case "$HOST_ARCH" in
 esac
 
 ensure_efforts_file
-python3 "$PARSE" scope "$TARGETS_FILE" >/dev/null   # fail fast on a bad file
-IFS=$'\t' read -r SYSTEM_ID FRAMEWORK_ID < <(python3 "$PARSE" scope "$TARGETS_FILE")
-log "scope: system=${SYSTEM_ID} framework=${FRAMEWORK_ID}"
+# FAIL FAST ON A BAD FILE, and report every effort rather than one scope: this
+# deployment can serve several, so a single "system=X framework=Y" line would be
+# a statement about whichever effort happened to be first.
+SCOPE_SUMMARY=""
+if [ -f "$EFFORTS_FILE" ]; then
+  python3 "$PARSE_EFFORTS" validate "$EFFORTS_FILE" >/dev/null
+  while read -r _e; do
+    [ -n "$_e" ] || continue
+    IFS=$'\t' read -r _sys _fw _cred < <(python3 "$PARSE_EFFORTS" scope "$_e" "$EFFORTS_FILE")
+    log "effort ${_e}: system=${_sys} framework=${_fw} credential=${_cred}"
+    SCOPE_SUMMARY="${SCOPE_SUMMARY}
+             ${_e}: ${_sys} / ${_fw}"
+  done < <(python3 "$PARSE_EFFORTS" efforts "$EFFORTS_FILE")
+else
+  python3 "$PARSE" scope "$TARGETS_FILE" >/dev/null   # fail fast on a bad file
+  IFS=$'\t' read -r SYSTEM_ID FRAMEWORK_ID < <(python3 "$PARSE" scope "$TARGETS_FILE")
+  log "scope: system=${SYSTEM_ID} framework=${FRAMEWORK_ID}"
+  SCOPE_SUMMARY="   ${SYSTEM_ID} / ${FRAMEWORK_ID}"
+fi
 
 # --- 2. credentials --------------------------------------------------------
 # TWO PATHS, AND THIS SCRIPT MUST NOT MIX THEM.
@@ -614,7 +630,7 @@ cat <<EOF
 
 bootstrap: done.
   targets:   ${TARGET_COUNT} under ${TARGETS_DIR} (bind-mounted read-only at /workspace/targets)${PRIVATE_SUMMARY}
-  scope:     ${SYSTEM_ID} / ${FRAMEWORK_ID}
+  efforts:${SCOPE_SUMMARY}
   image:     $([ "$DO_BUILD" = 1 ] && echo 'built locally (compose.build.yaml)' || echo "pulled ${IMAGE_REF:-}")
 
 Next:

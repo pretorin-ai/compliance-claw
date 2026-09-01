@@ -233,13 +233,20 @@ cp .env.example versions.env Dockerfile compose.yaml compose.secrets.yaml compos
 # deployment came up permanently Slack-less) and this file could not have seen
 # it. scripts/test-fresh-slack-seed.sh covers that region on purpose; if you add
 # a check here that needs bootstrap to COMPLETE, it belongs there instead.
-cat > "$SCRATCH/targets.yaml" <<'FIXTURE'
-system_id: 00000000-0000-0000-0000-000000000000
-framework_id: soc2
-targets:
-  - name: unreachable-fixture
-    url: https://github.invalid/pretorin-ai/does-not-exist.git
-    ref: main
+# AN EFFORTS FIXTURE, because efforts.yaml is what bootstrap reads. A targets.yaml
+# here would be refused before the clone phase this gate is about, with a message
+# about migration rather than about secrets.
+cat > "$SCRATCH/efforts.yaml" <<'FIXTURE'
+efforts:
+  - name: fixture
+    system_id: 00000000-0000-0000-0000-000000000000
+    framework_id: soc2
+    credential_ref: default
+    slack_channel_id: C0FIXTURE1
+    targets:
+      - name: unreachable-fixture
+        url: https://github.invalid/pretorin-ai/does-not-exist.git
+        ref: main
 FIXTURE
 
 # --- the file-secret path ---------------------------------------------------
