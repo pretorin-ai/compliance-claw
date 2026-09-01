@@ -1361,9 +1361,13 @@ head2 "A11. private targets refuse rather than prompt (negative paths)"
 # Mirrors A9's shape: the interesting behaviour of the private path is its
 # refusals, and all three of them are reachable with no credentials at all.
 PRIV_YAML="$(mktemp "${TMPDIR:-/tmp}/smoke-priv.XXXXXX")"
+# AN EFFORTS FIXTURE, because bootstrap reads efforts.yaml now. A targets.yaml
+# fixture here would simply be ignored: bootstrap would fall through to the real
+# efforts.yaml and every row below would be asserting on a refusal that came from
+# somewhere else — or on no refusal at all, if that file declares nothing private.
 priv_yaml() {
-  printf 'system_id: %s\nframework_id: %s\ntargets:\n  - name: smoke-private\n    url: %s\n    private: true\n' \
-    "$SCRATCH_SYS" "$SCRATCH_FW" "${1:-https://github.com/pretorin-ai/does-not-exist.git}" > "$PRIV_YAML"
+  printf 'efforts:\n  - name: smoke-priv\n    system_id: %s\n    framework_id: %s\n    credential_ref: default\n    slack_channel_id: C0SMOKEPRIV\n    targets:\n      - name: smoke-private\n        url: %s\n        private: true\n' \
+    "$NEG_UUID" "$SCRATCH_FW" "${1:-https://github.com/pretorin-ai/does-not-exist.git}" > "$PRIV_YAML"
 }
 
 # THE CREDENTIAL LADDER IS TESTED WITH AN EMPTY SECRET DIRECTORY, deliberately.
@@ -1373,7 +1377,7 @@ NOCRED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/smoke-nocred.XXXXXX")"
 
 # 1. private target, no GitHub App and no PAT: refuse, naming both fixes.
 priv_yaml
-OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+OUT="$(CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
 [ "$RC" != 0 ] && pass "bootstrap refuses a private target with no credential at all" \
@@ -1383,7 +1387,7 @@ has "the refusal also names the PAT file" "github-readonly-pat" "$OUT"
 hasnt "the refusal does not hang on a credential prompt" "Username for" "$OUT"
 
 # 2. App id present, key file missing.
-OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
+OUT="$(CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
        GITHUB_APP_PRIVATE_KEY_FILE=secrets/definitely-not-here.pem \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
@@ -1405,7 +1409,7 @@ git -C "${CLONE_ONLY_DIR}/targets/smoke-private" remote add origin \
   https://github.com/pretorin-ai/does-not-exist.git
 priv_yaml
 OUT="$(CC_CLONE_ONLY=1 CC_TARGETS_DIR="${CLONE_ONLY_DIR}/targets" \
-       TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+       CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh --targets-only 2>&1)"; RC=$?
 [ "$RC" = 0 ] && pass "clone-only needs NO credential when the private target is already cloned" \
@@ -1418,7 +1422,7 @@ has   "  it says the clone was left where it is" "left at its current commit" "$
 # so the exemption above cannot become a way to skip the ladder.
 rm -rf "${CLONE_ONLY_DIR}/targets/smoke-private"
 OUT="$(CC_CLONE_ONLY=1 CC_TARGETS_DIR="${CLONE_ONLY_DIR}/targets" \
-       TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+       CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh --targets-only 2>&1)"; RC=$?
 [ "$RC" != 0 ] && pass "  but a MISSING private clone still demands a credential" \
@@ -1431,7 +1435,7 @@ rm -rf "$CLONE_ONLY_DIR"
 #     longer-lived personal credential is the kind of downgrade nobody notices.
 printf '%s' 'CANARY-PAT-SHOULD-NOT-BE-USED' > "${NOCRED_DIR}/github-readonly-pat"
 chmod 600 "${NOCRED_DIR}/github-readonly-pat"
-OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
+OUT="$(CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID=123456 \
        GITHUB_APP_PRIVATE_KEY_FILE=secrets/definitely-not-here.pem \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
@@ -1444,7 +1448,7 @@ hasnt "  and no token value was printed" "CANARY-PAT-SHOULD-NOT-BE-USED" "$OUT"
 # 2c. NO App, PAT present: the pilot path is taken, said out loud, and the value
 #     is never printed. The clone still fails (the repository does not exist and
 #     the token is fake) — what is asserted here is WHICH credential was chosen.
-OUT="$(TARGETS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
+OUT="$(CC_EFFORTS_FILE="$PRIV_YAML" GITHUB_APP_ID= GITHUB_APP_PRIVATE_KEY_FILE= \
        COMPLIANCE_CLAW_SECRET_DIR="$NOCRED_DIR" \
        bash scripts/bootstrap.sh 2>&1)"; RC=$?
 has   "with no App, a present PAT is used for private targets" "fine-grained PAT from" "$OUT"

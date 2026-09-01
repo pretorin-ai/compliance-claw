@@ -35,11 +35,18 @@ jobs:
 
     # compose.yaml pulls the published image by default, which is wrong for CI:
     # the point here is to test the code in this commit, not whatever was last
-    # released. The overlay adds the build section back. COMPOSE_FILE is docker
-    # compose's own mechanism, so bootstrap.sh, onboard-targets.sh and smoke.sh
-    # all inherit it without a CI-specific flag.
+    # released. The build overlay adds the build section back. COMPOSE_FILE is
+    # docker compose's own mechanism, so bootstrap.sh and smoke.sh all inherit it
+    # without a CI-specific flag.
+    #
+    # compose.efforts.yaml IS REQUIRED, not optional. efforts.yaml is what the
+    # deployment reads, and that overlay is what mounts it into the gateway —
+    # compose.yaml deliberately does not, because the file is gitignored and a
+    # base-file bind mount would fail `up` on a fresh clone before anything could
+    # explain why. Without it here the gateway comes up with no declaration of
+    # which repositories exist, and /target-sync can address nothing.
     env:
-      COMPOSE_FILE: compose.yaml:compose.build.yaml
+      COMPOSE_FILE: compose.yaml:compose.build.yaml:compose.efforts.yaml
 
     steps:
       # Pinned to a commit: a tag is mutable, and this is the step that fetches
@@ -88,6 +95,14 @@ jobs:
           set -euo pipefail
           scripts/clawctl migrate --name ci-effort --slack-channel-id C0000000CI
           python3 scripts/parse-efforts.py validate efforts.yaml
+          # BOTH BIND SOURCES MUST EXIST BEFORE ANY COMPOSE COMMAND. Compose
+          # resolves every bind source at `up`/`run` time and a missing one fails
+          # the whole command naming neither the file nor the fix.
+          # compose.efforts.yaml mounts efforts.yaml (just created) and the
+          # per-effort credential DIRECTORY, which is gitignored and so never
+          # exists on a fresh checkout. `scripts/clawctl` creates it for an
+          # operator; CI never runs apply, so it is created here.
+          mkdir -p secrets/runtime/pretorin
           echo "efforts.yaml generated from targets.yaml and valid."
 
       # Runs the documented operator path rather than a CI-only shortcut, so a
