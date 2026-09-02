@@ -293,6 +293,94 @@ st_manifest() {
   done
 }
 
+# Regression fixture for a framework whose platform source profile does NOT
+# recommend code_repository (CMMC L1 is the production case). In that shape,
+# `preflight init --workspace` intentionally skips the Git repository. The
+# operator's declared targets must still be bound exactly once.
+st_declared_target_binding_regression() (
+  set -euo pipefail
+
+  local calls=()
+  local bindings=()
+
+  # Model only the preflight state transition ol_bind owns. `init` deliberately
+  # does nothing for code_repository. `unbind` removes every matching label,
+  # just like the CLI, and `bind` appends, so a missing replace step produces
+  # duplicates on rerun.
+  ol_pcli() {
+    local rendered="" arg action="${1:-} ${2:-}" name="" path=""
+    for arg in "$@"; do rendered="${rendered} $(printf '%q' "$arg")"; done
+    calls+=("${rendered# }")
+
+    case "$action" in
+      "preflight init")
+        return 0 ;;
+      "preflight unbind")
+        while [ "$#" -gt 0 ]; do
+          [ "$1" = --name ] && { name="$2"; break; }
+          shift
+        done
+        local kept=() binding
+        for binding in ${bindings[@]+"${bindings[@]}"}; do
+          case "$binding" in "${name}|"*) ;; *) kept+=("$binding") ;; esac
+        done
+        bindings=()
+        for binding in ${kept[@]+"${kept[@]}"}; do bindings+=("$binding"); done
+        return 0 ;;
+      "preflight bind")
+        [ "${3:-}" = code_repository ] || return 91
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --param)
+              case "$2" in path=*) path="${2#path=}" ;; esac
+              shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        [ -n "$name" ] && [ "$path" = "/workspace/targets/${name}" ] || return 92
+        bindings+=("${name}|${path}")
+        return 0 ;;
+    esac
+    return 93
+  }
+
+  OL_SYSTEM_ID="00000000-0000-4000-8000-000000000001"
+  OL_FRAMEWORK_ID="cmmc-l1"
+  OL_TARGETS=(monorepo pretorin-cli)
+  OL_DRY_RUN=0
+
+  ol_bind
+  ol_bind
+
+  [ "${#bindings[@]}" = 2 ] \
+    || { printf 'expected 2 bindings after a rerun, got %s\n' "${#bindings[@]}"; return 1; }
+  local target count call
+  for target in "${OL_TARGETS[@]}"; do
+    count=0
+    for call in "${bindings[@]}"; do
+      [ "$call" = "${target}|/workspace/targets/${target}" ] && count=$((count + 1))
+    done
+    [ "$count" = 1 ] \
+      || { printf '%s was bound %s times, expected exactly once\n' "$target" "$count"; return 1; }
+  done
+
+  # Two runs x two targets x (init, unbind, explicit bind).
+  [ "${#calls[@]}" = 12 ] \
+    || { printf 'expected 12 preflight calls, got %s\n' "${#calls[@]}"; return 1; }
+  for target in "${OL_TARGETS[@]}"; do
+    count=0
+    for call in "${calls[@]}"; do
+      case "$call" in
+        "preflight bind code_repository "*"--name ${target} "*"--param path=/workspace/targets/${target} "*)
+          count=$((count + 1)) ;;
+      esac
+    done
+    [ "$count" = 2 ] \
+      || { printf '%s had %s explicit bindings across two runs, expected 2\n' "$target" "$count"; return 1; }
+  done
+)
+
 clawctl_self_test() {
   local root tmp bin record
   root="$REPO_ROOT"
@@ -305,6 +393,17 @@ clawctl_self_test() {
   local S="${tmp}/secrets"
   mkdir -p "$S"
   st_fixture_targets "$T"
+
+  # ------------------------------------------------ declared target binding
+  st_head "0. declared target binding ignores framework recommendations"
+
+  local regression_out
+  if regression_out="$(st_declared_target_binding_regression 2>&1)"; then
+    st_ok "platform profile omission still binds every declared target exactly once"
+  else
+    st_bad "platform profile omission still binds every declared target exactly once" \
+           "${regression_out:-ol_bind did not explicitly bind the declared repositories}"
+  fi
 
   # ---------------------------------------------------------------- migrate
   st_head "1. migrate"
