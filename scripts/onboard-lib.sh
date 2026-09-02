@@ -19,7 +19,8 @@
 #   blunt instrument runs.
 #
 #   1. SWEEP             unbind foreign path resolvers, including /app
-#   2. BIND              preflight init --workspace, once per target
+#   2. BIND              discover recommended local sources, then explicitly
+#                        bind each declared target as a code_repository
 #   3. verify            probe every resolver, persist results
 #   4. provision --apply seed the active recipe set
 #   5. ASSERT            per-resolver invariants, and no /app anywhere
@@ -110,14 +111,33 @@ ol_sweep() {
 
 ol_bind() {
   local scope=(--system "$OL_SYSTEM_ID" --framework "$OL_FRAMEWORK_ID")
-  local name
+  local name path
   for name in "${OL_TARGETS[@]}"; do
     ol_log "binding ${name}"
-    # --workspace is what makes this deterministic: without it Pretorin binds the
-    # process's CURRENT DIRECTORY as the repository. Never --replace: it wipes the
-    # collections of every kind it detects, so target N would erase targets 1..N-1.
-    # Upsert-by-name means re-running this is a no-op rather than a duplicate.
-    ol_pcli preflight init --workspace "${OL_MOUNT}/${name}" "${scope[@]}" --no-verify
+    path="${OL_MOUNT}/${name}"
+    # Keep discovery for every other source kind the framework recommends.
+    # --workspace is what makes it deterministic: without it Pretorin inspects
+    # the process's CURRENT DIRECTORY. Never --replace: it would wipe target
+    # N-1 when target N is discovered.
+    ol_pcli preflight init --workspace "$path" "${scope[@]}" --no-verify
+
+    # A platform profile may intentionally omit code_repository (CMMC L1 does),
+    # in which case `preflight init` skips Git discovery. The target declaration
+    # is still authoritative for this deployment, so replace its named local
+    # resolver explicitly. `bind` appends; unbinding first is what makes a rerun
+    # exactly-once without disturbing other targets or provider resolvers.
+    ol_pcli preflight unbind code_repository --name "$name" "${scope[@]}" >/dev/null || true
+    ol_pcli preflight bind code_repository \
+      --type workspace_path \
+      --name "$name" \
+      --constraint "Local repository and git metadata only; remote governance is verified separately." \
+      --scope "workspace=${path}" \
+      --param "path=${path}" \
+      --param marker=.git \
+      --capability repository_inventory \
+      --capability source_configuration \
+      --capability commit_history \
+      "${scope[@]}"
   done
 }
 
