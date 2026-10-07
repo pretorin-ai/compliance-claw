@@ -111,8 +111,17 @@ def merge(dst, src):
         else:
             dst[k] = v
 merge(cfg, patch)
+if cfg.get("agents", {}).get("ownership") == "explicit":
+    entries = cfg["agents"].pop("list", None)
+    if entries is not None:
+        if any(a.get("default") for a in entries):
+            raise SystemExit("explicit ownership cannot use legacy default")
+        cfg["agents"]["entries"] = {a["id"]: {k:v for k,v in a.items() if k != "id"}
+                                     for a in entries}
 if os.environ.get("CC_DROP") and cfg.get("agents", {}).get("list"):
     cfg["agents"]["list"] = cfg["agents"]["list"][:-1]
+elif os.environ.get("CC_DROP") and cfg.get("agents", {}).get("entries"):
+    cfg["agents"]["entries"].pop(next(reversed(cfg["agents"]["entries"])))
 cfg.setdefault("meta", {})["lastTouchedAt"] = "stub"
 json.dump(cfg, open(os.environ["CC_CFG"], "w"), indent=2, sort_keys=True)
 '
@@ -223,7 +232,9 @@ case " \$* " in
         CC_CFG="\${STUB_OC_CONFIG}" python3 -c '
 import json, os
 cfg = json.load(open(os.environ["CC_CFG"]))
-print(json.dumps({"agents": cfg.get("agents", {}).get("list", []),
+roster = cfg.get("agents", {})
+entries = roster.get("list", [{"id": k, **v} for k,v in roster.get("entries", {}).items()])
+print(json.dumps({"agents": entries,
                   "bindings": cfg.get("bindings", [])}))
 '
         exit 0 ;;
@@ -450,7 +461,8 @@ clawctl_self_test() {
   fi
 
   # targets.yaml must be untouched: it is still what the deployment reads.
-  if diff -q "$T" <(st_fixture_targets /dev/stdout) >/dev/null 2>&1; then
+  st_fixture_targets "${tmp}/targets-original.yaml"
+  if diff -q "$T" "${tmp}/targets-original.yaml" >/dev/null 2>&1; then
     st_ok "targets.yaml was NOT modified"
   else
     st_bad "targets.yaml was NOT modified"
@@ -1094,6 +1106,58 @@ print(ch == bd == ['C0HIPAABB','C0SOC2AAA'])")" = "True" ]; then
   else
     st_bad "re-applying unchanged input is idempotent" "$(diff <(echo "$sig_before") <(echo "$sig_after") | head -3)"
   fi
+
+  # Reapply after candidate Doctor migration. Keep the legacy fixture for the
+  # following checks, so both configuration formats remain under test.
+  cp "$OC" "${tmp}/oc-legacy.json"
+  CC_OC="$OC" python3 - <<'PY_MIGRATED'
+import json, os
+path = os.environ["CC_OC"]
+cfg = json.load(open(path))
+entries = cfg["agents"].pop("list")
+cfg["agents"]["ownership"] = "explicit"
+cfg["agents"]["entries"] = {a["id"]: {k:v for k,v in a.items() if k not in ("id", "default")}
+                             for a in entries}
+for key in ("heartbeat", "systemAgent", "authInheritance"):
+    cfg["agents"]["defaults"][key] = {"agentId": "crm-soc2"}
+cfg["talk"] = {"agentId": "crm-soc2"}
+cfg["bindings"].append({"agentId": "crm-soc2",
+                        "match": {"channel": "slack", "accountId": "*"}})
+json.dump(cfg, open(path, "w"), indent=2, sort_keys=True)
+PY_MIGRATED
+  sig_before="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  if st_fleet_apply; then
+    st_ok "full apply passes after the candidate Doctor roster migration"
+  else
+    st_bad "full apply passes after candidate migration" "$(tail -12 "$fleetlog")"
+  fi
+  sig_after="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  if [ "$sig_before" = "$sig_after" ]; then
+    st_ok "candidate reapply keeps ownership, ambient routing and all other settings"
+  else
+    st_bad "candidate reapply keeps the migrated configuration"
+  fi
+  if [ "$(CC_STATE="${tmp}/state/last-applied.json" python3 -c '
+import json, os
+state = json.load(open(os.environ["CC_STATE"]))
+print(state.get("agentOwnership") == "explicit" and len(state.get("ambientBindings", [])) == 1)
+' 2>/dev/null)" = "True" ]; then
+    st_ok "the saved plan state keeps explicit ownership and ambient routing"
+  else
+    st_bad "the saved plan state keeps candidate ownership and routing"
+  fi
+  if st_fleet_apply verify; then
+    st_bad "candidate apply rejects a missing keyed agent" "apply exited zero"
+  else
+    st_ok "candidate apply rejects a missing keyed agent"
+  fi
+  sig_after="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  if [ "$sig_before" = "$sig_after" ]; then
+    st_ok "candidate apply restores the migrated configuration after verification failure"
+  else
+    st_bad "candidate rollback restores the migrated configuration"
+  fi
+  cp "${tmp}/oc-legacy.json" "$OC"
 
   # ------------------------------------------------- 8. DMs, and refusals
   st_head "8. Slack DMs"

@@ -102,6 +102,22 @@ export COMPOSE_PROJECT_NAME="$PROJECT"
 export CC_TEST_PORT="$PORT"
 export COMPLIANCE_CLAW_SECRET_DIR="${TMP}/secrets"
 export SLACK_CHANNEL_ID="$CANARY_CHANNEL"
+# Keep bootstrap independent of any local private effort declaration. The
+# runtime uses the legacy test overlay, so this declaration is for bootstrap only.
+cat > "${TMP}/efforts.yaml" <<'YAML'
+efforts:
+  - name: fresh-slack-test
+    system_id: 00000000-0000-0000-0000-000000000001
+    framework_id: soc2
+    credential_ref: default
+    slack_channel_id: C0FRESHSEED1
+    targets:
+      - name: simple-crm
+        url: https://github.com/pretorin-ai/simple-crm.git
+        private: false
+YAML
+export CC_EFFORTS_FILE="${TMP}/efforts.yaml"
+export CC_TARGETS_DIR="${TMP}/targets"
 # EXACTLY WHAT THE OPERATOR EXPORTS, in the order they export it. The build
 # overlay is already present, which is the shape that triggered the defect:
 # bootstrap saw it, decided to build, and then rewrote the whole variable.
@@ -244,6 +260,31 @@ case "$CFG" in
     bad "  and no Slack token value reached the config" "a canary token is in openclaw.json" ;;
   *) ok "  and no Slack token value reached the config" ;;
 esac
+
+PLUGIN_REPORT="$(docker compose run --rm -T cli openclaw plugins inspect slack --json 2>/dev/null)"
+if printf '%s' "$PLUGIN_REPORT" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+p, i = r["plugin"], r["install"]
+assert p["origin"] == "global" and p["trust"]["reason"] == "trusted-official"
+assert i["source"] == "npm" and i["spec"] == "@openclaw/slack@" + p["version"]
+'; then
+  ok "  and Slack has an official managed npm install"
+else
+  bad "  and Slack has an official managed npm install"
+fi
+case "$CFG" in
+  *'/opt/compliance-claw/plugins/slack'*) bad "  and the old image load path is absent" ;;
+  *) ok "  and the old image load path is absent" ;;
+esac
+
+REPEAT_LOG="${TMP}/repeat-seed.log"
+if docker compose run --rm -T cli true >"$REPEAT_LOG" 2>&1 \
+   && ! grep -q 'official Slack .* installed' "$REPEAT_LOG"; then
+  ok "a later CLI command reuses the install"
+else
+  bad "a later CLI command reuses the install"
+fi
 
 printf '\n'
 if [ "$FAIL" -eq 0 ]; then

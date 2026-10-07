@@ -147,6 +147,12 @@ jobs:
       # Ahead of the full suite on purpose: it needs no credentials, no gateway
       # and no network, so when the CLI updater's input rules break, that is the
       # first thing the log says rather than the fortieth.
+      - name: Gateway shutdown lease contract (isolated, no network)
+        run: bash scripts/test-gateway-stop.sh compliance-claw:local
+
+      - name: Managed Slack installation rules (offline, no credentials)
+        run: docker run --rm --platform linux/amd64 --network none --mount "type=bind,src=${{ github.workspace }}/scripts,dst=/tests,readonly" --entrypoint node compliance-claw:local --test /tests/managed-slack.test.mjs
+
       - name: CLI updater input rules (offline, no credentials)
         run: bash scripts/pretorin-update.sh --self-test
 

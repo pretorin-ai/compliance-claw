@@ -57,19 +57,17 @@ RUN bash scripts/fetch-pretorin.sh dist \
 
 
 # The OpenClaw Slack channel plugin, resolved and integrity-checked at BUILD
-# time. Slack is NOT bundled in 2026.7.1 — `openclaw plugins list` reports 70
-# stock plugins and slack is not one of them — so it comes from npm.
+# time. Slack is NOT bundled in 2026.9.8 — the image has no Slack extension,
+# so it comes from the official npm package.
 #
-# Why a build stage instead of `openclaw plugins install`: that command writes to
-# $OPENCLAW_STATE_DIR/npm/projects/..., i.e. INSIDE the ~/.openclaw named volume.
-# A managed install is therefore destroyed by `docker compose down -v` and can
-# never be pinned in an image. Installing here and pointing plugins.load.paths at
-# the image copy makes the plugin part of the image, like the Pretorin binary.
+# This stage checks the pinned package and its dependency tree. The runtime uses
+# `openclaw plugins install` to create official npm provenance in the state
+# volume. A local copy does not grant access to the durable channel ingress queue.
 #
 # This stage uses the OpenClaw image because it already carries the exact node
-# and npm the runtime will load the plugin with (node 24 / npm 11), so the
+# and npm the runtime will load the plugin with, so the
 # resolved tree is the tree that actually runs.
-FROM ghcr.io/openclaw/openclaw:2026.7.1@sha256:6a31d44b2944e7adcd2b582bf6fb463111264ebca97a0201795b799135bd102c AS slack-plugin
+FROM ghcr.io/openclaw/openclaw:2026.9.8@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8 AS slack-plugin
 
 USER root
 WORKDIR /build
@@ -82,11 +80,9 @@ COPY versions.env ./
 # PRETORIN_SHA256. A registry that serves different bytes under the same version
 # fails the build instead of shipping.
 #
-# No lock file is vendored here because the published package ships its own
-# npm-shrinkwrap.json, which pins all 103 transitive dependencies. That is also
-# why the tree ends up NESTED under the plugin directory rather than hoisted to
-# /build/node_modules, which is what makes copying just the plugin directory
-# self-contained.
+# The published tarball includes its complete dependency tree through
+# bundledDependencies. The integrity pin covers those dependency bytes too.
+# Copying the plugin directory therefore keeps the installation complete.
 RUN . ./versions.env \
  && test -n "${SLACK_PLUGIN_VERSION}" \
  && test -n "${SLACK_PLUGIN_INTEGRITY}" \
@@ -101,6 +97,7 @@ RUN . ./versions.env \
       echo "    npm view @openclaw/slack@${SLACK_PLUGIN_VERSION} dist.integrity" >&2; \
       exit 1; \
     fi \
+ && printf '%s\n' "${SLACK_PLUGIN_VERSION} ${RESOLVED}" > /build/slack-plugin.verified \
  && echo "SLACK PLUGIN VERIFIED: ${SLACK_PLUGIN_VERSION} ${RESOLVED}"
 
 # Structural assertions on what is about to be copied. Deliberately NOT
@@ -116,7 +113,7 @@ RUN P=/build/node_modules/@openclaw/slack \
  && test "$(node -e 'process.stdout.write(require("/build/node_modules/@openclaw/slack/openclaw.plugin.json").id)')" = slack \
  && test -f "$P/dist/index.js" \
  && node -e 'require.resolve("@slack/bolt",{paths:["/build/node_modules/@openclaw/slack"]})' \
- && node -e 'require.resolve("@slack/socket-mode",{paths:["/build/node_modules/@openclaw/slack"]})' \
+ && node -e 'require.resolve("@slack/socket-mode",{paths:["/build/node_modules/@openclaw/slack/node_modules/@slack/bolt"]})' \
  && echo "slack plugin tree resolves"
 
 
@@ -128,7 +125,7 @@ RUN P=/build/node_modules/@openclaw/slack \
 #
 # The base is node:24-bookworm-slim underneath, i.e. glibc: what the dynamically
 # linked Pretorin binary needs. An Alpine-based OpenClaw image would not run it.
-FROM ghcr.io/openclaw/openclaw:2026.7.1@sha256:6a31d44b2944e7adcd2b582bf6fb463111264ebca97a0201795b799135bd102c
+FROM ghcr.io/openclaw/openclaw:2026.9.8@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8
 
 # The image already runs as `node`; switch back at the end of the stage.
 USER root
@@ -223,18 +220,16 @@ RUN install -d -o node -g node /opt/compliance-claw/no-repo \
       > /opt/compliance-claw/no-repo/README-DO-NOT-ADD-FILES.txt \
  && chown node:node /opt/compliance-claw/no-repo/README-DO-NOT-ADD-FILES.txt
 
-# The verified Slack plugin, outside the state volume so `down -v` cannot remove
-# it and a newer image always ships the pinned version. Just the package
-# directory: its dependency tree is nested inside it (the published package
-# carries npm-shrinkwrap.json), so nothing else from /build is needed.
-#
-# node-owned because OpenClaw refuses to load plugin files owned by a different
-# uid than the process — "blocked plugin candidate: suspicious ownership". The
-# runtime is uid 1000 (node), so this must be too.
-#
-# Referenced as plugins.load.paths in scripts/slack-channel.patch.json5.
+# Keep the build verification evidence. First Slack setup and version changes
+# need registry access. OpenClaw installs the exact package into persistent state;
+# later starts reuse that install. Do not load this package from an image path.
 COPY --from=slack-plugin --chown=node:node \
-     /build/node_modules/@openclaw/slack /opt/compliance-claw/plugins/slack
+     /build/slack-plugin.verified /opt/compliance-claw/slack-plugin.verified
+# Retain the verified tree for release vulnerability scans and package inspection.
+# This seed is outside plugin discovery and is never a runtime load path.
+COPY --from=slack-plugin --chown=node:node \
+     /build/node_modules/@openclaw/slack /opt/compliance-claw/slack-seed
+COPY scripts/managed-slack.mjs /opt/compliance-claw/managed-slack.mjs
 
 # Config is generated on first start, not baked: ~/.openclaw is a named volume,
 # so anything baked there would be shadowed on first start. These are the
@@ -312,8 +307,9 @@ COPY scripts/pretorin-mcp-launch.sh /opt/compliance-claw/pretorin-mcp-launch
 
 # PYTHON3 IS INHERITED, NOT INSTALLED — SO ASSERT IT.
 #
-# The runtime stage adds no apt package: python3 comes from the OpenClaw base
-# image. Three things already depend on it at runtime (sync-targets.sh for
+# Python comes from the OpenClaw base. The security update below changes only
+# the existing Perl packages. Three things depend on Python in the base
+# image at runtime (sync-targets.sh for
 # /target-sync, mcp-call.py, and now the MCP launcher), and the launcher is the
 # one that turns its absence into a security problem rather than an outage: a
 # child that cannot resolve its own per-effort credential must not fall back to
@@ -358,6 +354,19 @@ ARG IMAGE_SELF_VERSION=0.0.0-dev
 LABEL org.opencontainers.image.version="${IMAGE_SELF_VERSION}"
 
 COPY versions.env /opt/compliance-claw/versions.env
+
+# Update only the four affected packages. Debian signs the package index;
+# exact versions keep this correction separate from a general OS upgrade.
+RUN . /opt/compliance-claw/versions.env \
+ && test -n "${DEBIAN_PERL_VERSION}" \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      "perl=${DEBIAN_PERL_VERSION}" \
+      "perl-base=${DEBIAN_PERL_VERSION}" \
+      "perl-modules-5.36=${DEBIAN_PERL_VERSION}" \
+      "libperl5.36=${DEBIAN_PERL_VERSION}" \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN . /opt/compliance-claw/versions.env \
  && test -n "${MODEL}" \
  && sed -i "s|@MODEL@|${MODEL}|" /opt/compliance-claw/openclaw-config.template.json \
@@ -369,6 +378,7 @@ RUN . /opt/compliance-claw/versions.env \
       /opt/compliance-claw/versions.env \
  && grep -qx "IMAGE_VERSION=${IMAGE_SELF_VERSION}" /opt/compliance-claw/versions.env \
  && test -x /usr/bin/tini \
+ && test -f /app/docker-entrypoint.mjs \
  && chmod 0755 /usr/local/bin/compliance-claw-entrypoint \
  && chown -R node:node /opt/compliance-claw \
  && chown -R root:root /opt/compliance-claw/pretorin-seed \

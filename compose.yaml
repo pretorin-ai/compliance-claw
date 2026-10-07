@@ -128,6 +128,11 @@ services:
     # recover from.
     restart: unless-stopped
 
+    # OpenClaw 2026.9.8 allows 325 seconds for shutdown and 5 seconds for its
+    # supervisor. Give it time to drain work and release the gateway-owner
+    # lease before Docker sends SIGKILL. This applies to replacement and stop.
+    stop_grace_period: 330s
+
     # RESTATED, NOT MERGED — and that is a property of YAML, not a style choice.
     # A `volumes:` key on the service REPLACES the one the merge key brought in;
     # it does not append to it. Writing only the two extra mounts here silently

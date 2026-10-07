@@ -231,9 +231,11 @@ jobs:
             PATH=/home/node/.pretorin/bin:*) ;;
             *) echo "::error::image PATH does not start with the active CLI dir: ${IMG_PATH}"; exit 1 ;;
           esac
-          # The Slack plugin has to be present in the image, not merely referenced
-          # by the config template — this is the check a broken COPY would fail.
-          run 'test -f /opt/compliance-claw/plugins/slack/dist/index.js'
+          # The verified Slack artifact stays in the image for scanning. Runtime
+          # activation uses the official managed installer, not this local path.
+          run 'test -f /opt/compliance-claw/slack-seed/dist/index.js'
+          run 'test -f /opt/compliance-claw/slack-plugin.verified'
+          run 'test -f /opt/compliance-claw/managed-slack.mjs'
           run 'test -f /opt/compliance-claw/slack-channel.patch.json5'
           # The CLI updater, for the same reason: a broken COPY would otherwise
           # publish an image where /pretorin-update and the pretorin_update tool
@@ -291,10 +293,9 @@ jobs:
       #   HIGH, and CRITICAL with no fix -> reported, does not block.
       #   listed in .trivyignore.yaml   -> shipped, with a dated reason, until it expires.
       #
-      # --ignore-unfixed and --ignorefile both exist because the OpenClaw base image
-      # ships five fixable CRITICALs this repository cannot patch without abandoning
-      # its digest-pinned base. Every exception is per-id, justified, and EXPIRES, so
-      # a new fixable CRITICAL still stops the release.
+      # Unfixed findings remain in the report. The exception file is empty;
+      # any future exception needs its own reason and expiry. New fixable
+      # CRITICAL findings must block publication.
       - name: Vulnerability scan (blocking — fixable CRITICAL)
         env:
           BUILD_REF: ${{ steps.pins.outputs.build_ref }}

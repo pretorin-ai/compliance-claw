@@ -15,9 +15,11 @@
 #
 # WHAT THIS IS NOT. It never runs `down -v`, never edits a config in the state
 # volume, and never touches .env or workspace/targets. An update replaces the
-# IMAGE; the volumes and everything in them — your model login, the seeded
-# config, sessions, the agent workspace, Pretorin's active context and bound
-# resolvers — survive untouched. That is also why a template fix in a new image
+# IMAGE; the volumes stay attached. OpenClaw startup can migrate their config
+# and databases. Before an OpenClaw upgrade, save and verify both state volumes
+# with the gateway stopped. Restore that state with the old image if rollback
+# is necessary. An old image alone cannot reverse a database migration.
+# See docs/upgrade.md. That is also why a template fix in a new image
 # does NOT reach a volume that already has a config: see the drift report below.
 #
 # AND IT NO LONGER MOVES THE PRETORIN CLI. The image ships a SEED; the CLI a
@@ -210,6 +212,7 @@ SECRETS
     ;;
 esac
 
+log "For an OpenClaw upgrade, verify a backup of both state volumes first. See docs/upgrade.md."
 log "pulling the pinned image"
 docker compose pull --quiet 2>/dev/null || docker compose pull || die \
   "could not pull ${IMAGE_REF}.
@@ -217,7 +220,7 @@ docker compose pull --quiet 2>/dev/null || docker compose pull || die \
   The package is not public, so the pull needs a login:  docker login ghcr.io
   A classic token needs the read:packages scope."
 
-log "starting the gateway on it"
+log "starting the gateway; Compose uses the configured shutdown limit"
 docker compose up -d
 
 # ---------------------------------------------------------------------------
@@ -250,9 +253,8 @@ if printf '%s' "$STARTUP" | grep -q 'predates the image'; then
       docker compose run --rm cli bash -c \
         'cat /opt/compliance-claw/config-template.version > /home/node/.openclaw/.compliance-claw-templates'
 
-    or reset — DESTROYS both volumes, including your model login:
+  Use docs/upgrade.md for backup and recovery. Keep the state volumes.
 DRIFT
-  printf '      docker compose down -v && scripts/bootstrap.sh && %s\n\n' "$REBUILD_CMD" >&2
 fi
 
 if printf '%s' "$STARTUP" | grep -q 'Slack credentials are supplied but NOT'; then
