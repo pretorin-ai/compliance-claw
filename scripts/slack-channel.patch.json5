@@ -38,63 +38,20 @@
 // to the base template's comments after observing OpenClaw reformat the file.
 {
   plugins: {
-    // TRUST PIN for the non-bundled plugins in this image. Upstream asks for
-    // this: a plugin loaded from an explicit path with no install provenance is
-    // reported as such in diagnostics, and plugins.allow is the documented way
-    // to say "yes, these, deliberately".
+    // Activation allowlist. Official Slack trust comes from the managed npm
+    // install, not from this list or an explicit local load path.
     //
-    // ESCAPE HATCH — READ BEFORE EDITING. plugins.allow is an EXCLUSIVE
-    // allowlist, not an addition. Naming slack here is therefore also a
-    // tool-surface trim: it takes the enabled set from 50 to 2 and the gateway's
-    // startup banner from
-    //     (8 plugins: browser, canvas, device-pair, file-transfer,
-    //                 memory-core, ollama, phone-control, talk-voice)
-    // to
-    //     (1 plugin: slack)
-    // That is intended — it removes the browser plugin and six others from a
-    // container whose tool execution is unsandboxed. Agent turns, the Pretorin
-    // MCP server, skills and tools.toolSearch are all unaffected (verified).
-    //
-    // To restore a bundled plugin, add its id to this list. To restore all of
-    // them, delete the `allow` line entirely.
-    //
-    // IF YOU REMOVE channels.slack BELOW, REMOVE THIS `allow` TOO. An orphaned
-    // allowlist keeps the seven bundled plugins off with no Slack to show for
-    // it, and nothing in the logs explains why. scripts/smoke.sh asserts the two
-    // move together.
-    //
-    // THE LOCAL PLUGINS ARE NOT OPTIONAL HERE. Because this list is exclusive,
-    // an entry omitted is a plugin disabled — so leaving one out would silently
-    // remove both of its routes on exactly the deployments that have Slack,
-    // which are the deployments those routes exist for. The banner therefore
-    // reads (3 plugins: pretorin-update, slack, target-sync).
-    //
-    // EVERY plugin added to the base template must be added to BOTH arrays in
-    // this file: this one, and load.paths below.
+    // This list limits activation. OpenClaw can add required provider and
+    // memory plugins during migration. Inspect the loaded set after an upgrade;
+    // do not treat a fixed plugin count as a security boundary.
+    // Keep both local plugins here so their tools remain available.
+    // If channels.slack is removed, review this allowlist too.
     allow: ["slack", "pretorin-update", "target-sync"],
 
     entries: { slack: { enabled: true } },
 
-    // The image copies, outside the state volume. The Slack plugin is baked by
-    // the Dockerfile's slack-plugin stage after an integrity check against
-    // SLACK_PLUGIN_INTEGRITY in versions.env, and both are node-owned because
-    // OpenClaw blocks plugin files owned by another uid.
-    //
-    // THE LOCAL PLUGIN PATHS ARE RE-LISTED ON PURPOSE, NOT DUPLICATED BY MISTAKE.
-    // `openclaw config patch` uses JSON merge-patch semantics, so an array in a
-    // patch REPLACES the array in the target rather than merging with it —
-    // verified: a base of [a, b] patched with [c] yields [c] alone. The base
-    // template already lists both local plugins; if this patch named only the
-    // Slack path, applying it on a fresh Slack seed would silently delete them
-    // and /pretorin-update, /target-sync and both agent tools would simply not
-    // exist. Any future entry added to the base template must be added here too.
-    load: {
-      paths: [
-        "/opt/compliance-claw/plugins/slack",
-        "/opt/compliance-claw/plugins/pretorin-update",
-        "/opt/compliance-claw/plugins/target-sync",
-      ],
-    },
+    // Keep plugins.load.paths from the base config. Slack is a managed install.
+    // A patch array would replace all customer plugin paths.
   },
 
   channels: {

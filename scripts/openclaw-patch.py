@@ -35,7 +35,7 @@ plugins.load.paths exactly that way. The rule here is the inverse and stronger:
 do not name what you do not own. `plugins` appears nowhere below.
 
     OWNED, regenerated
-      agents.list                          (array, --replace-path)
+      agents.list                          (array input, keyed on new OpenClaw)
       bindings                             (array, --replace-path)
       channels.slack.channels              (map,   --replace-path)
       channels.slack.dmPolicy              derived from the direct bindings
@@ -48,6 +48,7 @@ do not name what you do not own. `plugins` appears nowhere below.
       messages.*  mcp.sessionIdleTtlMs
       channels.slack.{enabled,mode,configWrites,slashCommand,groupPolicy}
       channels.slack.dm.*   (including groupEnabled/groupChannels — see below)
+      existing Slack account-wide bindings to declared agents
       every Slack token path
 
 THE BINDINGS ARRAY HAS TWO OWNERS, AND THAT IS THE WHOLE DESIGN.
@@ -153,6 +154,8 @@ PRESERVED_PATHS = (
     "gateway",
     "models",
     "agents.defaults",
+    "agents.ownership",
+    "talk",
     "tools",
     "plugins",
     "session",
@@ -327,6 +330,17 @@ def _peer(binding):
     return peer if isinstance(peer, dict) else {}
 
 
+def _is_ambient_slack_binding(binding):
+    """The account-wide Slack binding that Doctor can add for legacy ownership.
+
+    Keep an existing binding of this exact shape. Channel admission and DM
+    admission still come from the generated Slack policy. Do not create one.
+    """
+    return (_is_slack_binding(binding)
+            and binding.get("match") == {"channel": "slack", "accountId": "*"}
+            and set(binding) == {"agentId", "match"})
+
+
 def describe_binding(binding):
     """A stable one-line description for error messages."""
     if not isinstance(binding, dict):
@@ -339,14 +353,14 @@ def describe_binding(binding):
 
 
 def classify_bindings(existing, effort_channels, agent_ids):
-    """Split the live bindings array into (preserved_direct, refusals).
+    """Split the live bindings array into (preserved, refusals).
 
     effort_channels: {channel_id: agent_id} for the channels we generate.
     agent_ids:       the set of agent ids this apply will configure.
 
     Generated channel bindings are dropped here and re-emitted from efforts.yaml,
     so an edit to efforts.yaml always wins for the paths we own. Direct-peer
-    bindings are the operator's and are carried through untouched. Everything else
+    bindings and exact Slack account-wide bindings are kept. Everything else
     is a refusal: silently retaining an unrecognised binding would let a stale or
     hand-broken entry outlive the thing it referred to, and silently dropping one
     would delete operator intent without saying so.
@@ -363,6 +377,15 @@ def classify_bindings(existing, effort_channels, agent_ids):
                 " (DM) bindings you created. Remove it, or move it out of"
                 " openclaw.json before applying."
                 % describe_binding(binding))
+            continue
+
+        if _is_ambient_slack_binding(binding):
+            if binding.get("agentId") not in agent_ids:
+                refusals.append("Slack account-wide binding targets removed agent '%s';"
+                                " remove or update that binding before apply."
+                                % binding.get("agentId"))
+            else:
+                preserved.append(binding)
             continue
 
         peer = _peer(binding)
@@ -410,7 +433,7 @@ def classify_bindings(existing, effort_channels, agent_ids):
         refusals.append(
             "Slack binding with peer kind '%s' (%s) is not supported. This release"
             " serves channel bindings generated from efforts.yaml and direct (DM)"
-            " bindings; multi-person DMs additionally need"
+            " bindings and existing account-wide Slack bindings; multi-person DMs need"
             " channels.slack.dm.groupEnabled, which is deliberately not configured"
             " here." % (kind, describe_binding(binding)))
 
@@ -517,12 +540,14 @@ def build_patch(efforts, config, dm_bindings):
         name = effort["name"]
         agent = pe.agent_id(name)
         entry = build_agent(effort)
+        # Explicit ownership replaces the retired default marker. Keep its
+        # existing surface owners. Older OpenClaw uses the marker below.
         # The default agent is stated rather than left to list position. OpenClaw
         # falls back to the first entry when nothing claims it, so being explicit
         # means reordering efforts.yaml cannot change which agent answers a
         # request that matched no binding. Nothing should reach it: the Slack
         # allowlist and the exact bindings below are generated from one list.
-        if index == 0:
+        if index == 0 and get_path(config, "agents.ownership") != "explicit":
             entry["default"] = True
         deny = sorted(p for n, p in prefixes.items() if n != name)
         if deny:
@@ -556,7 +581,8 @@ def build_patch(efforts, config, dm_bindings):
     # message — but keeping generated entries first makes the array diffable.
     bindings.extend(dm_bindings)
 
-    bound_users = [b["match"]["peer"]["id"] for b in dm_bindings]
+    bound_users = [_peer(b)["id"] for b in dm_bindings
+                   if _peer(b).get("kind") == "direct"]
 
     # Retire the single-effort server explicitly. `null` is a delete in merge
     # semantics; leaving it would keep an unscoped Pretorin server visible to
@@ -601,10 +627,13 @@ def build_patch(efforts, config, dm_bindings):
                                 "credential_ref": e["credential_ref"]}
                     for e in efforts},
         "agents": [a["id"] for a in agents],
-        "defaultAgent": agents[0]["id"] if agents else None,
+        "defaultAgent": next((a["id"] for a in agents if a.get("default")), None),
         "channelBindings": {e["slack_channel_id"]: pe.agent_id(e["name"])
                             for e in efforts},
-        "directBindings": {b["match"]["peer"]["id"]: b["agentId"] for b in dm_bindings},
+        "directBindings": {_peer(b)["id"]: b["agentId"] for b in dm_bindings
+                           if _peer(b).get("kind") == "direct"},
+        "ambientBindings": [b for b in dm_bindings if _is_ambient_slack_binding(b)],
+        "agentOwnership": get_path(config, "agents.ownership"),
         "mcpServers": sorted(k for k, v in mcp_servers.items() if v is not None),
         "deactivatedMcpServers": sorted(k for k, v in mcp_servers.items() if v is None),
         "toolPrefixes": prefixes,
@@ -633,7 +662,7 @@ def apply_dm_edits(preserved, add, remove, agent_ids):
     out = [b for b in preserved]
     if remove:
         before = len(out)
-        out = [b for b in out if b["match"]["peer"]["id"] != remove]
+        out = [b for b in out if _peer(b).get("id") != remove]
         if len(out) == before:
             raise PatchError(
                 "no Slack direct binding exists for user %s; nothing to revoke."
@@ -653,7 +682,7 @@ def apply_dm_edits(preserved, add, remove, agent_ids):
                 " bound to an effort that exists, or it would route to the default"
                 " agent." % effort)
         for existing in out:
-            if existing["match"]["peer"]["id"] == user:
+            if _peer(existing).get("id") == user:
                 raise PatchError(
                     "Slack user %s is already bound to effort '%s'. One DM"
                     " conversation represents exactly one effort. Revoke first:"
@@ -697,7 +726,8 @@ def cmd_generate(args):
         # still fail the run below.
         preserved = apply_dm_edits(preserved, args.dm_add, args.dm_remove, agent_ids)
 
-    bound_users = {b["match"]["peer"]["id"] for b in preserved}
+    bound_users = {_peer(b)["id"] for b in preserved
+                   if _peer(b).get("kind") == "direct"}
     refusals.extend(check_allow_from(get_path(config, "channels.slack.allowFrom"),
                                      bound_users))
 
@@ -759,9 +789,23 @@ def cmd_verify(args):
     problems = []
 
     # --- what we own landed ---
-    live_agents = [a.get("id") for a in (get_path(config, "agents.list") or [])]
-    if live_agents != manifest["agents"]:
-        problems.append("agents.list is %r, expected %r" % (live_agents, manifest["agents"]))
+    roster = get_path(config, "agents") or {}
+    if "entries" in roster:
+        entries = roster["entries"]
+        if ("list" in roster or not isinstance(entries, dict)
+                or any(not isinstance(v, dict) or "id" in v for v in entries.values())):
+            problems.append("agents.entries is invalid or conflicts with agents.list")
+            live_agents = []
+        else:
+            live_agents = sorted(entries)
+        expected_agents = sorted(manifest["agents"])
+    else:
+        entries = roster.get("list", [])
+        live_agents = ([a.get("id") for a in entries if isinstance(a, dict)]
+                       if isinstance(entries, list) else [])
+        expected_agents = manifest["agents"]
+    if live_agents != expected_agents:
+        problems.append("agent roster is %r, expected %r" % (live_agents, expected_agents))
 
     # MCP SERVERS, CHECKED THREE WAYS — and deliberately NOT as an equality on the
     # whole key set. This deployment owns the `pretorin-<effort>` entries and
@@ -796,6 +840,10 @@ def cmd_verify(args):
             channel_bindings[peer.get("id")] = binding.get("agentId")
         elif peer.get("kind") == "direct":
             direct_bindings[peer.get("id")] = binding.get("agentId")
+    live_ambient = [b for b in (get_path(config, "bindings") or [])
+                    if _is_ambient_slack_binding(b)]
+    if live_ambient != manifest.get("ambientBindings", []):
+        problems.append("the existing Slack account-wide bindings changed")
     if channel_bindings != manifest["channelBindings"]:
         problems.append("Slack channel bindings are %r, expected %r"
                         % (channel_bindings, manifest["channelBindings"]))
@@ -999,7 +1047,8 @@ def _gen(text, config=None, dm=None):
     preserved, refusals = classify_bindings(get_path(config, "bindings"), channels, agent_ids)
     if dm:
         preserved = apply_dm_edits(preserved, dm, None, agent_ids)
-    bound_users = {b["match"]["peer"]["id"] for b in preserved}
+    bound_users = {_peer(b)["id"] for b in preserved
+                   if _peer(b).get("kind") == "direct"}
     refusals.extend(check_allow_from(get_path(config, "channels.slack.allowFrom"),
                                      bound_users))
     if refusals:
@@ -1333,6 +1382,72 @@ def self_test():
                    "(it must not require equality on the whole key set)")
     if rc != 0:
         print("      " + out.strip().replace("\n", "\n      "))
+
+    # Candidate writes use keyed IDs and explicit ownership. JSON key order is
+    # not a routing priority under explicit ownership.
+    keyed = json.loads(json.dumps(live))
+    keyed["agents"] = {"ownership": "explicit", "entries": {
+        a["id"]: {k: v for k, v in a.items() if k not in ("id", "default")}
+        for a in reversed(applied["agents"]["list"])}}
+    keyed_snap = dict(snap, agents={"ownership": "explicit"})
+    rc, out = _verify(keyed, applied_manifest, keyed_snap)
+    check(rc == 0, "verify accepts the candidate keyed roster in any key order")
+    del keyed["agents"]["entries"]["crm-hipaa"]
+    rc, out = _verify(keyed, applied_manifest, keyed_snap)
+    check(rc == 1, "verify rejects a missing agent in the candidate keyed roster")
+
+    ambient = {"agentId": "crm-soc2",
+               "match": {"channel": "slack", "accountId": "*"}}
+    migrated_cfg = {"agents": {"ownership": "explicit", "entries": {}},
+                    "bindings": [ambient]}
+    try:
+        repatch, remanifest = _gen(TWO_EFFORTS, migrated_cfg)
+        check(ambient in repatch["bindings"], "keep the existing Slack ambient binding")
+        check(not any(a.get("default") for a in repatch["agents"]["list"]),
+              "explicit ownership does not receive the retired default marker")
+        check(repatch["channels"]["slack"]["dmPolicy"] == "disabled"
+              and remanifest["directBindings"] == {},
+              "an ambient Slack binding does not admit any DM")
+    except PatchError:
+        check(False, "generation accepts the Doctor Slack ambient binding")
+
+    # Keep the default/ambient changes separate from DM admission and routing.
+    migrated_live = json.loads(json.dumps(live))
+    migrated_live["agents"] = {"ownership": "explicit", "entries": {
+        a["id"]: {k: v for k, v in a.items() if k not in ("id", "default")}
+        for a in applied["agents"]["list"]}}
+    migrated_live["bindings"].append(ambient)
+    migrated_snapshot = json.loads(json.dumps(migrated_live))
+    repatch, remanifest = _gen(TWO_EFFORTS, migrated_live)
+    rc, out = _verify(migrated_live, remanifest, migrated_snapshot)
+    check(rc == 0, "verify keeps the existing Slack ambient binding")
+    changed_ambient = json.loads(json.dumps(migrated_live))
+    changed_ambient["bindings"][-1]["agentId"] = "crm-hipaa"
+    rc, out = _verify(changed_ambient, remanifest, migrated_snapshot)
+    check(rc == 1 and "account-wide bindings changed" in out,
+          "verify rejects a changed ambient binding")
+    dm_repatch, dm_remanifest = _gen(TWO_EFFORTS, migrated_live, dm="U0DMUSER1:crm-hipaa")
+    check(dm_remanifest["allowFrom"] == ["U0DMUSER1"]
+          and ambient in dm_repatch["bindings"],
+          "DM addition keeps ambient routing and admits only the direct user")
+    dm_removed = apply_dm_edits(dm_repatch["bindings"][2:], None, "U0DMUSER1",
+                               {"crm-soc2", "crm-hipaa"})
+    check(dm_removed == [ambient], "DM removal keeps the ambient binding")
+    stale_ambient = {"bindings": [{"agentId": "removed",
+                                  "match": {"channel": "slack", "accountId": "*"}}]}
+    refuses("an ambient binding to a removed agent",
+            lambda: _gen(TWO_EFFORTS, stale_ambient), "targets removed agent")
+    unknown_ambient = {"bindings": [{"agentId": "crm-soc2",
+                                    "match": {"channel": "slack", "accountId": "*",
+                                              "teamId": "T0UNKNOWN"}}]}
+    refuses("an unrecognized ambient binding shape",
+            lambda: _gen(TWO_EFFORTS, unknown_ambient), "not supported")
+    for invalid_roster in ({"entries": {"crm-soc2": []}},
+                           {"entries": {"crm-soc2": {"id": "crm-soc2"}}},
+                           {"entries": {}, "list": applied["agents"]["list"]}):
+        malformed = dict(live, agents=invalid_roster)
+        rc, out = _verify(malformed, applied_manifest)
+        check(rc == 1, "verify rejects an invalid or ambiguous keyed roster")
 
     # ...and it must still notice one of OURS going missing.
     broken = json.loads(json.dumps(live))

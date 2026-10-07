@@ -1150,7 +1150,9 @@ bindings = [{"agentId": agent,
              "match": {"channel": "slack", "peer": {"kind": "direct", "id": user}},
              "session": {"dmScope": "per-channel-peer"}}
             for user, agent in sorted(direct.items())]
-config = {"bindings": bindings}
+config = {"bindings": bindings + (state.get("ambientBindings") or [])}
+if state.get("agentOwnership"):
+    config["agents"] = {"ownership": state["agentOwnership"]}
 if direct:
     config["channels"] = {"slack": {"allowFrom": sorted(direct)}}
 # THE MCP SERVERS FROM THE LAST APPLY, as placeholders. Deactivation is decided by
@@ -1409,6 +1411,8 @@ json.dump({
     "agents": manifest["agents"],
     "channelBindings": manifest["channelBindings"],
     "directBindings": manifest["directBindings"],
+    "ambientBindings": manifest.get("ambientBindings", []),
+    "agentOwnership": manifest.get("agentOwnership"),
     "mcpServers": manifest["mcpServers"],
     "dmPolicy": manifest["dmPolicy"],
     "targetsByEffort": manifest["targetsByEffort"],

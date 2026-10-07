@@ -300,11 +300,10 @@ between those paths is separation of *purpose*, not of *privilege*.
 > out of the environment. Until all three are done, only review repositories your
 > organisation already trusts.
 
-Phase 5 does part of the first item: `plugins.allow` is an exclusive allowlist, so
-on a Slack deployment the runtime activates the three local/Slack plugins instead
-of eight bundled ones and the `browser` plugin in particular is not loaded. That reduces the surface; it does not create a
-boundary. Sandbox enablement is future work, not a documented posture that can be
-substituted for it.
+The Slack seed uses `plugins.allow` to limit plugin activation. OpenClaw can add
+required provider and memory plugins during migration. Inspect the actual loaded
+set after an upgrade. This reduces the tool surface; it does not create a
+security boundary. Sandbox enablement remains future work.
 
 ## Hardening ledger — everything outstanding
 
@@ -356,19 +355,14 @@ Ordered roughly by how much it matters, not by effort.
    app-server plugin, which does not receive `tools.toolSearch` and bypasses
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
-6. **The base image ships five fixable CRITICAL vulnerabilities.** Measured, not
-   estimated: two `libgnutls30` (Debian has `3.7.9-2+deb12u7`), one
-   `@vitest/browser` — a test framework upstream ships inside a runtime image —
-   and two vendored copies of `node-tar`, one inside npm and one inside
-   corepack's pnpm. **Nothing this repository adds contributes any of them**; the
-   Pretorin binary and the Slack plugin scan clean at CRITICAL. They cannot be
-   patched here without running an unpinned `apt upgrade` over a digest-pinned
-   base, so they are documented per-id in `.trivyignore.yaml` with a written
-   justification and a **90-day expiry**, printed into every release job summary,
-   and fixed properly by bumping `OPENCLAW_VERSION` and the runtime `FROM` digest
-   once upstream rebuilds. The `libgnutls30` pair is the one to watch: unlike the
-   others it sits on a live TLS path, and the reason for deferring it is
-   inability to patch, not a claim that it is unreachable.
+6. **Keep base-image vulnerabilities under review.** The OpenClaw 2026.9.8
+   scan no longer reports the previously accepted vulnerability IDs. Those
+   exceptions were removed. The runtime updates four existing Perl packages to
+   the exact Debian security version in `DEBIAN_PERL_VERSION`; this fixes
+   CVE-2026-13221, CVE-2026-42496, and CVE-2026-8376. It does not run a general
+   OS upgrade. The release gate still blocks fixable CRITICAL findings and
+   reports unfixed findings. A passing gate is not proof that the image has no
+   vulnerabilities.
 7. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
    publishes and verifies an immutable digest, which is integrity but not
    authenticity: nothing attests *who* built a given digest. **The image is

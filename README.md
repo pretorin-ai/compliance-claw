@@ -720,14 +720,17 @@ Behaviour, all set by `scripts/slack-channel.patch.json5`: DMs are **disabled**,
 only the one allowlisted channel is served, and the agent answers only when
 **explicitly mentioned**.
 
-Enabling Slack also **trims the plugin surface**, because `plugins.allow` is an
-exclusive allowlist. The no-Slack profile loads the eight bundled plugins plus
-the two local plugins (`pretorin-update` and `target-sync`), for 10 total. The
-Slack profile loads exactly three: `pretorin-update`, `slack`, and `target-sync`.
-This removes the browser and other bundled tools from a container whose tool
-execution is unsandboxed. To restore a bundled plugin, add its id to
-`plugins.allow`; to restore all of them, delete the `allow` line. If you remove
-`channels.slack`, remove `allow` too.
+Slack uses the official OpenClaw plugin installer. Fresh Slack setup and a
+release that changes the Slack version need access to the npm registry. The
+installer pins the version from `versions.env` and checks the package integrity.
+The image retains the verified package for vulnerability scanning. OpenClaw stores
+the runtime installation in `openclaw-state`. Setup removes only the old Slack
+load path; it keeps other plugins, channel settings, and credentials.
+
+The Slack seed sets `plugins.allow`. OpenClaw can also enable required provider
+and memory plugins during migration. Do not use a fixed plugin count as an
+access control. Check the loaded plugins with `openclaw plugins list` after an
+upgrade. The local `pretorin-update` and `target-sync` plugins must remain loaded.
 
 > **Security, not a footnote.** Every member of that Slack channel acts with the
 > authority of the configured Pretorin key, and there is **no per-user
@@ -984,7 +987,10 @@ overlay (that is a rebuild, not an update).
 | `.env` | **yes** | **yes** — never touched by either |
 | `workspace/targets` clones | **yes** | **yes** — bind-mounted, not a volume |
 
-So an update never costs you a re-login or a re-onboard.
+OpenClaw can migrate the stored configuration and databases at startup. Before
+an upgrade, stop the gateway and back up both state volumes and deployment
+files. See [Upgrade and recovery](docs/upgrade.md). An older image can require
+the matching pre-upgrade state; changing the image alone is not a full rollback.
 
 **Two things about the CLI row, because both surprise people.** `down -v` deletes
 `pretorin-state`, so the next start re-seeds the CLI from the image and every
@@ -1021,16 +1027,17 @@ scripts/pretorin-update.sh latest       # update to the latest stable release
 an image upgrade did move it — that is how a v0.1.x deployment went from 0.26.14
 to 0.28.2. From this release on, the two are independent.
 
-**A newer image does not update an existing volume's config.** Templates are
-seeded write-if-absent and never overwritten, so a tightened template has no
-effect on a deployment that already has a config. The container tells you instead:
+**Templates do not replace an existing configuration.** OpenClaw can migrate its
+schema, and this release replaces the obsolete Slack load path with a managed
+installation. Other template changes still require administrator review. The
+container reports a template revision difference:
 
 ```
 compliance-claw: WARNING — this volume's config predates the image.
   volume template version 2, image ships 3.
 ```
 
-It never edits anything. Either merge the change by hand — diff your
+For a template change, merge the change by hand — diff your
 `~/.openclaw/openclaw.json` against
 `/opt/compliance-claw/openclaw-config.template.json` in the image, then
 `echo 3 > ~/.openclaw/.compliance-claw-templates` — or reset.
@@ -1044,7 +1051,8 @@ compliance-claw: WARNING — Slack credentials are supplied but NOT in this volu
 
 That means the Slack credentials this deployment requires — both tokens on the
 multi-effort path, all three variables on the legacy one — are set while the
-existing config predates them. It names both fixes.
+existing config predates them. It names the managed install and configuration
+steps. It does not replace the existing configuration.
 
 ## Resetting
 
@@ -1090,7 +1098,7 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | `Missing required scopes: write` | Read-only key, write tool | Correct behaviour — see "Read-only vs write-enabled" |
 | `Scope is not approved with a confirmed scale yet` | Platform prerequisite | Approve scope setup on platform.pretorin.com |
 | Agent answers with no sources bound | Wrong channel for the effort | Each agent serves one effort and refuses to switch; ask in that effort's own channel |
-| `plugins list` shows 10 plugins instead of 3 | Slack not configured | Expected; the two profiles are documented above |
+| Loaded plugin set differs after an upgrade | OpenClaw can change bundled and required provider plugins | Inspect the loaded set and compare it with your configured allowlist |
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
 | Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`. `--status` confirms which binary is active |
@@ -1183,10 +1191,9 @@ gh workflow run release.yml -f dry_run=true
 - Every pin lives in `versions.env`, with two documented carve-outs that cannot
   read a sourced file: image digests on the Dockerfile's `FROM` lines, and action
   commit SHAs on `uses:` lines. A pin audit looks in three places.
-- The Slack plugin is not bundled with OpenClaw. It is installed from npm at build
-  time, integrity-checked against `SLACK_PLUGIN_INTEGRITY`, and loaded from the
-  image via `plugins.load.paths` — never from the state volume, so `down -v`
-  cannot remove it.
+- Slack is an official external package. The image contains its verified bytes
+  for scanning. OpenClaw installs the pinned runtime package in `openclaw-state`;
+  deleting that volume also deletes the installation.
 - `mcp.sessionIdleTtlMs` stays at its default `600000` — milliseconds, so 10
   minutes of idleness before a session's MCP child is reaped; `0` disables idle
   cleanup. Untuned until multi-session usage is measured.

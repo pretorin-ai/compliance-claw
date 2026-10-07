@@ -7,9 +7,9 @@
 # is a named volume: anything baked would be shadowed by the volume on first
 # start, and the volume has to stay authoritative so operator edits survive.
 #
-# Both seeds are write-if-absent and never clobber. The consequence is
-# deliberate and worth knowing: a newer image ships a newer template, but an
-# existing volume keeps the old config. `docker compose down -v` is the reset.
+# Templates are applied only when absent. Existing settings stay in the volume.
+# The Slack upgrade removes only the obsolete image path and uses OpenClaw's
+# managed install command to record the pinned official npm source.
 #
 # This runs for the `cli` service too, which is wanted — one-off CLI commands
 # then read the same config the gateway does. That is also why every message
@@ -30,11 +30,20 @@ TEMPLATES="/opt/compliance-claw"
 STAMP="/home/node/.openclaw/.compliance-claw-templates"
 SHIPPED_VERSION_FILE="${TEMPLATES}/config-template.version"
 SLACK_PATCH="${TEMPLATES}/slack-channel.patch.json5"
-# The one string that proves the Slack patch was applied to a config. It appears
-# nowhere else in any config, so a fixed-string grep is exact — and it costs no
-# node startup, which matters because this script runs for every `cli`
-# invocation too, of which scripts/smoke.sh makes dozens.
-SLACK_MARKER="/opt/compliance-claw/plugins/slack"
+SLACK_HELPER="${TEMPLATES}/managed-slack.mjs"
+
+# Fresh setup and gateway startup can install Slack. Retained CLI commands do
+# not install it. Serialize setup for containers that share the state volume.
+prepare_managed_slack() {
+  (
+    flock -x 8
+    node "$SLACK_HELPER" prepare "$@"
+  ) 8>"$(dirname "$CONFIG")/.compliance-claw-slack-install.lock"
+}
+
+slack_configured() {
+  [ "$(node "$SLACK_HELPER" status)" = configured ]
+}
 # The effort declarations, mounted read-only by compose.efforts.yaml. Its presence
 # is how this script knows whether `clawctl` owns the Slack channel allowlist.
 EFFORTS_FILE="/etc/compliance-claw/efforts.yaml"
@@ -215,7 +224,7 @@ seed_pretorin_cli() {
   # file as "already seeded" and keeps it forever, leaving MCP permanently broken
   # with no way back. So: non-empty and executable, always; and the version exec
   # only on gateway starts, because execing a 25 MB binary on every one-off `cli`
-  # command is the cost the SLACK_MARKER comment above exists to avoid.
+  # command is not needed for ordinary CLI invocations.
   local why=""
   if [ ! -e "$PRETORIN_ACTIVE" ]; then
     why="absent"
@@ -383,6 +392,12 @@ seed_slack() {
 # patch and always removes it.
 seed_slack_apply() {
   local rendered="$1"
+  # Slack's schema is available only after the official package is installed.
+  if ! prepare_managed_slack --required; then
+    echo "compliance-claw: ERROR: the official Slack package was not installed." >&2
+    rm -f "$rendered"
+    return 1
+  fi
   # Gate two. --dry-run validates the merged result against OpenClaw's own config
   # schema and exits non-zero on anything it does not accept, so a value that
   # survived the character check but still produces an invalid config is refused
@@ -407,9 +422,8 @@ seed_slack_apply() {
   # Assert rather than assume. A patch that reports success but leaves no trace
   # would reproduce exactly the silent no-Slack failure this phase exists to
   # remove, one layer down.
-  if ! grep -q "$SLACK_MARKER" "$CONFIG"; then
-    echo "compliance-claw: ERROR — the Slack patch applied but ${CONFIG} does not" >&2
-    echo "  reference ${SLACK_MARKER}. Refusing to report success." >&2
+  if ! slack_configured; then
+    echo "compliance-claw: ERROR: the Slack patch did not add channels.slack to ${CONFIG}." >&2
     return 1
   fi
   return 0
@@ -442,18 +456,11 @@ if [ -e "$CONFIG" ]; then
     # DRIFT-WARNING: predates the image
     echo "compliance-claw: WARNING — this volume's config predates the image." >&2
     echo "  volume template version ${HAVE}, image ships ${SHIPPED}." >&2
-    echo "  Nothing was overwritten. The config in the volume stays authoritative," >&2
-    echo "  so template fixes in this image are NOT active — including" >&2
-    echo "  mcp.servers.pretorin.cwd, without which the Pretorin MCP server runs" >&2
-    echo "  with its working directory at /app and can register /app as the" >&2
-    echo "  repository under review." >&2
-    echo "  Diff ${CONFIG} against ${TEMPLATES}/openclaw-config.template.json, or reset with:" >&2
-    echo "    docker compose down -v   # DELETES BOTH named volumes: OpenClaw config," >&2
-    echo "                             # sessions, agent workspace and custom AGENTS.md," >&2
-    echo "                             # AND all Pretorin onboarding state (active" >&2
-    echo "                             # context, preflight resolvers, active recipes)." >&2
-    echo "                             # Bind-mounted target repos are NOT touched." >&2
-    echo "    scripts/bootstrap.sh && scripts/clawctl apply        # both idempotent" >&2
+    echo "  The config was kept. Review the template changes before you apply them." >&2
+    echo "  Back up both state volumes before you change the config." >&2
+    echo "  Compare ${CONFIG} with ${TEMPLATES}/openclaw-config.template.json." >&2
+    echo "  Review and apply the required changes. See docs/upgrade.md for backup" >&2
+    echo "  and restore steps." >&2
     echo "  After merging the template by hand: echo ${SHIPPED} > ${STAMP}" >&2
   fi
 
@@ -464,26 +471,15 @@ if [ -e "$CONFIG" ]; then
   # a bot that never connects and no explanation — the message above talks about
   # template versions and says nothing about Slack. That silence is the single
   # worst failure mode in this phase, so it gets its own warning naming both fixes.
-  if [ "$SLACK_SET" = 1 ] && ! grep -q "$SLACK_MARKER" "$CONFIG"; then
+  if [ "$SLACK_SET" = 1 ] && ! slack_configured; then
     # DRIFT-WARNING: Slack credentials are supplied but NOT
     echo "compliance-claw: WARNING — Slack credentials are supplied but NOT in this volume's config." >&2
-    echo "  All three Slack variables are set, yet ${CONFIG} has no channels.slack" >&2
-    echo "  and does not load the Slack plugin, so the agent will never appear in Slack." >&2
-    echo "  Nothing was overwritten. Two ways forward:" >&2
-    echo "    1. Reset (destroys BOTH volumes, keeps workspace/targets):" >&2
-    echo "         docker compose down -v && scripts/bootstrap.sh && scripts/clawctl apply" >&2
-    echo "    2. Apply the Slack patch to the existing config by hand:" >&2
-    if [ "$SLACK_EFFORTS_OWNED" = 1 ]; then
-      echo "         docker compose run --rm cli bash -c \\" >&2
-      echo "           'grep -v @SLACK_CHANNEL_ID@ ${SLACK_PATCH} > /tmp/p.json5 \\" >&2
-      echo "            && openclaw config patch --file /tmp/p.json5'" >&2
-      echo "       then admit each effort's channel:  scripts/clawctl apply" >&2
-    else
-      echo "         docker compose run --rm cli bash -c \\" >&2
-      echo "           'sed \"s|@SLACK_CHANNEL_ID@|\$SLACK_CHANNEL_ID|\" ${SLACK_PATCH} > /tmp/p.json5 \\" >&2
-      echo "            && openclaw config patch --file /tmp/p.json5'" >&2
-      echo "       then restart the gateway: docker compose restart openclaw" >&2
-    fi
+    echo "  ${CONFIG} has no channels.slack. The config was kept." >&2
+    echo "  Install the pinned package with node ${SLACK_HELPER} prepare --required." >&2
+    echo "  Review ${SLACK_PATCH}, then use openclaw config patch to add the Slack" >&2
+    echo "  settings. Keep your plugin allowlist and channel settings." >&2
+    echo "  With efforts.yaml, run scripts/clawctl apply to admit the effort channels." >&2
+    echo "  Restart the gateway after you apply the config." >&2
   fi
 
   # A third drift case, and the worst-behaved of the three: an existing config
@@ -520,7 +516,29 @@ if [ -e "$CONFIG" ]; then
   fi
 else
   echo "compliance-claw: seeding ${CONFIG}" >&2
-  install -D -m 0600 "${TEMPLATES}/openclaw-config.template.json" "$CONFIG"
+  if [ "$SLACK_EFFORTS_OWNED" = 1 ]; then
+    # Name every declared agent before OpenClaw makes its first config write.
+    # An absent roster creates implicit main; growing a one-agent roster also
+    # changes upstream defaults. clawctl apply supplies all other agent fields.
+    install -d -m 0700 "$(dirname "$CONFIG")"
+    node - "${TEMPLATES}/openclaw-config.template.json" "$CONFIG" "$EFFORTS_FILE" <<'NODE'
+const fs = require('node:fs');
+const { createRequire } = require('node:module');
+const { spawnSync } = require('node:child_process');
+const JSON5 = createRequire('/app/package.json')('json5');
+const parsed = spawnSync('python3', ['/opt/compliance-claw/parse-efforts.py', 'agents', process.argv[4]],
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+if (parsed.status !== 0) process.exit(1);
+const ids = parsed.stdout.trim().split('\n').filter(Boolean).map((line) => line.split('\t')[1]);
+if (!ids.length || ids.some((id) => !id)) throw new Error('No declared agent IDs were parsed.');
+const config = JSON5.parse(fs.readFileSync(process.argv[2], 'utf8'));
+config.agents = { ...config.agents, ownership: 'explicit',
+  entries: Object.fromEntries(ids.map((id) => [id, {}])) };
+fs.writeFileSync(process.argv[3], JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+NODE
+  else
+    install -D -m 0600 "${TEMPLATES}/openclaw-config.template.json" "$CONFIG"
+  fi
 
   # Slack, applied on top of the freshly seeded base — the only moment it is ever
   # applied, because the branch above never rewrites an existing config. A
@@ -547,7 +565,7 @@ else
       echo "  required together." >&2
     fi
     echo "  See .env.example or docs/file-secrets.md." >&2
-    echo "  Fix the selected secret source, then reset the config: docker compose down -v" >&2
+    echo "  Fix the secret source. Review ${SLACK_PATCH}, then use openclaw config patch." >&2
   fi
 
   # Written only on a fresh seed. An existing config with no marker keeps
@@ -555,6 +573,12 @@ else
   # real, and the operator has not merged anything yet.
   printf '%s\n' "$SHIPPED" > "$STAMP"
   chmod 0600 "$STAMP"
+fi
+
+# A gateway must have the pinned official Slack install before Doctor and the
+# channel start. This also upgrades retained state and removes the old override.
+if [ "$IS_GATEWAY" = 1 ] && node "$SLACK_HELPER" foreground "$@"; then
+  prepare_managed_slack
 fi
 
 # 0700 matches the mode OpenClaw itself uses for the workspace, so a seeded
@@ -580,8 +604,7 @@ elif [ "$IS_GATEWAY" = 1 ]; then
   echo "  'scripts/clawctl apply' into each effort's own workspace." >&2
 fi
 
-# The base image's entrypoint, restated. `exec` matters: without it tini would
-# be a child of this shell instead of PID 1, and signal handling and reaping
-# would break. The Dockerfile asserts this path exists at build time so a base
-# image that moves tini fails the build rather than the deployment.
-exec /usr/bin/tini -s -- "$@"
+# Keep the upstream container activation checks. The adapter runs Doctor before
+# a foreground gateway starts and refuses unsafe retained-state migrations.
+# It passes other commands through without running gateway maintenance.
+exec /usr/bin/tini -s -- node /app/docker-entrypoint.mjs "$@"

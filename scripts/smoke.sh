@@ -499,7 +499,9 @@ fi
 # Docker's own healthcheck already probes 127.0.0.1:18789/healthz from inside the
 # container, so container health is the same signal, correctly attributed.
 READY=0
-for _ in $(seq 1 60); do
+# The upstream image probes every 180 seconds. A probe during startup
+# maintenance can fail; allow the next scheduled probe to verify readiness.
+for _ in $(seq 1 180); do
   HSTATE="$(docker compose ps --format json 2>/dev/null | python3 -c '
 import json, sys
 for line in sys.stdin:
@@ -521,7 +523,7 @@ if [ "$READY" = 1 ]; then
   pass "this project's gateway container is running and healthy"
 else
   fail "this project's gateway container is running and healthy" \
-       "state was '${HSTATE:-absent}' after 120s. A port clash with another compose
+       "state was '${HSTATE:-absent}' after 360s. A port clash with another compose
         project is the usual cause; \`docker compose ps -a\` and COMPOSE_PROJECT_NAME."
 fi
 # The host port is only meaningful once our own container is known to be up.
@@ -561,70 +563,32 @@ CFG="$(val cat /home/node/.openclaw/openclaw.json)"
 # stripping from the first // anywhere would eat real values.
 CFG_LIVE="$(printf '%s\n' "$CFG" | sed 's|^[[:space:]]*//.*$||')"
 CFG_RAW="$CFG"
-if printf '%s' "$CFG" | grep -q '/opt/compliance-claw/plugins/slack'; then
+SLACK_PROFILE=0
+if val node /opt/compliance-claw/managed-slack.mjs status 2>/dev/null | grep -qx configured; then
   SLACK_PROFILE=1
-  printf '  config profile: SLACK (plugins.allow is exclusive, bundled set trimmed)\n'
-else
-  SLACK_PROFILE=0
-  printf '  config profile: no Slack (Phase 4 baseline, 8 bundled plugins)\n'
 fi
 
-# The WHOLE log, not `tail -N`: the plugin banner is printed once at startup, so
-# on a gateway that has been up for hours a tail no longer contains it — and then
-# the codex-absence check below passes against an empty string, which is a lie
-# rather than a pass.
-#
-# REGRESSION FIX. The Phase 4 pattern was '([0-9]* plugins:[^)]*)', which stopped
-# matching entirely once Slack shipped, for two independent reasons:
-#   - the banner says "1 plugin" (SINGULAR) when only one plugin activates
-#   - it now carries a timing suffix: "(1 plugin: slack; 0.6s)"
-# The check failed loudly rather than passing vacuously — Phase 4 fixed that class
-# — but a check that can never pass is still a dead check.
+# Require actual startup evidence. OpenClaw 2026.9.8 has a different bundled
+# plugin set and enables required provider plugins during migration. Check the
+# required capabilities and the excluded runtime, not the old plugin count.
 LOGS="$(docker compose logs openclaw 2>&1)"
 PLUGIN_LINE="$(printf '%s' "$LOGS" | grep -oE '\([0-9]+ plugins?: [^)]*\)' | tail -1)"
 if [ -z "$PLUGIN_LINE" ]; then
-  fail "runtime pin holds: plugin banner found in the log" \
-       "no '(N plugin(s): ...)' line; the codex-absence check cannot be trusted without it"
+  fail "runtime plugin banner found in the log" "no loaded-plugin banner was found"
 else
-  # Strip the wrapper and the "; 0.6s" timing so what is compared is the name set.
   PLUGIN_NAMES="$(printf '%s' "$PLUGIN_LINE" | sed -E 's/^\([0-9]+ plugins?: //; s/\)$//; s/;.*$//')"
-  # TWO PROFILES, and which one applies is decided by the config, not by hope.
-  # Slack's patch sets plugins.allow, which is an EXCLUSIVE allowlist and
-  # therefore also trims the bundled set. Asserting a single expected number would
-  # mean one of the two profiles is always failing.
-  if [ "$SLACK_PROFILE" = 1 ]; then
-    has "runtime plugin set includes slack (Slack profile)" "slack" "$PLUGIN_NAMES"
-    has "runtime plugin set includes pretorin-update (Slack profile)" "pretorin-update" "$PLUGIN_NAMES"
-    has "runtime plugin set includes target-sync (Slack profile)" "target-sync" "$PLUGIN_NAMES"
-    # The allowlist is exclusive, so it must name EVERY local id and nothing
-    # else: an id left out is a plugin silently disabled — the exact failure the
-    # Slack patch's comments warn about — and a bundled id creeping in would mean
-    # the trim stopped working. Compared as a sorted set so banner ordering, which
-    # is not a contract, cannot fail this.
-    EXPECTED_ALLOWED="pretorin-update slack target-sync"
-    GOT_ALLOWED="$(printf '%s' "$PLUGIN_NAMES" | tr ',' '\n' | tr -d ' ' | sort | tr '\n' ' ' | sed 's/ $//')"
-    if [ "$GOT_ALLOWED" = "$EXPECTED_ALLOWED" ]; then
-      pass "the exclusive allowlist activates exactly the local plugins"
+  for p in pretorin-update target-sync openai memory-core; do
+    if printf '%s' "$PLUGIN_NAMES" | tr ',' '\n' | tr -d ' ' | grep -qx "$p"; then
+      pass "required runtime plugin loaded: ${p}"
     else
-      fail "the exclusive allowlist activates exactly the local plugins" \
-           "expected '${EXPECTED_ALLOWED}', got '${GOT_ALLOWED}'"
+      fail "required runtime plugin loaded: ${p}" "$PLUGIN_LINE"
     fi
-  else
-    # 10, not 8: the base template adds two local load paths and deliberately
-    # sets NO plugins.allow, so the bundled eight still load and both local
-    # plugins join them. That is what keeps this profile — the one CI runs — able
-    # to exercise every route without a Slack workspace.
-    has "runtime plugin set is the 8 bundled + 2 local (no-Slack profile)" "10 plugins" "$PLUGIN_LINE"
-    has "  updater plugin present: pretorin-update" "pretorin-update" "$PLUGIN_NAMES"
-    has "  sync plugin present: target-sync" "target-sync" "$PLUGIN_NAMES"
-    for p in browser canvas device-pair file-transfer memory-core ollama phone-control talk-voice; do
-      has "  bundled plugin present: ${p}" "$p" "$PLUGIN_NAMES"
-    done
+  done
+  if [ "$SLACK_PROFILE" = 1 ]; then
+    has "Slack plugin loaded for the Slack profile" "slack" "$PLUGIN_NAMES"
+    hasnt "browser plugin excluded by the Slack seed allowlist" "browser" "$PLUGIN_NAMES"
   fi
-  # Independent of the profile, and still the point of the pin: the Codex
-  # app-server harness must not be the runtime. The allowlist would now mask codex
-  # on its own, so the log line below is what actually proves the pin.
-  hasnt "codex plugin absent from the banner" "codex" "$PLUGIN_LINE"
+  hasnt "Codex runtime plugin is absent" "codex" "$PLUGIN_NAMES"
 fi
 
 # Assert on values, not on formatting. OpenClaw can rewrite this file as strict
@@ -648,11 +612,46 @@ hasnt "config no longer loads a skill directory" 'extraDirs' "$CFG"
 #
 # NOT `plugins validate`: that command only understands defineToolPlugin metadata
 # and always fails on a mixed command+tool plugin like this one.
-PDOCTOR="$(val openclaw plugins doctor 2>&1 || true)"
-if printf '%s' "$PDOCTOR" | grep -q 'No plugin issues detected'; then
-  pass "openclaw plugins doctor reports no issues"
+# Local project plugins have no official install provenance. Accept only their
+# exact known warnings. Every other diagnostic, error or schema change fails.
+PDOCTOR_RC=0
+PDOCTOR="$(val openclaw plugins doctor --json)" || PDOCTOR_RC=$?
+if CC_PDOCTOR="$PDOCTOR" CC_PDOCTOR_RC="$PDOCTOR_RC" python3 - <<'PY_PDOCTOR'
+import json, os, sys
+
+arrays = ("pluginErrors", "sourceShadowing", "compatibility", "configurationWarnings")
+try:
+    report = json.loads(os.environ["CC_PDOCTOR"])
+    status = int(os.environ["CC_PDOCTOR_RC"])
+except (ValueError, TypeError):
+    sys.exit(1)
+if not isinstance(report, dict) or set(report) != {"ok", "diagnostics", *arrays}:
+    sys.exit(1)
+if any(report[key] != [] for key in arrays) or not isinstance(report["diagnostics"], list):
+    sys.exit(1)
+expected = []
+for plugin_id in ("pretorin-update", "target-sync"):
+    expected.append({
+        "level": "warn", "pluginId": plugin_id,
+        "source": "/opt/compliance-claw/plugins/%s/index.js" % plugin_id,
+        "message": "OpenClaw can't verify where this plugin came from. Review it with "
+                   "'openclaw plugins inspect %s'. Adding it to plugins.allow lets it load, "
+                   "but does not make it trusted. If it's an official plugin, reinstall "
+                   "it from its official npm package or its official ClawHub listing "
+                   "to enable trusted features." % plugin_id,
+    })
+diags = report["diagnostics"]
+if any(diag not in expected for diag in diags):
+    sys.exit(1)
+if len(diags) != len({diag["pluginId"] for diag in diags}):
+    sys.exit(1)
+sys.exit(0 if report["ok"] is (not diags) and status == (1 if diags else 0) else 1)
+PY_PDOCTOR
+then
+  pass "plugin checks pass with only expected local provenance warnings"
 else
-  fail "openclaw plugins doctor reports no issues" "$(printf '%s' "$PDOCTOR" | head -4)"
+  fail "plugin checks pass with only expected local provenance warnings" \
+       "exit=${PDOCTOR_RC}: $(printf '%s' "$PDOCTOR" | head -8)"
 fi
 
 PINSPECT="$(val openclaw plugins inspect pretorin-update --runtime --json 2>&1 || true)"
@@ -1204,9 +1203,9 @@ CFG_BEFORE="$(val md5sum /home/node/.openclaw/openclaw.json | awk '{print $1}')"
 cli bash -c 'printf "1\n" > /home/node/.openclaw/.compliance-claw-templates' >/dev/null 2>&1
 W="$(cli pretorin version 2>&1 >/dev/null)"
 has "older marker warns" "predates the image" "$W"
-has "warning names the cwd consequence" "cwd" "$W"
-has "warning names the reset command" "down -v" "$W"
-has "warning states target repos survive" "Bind-mounted target repos are NOT touched" "$W"
+has "warning requires template comparison" "Compare /home/node/.openclaw/openclaw.json" "$W"
+has "warning names the state backup" "Back up both state volumes" "$W"
+hasnt "warning does not recommend state deletion" "docker compose down -v" "$W"
 cli bash -c 'printf "not-a-number\n" > /home/node/.openclaw/.compliance-claw-templates' >/dev/null 2>&1
 W="$(cli pretorin version 2>&1 >/dev/null)"
 has "corrupt marker warns instead of aborting" "predates the image" "$W"
@@ -1540,8 +1539,10 @@ slack_seed() {
   # every assertion below fails for a reason that has nothing to do with Slack.
   # The image's own ENTRYPOINT runs, seeds, then execs `tini -s -- bash -c ...`.
   docker run --rm --platform linux/amd64 "$@" "$SLACK_IMG" bash -c '
-    grep -q "/opt/compliance-claw/plugins/slack" /home/node/.openclaw/openclaw.json \
+    test "$(node /opt/compliance-claw/managed-slack.mjs status)" = configured \
       && echo "SLACK_IN_CONFIG=yes" || echo "SLACK_IN_CONFIG=no"
+    grep -q "/opt/compliance-claw/plugins/slack" /home/node/.openclaw/openclaw.json \
+      && echo "SLACK_LOCAL_OVERRIDE=yes" || echo "SLACK_LOCAL_OVERRIDE=no"
     openclaw --version >/dev/null 2>&1 && echo "STILL_WORKS=yes" || echo "STILL_WORKS=no"
     grep -c CANARY /home/node/.openclaw/openclaw.json 2>/dev/null | sed "s/^/CANARY_HITS=/"
   ' 2>&1
@@ -1550,8 +1551,8 @@ S_OK="$(slack_seed -e SLACK_BOT_TOKEN="$SLACK_CANARY_BOT" -e SLACK_APP_TOKEN="$S
 has  "fresh volume + 3 vars -> Slack is in the config" "SLACK_IN_CONFIG=yes" "$S_OK"
 has  "  and the patch reports success"                 "Slack configured"    "$S_OK"
 has  "  and no token value reached the config"         "CANARY_HITS=0"       "$S_OK"
-ok   "  and the plugin loads from the image path" \
-     bash -c "docker run --rm --platform linux/amd64 -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y -e SLACK_CHANNEL_ID=C0SMOKE123 '$SLACK_IMG' bash -c 'openclaw plugins inspect slack 2>/dev/null | grep -q \"^Status: loaded\"'"
+has  "  and the pinned official install was verified" "official Slack" "$S_OK"
+has  "  and the old image load path is absent" "SLACK_LOCAL_OVERRIDE=no" "$S_OK"
 
 S_NAME="$(slack_seed -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y -e SLACK_CHANNEL_ID='#a-channel-name')"
 has  "channel NAME instead of ID is refused" "is not a Slack channel id" "$S_NAME"
@@ -1579,12 +1580,12 @@ docker run --rm --platform linux/amd64 -v "$T2_VOL":/home/node/.openclaw \
   "$SLACK_IMG" bash -c true >/dev/null 2>&1
 T2_OUT="$(docker run --rm --platform linux/amd64 -v "$T2_VOL":/home/node/.openclaw \
   -e SLACK_BOT_TOKEN=x -e SLACK_APP_TOKEN=y -e SLACK_CHANNEL_ID=C0SMOKE123 \
-  "$SLACK_IMG" bash -c 'grep -c "plugins/slack" /home/node/.openclaw/openclaw.json || true' 2>&1)"
+  "$SLACK_IMG" bash -c 'node /opt/compliance-claw/managed-slack.mjs status' 2>&1)"
 docker volume rm "$T2_VOL" >/dev/null 2>&1
 has "existing config + Slack credentials warn specifically" "Slack credentials are supplied but NOT in this volume" "$T2_OUT"
-has "  the warning offers the down -v reset"         "down -v"    "$T2_OUT"
+has "  the warning offers the pinned managed install" "prepare --required" "$T2_OUT"
 has "  the warning offers the by-hand patch"         "config patch" "$T2_OUT"
-hasnt "  and never-clobber still holds (config untouched)" "plugins/slack" "$(printf '%s' "$T2_OUT" | grep -v 'NOT in this volume')"
+has "  and the existing config stays without Slack" "absent" "$T2_OUT"
 
 # ===========================================================================
 head1 "SECTION B — credentialed integration test"
