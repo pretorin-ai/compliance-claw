@@ -614,8 +614,10 @@ hasnt "config no longer loads a skill directory" 'extraDirs' "$CFG"
 # and always fails on a mixed command+tool plugin like this one.
 # Local project plugins have no official install provenance. Accept only their
 # exact known warnings. Every other diagnostic, error or schema change fails.
+# Run these checks in the gateway container. OpenClaw must verify the live
+# owner's PID namespace before it can inspect runtime plugin state.
 PDOCTOR_RC=0
-PDOCTOR="$(val openclaw plugins doctor --json)" || PDOCTOR_RC=$?
+PDOCTOR="$(docker compose exec -T openclaw openclaw plugins doctor --json 2>/dev/null)" || PDOCTOR_RC=$?
 if CC_PDOCTOR="$PDOCTOR" CC_PDOCTOR_RC="$PDOCTOR_RC" python3 - <<'PY_PDOCTOR'
 import json, os, sys
 
@@ -638,7 +640,9 @@ for plugin_id in ("pretorin-update", "target-sync"):
                    "'openclaw plugins inspect %s'. Adding it to plugins.allow lets it load, "
                    "but does not make it trusted. If it's an official plugin, reinstall "
                    "it from its official npm package or its official ClawHub listing "
-                   "to enable trusted features." % plugin_id,
+                   "to enable trusted features. reason=record-missing; "
+                   'registryPath="~/.openclaw/state/openclaw.sqlite"; origin="config"; '
+                   "installSource=null; installSpec=null." % plugin_id,
     })
 diags = report["diagnostics"]
 if any(diag not in expected for diag in diags):
@@ -654,12 +658,12 @@ else
        "exit=${PDOCTOR_RC}: $(printf '%s' "$PDOCTOR" | head -8)"
 fi
 
-PINSPECT="$(val openclaw plugins inspect pretorin-update --runtime --json 2>&1 || true)"
+PINSPECT="$(docker compose exec -T openclaw openclaw plugins inspect pretorin-update --runtime --json 2>&1 || true)"
 has "updater plugin loads at runtime" 'pretorin-update' "$PINSPECT"
 has "updater registers its agent tool" 'pretorin_update' "$PINSPECT"
 hasnt "updater plugin passes OpenClaw file-safety checks" 'blocked plugin candidate' "$PINSPECT"
 
-SINSPECT="$(val openclaw plugins inspect target-sync --runtime --json 2>&1 || true)"
+SINSPECT="$(docker compose exec -T openclaw openclaw plugins inspect target-sync --runtime --json 2>&1 || true)"
 has "sync plugin loads at runtime" 'target-sync' "$SINSPECT"
 has "sync registers its agent tool" 'target_sync' "$SINSPECT"
 hasnt "sync plugin passes OpenClaw file-safety checks" 'blocked plugin candidate' "$SINSPECT"

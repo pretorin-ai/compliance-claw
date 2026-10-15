@@ -355,9 +355,12 @@ Ordered roughly by how much it matters, not by effort.
    app-server plugin, which does not receive `tools.toolSearch` and bypasses
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
-6. **Keep base-image vulnerabilities under review.** The OpenClaw 2026.9.8
-   scan no longer reports the previously accepted vulnerability IDs. Those
-   exceptions were removed. The runtime updates four existing Perl packages to
+6. **Keep base-image vulnerabilities under review.** The build pins OpenClaw
+   2026.10.3. Its fixed MCP SDK/client versions address CVE-2026-104850, and
+   source-map-js 1.2.2 addresses CVE-2026-93749. The base and rebuilt image scans
+   no longer report those findings or the previously accepted vulnerability IDs.
+   Bundled npm HIGH findings remain visible. The exception list stays empty.
+   The runtime pins four existing Perl packages to
    the exact Debian security version in `DEBIAN_PERL_VERSION`; this fixes
    CVE-2026-13221, CVE-2026-42496, and CVE-2026-8376. It does not run a general
    OS upgrade. The release gate still blocks fixable CRITICAL findings and
