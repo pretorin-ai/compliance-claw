@@ -296,12 +296,16 @@ jobs:
       # Unfixed findings remain in the report. The exception file is empty;
       # any future exception needs its own reason and expiry. New fixable
       # CRITICAL findings must block publication.
+      # Skip embedded SPDX manifests in _manifest/spdx_2.2/manifest.spdx.json:
+      # they list packages that are not installed. Both scans still check the
+      # installed packages, including bundled npm dependencies.
       - name: Vulnerability scan (blocking — fixable CRITICAL)
         env:
           BUILD_REF: ${{ steps.pins.outputs.build_ref }}
         run: |
           set -euo pipefail
           trivy image --scanners vuln --severity CRITICAL --ignore-unfixed \
+            --skip-files '**/_manifest/spdx_2.2/manifest.spdx.json' \
             --ignorefile .trivyignore.yaml \
             --exit-code 1 --format table "$BUILD_REF"
 
@@ -315,6 +319,7 @@ jobs:
             echo "### Vulnerability report"
             echo '```'
             trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 \
+              --skip-files '**/_manifest/spdx_2.2/manifest.spdx.json' \
               --format table "$BUILD_REF" 2>&1 | tail -60
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
