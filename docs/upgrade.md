@@ -1,5 +1,13 @@
 # OpenClaw upgrade and recovery
 
+The build pins OpenClaw 2026.10.3 and Pretorin CLI seed 0.30.3. A fresh
+installation uses this seed. An image upgrade keeps the active CLI in the
+Pretorin state volume. Use the CLI update command to change that active copy.
+
+Build pins can change before an image is published. Use the published image
+digest in `compose.yaml` for deployment. The release workflow must pass before
+the post-release PR changes that digest and `IMAGE_VERSION` together.
+
 Before an OpenClaw upgrade, record the running image digest, the checkout
 revision, the Compose files, and the names of both state volumes. Keep the
 previous image available. The image and both state volumes are one recovery
@@ -25,7 +33,7 @@ Pretorin CLI. Send a test request through the approved test channel. Replace
 the container once more and repeat the checks. The replacement must use the
 same state volumes.
 
-The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.9.8 allows
+The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.10.3 allows
 325 seconds for shutdown and 5 more seconds for its supervisor. Compose uses
 this limit for a service stop or replacement. A stop can take several minutes
 when work is active.

@@ -128,7 +128,7 @@ services:
     # recover from.
     restart: unless-stopped
 
-    # OpenClaw 2026.9.8 allows 325 seconds for shutdown and 5 seconds for its
+    # Allow 325 seconds for gateway shutdown and 5 seconds for its
     # supervisor. Give it time to drain work and release the gateway-owner
     # lease before Docker sends SIGKILL. This applies to replacement and stop.
     stop_grace_period: 330s

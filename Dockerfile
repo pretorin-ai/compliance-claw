@@ -57,7 +57,7 @@ RUN bash scripts/fetch-pretorin.sh dist \
 
 
 # The OpenClaw Slack channel plugin, resolved and integrity-checked at BUILD
-# time. Slack is NOT bundled in 2026.9.8 — the image has no Slack extension,
+# time. Slack is not bundled in 2026.10.3; the image has no Slack extension,
 # so it comes from the official npm package.
 #
 # This stage checks the pinned package and its dependency tree. The runtime uses
@@ -67,7 +67,7 @@ RUN bash scripts/fetch-pretorin.sh dist \
 # This stage uses the OpenClaw image because it already carries the exact node
 # and npm the runtime will load the plugin with, so the
 # resolved tree is the tree that actually runs.
-FROM ghcr.io/openclaw/openclaw:2026.9.8@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8 AS slack-plugin
+FROM ghcr.io/openclaw/openclaw:2026.10.3@sha256:70b8dbd23f8d27a206f43f9828fdebc87289e50d56dc55177354c9270d764026 AS slack-plugin
 
 USER root
 WORKDIR /build
@@ -125,7 +125,7 @@ RUN P=/build/node_modules/@openclaw/slack \
 #
 # The base is node:24-bookworm-slim underneath, i.e. glibc: what the dynamically
 # linked Pretorin binary needs. An Alpine-based OpenClaw image would not run it.
-FROM ghcr.io/openclaw/openclaw:2026.9.8@sha256:d0ded1dd76939b2bf4d67ef2d13247b8b160aa5666331d4a0b0e58811182cbb8
+FROM ghcr.io/openclaw/openclaw:2026.10.3@sha256:70b8dbd23f8d27a206f43f9828fdebc87289e50d56dc55177354c9270d764026
 
 # The image already runs as `node`; switch back at the end of the stage.
 USER root
