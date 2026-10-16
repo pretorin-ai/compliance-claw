@@ -20,8 +20,8 @@ attribution limit and the unsandboxed-tool-execution boundary.
 
 Baseline operation was verified against the published image, pulled by digest,
 on a fresh clone. Target synchronization and the fresh Slack-seeding fix were
-then verified against this branch's local image and in CI; they reach the
-published image only after the next release and digest-pin update.
+then verified in isolation and in CI. They are included in the v0.5.1 image
+pinned by this checkout.
 
 | | |
 | --- | --- |
