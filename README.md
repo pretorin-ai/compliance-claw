@@ -859,16 +859,33 @@ place for a release candidate.
 
 **An update changes the CLI for every user of the instance.** Deployments are
 independent of each other, but users of one deployment are not. The Slack
-acknowledgement says so before the work starts.
+command usage and tool description state this requirement.
 
 **Activation is part of the update.** The CLI replaces its own binary by rename,
 so a running `pretorin mcp-serve` child keeps the old one until it restarts —
 which means "the file was replaced" is not "the update is live". After a
-successful update the gateway is restarted (from Slack, through OpenClaw's own
-restart path; from the host, with `docker compose restart openclaw`) and the
-result is confirmed. If a restart is not possible, the update is reported as
-**installed but not yet active**, naming the manual step. It is never reported as
-complete when it is not.
+successful chat installation, both routes return the installed version and
+**OPERATOR RESTART REQUIRED**. Activation remains unverified. The command waits
+for this final result; it does not send an early acknowledgement from the plugin.
+OpenClaw's Slack handler acknowledges the request before it awaits the command.
+
+On the deployment host, with the deployment's Compose files and project selected,
+run:
+
+```sh
+docker compose restart openclaw
+docker compose exec -T openclaw pretorin version
+```
+
+The version command checks the installed binary selected by the container. It
+does not inspect a cached MCP process. Confirm that the restart succeeded and
+that the next Pretorin MCP call works before you treat the update as complete.
+The host updater script also runs a Compose restart and inspects MCP children.
+
+In the pinned OpenClaw `2026.10.3`, `api.runtime.gateway.request` is restricted
+to bundled or trusted official plugins. The external updater cannot use it to
+restart the gateway or send a follow-up message. It returns the result through
+the registered command or tool. It does not request a delegated restart from Slack.
 
 ### The update audit record
 
@@ -1101,7 +1118,7 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | Loaded plugin set differs after an upgrade | OpenClaw can change bundled and required provider plugins | Inspect the loaded set and compare it with your configured allowlist |
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
-| Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`. `--status` confirms which binary is active |
+| Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`, then check the next MCP call. `--status` reports the installed binary only |
 | `/compliance-claw /pretorin-update` does nothing in Slack | `channels.slack.slashCommand` missing from an existing config | Never-clobber: the container warns. Re-seed, or set it by hand |
 
 Logs and state:
