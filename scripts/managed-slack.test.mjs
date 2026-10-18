@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { LEGACY_SLACK_PATH, slackConfigState, prepareSlack } from './managed-slack.mjs';
 
@@ -50,6 +51,107 @@ test('unused Slack performs no command', () => {
   const f = fixture({});
   assert.equal(prepareSlack(f.options), 'unused');
   assert.deepEqual(f.calls, []);
+});
+
+test('retained config migrates before Slack operations without the obsolete path', () => {
+  for (const report of [trusted(), null]) {
+    const config = {
+      defaultModel: 'openai/gpt-5.6-sol',
+      agents: { ownership: 'explicit', entries: { customer: {} } },
+      models: { providers: { customer: { apiKey: '${CUSTOMER_MODEL_KEY}' } } },
+      channels: { slack: { enabled: false, accounts: { customer: {
+        botToken: '${CUSTOMER_SLACK_TOKEN}', dmPolicy: 'disabled',
+      } }, channels: { C0CUSTOMER: { enabled: true } } } },
+      bindings: [{ agentId: 'customer', match: { channel: 'slack', accountId: 'customer' } }],
+      plugins: { allow: ['customer', 'slack'], entries: { customer: { enabled: true } },
+        load: { paths: ['/customer/a', '/customer/b'] } },
+    };
+    const f = fixture(config, report);
+    const run = f.options.run;
+    f.options.run = (program, args) => {
+      if (args[0] === 'doctor') {
+        f.saved().agents.defaults = { model: f.saved().defaultModel };
+        delete f.saved().defaultModel;
+      } else {
+        assert.equal(Object.hasOwn(f.saved(), 'defaultModel'), false,
+          'Slack operations must read migrated configuration');
+      }
+      return run(program, args);
+    };
+    assert.equal(prepareSlack(f.options), report ? 'retained' : 'installed');
+    const expected = structuredClone(config);
+    expected.agents.defaults = { model: expected.defaultModel };
+    delete expected.defaultModel;
+    assert.deepEqual(f.saved(), expected);
+    assert.deepEqual(f.calls[0], ['openclaw', 'doctor', '--fix', '--non-interactive']);
+  }
+});
+
+test('Doctor failure without the obsolete path stops before Slack operations', () => {
+  const config = { defaultModel: 'openai/gpt-5.6-sol', channels: { slack: { enabled: false } } };
+  const f = fixture(config);
+  const calls = [];
+  f.options.run = (program, args) => {
+    calls.push([program, ...args]);
+    if (args[0] === 'doctor') throw new Error('Doctor repair refused');
+    return JSON.stringify(trusted());
+  };
+  assert.throws(() => prepareSlack(f.options), /Doctor repair refused/);
+  assert.deepEqual(calls, [['openclaw', 'doctor', '--fix', '--non-interactive']]);
+  assert.deepEqual(f.saved(), config);
+});
+
+test('pinned Doctor repairs supported retained config and refuses unsafe migration', {
+  skip: !fs.existsSync('/app/openclaw.mjs'),
+}, () => {
+  for (const refused of [false, true]) {
+    const stateDir = fs.mkdtempSync(path.join(dir, 'doctor-'));
+    const configPath = path.join(stateDir, 'openclaw.json');
+    const config = {
+      gateway: { mode: 'local', bind: 'loopback' },
+      agents: { ownership: 'explicit', entries: { customer: {} },
+        defaults: { workspace: path.join(stateDir, 'workspace') } },
+      defaultModel: 'openai/gpt-5.6-sol',
+      channels: { slack: { enabled: false } },
+      plugins: { allow: [] },
+      ...(refused ? { heartbeat: { every: '30m' } } : {}),
+    };
+    const before = JSON.stringify(config, null, 2) + '\n';
+    fs.writeFileSync(configPath, before);
+    const readConfig = () => JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    const calls = [];
+    const run = (program, args) => {
+      calls.push([program, ...args]);
+      if (args[0] === 'doctor') {
+        const result = spawnSync(process.execPath, ['/app/openclaw.mjs', ...args], {
+          env: { ...process.env, OPENCLAW_STATE_DIR: stateDir, OPENCLAW_CONFIG_PATH: configPath,
+            NODE_COMPILE_CACHE: path.join(dir, 'compile-cache'), OPENCLAW_NO_RESPAWN: '1' },
+          encoding: 'utf8', timeout: 180_000, maxBuffer: 16 * 1024 * 1024,
+        });
+        if (refused) {
+          assert.equal(result.status, 1, result.stderr);
+          assert.match(result.stderr + result.stdout, /retired pre-July-2026 settings: heartbeat/);
+          throw new Error('Doctor repair refused');
+        }
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout;
+      }
+      assert.equal(Object.hasOwn(readConfig(), 'defaultModel'), false,
+        'Slack inspection must follow the real supported migration');
+      assert.equal(readConfig().agents.defaults.model, config.defaultModel);
+      return JSON.stringify(trusted());
+    };
+    const prepare = () => prepareSlack({ readConfig, run, version, integrity });
+    if (refused) {
+      assert.throws(prepare, /Doctor repair refused/);
+      assert.deepEqual(calls, [['openclaw', 'doctor', '--fix', '--non-interactive']]);
+      assert.equal(fs.readFileSync(configPath, 'utf8'), before);
+    } else {
+      assert.equal(prepare(), 'retained');
+      assert.deepEqual(readConfig().channels, config.channels);
+      assert.deepEqual(readConfig().agents.entries, config.agents.entries);
+    }
+  }
 });
 
 test('remove only the exact old path and keep every other setting', () => {
@@ -101,8 +203,10 @@ test('Doctor can remove the old override without an extra config write', () => {
 test('a matching official install is reused without npm access', () => {
   const f = fixture({ channels: { slack: {} } });
   assert.equal(prepareSlack(f.options), 'retained');
-  assert.equal(f.calls.length, 1);
-  assert.deepEqual(f.calls[0], ['openclaw', 'plugins', 'inspect', 'slack', '--json']);
+  assert.deepEqual(f.calls, [
+    ['openclaw', 'doctor', '--fix', '--non-interactive'],
+    ['openclaw', 'plugins', 'inspect', 'slack', '--json'],
+  ]);
 });
 
 test('fresh setup uses exact official install without changing activation', () => {
@@ -110,6 +214,7 @@ test('fresh setup uses exact official install without changing activation', () =
   assert.equal(prepareSlack({ ...f.options, required: true }), 'installed');
   assert.deepEqual(f.calls[2], ['openclaw', 'plugins', 'install', `npm:@openclaw/slack@${version}`,
     '--pin', '--no-enable', '--force']);
+  assert.equal(f.calls.some((c) => c[1] === 'doctor'), false);
   assert.deepEqual(f.saved(), {});
 });
 

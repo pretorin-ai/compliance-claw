@@ -36,10 +36,11 @@ export function prepareSlack({ readConfig, run, version, integrity, required = f
   let state = slackConfigState(readConfig());
   if (!required && !state.configured && !state.legacy) return 'unused';
 
-  // The old config can contain retired fields that block all config writes.
-  // Repair it before path removal, then read the current array for the guard.
-  // Keep the upstream activation adapter; this extra repair is migration-only.
-  if (state.legacy) {
+  // Retained config can need migration without the obsolete Slack path.
+  // Use Doctor before inspection or writes, then read its current paths.
+  // Fresh required installs have no Slack config yet and keep install-before-patch.
+  // The final upstream adapter still checks state after plugin preparation.
+  if (state.configured || state.legacy) {
     run('openclaw', ['doctor', '--fix', '--non-interactive']);
     state = slackConfigState(readConfig());
   }
