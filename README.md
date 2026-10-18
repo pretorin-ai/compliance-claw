@@ -780,10 +780,8 @@ docker compose restart openclaw
 It needs a TTY, so run it yourself rather than from a script. Check it took with
 `openclaw models auth list` — but only an actual turn proves it reaches the model:
 
-```sh
-# Use the agent command in docs/file-secrets.md with your effort name
-# and the prompt "Reply with exactly: OK".
-```
+Use the [file-secret-aware agent command](docs/file-secrets.md#docker-compose-exec-does-not-see-these-secrets)
+with your configured effort name and the prompt “Reply with exactly: OK”.
 
 ### Changing the model on an existing deployment
 
