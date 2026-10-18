@@ -1,20 +1,45 @@
 # Compliance Claw
 
-OpenClaw with the Pretorin CLI attached, so an agent can review the repositories
-you mount and do compliance work against your Pretorin system — from a terminal or
-from a Slack channel.
+Compliance Claw is an OpenClaw runtime with Pretorin CLI integrated. Agents can
+review mounted repositories and work with your Pretorin system. Use a configured
+agent from a terminal or an optional communication channel such as Slack.
 
 Compliance Claw is deliberately thin. Pretorin already provides the compliance
 intelligence: the MCP tool surface and its own routing instructions, workflows,
 recipes, source preflight, active recipe sets, plans. This repository supplies the runtime that
 joins those to your code — a supply-chain-verified Pretorin binary, a configured
-OpenClaw gateway, a pinned Slack channel, and the wiring that tells Pretorin which
+OpenClaw gateway, optional Slack integration, and the wiring that tells Pretorin which
 repositories this deployment is about.
 
 This is a POC. `docs/plans/phase1.md` … `phase5.md` record what was built, what was
 verified, and what is deliberately not done yet. **Read [SECURITY.md](SECURITY.md)
 before pointing this at anything that matters** — in particular the shared-channel
 attribution limit and the unsandboxed-tool-execution boundary.
+
+## Documentation
+
+| Task | Start here |
+| --- | --- |
+| Install | [Requirements](#requirements), [Quickstart](#quickstart), and [image verification](#verifying-what-you-pulled) |
+| Administer the Claw | [Efforts and agents](docs/efforts.md), [providers/models](#the-model), [connections and secrets](docs/file-secrets.md), and [optional Slack](#slack) |
+| Use an agent | [Agent commands](docs/file-secrets.md#docker-compose-exec-does-not-see-these-secrets), [target sync](#keeping-targets-up-to-date), and [key permissions](#read-only-vs-write-enabled-keys) |
+| Upgrade or recover | [Deployment updates](#updating-an-existing-deployment), [CLI updates](#updating-the-pretorin-cli), [recovery](docs/upgrade.md), and [troubleshooting](#troubleshooting) |
+| Contribute | [CONTRIBUTING.md](CONTRIBUTING.md) and [coding-agent guide](AGENTS.md) |
+| Report a vulnerability | Private reporting contact in [SECURITY.md](SECURITY.md) |
+
+VM administrators deploy and maintain the runtime, persistent state, and network
+access. The gateway is published on host loopback. Claw administrators configure
+providers, connections, agents, and optional channels. Native UI administration
+is the intended path where verified; this checkout's effort setup uses
+`efforts.yaml` and host `clawctl` operations. The schema still requires a Slack
+channel ID even when Slack credentials are absent. This is a current setup limit,
+not a requirement of the intended product.
+
+`clawctl apply` regenerates [owned configuration](docs/efforts.md#what-apply-does-to-the-openclaw-configuration).
+Do not assume that manual UI edits to those fields will survive it. Complete
+native UI setup and channel-free effort setup still need evaluation; no new
+procedure for either is provided here. The plans under `docs/plans/` record
+historical work and test results, not a guarantee for every current deployment.
 
 ## Status
 
@@ -67,9 +92,9 @@ provenance — see "Verifying what you pulled".
   Tools, which `git` already requires. No PyYAML, no `jq`, no `gh`, nothing to
   `pip install`.
 - Access to the GHCR package. It is not public, so `docker login ghcr.io` first.
-- A Pretorin API key. **A read-only key is sufficient** for everything here, and
-  a write-enabled key is equally supported — the key's own server-side scopes
-  decide what is permitted, and nothing in this repository filters on top of them.
+- A Pretorin API key. A read-only key supports onboarding and read operations.
+  Platform writes need the relevant write scopes. The platform enforces the
+  key permissions; this repository does not add a local permission mode.
 - A model-provider key (OpenAI or Anthropic), or an OpenAI device-code login.
 - Optional: a Slack workspace where you can install an app, and a read-only
   GitHub App if you want to review private repositories.
@@ -115,7 +140,8 @@ docker compose ps
 
 # anything one-off, in the same image with the same mounts:
 docker compose run --rm cli pretorin --json context show
-docker compose exec openclaw openclaw agent --agent <effort-name> -m "..."
+# To invoke an effort agent, use the file-secret-aware command in
+# docs/file-secrets.md under "docker compose exec does not see these secrets".
 ```
 
 **Keep `COMPOSE_FILE` exported for every later command.** It is how compose knows
@@ -164,8 +190,8 @@ Two ordering rules, both of which bite silently if ignored:
   the legacy one. Which channels are served comes from each effort's
   `slack_channel_id` in `efforts.yaml`, not from `.env`. The Slack half of the
   config is seeded once and never overwritten, so adding the tokens later does
-  nothing until you reset — the container warns explicitly when it sees exactly
-  that situation.
+  not update an existing config. Inspect the warning and keep the state. See
+  [upgrade and recovery](docs/upgrade.md) before a configuration repair.
 - **Onboard before `up`.** Onboarding writes host-local Pretorin state, and a
   running gateway keeps a per-session `pretorin mcp-serve` child that can serve
   the older view (the preflight artifact carries a 3600-second TTL). If you do
@@ -250,9 +276,9 @@ The image's current integrity controls, in full:
 | **Vulnerability scan** at release | fixable CRITICAL findings block publication |
 | Documented release provenance | the workflow, the digest, and the version pin are all recorded |
 
-The SBOM is **not** attached to the image and **not** signed — attaching an SBOM as
-an OCI attestation is itself a signing operation. Read it from the release run's
-artifacts.
+The SBOM is not attached to the OCI image and is not signed. It is available
+as a workflow artifact and as an asset on the published GitHub Release. See the
+[release procedure](docs/releasing.md).
 
 **Planned, not implemented:** image signing backed by **Azure Key Vault**,
 following the approach the Pretorin CLI already uses for its own releases. That is
@@ -261,26 +287,16 @@ production / internal-pilot work; see the hardening ledger in
 
 ### Building locally instead (development)
 
-The default path pulls, and `compose.yaml` deliberately has no `build:` section so
-`docker compose up` can never quietly substitute an unscanned local build for the
-released, scanned image. To build:
-
-```sh
-export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml
-scripts/bootstrap.sh --build
-```
-
-`COMPOSE_FILE` is docker compose's own mechanism, so every script in the repo picks
-it up with no extra flags. A local build is tagged `compliance-claw:local` so it
-cannot be mistaken for the published image in `docker images`.
+Contributor builds use a separate local image. See
+[development setup and build commands](CONTRIBUTING.md#how-to-build-a-candidate-image).
 
 ## `targets.yaml` (legacy — see `efforts.yaml` above)
 
 > This is the single-effort format. It is still the shape `scripts/clawctl
 > migrate` reads, and the per-target rules below are unchanged in `efforts.yaml`,
-> but **nothing reads this file at runtime any more** and it is not mounted into
-> any container. A multi-effort deployment declares the same targets under each
-> effort in `efforts.yaml`.
+> but `efforts.yaml` takes precedence on the multi-effort path. `targets.yaml`
+> remains mounted for the legacy target-sync fallback. A multi-effort deployment
+> declares its targets under each effort in `efforts.yaml`.
 
 ```yaml
 system_id: 7b74d8f3-d77c-49e4-8792-c372dd154d38   # UUID or system name
@@ -645,9 +661,10 @@ interchangeable, and the container tells you which set it is enforcing:
       in efforts.yaml (NOT .env: one channel per effort)
    Everyone in that channel can then run /compliance-claw ... in it, so channel
    membership is the access control. Only configured channels are served.
-5. Supply the two tokens as secret files (recommended) or in .env (legacy). Then:
-     docker compose down -v && scripts/bootstrap.sh
-       && scripts/clawctl plan && scripts/clawctl apply && docker compose ps
+5. Supply the two tokens as secret files (recommended) or in .env (legacy).
+   For a fresh installation, follow Quickstart with the tokens present before
+   the first configuration seed. For an existing installation, keep the state
+   and inspect its configuration and startup warnings before a repair.
 ```
 
 For a **new** app, import the manifest rather than assembling scopes by hand — that
@@ -676,14 +693,9 @@ and a message can be answered by whichever Claw happened to receive it.
 The **image** contains the pinned Slack plugin and the logic that generates the
 Slack configuration. It contains **no Slack credentials**, and no channel id.
 
-`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are deployment-time values. **How many
-values Slack needs depends on which path you are on:**
-
-| | multi-effort (`efforts.yaml` present) | legacy single-effort |
-|---|---|---|
-| credentials | the **two** tokens | the two tokens **and** `SLACK_CHANNEL_ID` |
-| where the channels come from | each effort's `slack_channel_id` in `efforts.yaml`, written into the config by `clawctl apply` | `SLACK_CHANNEL_ID` in `.env`, written by the entrypoint |
-| `SLACK_CHANNEL_ID` in `.env` | **ignored**, and the container says so | required |
+`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are deployment-time values. The table
+above states the values required by each path. The full delivery matrix is in
+[File-backed runtime secrets](docs/file-secrets.md).
 
 On the recommended path the tokens come from mounted secret files rather than
 `.env`; on the legacy path every value is in `.env`. None is baked into the image.
@@ -698,9 +710,9 @@ allowlist keys.
   that never runs it stays closed rather than open.
 - An **existing** config volume is **never overwritten**. Adding the Slack
   variables to a volume that was previously Slack-less does nothing on its own; the
-  container detects exactly that and prints the two ways forward — the documented
-  reset (`down -v`, then bootstrap and onboard) or the manual
-  `openclaw config patch` procedure. See "Upgrading".
+  container reports the missing configuration. Review the existing config and
+  the shipped template. Preserve both state volumes before repair, as described
+  in [upgrade and recovery](docs/upgrade.md). Do not delete them to add Slack.
 
 Verify:
 
@@ -716,9 +728,10 @@ then `@Compliance Claw what targets are onboarded?` in that channel.
 there is no request URL, no inbound port and no reverse proxy. The gateway port
 stays published on `127.0.0.1` only, exactly as it is without Slack.
 
-Behaviour, all set by `scripts/slack-channel.patch.json5`: DMs are **disabled**,
-only the one allowlisted channel is served, and the agent answers only when
-**explicitly mentioned**.
+The Slack seed disables DMs and requires an explicit mention in allowed
+channels. `clawctl apply` configures one channel per effort. Administrators can
+add [optional DM bindings](docs/efforts.md#optional-slack-dms); DMs remain disabled
+until configured.
 
 Slack uses the official OpenClaw plugin installer. Fresh Slack setup and a
 release that changes the Slack version need access to the npm registry. The
@@ -768,7 +781,8 @@ It needs a TTY, so run it yourself rather than from a script. Check it took with
 `openclaw models auth list` — but only an actual turn proves it reaches the model:
 
 ```sh
-docker compose exec openclaw openclaw agent --agent <effort-name> -m "Reply with exactly: OK"
+# Use the agent command in docs/file-secrets.md with your effort name
+# and the prompt "Reply with exactly: OK".
 ```
 
 ### Changing the model on an existing deployment
@@ -839,36 +853,18 @@ scripts/pretorin-update.sh 0.28.7       # exactly that version
 scripts/pretorin-update.sh --dry-run    # say what would happen; change nothing
 ```
 
-From Slack, either route works and both run the same implementation:
+The Slack command and model-tool routes use the same installer. Result delivery
+and activation through those routes have an unresolved fault tracked in
+[#29](https://github.com/pretorin-ai/compliance-claw/issues/29). Use the host
+updater above until that flow is verified. Do not treat an acknowledgement or
+file replacement as proof that the running MCP process uses the new version.
 
-```
-/compliance-claw /pretorin-update latest           deterministic; bypasses the model entirely
-/compliance-claw /pretorin-update status
-@Compliance Claw update Pretorin        conversational; goes through the model
-```
-
-**Any authorized Slack user can do this, deliberately, with no approval step.**
-The compensating control is the audit record below, not a confirmation prompt.
-
-`latest` is passed to the CLI as *no argument at all*, which is how
-`pretorin update` already means "install the latest stable release" — so release
-selection, signature verification, downgrade refusal and prerelease exclusion are
-all the CLI's own, not reimplemented here. Explicit prereleases (`0.29.0-rc2`) are
-refused: an unattended, Slack-triggered update on a shared instance is the wrong
-place for a release candidate.
-
-**An update changes the CLI for every user of the instance.** Deployments are
-independent of each other, but users of one deployment are not. The Slack
-acknowledgement says so before the work starts.
-
-**Activation is part of the update.** The CLI replaces its own binary by rename,
-so a running `pretorin mcp-serve` child keeps the old one until it restarts —
-which means "the file was replaced" is not "the update is live". After a
-successful update the gateway is restarted (from Slack, through OpenClaw's own
-restart path; from the host, with `docker compose restart openclaw`) and the
-result is confirmed. If a restart is not possible, the update is reported as
-**installed but not yet active**, naming the manual step. It is never reported as
-complete when it is not.
+`latest` is passed to Pretorin as no version argument. Pretorin performs release
+selection, signature verification, and downgrade refusal. This changes the CLI
+for every agent and user in the deployment. `--status` reports the installed
+file, not the executable bytes retained by a running MCP child. The host updater
+restarts the gateway and checks its MCP processes; inspect its result before
+reporting completion.
 
 ### The update audit record
 
@@ -910,49 +906,8 @@ agent's write path, which is why the record is written twice.
 
 ## Testing
 
-`smoke.sh` writes to the volumes it runs against, so it requires a **disposable
-Compose project** and refuses the live `compliance-claw` name.
-
-```sh
-# Section A always; Section B if a key authenticates.
-COMPOSE_PROJECT_NAME=cc-smoke CC_TEST_PORT=18990 scripts/smoke.sh
-# Section A only — exactly what CI runs.
-COMPOSE_PROJECT_NAME=cc-smoke CC_TEST_PORT=18990 scripts/smoke.sh --no-creds
-COMPOSE_PROJECT_NAME=cc-smoke docker compose down -v   # remove it afterwards
-
-python3 scripts/parse-targets.py --self-test
-bash scripts/sync-targets.sh --self-test   # target sync: rules, outcomes, lock, leak canary
-scripts/pretorin-update.sh --self-test     # CLI updater input rules
-scripts/test-file-secrets.sh compliance-claw:local   # secret delivery, at runtime
-scripts/test-fresh-slack-seed.sh                     # a FRESH deployment configures Slack itself
-```
-
-`test-fresh-slack-seed.sh` builds a throwaway deployment — its own Compose
-project, volumes, secret directory, canary tokens and derived port — runs the
-real `bootstrap.sh --build` against it, and asserts that bootstrap creates no
-OpenClaw configuration and that the first legitimate seed comes up
-Slack-configured with no manual patch. It exists because that property lived in
-the gap between the other two gates: `test-file-secrets.sh` points bootstrap at
-an unreachable target so it never reaches the image phase, and smoke's Slack rows
-invoke the image directly, bypassing bootstrap and Compose.
-
-The two `--self-test` gates need no network, no credentials and no containers.
-`sync-targets.sh --self-test` builds throwaway local repositories and drives the
-**production** sync functions against them — the same ones `bootstrap.sh` and both
-Slack routes call — so it is evidence about the code that actually runs.
-
-Section A needs no credentials at all: versions, the Pretorin MCP surface, the
-the declaration parsers, the target-sync rules and mount matrix, gateway startup
-and the plugin profile, config and
-`AGENTS.md` seeding, mount posture, the stale-template warning, the CWD fix,
-secret containment for every secret class, the private-target refusals, and proof
-that a **fresh volume** comes up Slack-configured with no manual JSON. Section B
-proves onboarding end to end, that a read tool works through MCP, and that a write
-tool is rejected server-side.
-
-Pre-release, run the tests against a local build (`export
-COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml`), since the
-pull path needs a published image.
+Contributor test commands, prerequisites, and disposable container setup are in
+[CONTRIBUTING.md](CONTRIBUTING.md#test-selection).
 
 ## Updating an existing deployment
 
@@ -994,8 +949,8 @@ the matching pre-upgrade state; changing the image alone is not a full rollback.
 
 **Two things about the CLI row, because both surprise people.** `down -v` deletes
 `pretorin-state`, so the next start re-seeds the CLI from the image and every
-update you had applied is gone — worth knowing, because `down -v` is the remedy
-this README recommends in three other places. And rolling the *image* backwards
+update you had applied is gone. Reserve this command for intentional state
+deletion; it is not routine configuration repair. And rolling the *image* backwards
 does **not** roll the CLI backwards: the volume keeps whatever version it has.
 The CLI moves in exactly one way, `scripts/pretorin-update.sh`.
 
@@ -1040,7 +995,8 @@ compliance-claw: WARNING — this volume's config predates the image.
 For a template change, merge the change by hand — diff your
 `~/.openclaw/openclaw.json` against
 `/opt/compliance-claw/openclaw-config.template.json` in the image, then
-`echo 3 > ~/.openclaw/.compliance-claw-templates` — or reset.
+`echo 3 > ~/.openclaw/.compliance-claw-templates`. Back up the state before
+repair. Do not delete volumes to apply a template change.
 
 There is a second, Slack-specific version of this warning, because the
 template-version message says nothing about Slack:
@@ -1056,18 +1012,17 @@ steps. It does not replace the existing configuration.
 
 ## Resetting
 
-```sh
-docker compose down -v
-```
+`docker compose down` retains the named volumes. Adding `-v` deliberately deletes
+both: OpenClaw config, sessions, agent workspaces, model login, and the managed
+Slack installation; and Pretorin context, resolvers, recipes, active CLI, and
+volume audit files. Bind-mounted target clones and host files such as `.env`
+and secret files remain.
 
-This deletes **both** named volumes: the OpenClaw state volume (config, sessions,
-agent workspace, your customised `AGENTS.md`, and any model login) **and** the
-Pretorin state volume (active context, preflight resolvers, active recipe set). It
-does **not** touch the bind-mounted target repositories under `workspace/targets`,
-and it does not touch `.env`.
-
-Recovery is re-running `scripts/bootstrap.sh` and `scripts/clawctl apply`;
-both are idempotent. `docker compose down` without `-v` keeps everything.
+Do not use `down -v` for routine setup or troubleshooting. Before intentional
+state deletion, select the correct Compose project and files and follow
+[upgrade and recovery](docs/upgrade.md) to preserve verified backups. Bootstrap
+and `clawctl apply` can create initial state; they cannot restore deleted sessions
+or prior configuration. Restore from a verified recovery set when state matters.
 
 ## Troubleshooting
 
@@ -1075,9 +1030,9 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | --- | --- | --- |
 | `pull access denied` / `unauthorized` | The package is not public | `docker login ghcr.io`; a classic token needs `read:packages` |
 | `deployment is behind the repo pin` | Repo was pulled, deployment never restarted | `scripts/update.sh` |
-| Gateway exits 1 immediately | `OPENCLAW_GATEWAY_TOKEN` empty | `scripts/bootstrap.sh` generates one; check `.env` |
-| Gateway exits 78 `Missing config` | Config was never seeded | `docker compose down -v` then bootstrap |
-| Slack never connects | Credentials added after the first `up` | Look for the Slack-specific warning; `down -v` and re-bootstrap |
+| Gateway exits 1 immediately | `OPENCLAW_GATEWAY_TOKEN` empty | Check the gateway-token file on the file-secret path; `.env` is the legacy path. See [secret delivery](docs/file-secrets.md). |
+| Gateway exits 78 `Missing config` | Config missing or unreadable | Check logs, selected mounts, and file permissions. Preserve state and use [recovery guidance](docs/upgrade.md); do not delete volumes. |
+| Slack never connects | Missing credentials, channel setup, or existing config without Slack | Inspect the Slack warning and current configuration; see [Slack](#slack) and [recovery](docs/upgrade.md). |
 | Slack connects, bot never answers | Channel **name** instead of ID, or bot not invited | Use the `C...` ID; invite the bot; mention it explicitly |
 | `Slack is only partially configured` (multi-effort) | one of the **two** tokens set | Both tokens are required together; the channels come from `efforts.yaml` |
 | `Slack is only partially configured` (legacy) | 1 or 2 of the **three** variables set | All three are required together |
@@ -1092,7 +1047,7 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | `/target-sync` says `auth_failed` on a private target | No usable credential in the container | Put a fine-grained PAT in `secrets/runtime/github-readonly-pat` and use `compose.secrets.yaml` |
 | `up` fails with `bind source path does not exist: …/github-readonly-pat` | Upgraded without creating the new secret file | `scripts/init-file-secrets.sh` — or use `scripts/update.sh`, which does it before stopping anything |
 | `the GitHub App installation does not include:` | App not installed on that repo | Add it on the linked installation page |
-| `exists but is not the root of a git repository` | Interrupted clone | Inspect, then `rm -rf` that directory yourself and re-run |
+| `exists but is not the root of a git repository` | Interrupted clone | Inspect and move the directory aside if needed, then re-run bootstrap. |
 | `tracks a different remote` | the declared URL changed | Fix the URL, or move the directory aside |
 | `code_repository` is `degraded` | Expected | Needs a platform Connected Source; future work |
 | `Missing required scopes: write` | Read-only key, write tool | Correct behaviour — see "Read-only vs write-enabled" |
@@ -1101,8 +1056,8 @@ both are idempotent. `docker compose down` without `-v` keeps everything.
 | Loaded plugin set differs after an upgrade | OpenClaw can change bundled and required provider plugins | Inspect the loaded set and compare it with your configured allowlist |
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
-| Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`. `--status` confirms which binary is active |
-| `/compliance-claw /pretorin-update` does nothing in Slack | `channels.slack.slashCommand` missing from an existing config | Never-clobber: the container warns. Re-seed, or set it by hand |
+| Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | Restart the gateway and check the next MCP call. `--status` checks only the installed file; see [CLI updates](#updating-the-pretorin-cli). |
+| `/compliance-claw /pretorin-update` does nothing in Slack | Existing slash-command config or updater result fault | Check startup warnings and [#29](https://github.com/pretorin-ai/compliance-claw/issues/29); use the host updater. |
 
 Logs and state:
 
@@ -1116,75 +1071,8 @@ scripts/onboard-targets.sh --verify-only # LEGACY single-effort deployments only
 
 ## Releasing
 
-**The GitHub Release tag is the source of truth for the version.** Releasing means
-publishing `vX.Y.Z` — nothing is bumped first, and **no version-bump PR is required
-before releasing**. CI derives the version from the tag and builds the image with
-it, so the image states the version it was released as.
-
-```sh
-# 1. cut the release — this is the whole release trigger
-gh release create vX.Y.Z --target master --generate-notes
-
-# 2. wait for the release workflow to succeed
-
-# 3. one POST-RELEASE PR pins what it published:
-#      versions.env   IMAGE_VERSION=X.Y.Z
-#      compose.yaml   image: ghcr.io/pretorin-ai/compliance-claw:X.Y.Z@sha256:<digest>
-#    both lines are printed in the release run's job summary
-```
-
-**Why step 3 is a separate PR, and not a bump beforehand:** the digest does not
-exist until the image is built. Nothing can pin `@sha256:…` in advance, because
-that value is the hash of bytes that have not been produced yet. So the version
-flows *forward* from the tag into the image, and the digest flows *back* from the
-completed run into the checkout. Any attempt to bump first would either invent a
-digest or leave the pin stale.
-
-Step 3 is not optional bookkeeping. A tag is mutable and the image is unsigned, so
-the digest pin is the only thing tying a deployment to the bytes that were actually
-built and scanned. `IMAGE_VERSION` and the pin describe **what this checkout
-deploys**, which is why they move together, once, after the release.
-
-`.github/workflows/release.yml` builds `linux/amd64`, smokes the image, blocks on
-fixable CRITICAL vulnerabilities, generates an SPDX SBOM, then:
-
-1. **pushes by digest** under a single constant staging ref,
-   `ghcr.io/pretorin-ai/compliance-claw:build` — no version tag yet. `docker push`
-   requires *some* tag before a digest can be published; a constant name means at
-   most one such ref ever exists instead of one per release
-2. **pulls that digest back and re-verifies it** — the local image is removed first
-   so the pull cannot be served from cache, and the SBOM is regenerated from the
-   pulled bytes and compared against the built one
-3. **only then applies the version tag** to the verified digest, by re-PUTting the
-   same manifest bytes so the digest is preserved by construction, and resolves the
-   tag to confirm it lands there
-
-That ordering is deliberate: a floating tag should never point at bytes nobody has
-checked. The SBOM is also attached to the GitHub Release, so it outlives
-workflow-artifact retention.
-
-### Not part of releasing
-
-Releasing is the four steps above and nothing else. None of the following is a
-prerequisite, a blocker, or part of the procedure:
-
-| | Status |
-| --- | --- |
-| release-please or other release automation | not implemented; releases are cut by hand |
-| Azure Key Vault image signing | planned, SECURITY.md ledger item 5 — the image is unsigned |
-| cleaning up old GHCR package versions | separate housekeeping, never required to release |
-| `scripts/update.sh` | for operators updating a deployment, unrelated to publishing |
-| a pre-release version bump | explicitly not required — see step 3 above |
-
-CI holds **no** Pretorin, model or Slack credentials — only the automatic
-`GITHUB_TOKEN`, and it asserts that itself. It does not sign; see "Verifying what
-you pulled".
-
-Rehearse the pipeline without publishing anything:
-
-```sh
-gh workflow run release.yml -f dry_run=true
-```
+Maintainers use [How to publish a release](docs/releasing.md). Publishing is
+separate from updating a customer deployment or its active Pretorin CLI.
 
 ## Notes
 
