@@ -21,6 +21,7 @@
  * the image needs no Node toolchain and no npm dependency to carry this.
  */
 import { spawn } from "node:child_process";
+import { createActivation, MANUAL_RESTART } from "./activation.js";
 
 const WRAPPER = "/opt/compliance-claw/pretorin-update.sh";
 const TIMEOUT_MS = 360_000;
@@ -79,10 +80,10 @@ function resultingVersion(stdout) {
 
 const SHARED_INSTANCE_NOTE =
   "This changes the Pretorin CLI for EVERY user of this instance. " +
-  "An operator restart is required after installation. Wait for the installation result before restarting.";
+  "An owner can request a safe restart. Wait for the final activation message before treating the update as complete.";
 
 /** Shared by both routes so they cannot drift in what they promise. */
-async function performUpdate({ arg, requester, route }) {
+async function performUpdate({ arg, requester, route, activation, ctx }) {
   const res = await runWrapper(arg, { requester, route });
 
   if (!res.ok) {
@@ -102,16 +103,14 @@ async function performUpdate({ arg, requester, route }) {
     );
   }
 
-  // ACTIVE_VERSION identifies the installed file. It does not identify a
-  // running MCP child. OpenClaw 2026.10.3 restricts runtime.gateway.request to
-  // bundled or trusted official plugins; this external plugin cannot use it
-  // for restart or delivery. Return through the command/tool reply contract.
-  return (
-    `Pretorin CLI ${version} installation succeeded. OPERATOR RESTART REQUIRED.\n` +
-    "Activation is unverified. A running MCP server can still use the previous binary. " +
-    "This plugin cannot restart the gateway. On the deployment host, run: " +
-    "`docker compose restart openclaw`. The update is not complete until the new version is active."
-  );
+  if (route === "command") {
+    try {
+      if (await activation.request(version, ctx)) {
+        return `Pretorin CLI ${version} installation succeeded. Gateway restart requested. Activation is unverified. A final Slack message will confirm activation or report the required operator action.`;
+      }
+    } catch { /* Installation succeeded; use the verified operator fallback. */ }
+  }
+  return `Pretorin CLI ${version} installation succeeded. OPERATOR RESTART REQUIRED. ${MANUAL_RESTART}`;
 }
 
 export default {
@@ -122,6 +121,9 @@ export default {
   // MUST be synchronous. The loader rejects a promise-returning register with
   // "plugin register must be synchronous".
   register(api) {
+    const activation = createActivation(api);
+    api.on?.("gateway_start", activation.resume);
+    let updating = false;
     api.registerCommand({
       name: "pretorin-update",
       description: "Update this deployment's Pretorin CLI (latest, or an explicit X.Y.Z).",
@@ -130,6 +132,7 @@ export default {
       acceptsArgs: true,
       // Core rejects unauthorized senders before this handler ever runs.
       requireAuth: true,
+      requiredScopes: ["operator.admin"],
       agentPromptGuidance: [
         {
           text:
@@ -137,7 +140,7 @@ export default {
             "`/pretorin-update X.Y.Z` are operator commands that bypass the model; the " +
             "pretorin_update tool does the same thing conversationally. Never claim an " +
             "installation succeeded unless the tool returned an installed version. " +
-            "Activation remains unverified and requires an operator restart; do not claim the update is complete.",
+            "Activation remains unverified until the final activation result. The model tool requires an operator restart; do not claim the update is complete from installation alone.",
           surfaces: ["openclaw_main"],
         },
       ],
@@ -166,9 +169,11 @@ export default {
         // Slack acknowledges before dispatch. Keep this invocation open so core
         // delivers the final result. The command execution counter permits
         // concurrent commands, including status; it only drains on retirement.
-        return {
-          text: await performUpdate({ arg, requester, route: "command" }),
-        };
+        if (updating || activation.hasPending()) return { text: "A Pretorin update is pending. Wait for its activation result. Use `/pretorin-update status` to check the installed file." };
+        updating = true;
+        try {
+          return { text: await performUpdate({ arg, requester, route: "command", activation, ctx }) };
+        } finally { updating = false; }
       },
     });
 
@@ -200,6 +205,7 @@ export default {
           },
         },
         async execute(_toolCallId, params) {
+          if (updating || activation.hasPending()) return { content: [{ type: "text", text: "A Pretorin update is pending. Wait for its activation result." }] };
           const requested = String(params?.version ?? "").trim();
           const requester = `${toolContext?.messageChannel ?? "unknown"}:${
             toolContext?.requesterSenderId ?? "unavailable"

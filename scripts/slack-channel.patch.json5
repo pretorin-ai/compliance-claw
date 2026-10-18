@@ -79,9 +79,10 @@
 
       // Slack traffic may not rewrite the gateway's own configuration.
       //
-      // This is why the CLI updater never touches config to force MCP to pick up
-      // a new binary: it restarts the gateway through the supported restart RPC
-      // instead. A config write from a Slack-triggered path would contradict
+      // The CLI updater never changes config to activate a new binary. An owner
+      // command uses the public safe-restart CLI, then verifies activation and
+      // sends the final result through the Slack outbound adapter. A config write
+      // from a Slack-triggered path would contradict
       // this line, and on a non-Slack deployment `openclaw config set` would
       // also rewrite the JSON5 template as strict JSON and delete every comment.
       configWrites: false,
