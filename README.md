@@ -879,12 +879,14 @@ command usage and tool description state this requirement.
 **Activation is part of the update.** Replacing the CLI file does not change an
 already running MCP process. For an owner command from Slack, the updater requests
 `openclaw gateway restart --safe --json`. The first result reports installation
-and a pending restart. It does not report update completion.
+and a pending restart. This restarts the gateway inside the running container.
+It does not report update completion.
 
 The updater saves the expected version, executable hash, and original Slack
 channel before it requests restart. After a new gateway startup, it checks the
-configured CLI path and version, starts a real MCP server, calls `check_context`,
-and checks running MCP executable bytes. Only then does it send the final channel
+configured CLI path and version, calls `check_context` through a real MCP process
+for each configured Pretorin server, and checks running MCP executable bytes.
+Only then does it send the final channel
 message: `Pretorin CLI X.Y.Z is active. Update complete.` It keeps the original
 account and thread when supplied. This final message is a normal Slack message;
 the initial native command reply can be ephemeral.
@@ -913,7 +915,8 @@ The external plugin does not call the restricted `api.runtime.gateway.request`
 API or request a delegated restart. It uses the public CLI, the `gateway_start`
 hook, the health endpoint, and the registered Slack outbound adapter supported by
 pinned OpenClaw `2026.10.3`. The automatic verification supports this checkout's
-Linux container and canonical Pretorin MCP command. Other configurations report
+Linux container, canonical Pretorin MCP command, and shipped effort launcher.
+Other configurations report
 unverified activation rather than success.
 
 The Slack command name must match the app registration. For the dedicated test

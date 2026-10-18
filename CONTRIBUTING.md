@@ -124,6 +124,7 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | Target sync | `bash scripts/sync-targets.sh --self-test` | Bash, Git, Python 3; creates temporary local repositories. |
 | Shell diagnostic text | `python3 scripts/lint-heredocs.py scripts/*.sh` | Local static check; not a separate build CI step. |
 | CLI updater input | `bash scripts/pretorin-update.sh --self-test` | Docker and the candidate build overlay; the wrapper runs the in-image script. |
+| CLI updater result and activation rules | Node command below | Simulated installer, restart, MCP, and Slack boundaries; not live activation proof. |
 | Managed Slack rules | Node command below | Candidate image; network disabled; not live Slack proof. |
 | Gateway shutdown | `bash scripts/test-gateway-stop.sh compliance-claw:local` | Candidate image; synthetic drain, isolated volumes, no network. |
 | File-secret delivery | `bash scripts/test-file-secrets.sh compliance-claw:local` | Candidate image; temporary canary secrets. |
@@ -132,12 +133,13 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | Integrated runtime | `bash scripts/smoke.sh --no-creds` | Disposable project and fixtures above; writes test state. |
 | Documentation/templates | Links, anchors, front matter, and command/source checks | Run changed examples only where needed. No artificial tests or full image build solely for prose. |
 
-Run the existing Node test with the candidate image, from the repository root:
+Run the Node tests with the candidate image, from the repository root:
 
 ```sh
 docker run --rm --platform linux/amd64 --network none \
-  --mount "type=bind,src=$PWD/scripts,dst=/tests,readonly" \
-  --entrypoint node compliance-claw:local --test /tests/managed-slack.test.mjs
+  --mount "type=bind,src=$PWD,dst=/tests,readonly" \
+  --entrypoint node compliance-claw:local --experimental-vm-modules --test \
+  /tests/scripts/managed-slack.test.mjs /tests/scripts/pretorin-update.test.mjs
 ```
 
 For updater self-tests, select `compose.build.yaml` in the isolated stack so the

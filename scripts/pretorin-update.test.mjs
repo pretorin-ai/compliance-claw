@@ -347,6 +347,29 @@ test('a removed Slack account cannot fall back to the default account', async ()
   assert.equal(h.sent.length,0);assert.equal(h.files.has(pendingPath),true);
 });
 
+// Value: protects=final delivery uses inherited Slack account policy and channels;
+// fails_when=an inherited allowed channel is refused or a disabled policy sends;
+// why_new=existing account tests cover removal only; seam=none;
+// no_claim=live multi-account Slack delivery (adapter and activation are simulated).
+test('Slack account delivery inherits root settings and respects account restrictions', async () => {
+  for (const mode of ['inherited-open', 'inherited-channels', 'account-allowlist', 'account-disabled', 'root-disabled']) {
+    const h = activationHarness();
+    h.ctx.accountId = 'ops';
+    const slack = h.ctx.config.channels.slack;
+    slack.accounts = { ops: { enabled: true } };
+    if (mode === 'inherited-open') { slack.groupPolicy = 'open'; delete slack.channels; }
+    if (mode === 'account-allowlist') { slack.groupPolicy = 'open'; slack.accounts.ops.groupPolicy = 'allowlist'; slack.accounts.ops.channels = {}; }
+    if (mode === 'account-disabled') slack.accounts.ops.groupPolicy = 'disabled';
+    if (mode === 'root-disabled') slack.groupPolicy = 'disabled';
+    await h.controller.request('0.30.4', h.ctx);
+    await h.resume();
+    const allowed = mode.startsWith('inherited-');
+    assert.equal(h.sent.length, allowed ? 1 : 0, mode);
+    assert.equal(h.files.has(pendingPath), !allowed, mode);
+    if (allowed) assert.equal(h.sent[0].accountId, 'ops');
+  }
+});
+
 test('a failed probe cannot claim activation when no MCP process remains', async () => {
   const h=activationHarness();await h.controller.request('0.30.4',h.ctx);
   await createActivation(h.api,{...h.deps,inspect:()=>0}).resume({},h.ctx);

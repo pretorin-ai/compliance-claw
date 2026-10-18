@@ -183,9 +183,12 @@ export function createActivation(api, {
         }
         const cfg = ctx.config;
         const slack = cfg.channels?.slack;
-        const account = pending.accountId === 'default' ? (slack?.accounts?.default ?? slack) : slack?.accounts?.[pending.accountId];
+        const override = pending.accountId === 'default' ? (slack?.accounts?.default ?? slack) : slack?.accounts?.[pending.accountId];
+        // Pinned Slack accounts inherit root settings; explicit overrides win.
+        // A removed named account must not fall back to the root account.
+        const account = override && { ...slack, ...override };
         const channel = pending.to.slice('channel:'.length);
-        if (!account || slack.enabled === false || account.enabled === false || account.channels?.[channel] === false || account.channels?.[channel]?.enabled === false ||
+        if (!account || slack.enabled === false || account.enabled === false || account.groupPolicy === 'disabled' || account.channels?.[channel] === false || account.channels?.[channel]?.enabled === false ||
             (account.groupPolicy !== 'open' && !account.channels?.[channel])) throw new Error('Original Slack channel is no longer enabled');
         const adapter = await api.runtime.channel.outbound.loadAdapter('slack');
         if (typeof adapter?.sendText !== 'function') throw new Error('Slack outbound adapter is unavailable');
