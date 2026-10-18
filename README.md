@@ -837,70 +837,53 @@ configuration.
 
 ## Updating the Pretorin CLI
 
-The image ships an **immutable seed**. On first start it is copied to
-`/home/node/.pretorin/bin/pretorin` inside the `pretorin-state` volume, and that
-copy is the CLI this deployment runs: it is first on `PATH`, it is what
-`mcp.servers.pretorin.command` points at, and an image upgrade never replaces it.
-So `pretorin version` has one meaning everywhere, and moving the CLI does not
-require a Compliance Claw release.
+The active CLI is `/home/node/.pretorin/bin/pretorin` in `pretorin-state`.
+It survives image upgrades. A CLI update affects **every agent and user of this
+instance** and does not require an image release. The shared installer verifies
+signatures and refuses downgrades and prereleases.
+
+From the deployment host:
 
 ```sh
-scripts/pretorin-update.sh              # status: active vs seed, and the last update
-scripts/pretorin-update.sh latest       # the latest stable release
-scripts/pretorin-update.sh 0.28.7       # exactly that version
-scripts/pretorin-update.sh --dry-run    # say what would happen; change nothing
+scripts/pretorin-update.sh              # installed version, seed, and last update
+scripts/pretorin-update.sh latest       # latest stable release
+scripts/pretorin-update.sh 0.28.7       # exact version
+scripts/pretorin-update.sh --dry-run    # inspect without changes
 ```
 
-The Slack command and model-tool routes use the same installer. Result delivery
-and activation through those routes have an unresolved fault tracked in
-[#29](https://github.com/pretorin-ai/compliance-claw/issues/29). Use the host
-updater above until that flow is verified. Do not treat an acknowledgement or
-file replacement as proof that the running MCP process uses the new version.
-
-`latest` is passed to Pretorin as no version argument. Pretorin performs release
-selection, signature verification, and downgrade refusal. This changes the CLI
-for every agent and user in the deployment. `--status` reports the installed
-file, not the executable bytes retained by a running MCP child. The host updater
-restarts the gateway and checks its MCP processes; inspect its result before
-reporting completion.
-
-### The update audit record
-
-Every invocation appends one line to `/home/node/.pretorin/update-audit.log`
-(mode `0600`) **and** writes the same line to the container log:
+From Slack, use the command name registered for your app:
 
 ```
-v=1 ts=2026-08-24T14:05:02Z requested=latest normalized= previous=0.28.7 \
-    resulting=0.29.0 outcome=installed requester=slack:U024BE7LH route=command
+/compliance-claw /pretorin-update latest
+/compliance-claw /pretorin-update 0.28.7
+/compliance-claw /pretorin-update status
+@Compliance Claw update Pretorin
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `v` | record format version, so a parser can tell when this changes |
-| `requested` / `normalized` | what was asked for, verbatim, and after normalizing (`v0.28.7` → `0.28.7`) |
-| `previous` / `resulting` | the version before and after |
-| `outcome` | `installed`, `already_current`, `refused_input`, `rolled_back`, `timeout`, `backup_failed`, `backup_mismatch`, `interrupted` |
-| `requester` | `<channel>:<user-id>`, from the **authenticated** invocation, or `unavailable` |
-| `route` | `command`, `tool`, or `repair` |
+**Automatic restart applies only to the owner Slack command.** Configure
+`commands.ownerAllowFrom` with the operator's verified Slack identity, for example
+`["slack:U0123456789"]`. Channel membership alone does not grant restart authority.
+The first reply reports installation and pending activation. The gateway restarts
+inside the running container. A final Slack message reports completion only after
+the expected CLI version, executable bytes, and real MCP calls are verified.
 
-Read it with `scripts/pretorin-update.sh --status`, or in full:
+**The conversational model tool requires an operator restart.** Disabled restart
+and unsupported reply routes also return **OPERATOR RESTART REQUIRED**. With the
+deployment's Compose project and overlays selected, run:
 
 ```sh
-docker compose run --rm cli cat /home/node/.pretorin/update-audit.log
-docker compose logs openclaw | grep 'outcome='
+docker compose restart openclaw
+docker compose exec -T openclaw pretorin version
 ```
 
-**Requester identity is never taken from a model or an argument.** The command
-route reads it from the authenticated Slack message; the tool route reads it from
-the runtime's trusted inbound sender. When neither is available the field is
-literally `unavailable` rather than a value someone could have chosen.
+The version command checks the installed file. Confirm that the restart and next
+Pretorin MCP call succeed before treating the update as complete. Failed automatic
+verification reports installation success with unverified activation.
 
-**What this record is, and is not.** It is the compensating control for having no
-approval workflow: it tells you who moved the CLI, when, and to what. It is not
-tamper-evident storage. The agent runs as the same user, tool execution in this
-container is unsandboxed (see SECURITY.md), and `down -v` deletes the volume the
-file lives in. The copy in the container log is outside the volume and outside the
-agent's write path, which is why the record is written twice.
+Automatic verification supports the pinned OpenClaw `2026.10.3` Linux container,
+the canonical Pretorin MCP command, and the shipped effort launcher. See
+[activation, pending results, and recovery limits](docs/upgrade.md#pretorin-cli-activation-and-results)
+and the [update audit record](docs/upgrade.md#pretorin-cli-update-audit).
 
 ## Testing
 
@@ -1054,8 +1037,8 @@ or prior configuration. Restore from a verified recovery set when state matters.
 | Loaded plugin set differs after an upgrade | OpenClaw can change bundled and required provider plugins | Inspect the loaded set and compare it with your configured allowlist |
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
-| Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | Restart the gateway and check the next MCP call. `--status` checks only the installed file; see [CLI updates](#updating-the-pretorin-cli). |
-| `/compliance-claw /pretorin-update` does nothing in Slack | Existing slash-command config or updater result fault | Check startup warnings and [#29](https://github.com/pretorin-ai/compliance-claw/issues/29); use the host updater. |
+| Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`, then check the next MCP call. `--status` reports the installed binary only |
+| `/compliance-claw /pretorin-update` does nothing in Slack | Existing slash-command configuration or missing owner authority | Check startup warnings, the registered command name, and `commands.ownerAllowFrom`. Preserve state before configuration repair; see [CLI updates](#updating-the-pretorin-cli). |
 
 Logs and state:
 

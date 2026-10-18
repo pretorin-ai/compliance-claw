@@ -156,6 +156,9 @@ jobs:
       - name: CLI updater input rules (offline, no credentials)
         run: bash scripts/pretorin-update.sh --self-test
 
+      - name: CLI updater final result (offline, no credentials)
+        run: docker run --rm --platform linux/amd64 --network none --mount "type=bind,src=${{ github.workspace }},dst=/tests,readonly" --entrypoint node compliance-claw:local --experimental-vm-modules --test /tests/scripts/pretorin-update.test.mjs
+
       # Same reasoning, and same position: no credentials, no gateway, no
       # network. It builds throwaway local repositories and drives the REAL
       # sync functions against them — the ones bootstrap.sh and both Slack

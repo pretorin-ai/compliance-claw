@@ -232,15 +232,6 @@ else
   note "active CLI is ${V_ACTIVE}; the image seeds ${V_SEED} (expected after a CLI update)"
 fi
 
-# The config must point MCP at the SAME file PATH resolves, or an update lands
-# somewhere the agent never runs. This is the assertion the "two meanings of
-# pretorin version" hazard used to require prose to explain.
-CFG_CMD="$(val openclaw config get mcp.servers.pretorin.command | tr -d '"[:space:]')"
-if [ "$CFG_CMD" = "/home/node/.pretorin/bin/pretorin" ]; then
-  pass "mcp.servers.pretorin.command is the active binary"
-else
-  fail "mcp.servers.pretorin.command is the active binary" "config says: ${CFG_CMD:-<unset>}"
-fi
 has "openclaw matches versions.env (${OPENCLAW_VERSION})" "$OPENCLAW_VERSION" "$(val openclaw --version)"
 # The FROM line restates the tag next to its digest, because FROM cannot source a
 # file. If they drift, the image is not the version versions.env claims it is.
@@ -525,6 +516,23 @@ else
   fail "this project's gateway container is running and healthy" \
        "state was '${HSTATE:-absent}' after 360s. A port clash with another compose
         project is the usual cause; \`docker compose ps -a\` and COMPOSE_PROJECT_NAME."
+fi
+# Check runtime configuration after startup maintenance, in the gateway's PID
+# namespace. A one-off CLI during maintenance cannot read the canonical state.
+# Keep the exact path assertion: installation must change the file MCP runs.
+CFG_CMD=""; CFG_CMD_RC=0
+if [ "$READY" = 1 ]; then
+  CFG_CMD="$(docker compose exec -T openclaw openclaw config get mcp.servers.pretorin.command)" || CFG_CMD_RC=$?
+  CFG_CMD="$(printf '%s' "$CFG_CMD" | tr -d '"[:space:]')"
+  if [ "$CFG_CMD_RC" != 0 ]; then
+    fail "mcp.servers.pretorin.command is the active binary" "configuration read failed (exit ${CFG_CMD_RC}); see the diagnostic above"
+  elif [ "$CFG_CMD" = "/home/node/.pretorin/bin/pretorin" ]; then
+    pass "mcp.servers.pretorin.command is the active binary"
+  else
+    fail "mcp.servers.pretorin.command is the active binary" "config says: ${CFG_CMD:-<unset>}"
+  fi
+else
+  fail "mcp.servers.pretorin.command is the active binary" "the gateway did not become healthy; runtime configuration was not verified"
 fi
 # The host port is only meaningful once our own container is known to be up.
 # Skipped rather than run when it is not: a reply from a neighbouring project's
