@@ -82,8 +82,9 @@ provenance — see "Verifying what you pulled".
 
 ## Requirements
 
-- Docker Compose **v2.24.0 or newer**. The file-secret overlay uses the `!reset`
-  tag introduced in that release; older versions may retain `.env` unexpectedly.
+- Docker Compose **v2.24.4 or newer**. The file-secret overlay needs `!reset`
+  (introduced in v2.24.0), and test overlays need `!override`. Without `!reset`
+  support, Compose can retain `.env` unexpectedly.
 - Docker Desktop (or another daemon) with **linux/amd64** support. Upstream ships
   no linux/arm64 Pretorin binary, so on Apple Silicon this runs emulated — enable
   Rosetta for amd64 in Docker Desktop settings. `bootstrap.sh` checks before it
@@ -897,8 +898,24 @@ scripts/update.sh
 ```
 
 One command: fast-forward the checkout, pull the image this checkout pins, restart
-the gateway on it, then report anything you have to act on. It is idempotent — run
-it twice and the second run pulls nothing and recreates nothing.
+the selected gateway, then report anything you have to act on. Compose waits up
+to 360 seconds for startup. The script then verifies the selected container's
+running state, health, and actual image against the effective Compose selection,
+including customer overlays. It checks the gateway again after diagnostics.
+It is idempotent: a second run does not force container replacement.
+
+Use Docker Compose 2.24.4 or newer, with `--wait` and `--wait-timeout` support,
+and Python 3. Keep the deployment's `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, and
+profiles selected. Only the gateway and its Compose dependencies are started;
+the one-shot `cli` service is used for diagnostics.
+
+Exit 0 means gateway image and health verification and the configuration
+diagnostic succeeded. Recognized configuration-drift warnings remain warnings.
+Startup, wait, inspection, image mismatch, and diagnostic failures return nonzero
+without a completion report. A failed diagnostic reports configuration status as
+unknown. Inspect the reported error and `docker compose ps -a` with the same
+deployment selection. No automatic recovery is attempted. Gateway health does
+not prove that Slack or Pretorin MCP calls succeed.
 
 On `master` the digest pin and `IMAGE_VERSION` are already set to the current
 release, so updating means pulling `master` rather than editing anything. To move

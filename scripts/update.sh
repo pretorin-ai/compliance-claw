@@ -6,8 +6,8 @@
 #   2. create any secret file this release added, write-if-absent, BEFORE
 #      anything stops — a missing one would otherwise fail `up` as an outage
 #   3. pull the pinned image            (docker compose pull)
-#   4. restart the gateway on it        (docker compose up -d)
-#   5. report what the operator has to know, and change nothing else
+#   4. start and wait for the gateway  (Compose wait limit: 360 seconds)
+#   5. verify its image, health, and diagnostic result, then report
 #
 #   scripts/update.sh
 #
@@ -213,6 +213,32 @@ SECRETS
 esac
 
 log "For an OpenClaw upgrade, verify a backup of both state volumes first. See docs/upgrade.md."
+# Check support before replacing a running gateway. Compose owns the wait;
+# this script only verifies its result. The repository requires Compose 2.24.4+.
+UP_HELP="$(docker compose up --help)" || die "could not check Compose wait support."
+case "$UP_HELP" in
+  *--wait-timeout*) ;;
+  *) die "Docker Compose must support --wait and --wait-timeout. Install Compose 2.24.4 or newer." ;;
+esac
+
+# Read only the selected project and gateway image from Compose's merged model.
+# Do not print the model: it can contain credentials. Python 3 is already a host
+# prerequisite. The base-file pin alone cannot account for customer overlays.
+SELECTION="$(docker compose config --format json | python3 -c '
+import json, sys
+try:
+    config = json.load(sys.stdin)
+    project = config["name"]
+    image = config["services"]["openclaw"]["image"]
+    if not all(isinstance(v, str) and v and not any(c.isspace() for c in v)
+               for v in (project, image)):
+        raise ValueError()
+except (ValueError, KeyError, TypeError):
+    sys.exit("update: cannot resolve the Compose project and gateway image")
+print(project + "\t" + image)
+')" || die "could not read the effective Compose selection."
+IFS=$'\t' read -r SELECTED_PROJECT SELECTED_IMAGE <<< "$SELECTION"
+
 log "pulling the pinned image"
 docker compose pull --quiet 2>/dev/null || docker compose pull || die \
   "could not pull ${IMAGE_REF}.
@@ -220,8 +246,38 @@ docker compose pull --quiet 2>/dev/null || docker compose pull || die \
   The package is not public, so the pull needs a login:  docker login ghcr.io
   A classic token needs the read:packages scope."
 
-log "starting the gateway; Compose uses the configured shutdown limit"
-docker compose up -d
+EXPECTED_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$SELECTED_IMAGE")" \
+  || die "could not resolve the selected gateway image: ${SELECTED_IMAGE}."
+[[ "$EXPECTED_IMAGE_ID" =~ ^sha256:[a-f0-9]{64}$ ]] \
+  || die "the selected gateway image has no unambiguous local image ID."
+
+log "starting the gateway; Compose waits up to 360 seconds for health"
+# Name the gateway so an enabled cli profile cannot start a second gateway or
+# make Compose wait for a one-shot command. All deployment selection is inherited.
+docker compose up -d --wait --wait-timeout 360 openclaw \
+  || die "gateway startup or the Compose health wait failed. Check: docker compose ps -a"
+
+# Use the selected container, never the host port or the diagnostic container.
+# Repeat this small check after diagnostics to reject a replaced or failed gateway.
+GATEWAY_CID=""
+verify_gateway() {
+  local cid actual
+  cid="$(docker compose ps --all --quiet openclaw)" \
+    || die "could not find the selected gateway container."
+  [[ "$cid" =~ ^[a-f0-9]+$ ]] \
+    || die "expected exactly one gateway container in project ${SELECTED_PROJECT}."
+  [ -z "$GATEWAY_CID" ] || [ "$cid" = "$GATEWAY_CID" ] \
+    || die "the gateway container changed during verification; update completion is unverified."
+  actual="$(docker inspect --format '{{.Image}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}}' "$cid")" \
+    || die "could not inspect the selected gateway container."
+  [ "$actual" = "$EXPECTED_IMAGE_ID running healthy $SELECTED_PROJECT openclaw" ] \
+    || die "gateway image, state, health, or Compose ownership did not match.
+  Expected: ${EXPECTED_IMAGE_ID} running healthy ${SELECTED_PROJECT} openclaw
+  Observed: ${actual:-<missing>}
+  Check: docker compose ps -a"
+  GATEWAY_CID="$cid"
+}
+verify_gateway
 
 # ---------------------------------------------------------------------------
 # Report. Nothing below this line changes anything.
@@ -231,7 +287,8 @@ docker compose up -d
 # this on every start. Re-running the entrypoint through the one-shot `cli`
 # service surfaces the same warning here rather than reimplementing the
 # comparison — one source of truth, and it cannot drift from the entrypoint's.
-STARTUP="$(docker compose run --rm -T cli true 2>&1 || true)"
+STARTUP_RC=0
+STARTUP="$(docker compose run --rm -T cli true 2>&1)" || STARTUP_RC=$?
 
 printf '\n'
 DRIFT_FOUND=0
@@ -275,6 +332,13 @@ if printf '%s' "$STARTUP" | grep -q 'still loads the Pretorin skill'; then
   printf '%s\n' "$STARTUP" | grep -A8 'still loads the Pretorin skill' | sed 's/^/  /'
 fi
 
+if [ "$STARTUP_RC" != 0 ]; then
+  printf '%s\n' "$STARTUP" >&2
+  die "configuration diagnostic failed (exit ${STARTUP_RC}); configuration status is unknown.
+  Update completion is unverified. Check: docker compose ps -a"
+fi
+
+verify_gateway
 if [ "$DRIFT_FOUND" = 0 ]; then
   log "the volume's config is current with this image."
 fi
@@ -285,7 +349,7 @@ log "set live in the Pretorin state volume and survive an update like this one."
 log "Re-run ${REBUILD_CMD} only after 'down -v', or when ${DECLARATION_FILE}"
 log "changes — it is idempotent either way."
 printf '\n'
-log "done. Check it came up:  docker compose ps"
-log "and that the versions are what you expect — they are now two answers, not one:"
+log "done. The selected gateway is running and healthy on ${SELECTED_IMAGE}."
+log "Image and independent CLI version checks:"
 log "  docker compose run --rm cli cat /opt/compliance-claw/versions.env | grep IMAGE_VERSION"
 log "  scripts/pretorin-update.sh --status     # the CLI, which this script does NOT move"

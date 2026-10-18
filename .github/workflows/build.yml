@@ -85,6 +85,9 @@ jobs:
           fi
           echo "targets.yaml is credential-free, as required."
 
+      - name: Host image-update verification (isolated command stubs)
+        run: python3 scripts/test-update.py
+
       # efforts.yaml IS THE RUNTIME AUTHORITY AND IS GITIGNORED, so CI has none —
       # it names YOUR systems. It is produced here the same way an operator
       # produces one, from the committed targets.yaml, which keeps CI on the
