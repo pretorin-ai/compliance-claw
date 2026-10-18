@@ -26,6 +26,10 @@ packaged Compose is often older than Docker Desktop's.
 
 ## Local proof before Azure
 
+For contributor testing, use the [isolated setup](../CONTRIBUTING.md#isolated-container-testing).
+The commands below operate on the selected deployment; they are not an isolated
+test environment.
+
 Prepare files without replacing anything already present:
 
 ```sh
@@ -69,8 +73,8 @@ points here rather than restating it, so the two cannot drift.
 | `openclaw-gateway-token` | `OPENCLAW_GATEWAY_TOKEN` | **yes** — the gateway exits 1 without it | `openclaw` only |
 | `slack-app-token` | `SLACK_APP_TOKEN` | only for Slack — **both tokens together** | `openclaw`, `cli` |
 | `slack-bot-token` | `SLACK_BOT_TOKEN` | only for Slack — **both tokens together** | `openclaw`, `cli` |
-| `openai-api-key` | `OPENAI_API_KEY` | **exactly one** model key | `openclaw` only |
-| `anthropic-api-key` | `ANTHROPIC_API_KEY` | **exactly one** model key | `openclaw` only |
+| `openai-api-key` | `OPENAI_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
+| `anthropic-api-key` | `ANTHROPIC_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
 | `github-readonly-pat` | *(none — see below)* | only to sync a **private** target from Slack | `openclaw` only |
 
 **Slack needs two files here, not three.** On the multi-effort path those two
@@ -143,8 +147,10 @@ going unnoticed.
 
 ### The model credential needs no variable
 
-Populate exactly one of `openai-api-key` or `anthropic-api-key`. Nothing else is
-required: the entrypoint derives the OpenAI request adapter
+For model API-key mode, populate the file for the selected provider:
+`openai-api-key` or `anthropic-api-key`. Device-code login instead stores its
+credential in OpenClaw state; see [model setup](../README.md#the-model). For an
+OpenAI API key, the entrypoint derives the OpenAI request adapter
 (`models.providers.openai.api`) from whether an OpenAI key is visible, and exports
 it on every start, so the config carries a `${OPENAI_REQUEST_ADAPTER}` marker
 rather than a baked value.
@@ -183,8 +189,11 @@ never crosses the `docker` CLI boundary:
 ```sh
 docker compose exec -T openclaw sh -c '
   export OPENCLAW_GATEWAY_TOKEN="$(cat /run/secrets/openclaw_gateway_token)"
-  openclaw agent --agent main -m "your prompt"'
+  exec openclaw agent --agent "$1" -m "your prompt"' sh crm-soc2
 ```
+
+Replace `crm-soc2` with a configured effort agent name. The gateway must be
+running. This example is for the file-secret path.
 
 Do **not** use `docker compose exec -e OPENCLAW_GATEWAY_TOKEN="$(cat ...)"`: that
 reads the secret on the host and puts it in an argument list, which is visible to
