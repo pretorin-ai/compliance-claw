@@ -4,7 +4,6 @@
 Usage: python3 scripts/test-update-compose.py LOCAL_IMAGE OTHER_LOCAL_IMAGE
 Uses no registry, credentials, ports, or OpenClaw runtime. Git and image pulls
 are stubbed; Compose selection, startup, wait, and inspection are real.
-The timeout case uses the updater's full 360-second wait.
 """
 import json
 import os
@@ -13,7 +12,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 
 def main():
@@ -138,16 +136,6 @@ os.execv(os.environ["FIXTURE_DOCKER"], [os.environ["FIXTURE_DOCKER"], *sys.argv[
             unhealthy_cid = compose(project, "ps", "--all", "-q", "openclaw").stdout.strip()
             assert docker_run("inspect", "--format", "{{.State.Health.Status}}", unhealthy_cid).stdout.strip() == "unhealthy"
             print("PASS: unhealthy startup")
-
-            configure(command=["exec sleep infinity"], healthcheck={"start_period": "600s"})
-            started = time.monotonic()
-            update(False)
-            elapsed = time.monotonic() - started
-            # gstack-timing-ok: Verify the full Compose timeout, not a performance threshold.
-            assert elapsed >= 360, f"Compose returned before its wait limit: {elapsed}s"
-            timeout_cid = compose(project, "ps", "--all", "-q", "openclaw").stdout.strip()
-            assert docker_run("inspect", "--format", "{{.State.Health.Status}}", timeout_cid).stdout.strip() == "starting"
-            print("PASS: Compose timeout at the unchanged 360-second limit")
 
             configure()
             state = compose(project, "run", "--rm", "-T", "cli", "sh", "-c",

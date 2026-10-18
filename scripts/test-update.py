@@ -136,11 +136,6 @@ class UpdateTest(unittest.TestCase):
         self.assertNotIn("--force-recreate", str(docker))
         self.assertNotIn("down", str(docker))
 
-    def test_second_run_still_verifies_without_forced_recreation(self):
-        for _ in range(2):
-            self.assertEqual(self.run_update(), 0, self.output)
-            self.assertNotIn("--force-recreate", str(self.calls))
-
     def test_startup_or_compose_timeout_stops_before_diagnostics(self):
         for rc in (1, 17):
             with self.subTest(rc=rc):

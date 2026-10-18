@@ -82,9 +82,8 @@ provenance — see "Verifying what you pulled".
 
 ## Requirements
 
-- Docker Compose **v2.24.4 or newer**. The file-secret overlay needs `!reset`
-  (introduced in v2.24.0), and test overlays need `!override`. Without `!reset`
-  support, Compose can retain `.env` unexpectedly.
+- Docker Compose **v2.24.0 or newer**. The file-secret overlay uses the `!reset`
+  tag introduced in that release; older versions may retain `.env` unexpectedly.
 - Docker Desktop (or another daemon) with **linux/amd64** support. Upstream ships
   no linux/arm64 Pretorin binary, so on Apple Silicon this runs emulated — enable
   Rosetta for amd64 in Docker Desktop settings. `bootstrap.sh` checks before it
@@ -904,7 +903,7 @@ running state, health, and actual image against the effective Compose selection,
 including customer overlays. It checks the gateway again after diagnostics.
 It is idempotent: a second run does not force container replacement.
 
-Use Docker Compose 2.24.4 or newer, with `--wait` and `--wait-timeout` support,
+Use Docker Compose 2.24.0 or newer, with `--wait` and `--wait-timeout` support,
 and Python 3. Keep the deployment's `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, and
 profiles selected. Only the gateway and its Compose dependencies are started;
 the one-shot `cli` service is used for diagnostics.

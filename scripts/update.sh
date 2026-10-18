@@ -214,11 +214,11 @@ esac
 
 log "For an OpenClaw upgrade, verify a backup of both state volumes first. See docs/upgrade.md."
 # Check support before replacing a running gateway. Compose owns the wait;
-# this script only verifies its result. The repository requires Compose 2.24.4+.
+# this script only verifies its result. Customer deployments need Compose 2.24.0+.
 UP_HELP="$(docker compose up --help)" || die "could not check Compose wait support."
 case "$UP_HELP" in
   *--wait-timeout*) ;;
-  *) die "Docker Compose must support --wait and --wait-timeout. Install Compose 2.24.4 or newer." ;;
+  *) die "Docker Compose must support --wait and --wait-timeout. Install Compose 2.24.0 or newer." ;;
 esac
 
 # Read only the selected project and gateway image from Compose's merged model.
