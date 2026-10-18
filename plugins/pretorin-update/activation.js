@@ -192,16 +192,15 @@ export function createActivation(api, {
             (account.groupPolicy !== 'open' && !account.channels?.[channel])) throw new Error('Original Slack channel is no longer enabled');
         const adapter = await api.runtime.channel.outbound.loadAdapter('slack');
         if (typeof adapter?.sendText !== 'function') throw new Error('Slack outbound adapter is unavailable');
-        let delivered = false;
         for (let attempt = 0; attempt < 3; attempt++) {
           ctx.abortSignal?.throwIfAborted();
           try {
             const result = await adapter.sendText({ cfg, to: pending.to, accountId: pending.accountId, threadId: pending.threadId, text });
             if (!result?.messageId) throw new Error('Slack did not confirm delivery');
-            delivered = true; break;
+            break;
           } catch (error) { if (attempt === 2) throw error; await wait(1_000 * (attempt + 1), ctx.abortSignal); }
         }
-        if (delivered) remove(pending.id);
+        remove(pending.id);
       } catch (error) { api.logger?.error?.(`Pretorin activation result remains pending: ${error.message}. ${MANUAL_RESTART}`); }
       finally { for (const mcp of probes) mcp.close(); resuming = false; }
     },

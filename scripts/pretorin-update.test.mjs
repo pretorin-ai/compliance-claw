@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto';
 const source = await readFile(new URL('../plugins/pretorin-update/index.js', import.meta.url), 'utf8');
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-async function harness({ gateway = 'restricted', spawnError, clock, activation = { hasPending: () => false, request: async () => false } } = {}) {
+async function harness({ spawnError, clock, activation = { hasPending: () => false, request: async () => false } } = {}) {
   const calls = [];
   const children = [];
   const rpc = [];
@@ -50,11 +50,10 @@ async function harness({ gateway = 'restricted', spawnError, clock, activation =
     on: (...value) => hooks.push(value),
     registerCommand: (value) => { command = value; },
     registerTool: (value) => { factory = value; },
-    ...(gateway === 'missing' ? {} : { runtime: { gateway: { request: async (...args) => {
+    runtime: { gateway: { request: async (...args) => {
       rpc.push(args);
-      if (gateway === 'restricted') throw new Error('Gateway requests are only available to bundled or trusted official plugins');
       return { ok: true, status: 'deferred' };
-    } } } }),
+    } } },
   });
   return {
     command, factory, calls, children, rpc, hooks,
@@ -95,20 +94,20 @@ test('command waits for installation and returns the final restart instructions'
   assert.equal(h.calls[0].options.stdio[2], 'inherit');
 });
 
-for (const gateway of ['restricted', 'missing', 'permissive']) {
-  test(`tool returns installation state with ${gateway} Gateway RPC`, async () => {
-    const h = await harness({ gateway });
-    const tool = h.factory({ messageChannel: 'slack', requesterSenderId: 'U456' });
-    const pending = tool.execute('call-1', { version: ' 0.30.4 ' });
-    h.finish();
-    const result = await pending;
-    assertRestartRequired(result.content[0].text);
-    assert.deepEqual(h.rpc, [], 'RPC availability or acceptance must not become activation evidence');
-    assert.deepEqual(h.calls[0].args, ['0.30.4']);
-    assert.equal(h.calls[0].options.env.PRETORIN_UPDATE_REQUESTER, 'slack:U456');
-    assert.equal(h.calls[0].options.env.PRETORIN_UPDATE_ROUTE, 'tool');
-  });
-}
+// A permissive RPC is the strongest trap: the tool must not use it even when
+// a restart request would appear to succeed.
+test('tool requires an operator restart even with permissive Gateway RPC', async () => {
+  const h = await harness();
+  const tool = h.factory({ messageChannel: 'slack', requesterSenderId: 'U456' });
+  const pending = tool.execute('call-1', { version: ' 0.30.4 ' });
+  h.finish();
+  const result = await pending;
+  assertRestartRequired(result.content[0].text);
+  assert.deepEqual(h.rpc, [], 'RPC acceptance must not become activation evidence');
+  assert.deepEqual(h.calls[0].args, ['0.30.4']);
+  assert.equal(h.calls[0].options.env.PRETORIN_UPDATE_REQUESTER, 'slack:U456');
+  assert.equal(h.calls[0].options.env.PRETORIN_UPDATE_ROUTE, 'tool');
+});
 
 for (const route of ['command', 'tool']) {
   for (const outcome of ['failed', 'missing-version']) {
@@ -174,8 +173,8 @@ test('timeout kills the child and returns failure after signal close', async () 
 });
 
 // Value: protects=usage and model metadata separate installation from activation;
-// fails_when=guidance permits success without a version or completion before restart;
-// why_new=the earlier metadata assertions checked only isolated phrases;
+// fails_when=model guidance promises automatic restart or completion from installation;
+// why_new=tool results cannot enforce the instructions that the model receives;
 // seam=none; no_claim=actual model compliance or live Slack delivery.
 test('usage separates an owner restart from the manual model-tool path', async () => {
   const h = await harness();
@@ -183,14 +182,12 @@ test('usage separates an owner restart from the manual model-tool path', async (
   assert.match(result.text, /Usage:/);
   assert.match(result.text, /owner.*safe restart/i);
   const description = h.factory({}).description;
-  assert.match(description, /requires an operator restart to activate/);
-  assert.match(description, /returns installation state/i);
-  assert.match(description, /activation remains unverified/i);
+  assert.match(description, /operator restart/i);
+  assert.match(description, /activation.*unverified/i);
   assert.doesNotMatch(description, /restarts the gateway|update complete/i);
   const guidance = h.command.agentPromptGuidance[0].text;
-  assert.match(guidance, /never claim an installation succeeded unless the tool returned an installed version/i);
-  assert.match(guidance, /activation remains unverified until the final activation result/i);
-  assert.match(guidance, /do not claim the update is complete/i);
+  assert.match(guidance, /model tool.*operator restart/i);
+  assert.match(guidance, /not claim.*complete.*installation alone/i);
   assert.deepEqual(h.calls, []);
 });
 

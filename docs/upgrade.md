@@ -56,3 +56,61 @@ alone is not a full state backup.
 state recovery. The OpenClaw container adapter runs Doctor before the gateway
 and can migrate retained state. Stop and verify the backup before you use the
 update script for an OpenClaw upgrade.
+
+## Pretorin CLI activation and results
+
+The [CLI update commands](../README.md#updating-the-pretorin-cli) share the signed
+installer. Only the owner Slack command requests automatic activation. It uses
+`openclaw gateway restart --safe --json`, the `gateway_start` hook, and the public
+Slack outbound adapter. It does not use restricted Gateway RPC or delegated
+restart. The conversational model tool requires an operator restart.
+
+Before restart, the updater creates `~/.pretorin/update-activation.json` with mode
+`0600`. It records the expected version and executable hash, request time, and
+original Slack account, channel, and thread. A restart request is a pending state,
+not proof of activation.
+
+After a new gateway startup, verification checks the configured CLI path, version,
+and installed bytes. It calls `check_context` through each configured Pretorin MCP
+server and checks loaded executable bytes, including retained file descriptors
+under emulation. It keeps successful probe processes alive until these checks
+finish, then closes them. A plugin reload alone does not count as a restart.
+
+The final message reports completion only after verification. An activation
+failure reports installation success, unverified activation, and the operator
+restart command. Delivery uses the original Slack destination and requires an
+acknowledged message ID. It tries at most three times. An unconfirmed delivery or
+interrupted startup keeps the receipt for the next startup; another chat update
+is blocked while it is pending, but status remains available. Do not remove a
+receipt while an update is pending. A lost Slack acknowledgement can cause a
+duplicate final message on retry.
+
+If the original Slack account or channel is removed or disabled, the receipt can
+remain pending and block further chat updates. This is a known recovery limit.
+The updater does not redirect the result or clear the receipt automatically.
+
+## Pretorin CLI update audit
+
+The installer writes `/home/node/.pretorin/update-audit.log` with mode `0600` and
+copies each record to stderr. Chat routes send stderr to the gateway container
+log; the host updater sends it to the operator terminal. These records describe
+installation, not verified activation. Read the file with
+`scripts/pretorin-update.sh --status`, or in full:
+
+```sh
+docker compose run --rm cli cat /home/node/.pretorin/update-audit.log
+docker compose logs openclaw | grep 'outcome='
+```
+
+Each record includes the format version (`v`), requested and normalized version,
+previous and resulting version, outcome, requester, and route. Outcomes include
+`installed`, `already_current`, `refused_input`, `rolled_back`, `timeout`,
+`backup_failed`, `backup_mismatch`, and `interrupted`. Routes are `command`,
+`tool`, or `repair`.
+
+Requester identity comes from the authenticated command or trusted tool context,
+never a model argument. If unavailable, the record says `unavailable`. The log
+shows who changed the CLI, when, and to which version. It is not tamper-evident:
+the agent uses the same container user, and deleting the state volume removes the
+file. Chat routes also keep a copy in the gateway container log. See the limits
+in [SECURITY.md](../SECURITY.md).

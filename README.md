@@ -837,130 +837,53 @@ configuration.
 
 ## Updating the Pretorin CLI
 
-The image ships an **immutable seed**. On first start it is copied to
-`/home/node/.pretorin/bin/pretorin` inside the `pretorin-state` volume, and that
-copy is the CLI this deployment runs: it is first on `PATH`, it is what
-`mcp.servers.pretorin.command` points at, and an image upgrade never replaces it.
-So `pretorin version` has one meaning everywhere, and moving the CLI does not
-require a Compliance Claw release.
+The active CLI is `/home/node/.pretorin/bin/pretorin` in `pretorin-state`.
+It survives image upgrades. A CLI update affects **every agent and user of this
+instance** and does not require an image release. The shared installer verifies
+signatures and refuses downgrades and prereleases.
+
+From the deployment host:
 
 ```sh
-scripts/pretorin-update.sh              # status: active vs seed, and the last update
-scripts/pretorin-update.sh latest       # the latest stable release
-scripts/pretorin-update.sh 0.28.7       # exactly that version
-scripts/pretorin-update.sh --dry-run    # say what would happen; change nothing
+scripts/pretorin-update.sh              # installed version, seed, and last update
+scripts/pretorin-update.sh latest       # latest stable release
+scripts/pretorin-update.sh 0.28.7       # exact version
+scripts/pretorin-update.sh --dry-run    # inspect without changes
 ```
 
-The Slack command and model-tool routes use the same installer:
+From Slack, use the command name registered for your app:
 
 ```
-/compliance-claw /pretorin-update latest           deterministic; bypasses the model entirely
+/compliance-claw /pretorin-update latest
+/compliance-claw /pretorin-update 0.28.7
 /compliance-claw /pretorin-update status
-@Compliance Claw update Pretorin        conversational; goes through the model
+@Compliance Claw update Pretorin
 ```
 
-**The deterministic updater command requires a gateway owner.** Set
-`commands.ownerAllowFrom` to the operator's verified Slack identity, for example
+**Automatic restart applies only to the owner Slack command.** Configure
+`commands.ownerAllowFrom` with the operator's verified Slack identity, for example
 `["slack:U0123456789"]`. Channel membership alone does not grant restart authority.
-The model tool retains the installation-only path and reports the operator restart
-step. Both paths keep the update audit record below.
+The first reply reports installation and pending activation. The gateway restarts
+inside the running container. A final Slack message reports completion only after
+the expected CLI version, executable bytes, and real MCP calls are verified.
 
-`latest` is passed to the CLI as *no argument at all*, which is how
-`pretorin update` already means "install the latest stable release" — so release
-selection, signature verification, downgrade refusal and prerelease exclusion are
-all the CLI's own, not reimplemented here. Explicit prereleases (`0.29.0-rc2`) are
-refused: an unattended, Slack-triggered update on a shared instance is the wrong
-place for a release candidate.
-
-**An update changes the CLI for every user of the instance.** Deployments are
-independent of each other, but users of one deployment are not. The Slack
-command usage and tool description state this requirement.
-
-**Activation is part of the update.** Replacing the CLI file does not change an
-already running MCP process. For an owner command from Slack, the updater requests
-`openclaw gateway restart --safe --json`. The first result reports installation
-and a pending restart. This restarts the gateway inside the running container.
-It does not report update completion.
-
-The updater saves the expected version, executable hash, and original Slack
-channel before it requests restart. After a new gateway startup, it checks the
-configured CLI path and version, calls `check_context` through a real MCP process
-for each configured Pretorin server, and checks running MCP executable bytes.
-Only then does it send the final channel
-message: `Pretorin CLI X.Y.Z is active. Update complete.` It keeps the original
-account and thread when supplied. This final message is a normal Slack message;
-the initial native command reply can be ephemeral.
-
-If activation cannot be verified, the final message reports installation success
-and unverified activation with the operator action. A Slack delivery failure
-keeps the pending receipt at `~/.pretorin/update-activation.json` for the next
-startup. Do not remove that receipt while an update is pending. Repeated delivery
-can produce a duplicate message if Slack accepted an earlier request but its
-receipt was lost.
-
-The model tool, disabled restart, and unsupported reply routes return
-**OPERATOR RESTART REQUIRED**. On the deployment host, with the deployment's
-Compose files and project selected, run:
+**The conversational model tool requires an operator restart.** Disabled restart
+and unsupported reply routes also return **OPERATOR RESTART REQUIRED**. With the
+deployment's Compose project and overlays selected, run:
 
 ```sh
 docker compose restart openclaw
 docker compose exec -T openclaw pretorin version
 ```
 
-The version command checks the installed file. Check that restart succeeded and
-that the next Pretorin MCP call works before treating a manual update as complete.
-The host updater script also runs a Compose restart and inspects MCP children.
+The version command checks the installed file. Confirm that the restart and next
+Pretorin MCP call succeed before treating the update as complete. Failed automatic
+verification reports installation success with unverified activation.
 
-The external plugin does not call the restricted `api.runtime.gateway.request`
-API or request a delegated restart. It uses the public CLI, the `gateway_start`
-hook, the health endpoint, and the registered Slack outbound adapter supported by
-pinned OpenClaw `2026.10.3`. The automatic verification supports this checkout's
-Linux container, canonical Pretorin MCP command, and shipped effort launcher.
-Other configurations report
-unverified activation rather than success.
-
-The Slack command name must match the app registration. For the dedicated test
-app it is `/compliance-claw-test`, so its configured `slashCommand.name` must match.
-Send exact commands through Slack. Connector-added attribution text becomes part
-of a text command's argument and is refused by the version validator.
-
-### The update audit record
-
-Every invocation appends one line to `/home/node/.pretorin/update-audit.log`
-(mode `0600`) **and** writes the same line to the container log:
-
-```
-v=1 ts=2026-08-24T14:05:02Z requested=latest normalized= previous=0.28.7 \
-    resulting=0.29.0 outcome=installed requester=slack:U024BE7LH route=command
-```
-
-| Field | Meaning |
-| --- | --- |
-| `v` | record format version, so a parser can tell when this changes |
-| `requested` / `normalized` | what was asked for, verbatim, and after normalizing (`v0.28.7` → `0.28.7`) |
-| `previous` / `resulting` | the version before and after |
-| `outcome` | `installed`, `already_current`, `refused_input`, `rolled_back`, `timeout`, `backup_failed`, `backup_mismatch`, `interrupted` |
-| `requester` | `<channel>:<user-id>`, from the **authenticated** invocation, or `unavailable` |
-| `route` | `command`, `tool`, or `repair` |
-
-Read it with `scripts/pretorin-update.sh --status`, or in full:
-
-```sh
-docker compose run --rm cli cat /home/node/.pretorin/update-audit.log
-docker compose logs openclaw | grep 'outcome='
-```
-
-**Requester identity is never taken from a model or an argument.** The command
-route reads it from the authenticated Slack message; the tool route reads it from
-the runtime's trusted inbound sender. When neither is available the field is
-literally `unavailable` rather than a value someone could have chosen.
-
-**What this record is, and is not.** It is the compensating control for having no
-approval workflow: it tells you who moved the CLI, when, and to what. It is not
-tamper-evident storage. The agent runs as the same user, tool execution in this
-container is unsandboxed (see SECURITY.md), and `down -v` deletes the volume the
-file lives in. The copy in the container log is outside the volume and outside the
-agent's write path, which is why the record is written twice.
+Automatic verification supports the pinned OpenClaw `2026.10.3` Linux container,
+the canonical Pretorin MCP command, and the shipped effort launcher. See
+[activation, pending results, and recovery limits](docs/upgrade.md#pretorin-cli-activation-and-results)
+and the [update audit record](docs/upgrade.md#pretorin-cli-update-audit).
 
 ## Testing
 
