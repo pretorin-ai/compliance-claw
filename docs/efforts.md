@@ -231,8 +231,10 @@ edits, the same write-if-absent rule the rest of this deployment follows.
 state volume (config, sessions, agent workspace, custom `AGENTS.md`) **and** the
 Pretorin state volume (active context, preflight resolvers, active recipe sets
 for every effort, and the `clawctl` audit record). It does not touch
-`workspace/targets`. Recovery is `scripts/bootstrap.sh` then
-`scripts/clawctl apply`; both are idempotent.
+`workspace/targets`. Bootstrap and `scripts/clawctl apply` can create initial
+state. They cannot restore deleted sessions, configuration, or an updated CLI.
+Do not delete volumes to migrate an effort. Preserve verified backups and use
+[upgrade and recovery](upgrade.md) when state must be restored.
 
 ---
 

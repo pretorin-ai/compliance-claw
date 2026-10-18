@@ -21,7 +21,7 @@ and does not second-guess the platform.
   operator  │  gateway.auth.token ──► who may talk to the gateway       │
   ────────► │  tools.toolSearch   ──► how many schemas reach the prompt │
      or     │  plugins.allow      ──► which plugin code loads at all    │
-   Slack    │  channels.slack     ──► which channel, mention-only, no DMs│
+   Slack    │  channels.slack     ──► allowed channels and DM bindings  │
             └───────────────────────────┬───────────────────────────────┘
                                         │ stdio, full 192-tool surface
                                         ▼
@@ -75,8 +75,8 @@ What containment does exist is real but partial, and is not a substitute:
 
 | Control | Effect |
 | --- | --- |
-| `dmPolicy: "disabled"` | No DMs at all — no unattributed private sessions |
-| `groupPolicy: "allowlist"` + one channel ID | Only the channel you named is served |
+| `dmPolicy: "disabled"` by default | No DMs until an administrator configures a user binding |
+| `groupPolicy: "allowlist"` + configured channel IDs | One allowed channel per effort; only configured channels are served |
 | `requireMention: true` | The agent answers only when explicitly addressed |
 | `users: ["*"]` per channel | Slash commands are authorized by **membership of that configured channel** — the channel is the trust boundary, not an individual allowlist. Anyone who can post in a served channel can run its commands |
 | `configWrites: false` | Slack traffic cannot rewrite the gateway config |
@@ -85,13 +85,14 @@ What containment does exist is real but partial, and is not a substitute:
 
 `users: ["*"]` is worth reading twice: it does **not** widen which channels are
 served — `groupPolicy: "allowlist"` still admits only the channels generated from
-`efforts.yaml`, and DMs stay disabled. It means that within an admitted channel,
+`efforts.yaml`. DMs stay disabled unless an administrator configures the
+[optional DM bindings](docs/efforts.md#optional-slack-dms). Within an admitted channel,
 every member may run `/compliance-claw ...`. Control who is in the channel.
 
 One honest gap in that table: the manifest grants `im:history`, `im:read` and
 `im:write` because they are part of upstream's supported minimal scope set, while
-DMs are closed one layer up in OpenClaw's config. The scopes are granted and
-unused. Removing them is untested against the plugin.
+DMs are closed by default in OpenClaw's config. The scopes remain granted when
+no DM binding is configured. Removing them is untested against the plugin.
 
 ## Credentials and where they live
 
@@ -331,7 +332,8 @@ Ordered roughly by how much it matters, not by effort.
    rewrite the update audit file. The wrapper's audit therefore covers the
    supported routes only. `tools.exec.security: "allowlist"` with a host approvals
    file is the narrow fix; enabling the sandbox is the broad one. **Required
-   before production** — the provenance workflow in `AGENTS.md` currently depends
+   before production** — the provenance workflow in the deployed agent instructions
+   (`scripts/agents-md.template`) currently depends
    on `git`, so neither can simply be switched on without replacing that path.
 
    Target synchronization widens the same gap again, and in two specific ways
@@ -410,7 +412,9 @@ Ordered roughly by how much it matters, not by effort.
    write-if-absent and never overwritten, so a newer image cannot tighten an
    existing deployment's config. Today the entrypoint warns — including a specific
    warning when Slack is configured in `.env` but absent from an existing
-   config — and `down -v` is the only reset.
+   config. Automated configuration reconciliation is still missing. Review
+   configuration changes and preserve state before repair; see
+   [upgrade and recovery](docs/upgrade.md). Do not delete volumes to clear a warning.
 12. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
    observed working (`cataloged 223 tools behind compact directory surface`) but
    upstream marks all Tool Search modes experimental. If it regresses, the prompt
