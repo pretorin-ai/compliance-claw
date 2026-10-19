@@ -57,6 +57,20 @@ state recovery. The OpenClaw container adapter runs Doctor before the gateway
 and can migrate retained state. Stop and verify the backup before you use the
 update script for an OpenClaw upgrade.
 
+Slack preparation also runs the pinned OpenClaw Doctor command before it
+inspects or changes configured Slack state. This pass allows supported retained
+configuration to migrate even when the obsolete Slack load path is absent. A
+Doctor failure stops preparation. The final upstream adapter still runs Doctor
+after plugin preparation, because the installed plugin set can change. This adds
+one Doctor pass for configured Slack state without the obsolete path; it does
+not add migration rules or replace upstream activation.
+
+Initial fresh Slack installation still installs the package before it applies
+the channel patch. That initial step has no Slack configuration and does not run
+the extra Doctor pass. Ordinary retained CLI commands do not run Slack
+preparation during startup. Unused Slack skips its operations and early Doctor
+pass.
+
 ## Pretorin CLI activation and results
 
 The [CLI update commands](../README.md#updating-the-pretorin-cli) share the signed

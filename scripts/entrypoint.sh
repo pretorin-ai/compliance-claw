@@ -575,8 +575,8 @@ NODE
   chmod 0600 "$STAMP"
 fi
 
-# A gateway must have the pinned official Slack install before Doctor and the
-# channel start. This also upgrades retained state and removes the old override.
+# Prepare the pinned official Slack install before final upstream activation.
+# The helper runs Doctor before it inspects or changes configured Slack state.
 if [ "$IS_GATEWAY" = 1 ] && node "$SLACK_HELPER" foreground "$@"; then
   prepare_managed_slack
 fi
