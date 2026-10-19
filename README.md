@@ -273,7 +273,7 @@ The image's current integrity controls, in full:
 | --- | --- |
 | GHCR image pinned by **immutable digest** | the bytes are the bytes that were built and scanned |
 | **SBOM** generated per release (SPDX JSON) | a package inventory, retained as a workflow artifact on the release run |
-| **Vulnerability scan** at release | fixable CRITICAL findings block publication |
+| **Vulnerability scan** at release | fixable HIGH and CRITICAL findings block publication |
 | Documented release provenance | the workflow, the digest, and the version pin are all recorded |
 
 The SBOM is not attached to the OCI image and is not signed. It is available
@@ -880,7 +880,7 @@ The version command checks the installed file. Confirm that the restart and next
 Pretorin MCP call succeed before treating the update as complete. Failed automatic
 verification reports installation success with unverified activation.
 
-Automatic verification supports the pinned OpenClaw `2026.10.3` Linux container,
+Automatic verification supports the pinned OpenClaw `2026.10.5` Linux container,
 the canonical Pretorin MCP command, and the shipped effort launcher. See
 [activation, pending results, and recovery limits](docs/upgrade.md#pretorin-cli-activation-and-results)
 and the [update audit record](docs/upgrade.md#pretorin-cli-update-audit).

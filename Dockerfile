@@ -57,7 +57,7 @@ RUN bash scripts/fetch-pretorin.sh dist \
 
 
 # The OpenClaw Slack channel plugin, resolved and integrity-checked at BUILD
-# time. Slack is not bundled in 2026.10.3; the image has no Slack extension,
+# time. Slack is not bundled in 2026.10.5; the image has no Slack extension,
 # so it comes from the official npm package.
 #
 # This stage checks the pinned package and its dependency tree. The runtime uses
@@ -67,7 +67,7 @@ RUN bash scripts/fetch-pretorin.sh dist \
 # This stage uses the OpenClaw image because it already carries the exact node
 # and npm the runtime will load the plugin with, so the
 # resolved tree is the tree that actually runs.
-FROM ghcr.io/openclaw/openclaw:2026.10.3@sha256:70b8dbd23f8d27a206f43f9828fdebc87289e50d56dc55177354c9270d764026 AS slack-plugin
+FROM ghcr.io/openclaw/openclaw:2026.10.5@sha256:f40d1e66fd14d8c5b49c832f4100f83b53fdc01f5108f7db11de38fd0ee6dbe5 AS slack-plugin
 
 USER root
 WORKDIR /build
@@ -125,7 +125,7 @@ RUN P=/build/node_modules/@openclaw/slack \
 #
 # The base is node:24-bookworm-slim underneath, i.e. glibc: what the dynamically
 # linked Pretorin binary needs. An Alpine-based OpenClaw image would not run it.
-FROM ghcr.io/openclaw/openclaw:2026.10.3@sha256:70b8dbd23f8d27a206f43f9828fdebc87289e50d56dc55177354c9270d764026
+FROM ghcr.io/openclaw/openclaw:2026.10.5@sha256:f40d1e66fd14d8c5b49c832f4100f83b53fdc01f5108f7db11de38fd0ee6dbe5
 
 # The image already runs as `node`; switch back at the end of the stage.
 USER root
@@ -307,8 +307,7 @@ COPY scripts/pretorin-mcp-launch.sh /opt/compliance-claw/pretorin-mcp-launch
 
 # PYTHON3 IS INHERITED, NOT INSTALLED — SO ASSERT IT.
 #
-# Python comes from the OpenClaw base. The security update below changes only
-# the existing Perl packages. Three things depend on Python in the base
+# Python comes from the OpenClaw base. Three things depend on Python in the base
 # image at runtime (sync-targets.sh for
 # /target-sync, mcp-call.py, and now the MCP launcher), and the launcher is the
 # one that turns its absence into a security problem rather than an outage: a
@@ -355,17 +354,20 @@ LABEL org.opencontainers.image.version="${IMAGE_SELF_VERSION}"
 
 COPY versions.env /opt/compliance-claw/versions.env
 
-# Update only the four affected packages. Debian signs the package index;
-# exact versions keep this correction separate from a general OS upgrade.
+# OpenClaw 2026.10.5 already has the fixed Debian Perl packages. Its app-local
+# npm still bundles vulnerable brace-expansion and undici. Replace that npm
+# package with the official patch release; preserve the existing pnpm links.
 RUN . /opt/compliance-claw/versions.env \
- && test -n "${DEBIAN_PERL_VERSION}" \
- && apt-get update \
- && apt-get install -y --no-install-recommends \
-      "perl=${DEBIAN_PERL_VERSION}" \
-      "perl-base=${DEBIAN_PERL_VERSION}" \
-      "perl-modules-5.36=${DEBIAN_PERL_VERSION}" \
-      "libperl5.36=${DEBIAN_PERL_VERSION}" \
- && rm -rf /var/lib/apt/lists/*
+ && test "$(node -p 'require("/app/node_modules/npm/package.json").version')" = 12.2.0 \
+ && test "$(readlink -f /app/node_modules/npm)" = /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
+ && curl -fsSL --retry 3 --retry-all-errors -o /tmp/npm.tgz \
+      "https://registry.npmjs.org/npm/-/npm-${NPM_VERSION}.tgz" \
+ && NPM_INTEGRITY="$NPM_INTEGRITY" node -e 'const fs=require("fs"),c=require("crypto"); const actual="sha512-"+c.createHash("sha512").update(fs.readFileSync("/tmp/npm.tgz")).digest("base64"); if(actual!==process.env.NPM_INTEGRITY) throw Error("npm integrity mismatch")' \
+ && rm -rf /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
+ && mkdir /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
+ && tar -xzf /tmp/npm.tgz --strip-components=1 -C /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
+ && rm /tmp/npm.tgz \
+ && test "$(node /app/node_modules/npm/bin/npm-cli.js --version)" = "$NPM_VERSION"
 
 RUN . /opt/compliance-claw/versions.env \
  && test -n "${MODEL}" \

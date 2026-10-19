@@ -2,14 +2,14 @@
 #
 # READ THIS BEFORE ADDING AN ENTRY.
 #
-# The release gate blocks on CRITICAL findings that have a fix available. Every
-# entry below is a finding that meets that bar and is being shipped anyway, so
+# The release gate blocks on HIGH and CRITICAL findings that have a fix available.
+# Every entry below is a finding that meets that bar and is being shipped anyway, so
 # each one needs a reason that survives being read out loud in an audit.
 #
 # Three rules:
 #   1. NEVER a blanket ignore. One entry per vulnerability id, never a package
-#      wildcard and never a severity-wide exclusion. A new fixable CRITICAL must
-#      still stop the release.
+#      wildcard and never a severity-wide exclusion. A new fixable HIGH or
+#      CRITICAL must still stop the release.
 #   2. EVERY entry expires. `expired_at` is what stops this file becoming a
 #      permanent amnesty. When an entry expires the gate starts failing again,
 #      which is the point: the exception is reviewed or the base image moves.

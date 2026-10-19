@@ -358,16 +358,13 @@ Ordered roughly by how much it matters, not by effort.
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
 6. **Keep base-image vulnerabilities under review.** The build pins OpenClaw
-   2026.10.3. Its fixed MCP SDK/client versions address CVE-2026-104850, and
-   source-map-js 1.2.2 addresses CVE-2026-93749. The base and rebuilt image scans
-   no longer report those findings or the previously accepted vulnerability IDs.
-   Bundled npm HIGH findings remain visible. The exception list stays empty.
-   The runtime pins four existing Perl packages to
-   the exact Debian security version in `DEBIAN_PERL_VERSION`; this fixes
-   CVE-2026-13221, CVE-2026-42496, and CVE-2026-8376. It does not run a general
-   OS upgrade. The release gate still blocks fixable CRITICAL findings and
-   reports unfixed findings. A passing gate is not proof that the image has no
-   vulnerabilities.
+   2026.10.5. This base already contains the four fixed Debian Perl packages;
+   Claw no longer installs them again. Its app-local npm 12.2.0 still contains
+   three fixable HIGH findings in brace-expansion and undici. Claw replaces
+   that package with official npm 12.2.1 and verifies its pinned integrity.
+   The release gate blocks fixable HIGH and CRITICAL findings. Unfixed findings
+   remain in the report. Exceptions require a reason and expiry; the list is
+   empty. A passing gate is not proof that the image has no vulnerabilities.
 7. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
    publishes and verifies an immutable digest, which is integrity but not
    authenticity: nothing attests *who* built a given digest. **The image is
@@ -448,9 +445,9 @@ Ordered roughly by how much it matters, not by effort.
   cosign v3 removed `verify-blob --signature`. There is deliberately no second
   pin, because nothing signs the container image — a pin no job consumes would
   advertise a verification that does not happen.
-- **Trivy's release gate ignores unfixed CRITICALs.** A critical CVE in the base
-  image with no upstream patch would otherwise make every release unshippable,
-  and an unsatisfiable gate gets disabled. Unfixed criticals are printed in the
+- **Trivy's release gate does not block unfixed HIGH or CRITICAL findings.**
+  A CVE in the base image with no upstream patch would otherwise make every release unshippable,
+  and an unsatisfiable gate gets disabled. Unfixed findings are printed in the
   job summary rather than dropped.
 - **The published image is not signed, and the SBOM is not an attestation.** The
   release publishes by immutable digest and verifies the round trip in CI — the
