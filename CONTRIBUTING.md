@@ -121,6 +121,8 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | Effort schema/credentials | `python3 scripts/parse-efforts.py --self-test` | Python 3; validates rules, not runtime secret delivery. |
 | Config patch | `python3 scripts/openclaw-patch.py --self-test` | Python 3; no running gateway. |
 | `clawctl` | `bash scripts/clawctl --self-test` | Host tools; uses stub Docker and temporary files. |
+| Host image update | `python3 scripts/test-update.py` | Host tools; runs the real updater with isolated Git and Docker stubs. Does not prove live readiness or Compose merging. |
+| Host image update with Compose | `python3 scripts/test-update-compose.py LOCAL_IMAGE OTHER_LOCAL_IMAGE` | Two cached images with `sh`, `sleep`, and `test`; synthetic containers, two disposable projects, no registry or service credentials. Does not run OpenClaw or prove channel/MCP operation. |
 | Target sync | `bash scripts/sync-targets.sh --self-test` | Bash, Git, Python 3; creates temporary local repositories. |
 | Shell diagnostic text | `python3 scripts/lint-heredocs.py scripts/*.sh` | Local static check; not a separate build CI step. |
 | CLI updater input | `bash scripts/pretorin-update.sh --self-test` | Docker and the candidate build overlay; the wrapper runs the in-image script. |
