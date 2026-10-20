@@ -71,6 +71,13 @@ the extra Doctor pass. Ordinary retained CLI commands do not run Slack
 preparation during startup. Unused Slack skips its operations and early Doctor
 pass.
 
+`clawctl apply` validates and applies its configuration patch inside the gateway
+container when that service is running. OpenClaw verifies the state owner in the
+same PID namespace. The command uses the existing entrypoint to load file
+credentials inside the container. Before the gateway exists, it uses the CLI
+container. Do not remove state ownership locks to make a separate container read
+live state.
+
 ## Pretorin CLI activation and results
 
 The [CLI update commands](../README.md#updating-the-pretorin-cli) share the signed

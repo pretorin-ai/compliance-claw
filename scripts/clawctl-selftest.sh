@@ -82,6 +82,12 @@ esac
 case " \$* " in
   *" openclaw config patch --stdin "*|*" openclaw config patch --stdin")
     _patch="\$(cat)"
+    if [ "\${STUB_GATEWAY_RUNNING:-0}" = 1 ]; then
+      case " \$* " in
+        *" exec -T openclaw /usr/local/bin/compliance-claw-entrypoint openclaw config patch "*) ;;
+        *) echo 'GatewayLockNamespaceError: different PID namespace' >&2; exit 1 ;;
+      esac
+    fi
     case " \$* " in
       *" --dry-run "*|*" --dry-run")
         [ "\${STUB_OC_FAIL}" = dryrun ] && exit 1
@@ -144,6 +150,9 @@ fi
 # The lock sidecar: report a plausible container id.
 case " \$* " in
   *" run -d "*) echo "0123456789abcdef0123"; exit 0 ;;
+  *" compose ps --status running -q openclaw "*)
+    [ "\${STUB_GATEWAY_RUNNING:-0}" = 1 ] && echo gateway-container
+    exit 0 ;;
 esac
 case "\${1:-}" in
   logs)    echo CLAWCTL_LOCK_HELD; exit 0 ;;
@@ -910,9 +919,19 @@ BASE
         STUB_OC_CONFIG="$OC" STUB_OC_FAIL="${1:-}" STUB_WS_ROOT="${tmp}/ocstate" \
         STUB_TARGETS="simple-crm other" STUB_ONBOARD="${2:-ok}" \
         STUB_WS_FAIL="${STUB_WS_FAIL:-}" \
+        STUB_GATEWAY_RUNNING="${STUB_GATEWAY_RUNNING:-0}" \
         bash "${root}/scripts/clawctl" apply ) >"$fleetlog" 2>&1
   }
-  st_fleet_apply || true
+  if st_fleet_apply; then
+    st_ok "full apply works before a gateway exists"
+  else
+    st_bad "full apply works before a gateway exists" "$(tail -8 "$fleetlog")"
+  fi
+  if STUB_GATEWAY_RUNNING=1 st_fleet_apply; then
+    st_ok "full apply uses the gateway PID namespace and entrypoint when running"
+  else
+    st_bad "full apply uses the gateway PID namespace and entrypoint when running" "$(tail -8 "$fleetlog")"
+  fi
 
   # --- agents ---
   local q

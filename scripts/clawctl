@@ -717,11 +717,10 @@ print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))'
 # ---------------------------------------------------------------------------
 # TWO COMMAND PATHS, AND USING THE WRONG ONE IS A SILENT FAILURE.
 #
-#   oc_cli   `run --rm -T cli openclaw ...` — offline config work, and the only
-#            path that works BEFORE a gateway container exists. `run` executes the
-#            entrypoint, so the file-backed gateway token is loaded in-process;
-#            without it the config's "${OPENCLAW_GATEWAY_TOKEN}" is unset and the
-#            WHOLE config is invalid.
+#   oc_cli   config commands run inside the gateway when it is running. OpenClaw
+#            must verify the state owner in the same PID namespace. Before a
+#            gateway exists, use the one-off CLI container. Both routes run the
+#            existing entrypoint to load file secrets inside the container.
 #
 #   oc_exec  `exec -T openclaw sh -c '...'` — anything that talks to the RUNNING
 #            gateway. `cli` has its own empty loopback, so a gateway-bound command
@@ -733,7 +732,13 @@ print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))'
 # smoke.sh and docs/file-secrets.md already use. NEVER
 # `exec -e TOKEN="$(cat ...)"`: that puts the secret in host argv.
 oc_cli() {
-  docker compose run --rm -T cli openclaw "$@" < /dev/null
+  local running
+  running="$(docker compose ps --status running -q openclaw)" || return 1
+  if [ -n "$running" ]; then
+    docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint openclaw "$@"
+  else
+    docker compose run --rm -T cli openclaw "$@"
+  fi
 }
 
 # The token reload, verbatim, as a prelude to every exec'd command. The -z guard
@@ -1190,7 +1195,7 @@ validate_patch() {
   done < "${GEN_DIR}/replace-paths.txt"
 
   log "  validating the patch against OpenClaw's own schema (--dry-run)"
-  docker compose run --rm -T cli openclaw config patch --stdin --dry-run \
+  oc_cli config patch --stdin --dry-run \
     ${flags[@]+"${flags[@]}"} < "${GEN_DIR}/patch.json" >&2 \
     || die "the generated configuration did not validate. Nothing has been changed:
   no workspace was written and ${OC_CONFIG} was not modified. The patch is at
@@ -1216,7 +1221,7 @@ apply_patch() {
   done < "${GEN_DIR}/replace-paths.txt"
 
   log "  applying"
-  if ! docker compose run --rm -T cli openclaw config patch --stdin \
+  if ! oc_cli config patch --stdin \
          ${flags[@]+"${flags[@]}"} < "${GEN_DIR}/patch.json" >&2; then
     return 1
   fi
