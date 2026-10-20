@@ -24,9 +24,10 @@ gh release create vX.Y.Z --target master --generate-notes
 
 The `release: published` event starts the workflow. It builds `linux/amd64`,
 checks the image and file-secret contract, scans vulnerabilities, and generates
-an SPDX software bill of materials (SBOM). Fixable CRITICAL findings block
-publication, subject to the reviewed exception file. HIGH and unfixed findings
-are reported separately.
+an SPDX software bill of materials (SBOM). Fixable HIGH and CRITICAL findings
+block publication, subject to the reviewed exception file. The separate scan checks HIGH and
+CRITICAL findings, including those with no fix. The job summary keeps its last
+60 lines. Scanner failures also fail the workflow.
 
 The workflow pushes a staging reference, pulls its digest back, checks the
 pulled bytes and SBOM, and only then applies and verifies the version tag.

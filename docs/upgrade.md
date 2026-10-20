@@ -1,6 +1,6 @@
 # OpenClaw upgrade and recovery
 
-The build pins OpenClaw 2026.10.3 and Pretorin CLI seed 0.30.3. A fresh
+The build pins OpenClaw 2026.10.5 and Pretorin CLI seed 0.30.4. A fresh
 installation uses this seed. An image upgrade keeps the active CLI in the
 Pretorin state volume. Use the CLI update command to change that active copy.
 
@@ -33,7 +33,7 @@ Pretorin CLI. Send a test request through the approved test channel. Replace
 the container once more and repeat the checks. The replacement must use the
 same state volumes.
 
-The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.10.3 allows
+The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.10.5 allows
 325 seconds for shutdown and 5 more seconds for its supervisor. Compose uses
 this limit for a service stop or replacement. A stop can take several minutes
 when work is active.
@@ -70,6 +70,13 @@ the channel patch. That initial step has no Slack configuration and does not run
 the extra Doctor pass. Ordinary retained CLI commands do not run Slack
 preparation during startup. Unused Slack skips its operations and early Doctor
 pass.
+
+`clawctl apply` validates and applies its configuration patch inside the gateway
+container when that service is running. OpenClaw verifies the state owner in the
+same PID namespace. The command uses the existing entrypoint to load file
+credentials inside the container. Before the gateway exists, it uses the CLI
+container. Do not remove state ownership locks to make a separate container read
+live state.
 
 ## Pretorin CLI activation and results
 
