@@ -511,13 +511,29 @@ clawctl_self_test() {
   [ -e "$E" ] && st_bad "the refused migrate wrote no file" || st_ok "the refused migrate wrote no file"
 
   if out="$(TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
-              bash "${root}/scripts/clawctl" migrate --name crm-soc2 2>&1)" \
+              SLACK_CHANNEL_ID=C0IGNORED bash "${root}/scripts/clawctl" migrate --name crm-soc2 2>&1)" \
       && ! grep -q 'slack_channel_id:' "$E"; then
     st_ok "migrate supports an effort without a Slack channel"
   else
     st_bad "migrate supports an effort without a Slack channel" "$out"
   fi
+  case "$out" in
+    *"browser-only"*"retain Slack"*"slack_channel_id"*"before apply"*)
+      st_ok "migration explains browser-only access and how to retain Slack" ;;
+    *) st_bad "migration explains browser-only access and how to retain Slack" "$out" ;;
+  esac
   rm -f "$E"
+  if out="$(TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
+      bash "${root}/scripts/clawctl" migrate --name crm-soc2 --slack-channel-id '' 2>&1)"; then
+    st_bad "migrate rejects an explicitly empty channel" "$out"
+  else
+    case "$out" in
+      *"--slack-channel-id needs a value"*) st_ok "migrate rejects an explicitly empty channel" ;;
+      *) st_bad "migrate rejects an explicitly empty channel" "$out" ;;
+    esac
+  fi
+  [ ! -e "$E" ] && st_ok "empty channel rejection creates no output file" \
+    || st_bad "empty channel rejection creates no output file"
 
   # A D id is a DM conversation, not a channel; refusing it here is what keeps a
   # DM from being configured as an effort's home.
@@ -921,6 +937,37 @@ BASE
         STUB_GATEWAY_RUNNING="${STUB_GATEWAY_RUNNING:-0}" \
         bash "${root}/scripts/clawctl" apply ) >"$fleetlog" 2>&1
   }
+  # Run the full apply path with no prior Slack config or recorded routes.
+  cp "$OC" "${tmp}/slack-base.json"; cp "$E" "${tmp}/slack-efforts.yaml"
+  python3 - "$OC" "$E" <<'PYTHON'
+import json, sys
+p, e = sys.argv[1:]
+c = json.load(open(p)); c.pop("channels")
+c["plugins"]["allow"].remove("slack")
+json.dump(c, open(p, "w"))
+text = open(e).readlines()
+open(e, "w").write("".join(line for line in text if "slack_channel_id:" not in line))
+PYTHON
+  if st_fleet_apply; then
+    st_ok "full apply passes with Slack never configured (stub services)"
+  else
+    st_bad "full apply passes with Slack never configured" "$(tail -8 "$fleetlog")"
+  fi
+  if python3 - "$OC" "${tmp}/state/last-applied.json" <<'PYTHON'
+import json, sys
+c, state = [json.load(open(p)) for p in sys.argv[1:]]
+assert "slack" not in c.get("channels", {}) and c["bindings"] == []
+assert state["dmPolicy"] is None and state["channelBindings"] == {}
+assert len(c["agents"]["list"]) == 2
+assert all("pretorin-" + a["id"] in c["mcp"]["servers"] for a in c["agents"]["list"])
+PYTHON
+  then st_ok "fresh browser apply retains agents and MCP without configuring Slack"
+  else st_bad "fresh browser apply retains agents and MCP without configuring Slack"; fi
+  case "$(cat "$fleetlog")" in
+    *"Slack not configured"*) st_ok "patch summary distinguishes unconfigured Slack" ;;
+    *) st_bad "patch summary distinguishes unconfigured Slack" "$(tail -8 "$fleetlog")" ;;
+  esac
+  cp "${tmp}/slack-base.json" "$OC"; cp "${tmp}/slack-efforts.yaml" "$E"
   if st_fleet_apply; then
     st_ok "full apply works before a gateway exists"
   else
@@ -1829,6 +1876,26 @@ PY
   st_head "13. optional Slack channel transitions"
   st_fleet_apply || st_bad "prepare channel transition" "$(tail -4 "$fleetlog")"
   cp "$E" "${tmp}/efforts.channels.yaml"
+  st_channel_plan() {
+    ( cd "$tmp" && PATH="${bin}:$PATH" CC_EFFORTS_FILE="$E" \
+      COMPLIANCE_CLAW_SECRET_DIR="$S" COMPOSE_FILE=compose.yaml:compose.secrets.yaml \
+      CC_TARGETS_DIR="${tmp}/workspace/targets" CC_STATE_DIR="${tmp}/state" \
+      bash "${root}/scripts/clawctl" plan ) 2>&1
+  }
+  python3 - "$E" <<'PYTHON'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, "w").write(s.replace("C0SOC2AAA", "TEMP").replace("C0HIPAABB", "C0SOC2AAA").replace("TEMP", "C0HIPAABB"))
+PYTHON
+  before="$(st_manifest "$tmp")"; plan_out="$(st_channel_plan)"; after="$(st_manifest "$tmp")"
+  case "$plan_out" in
+    *"~ channel C0HIPAABB: crm-hipaa -> crm-soc2 (reassigned)"*"~ channel C0SOC2AAA: crm-soc2 -> crm-hipaa (reassigned)"*)
+      st_ok "plan reports both channel reassignments" ;;
+    *) st_bad "plan reports both channel reassignments" "$plan_out" ;;
+  esac
+  [ "$before" = "$after" ] && st_ok "channel plan changes no files and calls no Docker stub" \
+    || st_bad "channel plan changes no files and calls no Docker stub"
+  cp "${tmp}/efforts.channels.yaml" "$E"
   printf 'keep memory\n' > "${tmp}/ocstate/workspace-crm-hipaa/MEMORY.md"
   local channel_state_before
   channel_state_before="$(st_manifest "$S")"
@@ -1840,6 +1907,11 @@ p, channel = sys.argv[1:]
 s = open(p).read().replace("    slack_channel_id: " + channel + "\n", "")
 open(p, "w").write(s)
 PYTHON
+    plan_out="$(st_channel_plan)"
+    case "$plan_out" in
+      *"- channel $channel -> "*"(removed)"*) st_ok "plan reports removal of $channel" ;;
+      *) st_bad "plan reports removal of $channel" "$plan_out" ;;
+    esac
     if st_fleet_apply; then
       st_ok "apply succeeds after removal of $channel"
     else
@@ -1857,6 +1929,10 @@ PYTHON
   else
     st_bad "browser workspace retains its MCP prefix and has no channel"
   fi
+  case "$plan_out" in
+    *"Slack not configured by this patch"*) st_ok "browser-only plan does not report dmPolicy None" ;;
+    *) st_bad "browser-only plan does not report dmPolicy None" "$plan_out" ;;
+  esac
   cp "${tmp}/efforts.channels.yaml" "$E"
   st_fleet_apply && st_ok "apply restores declared channels" \
     || st_bad "apply restores declared channels" "$(tail -6 "$fleetlog")"

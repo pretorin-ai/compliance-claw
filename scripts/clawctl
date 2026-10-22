@@ -438,7 +438,12 @@ HDR
   log "  effort:     ${name}"
   log "  scope:      ${system} / ${framework}"
   log "  credential: default -> ${SECRET_DIR}/pretorin-api-key (the one you already have)"
-  log "  channel:    ${want_channel}"
+  if [ -n "$want_channel" ]; then
+    log "  channel:    ${want_channel}"
+  else
+    log "  access:     browser-only (select this agent in the Control UI)"
+    log "  To retain Slack, declare slack_channel_id in ${EFFORTS_FILE} before apply."
+  fi
   log "  targets:    $(effort_targets "$name" | tr '\n' ' ')"
   log ""
   log "${TARGETS_FILE} was NOT modified. It is migration input only from here on:"
@@ -1794,14 +1799,25 @@ for a in sorted(was_agents - now_agents):
     p("- agent %s  (binding, MCP entry and channel allowlist entry removed;"
       " workspace, memory, credential and clones KEPT)" % a)
 
-for channel, agent in sorted(manifest["channelBindings"].items()):
-    p("  channel %s -> %s" % (channel, agent))
+was_channels = state.get("channelBindings") or {}
+now_channels = manifest["channelBindings"]
+for channel in sorted(set(was_channels) | set(now_channels)):
+    was, now = was_channels.get(channel), now_channels.get(channel)
+    if now is None:
+        p("- channel %s -> %s (removed)" % (channel, was))
+    elif was is None:
+        p("+ channel %s -> %s (added)" % (channel, now))
+    elif was != now:
+        p("~ channel %s: %s -> %s (reassigned)" % (channel, was, now))
+    else:
+        p("  channel %s -> %s (unchanged)" % (channel, now))
 for server in manifest["mcpServers"]:
     p("  mcp %s" % server)
 for server in manifest["deactivatedMcpServers"]:
     p("- mcp %s (deactivated)" % server)
 
-p("  dmPolicy %s" % manifest["dmPolicy"])
+p("  Slack not configured by this patch" if manifest["dmPolicy"] is None
+  else "  dmPolicy %s" % manifest["dmPolicy"])
 for user, agent in sorted(manifest["directBindings"].items()):
     p("  DM %s -> %s (operator-managed, preserved)" % (user, agent))
 

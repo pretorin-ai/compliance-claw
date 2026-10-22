@@ -718,7 +718,7 @@ mode_sync() {
     # difference between a useful refusal and a misleading one.
     if [ -n "$EFFORT" ]; then
       emit_result "$name" out_of_effort - - \
-        "'${name}' is not one of effort '${EFFORT}'s targets. Each effort agent can only synchronize the repositories declared for its own effort in $(target_source); if '${name}' belongs to another effort, ask in that effort's Slack channel."
+        "'${name}' is not one of effort '${EFFORT}'s targets. Each effort agent can only synchronize the repositories declared for its own effort in $(target_source); if '${name}' belongs to another effort, ask that effort's agent in the Control UI or its declared Slack channel."
       audit "$name" out_of_effort "" ""
       printf 'SUMMARY\ttotal=0\tupdated=0\tfailed=1\toverall=failed\n'
       exit 1
@@ -1294,6 +1294,13 @@ EFF
   else
     st_ok "  a target of ANOTHER effort is refused"
   fi
+  local refusal
+  refusal="$(mode_sync only-b 2>&1)" && st_bad "cross-effort sync must fail"
+  case "$refusal" in
+    *"ask that effort's agent in the Control UI or its declared Slack channel"*)
+      st_ok "cross-effort refusal supports browser-only efforts" ;;
+    *) st_bad "cross-effort refusal supports browser-only efforts" "$refusal" ;;
+  esac
   case "$(target_source)" in *efforts.yaml) st_ok "  refusals name efforts.yaml, not targets.yaml" ;;
     *) st_bad "  refusals name efforts.yaml, not targets.yaml" "$(target_source)" ;;
   esac

@@ -94,7 +94,7 @@ tool said `updated`.
 
 `all` means **all of this effort's targets**, never every repository on the
 deployment. A target belonging to another effort is refused by name; that refusal
-is correct, and the answer is to ask in that effort's channel.
+is correct. Ask that effort's agent in the Control UI or its declared Slack channel.
 
 Adding, removing or re-pointing a target is an operator action on the host — if
 one is missing, say so and stop.

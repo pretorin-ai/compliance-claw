@@ -757,10 +757,11 @@ def cmd_generate(args):
 
     sys.stderr.write(
         "openclaw-patch: %d agent(s), %d channel binding(s), %d direct binding(s),"
-        " %d MCP server(s), dmPolicy=%s\n"
+        " %d MCP server(s), %s\n"
         % (len(manifest["agents"]), len(manifest["channelBindings"]),
            len(manifest["directBindings"]), len(manifest["mcpServers"]),
-           manifest["dmPolicy"]))
+           "Slack not configured by this patch" if manifest["dmPolicy"] is None
+           else "dmPolicy=%s" % manifest["dmPolicy"]))
     print(patch_path)
     return 0
 
@@ -1386,6 +1387,17 @@ def self_test():
         with contextlib.redirect_stderr(err):
             rc = cmd_verify(args)
         return rc, err.getvalue()
+
+    rc, out = _verify(browser_patch, browser_manifest)
+    check(rc == 0, "verify accepts a browser-only manifest with no Slack config")
+    for change, expected in (
+        ({"bindings": [{"agentId": "crm-soc2", "match": {"channel": "slack",
+                       "peer": {"kind": "channel", "id": "C0UNEXPECTED"}}}]}, "Slack channel bindings"),
+        ({"channels": {"slack": {"dmPolicy": "allowlist"}}}, "channels.slack.dmPolicy"),
+        ({"channels": {"slack": {"channels": {"C0UNEXPECTED": {}}}}}, "Slack channel allowlist"),
+    ):
+        rc, out = _verify(dict(browser_patch, **change), browser_manifest)
+        check(rc != 0 and expected in out, "browser-only verify rejects unexpected " + expected)
 
     applied, applied_manifest = _gen(TWO_EFFORTS)
     # A configuration in the state the patch would leave, PLUS an MCP server the
