@@ -102,18 +102,22 @@ case " \$* " in
     CC_DROP=""
     case "\${STUB_OC_FAIL}" in verify|rollback) CC_DROP=1 ;; esac
     CC_DROP="\$CC_DROP" CC_PATCH="\$_patch" CC_CFG="\${STUB_OC_CONFIG}" python3 -c '
-import json, os
+import json, os, sys
+replace = {sys.argv[i+1] for i, a in enumerate(sys.argv[:-1]) if a == "--replace-path"}
 patch = json.loads(os.environ["CC_PATCH"])
 try:
     cfg = json.load(open(os.environ["CC_CFG"]))
 except Exception:
     cfg = {}
-def merge(dst, src):
+def merge(dst, src, path=""):
     for k, v in src.items():
-        if v is None:
+        child = path + "." + k if path else k
+        if child in replace:
+            dst[k] = v
+        elif v is None:
             dst.pop(k, None)
         elif isinstance(v, dict) and isinstance(dst.get(k), dict):
-            merge(dst[k], v)
+            merge(dst[k], v, child)
         else:
             dst[k] = v
 merge(cfg, patch)
@@ -130,7 +134,7 @@ elif os.environ.get("CC_DROP") and cfg.get("agents", {}).get("entries"):
     cfg["agents"]["entries"].pop(next(reversed(cfg["agents"]["entries"])))
 cfg.setdefault("meta", {})["lastTouchedAt"] = "stub"
 json.dump(cfg, open(os.environ["CC_CFG"], "w"), indent=2, sort_keys=True)
-'
+' "\$@"
     exit 0 ;;
 esac
 
@@ -506,19 +510,14 @@ clawctl_self_test() {
   fi
   [ -e "$E" ] && st_bad "the refused migrate wrote no file" || st_ok "the refused migrate wrote no file"
 
-  # THE CHANNEL IS THE OTHER THING THAT CANNOT BE DERIVED. targets.yaml has no
-  # Slack in it at all, and a placeholder would produce a file that validates and
-  # routes nowhere — the exact failure that looks like a broken bot.
   if out="$(TARGETS_FILE="$T" CC_EFFORTS_FILE="$E" COMPLIANCE_CLAW_SECRET_DIR="$S" \
-              bash "${root}/scripts/clawctl" migrate --name crm-soc2 2>&1)"; then
-    st_bad "migrate refuses to invent a Slack channel id" "it generated one"
+              bash "${root}/scripts/clawctl" migrate --name crm-soc2 2>&1)" \
+      && ! grep -q 'slack_channel_id:' "$E"; then
+    st_ok "migrate supports an effort without a Slack channel"
   else
-    case "$out" in
-      *"--slack-channel-id"*) st_ok "migrate refuses to invent a channel and names the flag" ;;
-      *) st_bad "migrate refuses to invent a channel" "message did not name the flag" ;;
-    esac
+    st_bad "migrate supports an effort without a Slack channel" "$out"
   fi
-  [ -e "$E" ] && st_bad "that refusal wrote no file either" || st_ok "that refusal wrote no file either"
+  rm -f "$E"
 
   # A D id is a DM conversation, not a channel; refusing it here is what keeps a
   # DM from being configured as an effort's home.
@@ -1826,6 +1825,47 @@ PY
     *) st_bad "  and says removal is non-destructive" ;;
   esac
   cp "${tmp}/efforts.both2.yaml" "$E"
+
+  st_head "13. optional Slack channel transitions"
+  st_fleet_apply || st_bad "prepare channel transition" "$(tail -4 "$fleetlog")"
+  cp "$E" "${tmp}/efforts.channels.yaml"
+  printf 'keep memory\n' > "${tmp}/ocstate/workspace-crm-hipaa/MEMORY.md"
+  local channel_state_before
+  channel_state_before="$(st_manifest "$S")"
+  # First a mixed fleet, then a fleet with no channel declarations.
+  for channel in C0HIPAABB C0SOC2AAA; do
+    python3 - "$E" "$channel" <<'PYTHON'
+import sys
+p, channel = sys.argv[1:]
+s = open(p).read().replace("    slack_channel_id: " + channel + "\n", "")
+open(p, "w").write(s)
+PYTHON
+    if st_fleet_apply; then
+      st_ok "apply succeeds after removal of $channel"
+    else
+      st_bad "apply succeeds after removal of $channel" "$(tail -6 "$fleetlog")"
+    fi
+    if [ "$(q "print('$channel' in cfg['channels']['slack']['channels'])")" = False ]; then
+      st_ok "removed channel is absent from the allowlist"
+    else
+      st_bad "removed channel is absent from the allowlist"
+    fi
+  done
+  if grep -q 'pretorin-crm-hipaa' "${tmp}/ocstate/workspace-crm-hipaa/AGENTS.md" \
+      && grep -q 'Slack channel:.*none' "${tmp}/ocstate/workspace-crm-hipaa/AGENTS.md"; then
+    st_ok "browser workspace retains its MCP prefix and has no channel"
+  else
+    st_bad "browser workspace retains its MCP prefix and has no channel"
+  fi
+  cp "${tmp}/efforts.channels.yaml" "$E"
+  st_fleet_apply && st_ok "apply restores declared channels" \
+    || st_bad "apply restores declared channels" "$(tail -6 "$fleetlog")"
+  if [ "$(cat "${tmp}/ocstate/workspace-crm-hipaa/MEMORY.md")" = 'keep memory' ] \
+      && [ "$(st_manifest "$S")" = "$channel_state_before" ]; then
+    st_ok "channel transitions preserve memory and credential files"
+  else
+    st_bad "channel transitions preserve memory and credential files"
+  fi
 
   # Keep the fixture on request, so a failure here can be inspected rather than
   # reproduced from scratch.

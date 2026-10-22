@@ -6,7 +6,7 @@
     parse-efforts.py scope    EFFORT  [FILE]        -> "<system>\\t<framework>\\t<credential_ref>"
     parse-efforts.py list     EFFORT  [FILE]        -> "<name>\\t<url>\\t<private>\\t<ref>"
     parse-efforts.py targets-all      [FILE]        -> the same, deduped across every effort
-    parse-efforts.py agents           [FILE]        -> "<effort>\\t<agent>\\t<channel>\\t<mcp>\\t<prefix>\\t<ref>"
+    parse-efforts.py agents           [FILE]        -> "<effort>\\t<agent>\\t<mcp>\\t<prefix>\\t<ref>\\t<channel>"
     parse-efforts.py credentials      [FILE]        -> "<effort>\\t<ref>\\t<host_path>\\t<container_path>"
     parse-efforts.py credential-path EFFORT [FILE] [--container]
     parse-efforts.py --self-test
@@ -46,7 +46,7 @@ The subset:
         system_id: <scalar>
         framework_id: <scalar>
         credential_ref: <scalar>
-        slack_channel_id: <scalar>
+        slack_channel_id: <scalar>  # optional
         targets:
           - name: <scalar>
             url: <scalar>
@@ -93,8 +93,7 @@ _scalar = pt._scalar
 
 EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref",
                "slack_channel_id", "targets")
-REQUIRED_EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref",
-                        "slack_channel_id")
+REQUIRED_EFFORT_KEYS = ("name", "system_id", "framework_id", "credential_ref")
 # Keys whose value may legally be empty on its own line, because their content
 # is the indented block beneath them.
 BLOCK_KEYS = ("targets",)
@@ -557,13 +556,14 @@ def validate(efforts):
         _check_system_uuid(effort["system_id"], name, line)
         _check_token(effort["framework_id"], "framework_id", name, line)
         _check_token(effort["credential_ref"], "credential_ref", name, line)
-        _check_slack_channel_id(effort["slack_channel_id"], name, line)
+        if "slack_channel_id" in effort:
+            _check_slack_channel_id(effort["slack_channel_id"], name, line)
 
         # ONE CHANNEL ROUTES TO ONE AGENT. The channel id is both an allowlist key
         # and a binding's peer id; two efforts claiming it would produce two
         # bindings in the same match tier, where OpenClaw takes the first in config
         # order and the other effort silently never answers in its own channel.
-        channel = effort["slack_channel_id"]
+        channel = effort.get("slack_channel_id")
         if channel in seen_channels:
             other, other_line = seen_channels[channel]
             raise ParseError(
@@ -575,7 +575,8 @@ def validate(efforts):
                 " anywhere. Give each effort its own channel."
                 % (name, other, other_line, channel),
             )
-        seen_channels[channel] = (name, line)
+        if channel is not None:
+            seen_channels[channel] = (name, line)
 
         # One preflight artifact is keyed on system+framework. Two efforts on the
         # same pair are the same compliance effort wearing two names, and they
@@ -802,9 +803,7 @@ CASES = [
     #
     # C ONLY. The two interesting rejections are D and G, and they are separate
     # cases because they are separate mistakes with separate remedies.
-    ("slack_channel_id missing",
-     "efforts:\n  - name: a\n    system_id: " + UUID_A + "\n    framework_id: f\n    credential_ref: c\n"
-     "    targets:\n      - name: t\n        url: https://e/r.git\n", "has no slack_channel_id"),
+    ("slack_channel_id is empty", _e(chan=""), "empty value"),
     ("slack_channel_id is a DM id", _e(chan="D0123ABCDEF"), "is a DM conversation id"),
     ("slack_channel_id is a legacy G id", _e(chan="G0123ABCDEF"), "is a legacy G id"),
     ("slack_channel_id is a channel NAME", _e(chan="#compliance"), "is a channel NAME"),
@@ -884,7 +883,14 @@ def self_test():
         print("FAIL  happy path rejected: %s" % exc)
         return 1
 
+    browser = parse(re.sub(r"    slack_channel_id: [^\n]+\n", "", GOOD))
+    mixed = parse(GOOD.replace("    slack_channel_id: C0HIPAABB\n", ""))
+
     checks = [
+        (len(browser) == 2 and all("slack_channel_id" not in e for e in browser),
+         "two browser efforts need no channel"),
+        (mixed[0]["slack_channel_id"] == "C0SOC2AAA" and "slack_channel_id" not in mixed[1],
+         "mixed efforts retain only the declared channel"),
         (len(efforts) == 2, "effort count"),
         (efforts[0]["name"] == "crm-soc2", "first effort name"),
         (efforts[0]["system_id"] == "13c1f44e-b66d-417c-8604-4ac7b988b411", "system_id"),
@@ -1024,12 +1030,13 @@ def main(argv):
     if mode == "agents":
         # One row per effort: everything downstream needs to generate an agent,
         # a binding and an MCP server, derived HERE so nothing re-derives it.
+        # The optional channel is last: Bash read collapses empty middle fields.
         for effort in efforts:
             name = effort["name"]
             server = mcp_server_name(name)
             print("%s\t%s\t%s\t%s\t%s\t%s" % (
-                name, agent_id(name), effort["slack_channel_id"],
-                server, mcp_tool_prefix(server), effort["credential_ref"]))
+                name, agent_id(name), server, mcp_tool_prefix(server),
+                effort["credential_ref"], effort.get("slack_channel_id", "")))
         return 0
 
     effort = find_effort(efforts, effort_name)

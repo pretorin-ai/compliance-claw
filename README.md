@@ -109,9 +109,9 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password
 export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
 
 # 2. declare what you are reviewing, for which compliance scope, and where it
-#    lives in Slack. efforts.yaml is what the deployment reads.
+#    uses a Slack channel, if needed. efforts.yaml is what the deployment reads.
 cp efforts.example.yaml efforts.yaml
-vi efforts.yaml                  # system_id, framework_id, slack_channel_id, targets
+vi efforts.yaml                  # system_id, framework_id, targets; optional slack_channel_id
 #    Already have a single-effort targets.yaml? Convert it instead:
 #    scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 
