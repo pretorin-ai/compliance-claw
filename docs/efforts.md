@@ -55,6 +55,7 @@ efforts:
 Control UI. Select that effort's agent in the UI. Its Pretorin scope, credential,
 and repository context remain the same. To add or remove a Slack channel binding, edit
 this field and run `scripts/clawctl apply`; workspace and memory remain in place.
+Slack must already be set up in this deployment before you add a channel.
 
 A supplied channel ID must be unique across efforts. Use the channel's `C` ID
 (open the channel → right-click → *Copy link*). A `D` conversation ID or a

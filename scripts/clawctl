@@ -1170,6 +1170,21 @@ json.dump(config, open(1, "w"))
 PY
   else
     oc_config_read "$live"
+    # A partial Slack block would hide the entrypoint's Slack drift warning.
+    # An absent config is left to the no-configuration path below.
+    python3 - "$live" "$EFFORTS_FILE" <<'PYTHON' || return 1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("patch", "scripts/openclaw-patch.py")
+p = importlib.util.module_from_spec(spec); spec.loader.exec_module(p)
+config = p.load_config_text(open(sys.argv[1]).read())
+if config and p.get_path(config, "channels.slack") is None and any(
+        "slack_channel_id" in e for e in p.pe.load(sys.argv[2])):
+    sys.stderr.write(
+        "clawctl: ERROR — an effort declares slack_channel_id, but Slack is not set up\n"
+        "  in this deployment. Nothing was changed. Supply the Slack tokens and restart\n"
+        "  the gateway, then follow the Slack setup steps it prints; run apply after.\n")
+    raise SystemExit(1)
+PYTHON
     # Retire only an unchanged binding recorded by the last successful apply.
     # Edit this temporary input, not the live configuration or rollback snapshot.
     if [ -f "$STATE_FILE" ]; then
@@ -1181,7 +1196,7 @@ config = p.load_config_text(open(sys.argv[1]).read())
 state = json.load(open(sys.argv[2]))
 efforts = {p.pe.agent_id(e["name"]): e for e in p.pe.load(sys.argv[3])}
 for channel, agent in (state.get("channelBindings") or {}).items():
-    if agent in efforts and efforts[agent].get("slack_channel_id") != channel:
+    if efforts.get(agent, {}).get("slack_channel_id") != channel:
         old = {"agentId": agent, "match": {"channel": "slack",
                "peer": {"kind": "channel", "id": channel}}}
         config["bindings"] = [b for b in config.get("bindings", []) if b != old]

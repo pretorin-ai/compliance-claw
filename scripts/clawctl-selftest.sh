@@ -1871,6 +1871,18 @@ PY
       st_ok "  and says removal is non-destructive" ;;
     *) st_bad "  and says removal is non-destructive" ;;
   esac
+  # Apply must agree with plan: the removed effort's recorded channel binding is
+  # retired, not refused as undeclared.
+  if st_fleet_apply; then
+    st_ok "apply succeeds after removal of an effort with a channel"
+  else
+    st_bad "apply succeeds after removal of an effort with a channel" "$(tail -6 "$fleetlog")"
+  fi
+  if [ "$(q "print('C0HIPAABB' in cfg['channels']['slack']['channels'])")" = False ]; then
+    st_ok "  and its channel is absent from the allowlist"
+  else
+    st_bad "  and its channel is absent from the allowlist"
+  fi
   cp "${tmp}/efforts.both2.yaml" "$E"
 
   st_head "13. optional Slack channel transitions"
@@ -1942,6 +1954,26 @@ PYTHON
   else
     st_bad "channel transitions preserve memory and credential files"
   fi
+  # A browser-only deployment has no channels.slack. Declaring a channel there
+  # must refuse rather than write a partial Slack block that hides the drift
+  # warning in entrypoint.sh.
+  cp "$OC" "${tmp}/oc.with-slack.json"
+  q "cfg['channels'].pop('slack'); json.dump(cfg, open(os.environ['CC_OC'], 'w'))"
+  cp "$OC" "${tmp}/oc.no-slack.json"
+  if st_fleet_apply; then
+    st_bad "apply refuses a channel when Slack is not set up" "it exited 0"
+  else
+    case "$(cat "$fleetlog")" in
+      *"Slack is not set up"*) st_ok "apply refuses a channel when Slack is not set up" ;;
+      *) st_bad "apply refuses a channel when Slack is not set up" "$(tail -6 "$fleetlog")" ;;
+    esac
+  fi
+  if cmp -s "$OC" "${tmp}/oc.no-slack.json"; then
+    st_ok "  and leaves the configuration unchanged"
+  else
+    st_bad "  and leaves the configuration unchanged"
+  fi
+  cp "${tmp}/oc.with-slack.json" "$OC"
 
   # Keep the fixture on request, so a failure here can be inspected rather than
   # reproduced from scratch.
