@@ -517,7 +517,7 @@ def fleet_fingerprint(efforts):
         {"name": e["name"],
          "system_id": e["system_id"],
          "framework_id": e["framework_id"],
-         "slack_channel_id": e["slack_channel_id"],
+         "slack_channel_id": e.get("slack_channel_id"),
          "credential_ref": e["credential_ref"],
          "targets": sorted((target(t) for t in e["targets"]),
                            key=lambda t: t["name"])}
@@ -554,21 +554,22 @@ def build_patch(efforts, config, dm_bindings):
             entry["tools"] = {"deny": ["%s__*" % p for p in deny]}
         agents.append(entry)
 
-        bindings.append({
-            "agentId": agent,
-            "match": {"channel": "slack",
-                      "peer": {"kind": "channel", "id": effort["slack_channel_id"]}},
-        })
-        # THE CHANNEL IS THE TRUST BOUNDARY. Without `users`, OpenClaw refuses
-        # every slash command with "You are not authorized to use this command."
-        # "*" authorizes the members of THIS channel only: groupPolicy
-        # "allowlist" still serves no channel that is not generated here, DMs
-        # stay disabled, and /target-sync is still scoped to the effort the
-        # channel routes to. Membership of the Slack channel is the grant.
-        slack_channels[effort["slack_channel_id"]] = {
-            "requireMention": True,
-            "users": ["*"],
-        }
+        if "slack_channel_id" in effort:
+            bindings.append({
+                "agentId": agent,
+                "match": {"channel": "slack",
+                          "peer": {"kind": "channel", "id": effort["slack_channel_id"]}},
+            })
+            # THE CHANNEL IS THE TRUST BOUNDARY. Without `users`, OpenClaw refuses
+            # every slash command with "You are not authorized to use this command."
+            # "*" authorizes the members of THIS channel only: groupPolicy
+            # "allowlist" still serves no channel that is not generated here, DMs
+            # stay disabled, and /target-sync is still scoped to the effort the
+            # channel routes to. Membership of the Slack channel is the grant.
+            slack_channels[effort["slack_channel_id"]] = {
+                "requireMention": True,
+                "users": ["*"],
+            }
 
         mcp_servers[pe.mcp_server_name(name)] = {
             "command": LAUNCHER,
@@ -615,21 +616,22 @@ def build_patch(efforts, config, dm_bindings):
         "agents": {"list": agents},
         "bindings": bindings,
         "mcp": {"servers": mcp_servers},
-        "channels": {"slack": slack},
     }
+    if slack_channels or dm_bindings or get_path(config, "channels.slack") is not None:
+        patch["channels"] = {"slack": slack}
 
     manifest = {
         # The scope of every effort, so the next apply can refuse a name that has
         # been repointed at a different system or framework.
         "efforts": {e["name"]: {"system_id": e["system_id"],
                                 "framework_id": e["framework_id"],
-                                "slack_channel_id": e["slack_channel_id"],
+                                "slack_channel_id": e.get("slack_channel_id"),
                                 "credential_ref": e["credential_ref"]}
                     for e in efforts},
         "agents": [a["id"] for a in agents],
         "defaultAgent": next((a["id"] for a in agents if a.get("default")), None),
         "channelBindings": {e["slack_channel_id"]: pe.agent_id(e["name"])
-                            for e in efforts},
+                            for e in efforts if "slack_channel_id" in e},
         "directBindings": {_peer(b)["id"]: b["agentId"] for b in dm_bindings
                            if _peer(b).get("kind") == "direct"},
         "ambientBindings": [b for b in dm_bindings if _is_ambient_slack_binding(b)],
@@ -637,7 +639,7 @@ def build_patch(efforts, config, dm_bindings):
         "mcpServers": sorted(k for k, v in mcp_servers.items() if v is not None),
         "deactivatedMcpServers": sorted(k for k, v in mcp_servers.items() if v is None),
         "toolPrefixes": prefixes,
-        "dmPolicy": slack["dmPolicy"],
+        "dmPolicy": get_path(patch, "channels.slack.dmPolicy"),
         "allowFrom": sorted(bound_users),
         "workspaces": {pe.agent_id(e["name"]): workspace_dir(pe.agent_id(e["name"]))
                        for e in efforts},
@@ -715,7 +717,8 @@ def cmd_generate(args):
                 " was generated." % (args.config, exc))
 
     agent_ids = {pe.agent_id(e["name"]) for e in efforts}
-    effort_channels = {e["slack_channel_id"]: pe.agent_id(e["name"]) for e in efforts}
+    effort_channels = {e["slack_channel_id"]: pe.agent_id(e["name"])
+                       for e in efforts if "slack_channel_id" in e}
 
     preserved, refusals = classify_bindings(
         get_path(config, "bindings"), effort_channels, agent_ids)
@@ -754,10 +757,11 @@ def cmd_generate(args):
 
     sys.stderr.write(
         "openclaw-patch: %d agent(s), %d channel binding(s), %d direct binding(s),"
-        " %d MCP server(s), dmPolicy=%s\n"
+        " %d MCP server(s), %s\n"
         % (len(manifest["agents"]), len(manifest["channelBindings"]),
            len(manifest["directBindings"]), len(manifest["mcpServers"]),
-           manifest["dmPolicy"]))
+           "Slack not configured by this patch" if manifest["dmPolicy"] is None
+           else "dmPolicy=%s" % manifest["dmPolicy"]))
     print(patch_path)
     return 0
 
@@ -1043,7 +1047,8 @@ def _gen(text, config=None, dm=None):
     efforts = _efforts_from(text)
     config = config or {}
     agent_ids = {pe.agent_id(e["name"]) for e in efforts}
-    channels = {e["slack_channel_id"]: pe.agent_id(e["name"]) for e in efforts}
+    channels = {e["slack_channel_id"]: pe.agent_id(e["name"])
+                       for e in efforts if "slack_channel_id" in e}
     preserved, refusals = classify_bindings(get_path(config, "bindings"), channels, agent_ids)
     if dm:
         preserved = apply_dm_edits(preserved, dm, None, agent_ids)
@@ -1107,6 +1112,26 @@ def self_test():
           "json5: an escaped quote does not end the string")
     check(load_config_text("") == {}, "json5: an empty config reads as empty, not an error")
     check(load_config_text('{"a":1}')["a"] == 1, "json5: strict JSON still parses")
+
+    browser_text = re.sub(r"    slack_channel_id: [^\n]+\n", "", TWO_EFFORTS)
+    browser_patch, browser_manifest = _gen(browser_text)
+    check("channels" not in browser_patch,
+          "browser-only setup does not configure Slack")
+    check(browser_patch["bindings"] == [] and browser_manifest["channelBindings"] == {},
+          "browser efforts produce no channel bindings")
+    check(len(browser_patch["agents"]["list"]) == 2 and
+          len(browser_patch["mcp"]["servers"]) == 2,
+          "browser efforts retain both agents and MCP servers")
+    retained_patch, _ = _gen(browser_text, {"channels": {"slack": {"enabled": True}}})
+    check(retained_patch["channels"]["slack"]["channels"] == {} and
+          retained_patch["channels"]["slack"]["dmPolicy"] == "disabled",
+          "browser efforts clear owned routes in an existing Slack setup")
+    mixed_patch, mixed_manifest = _gen(TWO_EFFORTS.replace("    slack_channel_id: C0HIPAABB\n", ""))
+    check(mixed_manifest["channelBindings"] == {"C0SOC2AAA": "crm-soc2"} and
+          len(mixed_patch["bindings"]) == 1,
+          "mixed efforts bind only the declared channel")
+    check(mixed_patch["channels"]["slack"]["dmPolicy"] == "disabled",
+          "omitting a channel does not enable DMs")
 
     patch, manifest = _gen(TWO_EFFORTS)
     check(len(manifest["fleetFingerprint"]) == 64,
@@ -1362,6 +1387,17 @@ def self_test():
         with contextlib.redirect_stderr(err):
             rc = cmd_verify(args)
         return rc, err.getvalue()
+
+    rc, out = _verify(browser_patch, browser_manifest)
+    check(rc == 0, "verify accepts a browser-only manifest with no Slack config")
+    for change, expected in (
+        ({"bindings": [{"agentId": "crm-soc2", "match": {"channel": "slack",
+                       "peer": {"kind": "channel", "id": "C0UNEXPECTED"}}}]}, "Slack channel bindings"),
+        ({"channels": {"slack": {"dmPolicy": "allowlist"}}}, "channels.slack.dmPolicy"),
+        ({"channels": {"slack": {"channels": {"C0UNEXPECTED": {}}}}}, "Slack channel allowlist"),
+    ):
+        rc, out = _verify(dict(browser_patch, **change), browser_manifest)
+        check(rc != 0 and expected in out, "browser-only verify rejects unexpected " + expected)
 
     applied, applied_manifest = _gen(TWO_EFFORTS)
     # A configuration in the state the patch would leave, PLUS an MCP server the

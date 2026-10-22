@@ -12,7 +12,7 @@ declares them; `scripts/clawctl` validates, migrates and applies them.
 
 > **`efforts.yaml` is the runtime authority.** Each effort gets its own OpenClaw
 > agent — its own workspace, sessions, memory, instructions, Pretorin MCP server
-> and Slack channel — inside one gateway and one Slack app. `targets.yaml`
+> and optional Slack channel — inside one gateway. `targets.yaml`
 > survives as input to `clawctl migrate` and as the legacy fallback for a
 > deployment that has not migrated; once `efforts.yaml` exists it is ignored.
 
@@ -43,7 +43,7 @@ efforts:
   - name: crm-hipaa                                  # NEW
     system_id: 13c1f44e-b66d-417c-8604-4ac7b988b411  # the same system, by UUID
     framework_id: hipaa                              # a different framework
-    slack_channel_id: C0456GHIJKL                    # ITS OWN channel, required
+    slack_channel_id: C0456GHIJKL                    # Optional; must be unique if supplied
     credential_ref: hipaa-key                        # its own credential
     targets:
       - name: simple-crm                             # the SAME repository
@@ -51,10 +51,15 @@ efforts:
         ref: main
 ```
 
-`slack_channel_id` is **required and unique across efforts** — it is the whole of
-how a message reaches this agent rather than another. Use the channel's `C` id
-(open the channel → right-click → *Copy link*); a `D` conversation id or a
-`#name` is refused, because neither can route.
+`slack_channel_id` is optional. Omit it for an effort used only through the
+Control UI. Select that effort's agent in the UI. Its Pretorin scope, credential,
+and repository context remain the same. To add or remove a Slack channel binding, edit
+this field and run `scripts/clawctl apply`; workspace and memory remain in place.
+Slack must already be set up in this deployment before you add a channel.
+
+A supplied channel ID must be unique across efforts. Use the channel's `C` ID
+(open the channel → right-click → *Copy link*). A `D` conversation ID or a
+`#name` is refused. DM bindings remain separate and are not enabled by omission.
 
 `system_id` is the **canonical UUID**, never a friendly system name. Pretorin
 resolves a write's target to a UUID before comparing it against the pinned scope,
@@ -211,10 +216,9 @@ file is created**. After this, `targets.yaml` is inert: it stays mounted
 read-only for deployments that have not migrated, and the runtime prefers
 `efforts.yaml` wherever both exist.
 
-**Why `--slack-channel-id` is required.** It is how messages reach this effort's
-agent, and there is nothing in `targets.yaml` to derive it from. A placeholder
-would produce a file that validates and routes nowhere, which is exactly the
-failure that looks like a broken bot — so `migrate` asks instead of guessing.
+**Optional Slack channel.** Omit `--slack-channel-id` to migrate an effort for
+Control UI access without Slack. To use Slack, supply its channel ID. The command
+does not derive a channel from `targets.yaml` or insert a placeholder.
 
 **Why `--name` is required.** `system_id` is always a UUID, so a derived name
 would be `13c1f44e-…-soc2`. That string is the stable identifier for this effort,
@@ -258,7 +262,7 @@ This is the same convention as the target-sync and CLI-update records.
 
 ## One channel, one agent, one effort
 
-Each effort declares the Slack channel it lives in:
+An effort that uses a Slack channel declares it as follows:
 
 ```yaml
   - name: crm-soc2

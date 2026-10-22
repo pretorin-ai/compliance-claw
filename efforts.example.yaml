@@ -45,6 +45,7 @@ efforts:
     credential_ref: default
 
     # THE SLACK CHANNEL THIS EFFORT LIVES IN, and the whole of its routing.
+    # Optional. Omit this field for Control UI access without Slack.
     # One channel, one agent, one effort: a message here reaches an agent that is
     # pinned to this system + framework and can see only this effort's
     # repositories and only this effort's Pretorin MCP server.
