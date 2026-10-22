@@ -1857,7 +1857,7 @@ cmd_apply() {
   run_efforts 0 "" || exit 1
   printf '\n'
   log "done. Each effort now has its own agent, workspace, instructions, Pretorin"
-  log "  MCP server and Slack channel binding."
+  log "  MCP server and any declared Slack channel binding."
 }
 
 # ---------------------------------------------------------------------------
