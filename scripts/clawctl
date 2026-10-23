@@ -1185,28 +1185,12 @@ if config and p.get_path(config, "channels.slack") is None and any(
         "  the gateway, then follow the Slack setup steps it prints; run apply after.\n")
     raise SystemExit(1)
 PYTHON
-    # Retire only an unchanged binding recorded by the last successful apply.
-    # Edit this temporary input, not the live configuration or rollback snapshot.
-    if [ -f "$STATE_FILE" ]; then
-      python3 - "$live" "$STATE_FILE" "$EFFORTS_FILE" <<'PYTHON' || return 1
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location("patch", "scripts/openclaw-patch.py")
-p = importlib.util.module_from_spec(spec); spec.loader.exec_module(p)
-config = p.load_config_text(open(sys.argv[1]).read())
-state = json.load(open(sys.argv[2]))
-efforts = {p.pe.agent_id(e["name"]): e for e in p.pe.load(sys.argv[3])}
-for channel, agent in (state.get("channelBindings") or {}).items():
-    if efforts.get(agent, {}).get("slack_channel_id") != channel:
-        old = {"agentId": agent, "match": {"channel": "slack",
-               "peer": {"kind": "channel", "id": channel}}}
-        config["bindings"] = [b for b in config.get("bindings", []) if b != old]
-with open(sys.argv[1], "w") as handle:
-    json.dump(config, handle)
-PYTHON
-    fi
   fi
 
   local -a args=(generate --efforts "$EFFORTS_FILE" --config "$live" --out-dir "$GEN_DIR")
+  if [ "$offline" != 1 ]; then
+    args+=(--last-applied-state "$STATE_FILE")
+  fi
   [ -n "$dm_add" ] && args+=(--dm-add "$dm_add")
   [ -n "$dm_remove" ] && args+=(--dm-remove "$dm_remove")
   python3 "$PATCH_TOOL" "${args[@]}" >/dev/null || return 1
