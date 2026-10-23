@@ -3,6 +3,7 @@
 that applying it did what it said.
 
     openclaw-patch.py generate --efforts FILE --config FILE --out-dir DIR
+                               [--last-applied-state FILE]
                                [--dm-add USER:EFFORT] [--dm-remove USER]
     openclaw-patch.py verify   --manifest FILE --config FILE --snapshot FILE
                                [--agents-json FILE] [--mcp-json FILE]
@@ -319,6 +320,11 @@ def agent_dir(agent):
 
 # --- binding classification ------------------------------------------------
 
+def _channel_binding(agent, channel):
+    return {"agentId": agent,
+            "match": {"channel": "slack", "peer": {"kind": "channel", "id": channel}}}
+
+
 def _is_slack_binding(binding):
     return (isinstance(binding, dict)
             and isinstance(binding.get("match"), dict)
@@ -555,11 +561,7 @@ def build_patch(efforts, config, dm_bindings):
         agents.append(entry)
 
         if "slack_channel_id" in effort:
-            bindings.append({
-                "agentId": agent,
-                "match": {"channel": "slack",
-                          "peer": {"kind": "channel", "id": effort["slack_channel_id"]}},
-            })
+            bindings.append(_channel_binding(agent, effort["slack_channel_id"]))
             # THE CHANNEL IS THE TRUST BOUNDARY. Without `users`, OpenClaw refuses
             # every slash command with "You are not authorized to use this command."
             # "*" authorizes the members of THIS channel only: groupPolicy
@@ -719,6 +721,17 @@ def cmd_generate(args):
     agent_ids = {pe.agent_id(e["name"]) for e in efforts}
     effort_channels = {e["slack_channel_id"]: pe.agent_id(e["name"])
                        for e in efforts if "slack_channel_id" in e}
+
+    # Retire only an unchanged binding recorded by the last successful apply.
+    # Work on the loaded input, not the live configuration or rollback snapshot.
+    if args.last_applied_state and os.path.isfile(args.last_applied_state):
+        with open(args.last_applied_state) as handle:
+            state = json.load(handle)
+        by_agent = {pe.agent_id(e["name"]): e for e in efforts}
+        for channel, agent in (state.get("channelBindings") or {}).items():
+            if by_agent.get(agent, {}).get("slack_channel_id") != channel:
+                old = _channel_binding(agent, channel)
+                config["bindings"] = [b for b in config.get("bindings", []) if b != old]
 
     preserved, refusals = classify_bindings(
         get_path(config, "bindings"), effort_channels, agent_ids)
@@ -1038,7 +1051,7 @@ def _efforts_from(text):
 
 
 def _gen(text, config=None, dm=None):
-    """The same sequence cmd_generate runs, against in-memory inputs.
+    """The cmd_generate sequence without a state record, using in-memory inputs.
 
     It mirrors cmd_generate rather than reimplementing it: a helper that skipped a
     check would report a pass for a refusal the real path performs, which is the
@@ -1362,6 +1375,62 @@ def self_test():
     check(shrunk_manifest["deactivatedMcpServers"] == ["pretorin-crm-hipaa"],
           "the manifest records the deactivation")
 
+    # Use real generator inputs to check retirement before binding classification.
+    import contextlib, io, tempfile
+
+    def _generate(text, config, state=None):
+        with tempfile.TemporaryDirectory() as d:
+            ef = os.path.join(d, "efforts.yaml")
+            cf = os.path.join(d, "config.json")
+            sf = os.path.join(d, "state.json")
+            with open(ef, "w") as handle:
+                handle.write(text)
+            with open(cf, "w") as handle:
+                json.dump(config, handle)
+            if state is not None:
+                with open(sf, "w") as handle:
+                    json.dump(state, handle)
+            argv = ["openclaw-patch.py", "generate", "--efforts", ef,
+                    "--config", cf, "--out-dir", d, "--last-applied-state", sf]
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = main(argv)
+            if rc:
+                raise PatchError(err.getvalue())
+            with open(os.path.join(d, "patch.json")) as handle:
+                return json.load(handle)
+
+    removed_channel = TWO_EFFORTS.replace("    slack_channel_id: C0HIPAABB\n", "")
+    for text, label in ((removed_channel, "channel removal"),
+                        (one_effort, "effort deletion")):
+        generated = _generate(text, patch, manifest)
+        check(generated["bindings"] == [channel_bindings[0]],
+              "generate retires the recorded binding after " + label)
+        check(generated["channels"]["slack"]["channels"] ==
+              {"C0SOC2AAA": patch["channels"]["slack"]["channels"]["C0SOC2AAA"]}
+              and generated["channels"]["slack"]["dmPolicy"] == "disabled",
+              "generate retains the declared route and DM restriction after " + label)
+
+    reassigned = TWO_EFFORTS.replace("C0SOC2AAA", "TEMP").replace(
+        "C0HIPAABB", "C0SOC2AAA").replace("TEMP", "C0HIPAABB")
+    reassigned_patch = _generate(reassigned, patch, manifest)
+    check({_peer(b)["id"]: b["agentId"] for b in reassigned_patch["bindings"]}
+          == {"C0HIPAABB": "crm-soc2", "C0SOC2AAA": "crm-hipaa"},
+          "generate routes reassigned channels to their declared agents")
+
+    old_binding = channel_bindings[1]
+    changed_match = dict(old_binding["match"], accountId="other")
+    for binding in (dict(old_binding, session={"dmScope": "per-channel-peer"}),
+                    dict(old_binding, match=changed_match),
+                    dict(old_binding, agentId="crm-soc2")):
+        refuses("retirement of a binding that differs from the recorded shape",
+                lambda: _generate(removed_channel, {"bindings": [binding]}, manifest),
+                "not declared in efforts.yaml")
+    for state in (None, {}):
+        refuses("retirement without a recorded channel binding",
+                lambda: _generate(removed_channel, patch, state),
+                "not declared in efforts.yaml")
+
     # --- the legacy single-effort server is retired explicitly ---
     migrated, _ = _gen(TWO_EFFORTS, config={"mcp": {"servers": {"pretorin": {}}}})
     check(migrated["mcp"]["servers"]["pretorin"] is None,
@@ -1565,6 +1634,7 @@ def main(argv):
     gen = sub.add_parser("generate")
     gen.add_argument("--efforts", required=True)
     gen.add_argument("--config", default="")
+    gen.add_argument("--last-applied-state", default="")
     gen.add_argument("--out-dir", required=True)
     gen.add_argument("--dm-add", default="")
     gen.add_argument("--dm-remove", default="")
