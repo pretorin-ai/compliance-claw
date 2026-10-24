@@ -29,14 +29,14 @@ WHAT IT OWNS, AND WHAT IT REFUSES TO TOUCH.
 
 Compliance Claw owns a small, named set of config paths and regenerates them from
 efforts.yaml every apply. Everything else in openclaw.json belongs to the operator
-or to OpenClaw, and this program must never name it — because `config patch`
+or to OpenClaw. The patch omits other top-level paths because `config patch`
 merges objects but REPLACES arrays, so naming an array you do not own silently
 deletes its contents. That is not hypothetical: an earlier release lost
 plugins.load.paths exactly that way. The rule here is the inverse and stronger:
 do not name what you do not own. `plugins` appears nowhere below.
 
     OWNED, regenerated
-      agents.list                          (array input, keyed on new OpenClaw)
+      agents.list IDs and effort-owned fields (keyed on new OpenClaw)
       bindings                             (array, --replace-path)
       channels.slack.channels              (map,   --replace-path)
       channels.slack.dmPolicy              derived from the direct bindings
@@ -51,6 +51,9 @@ do not name what you do not own. `plugins` appears nowhere below.
       channels.slack.dm.*   (including groupEnabled/groupChannels — see below)
       existing Slack account-wide bindings to declared agents
       every Slack token path
+
+    PRESERVED, copied into replacement entries
+      matching agents' settings, except effort-owned fields/generated denies
 
 THE BINDINGS ARRAY HAS TWO OWNERS, AND THAT IS THE WHOLE DESIGN.
 
@@ -74,6 +77,7 @@ never writes channels.slack.dm.*.
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import importlib.util
@@ -318,6 +322,53 @@ def agent_dir(agent):
     return "%s/agents/%s/agent" % (WORKSPACE_ROOT, agent)
 
 
+# Agent settings have one ownership rule in generation and verification.
+AGENT_OWNED_FIELDS = {"id", "workspace", "agentDir", "default"}
+
+
+def agent_entries(config):
+    """Return settings by ID for either supported native roster shape."""
+    roster = get_path(config, "agents") or {}
+    if not isinstance(roster, dict):
+        raise PatchError("agents must be an object")
+    if "entries" in roster:
+        entries = roster["entries"]
+        if ("list" in roster or not isinstance(entries, dict)
+                or any(not isinstance(v, dict) or "id" in v for v in entries.values())):
+            raise PatchError("agents.entries is invalid or conflicts with agents.list")
+        return entries
+    entries = roster.get("list", [])
+    if not isinstance(entries, list):
+        raise PatchError("agents.list must be an array")
+    result = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            raise PatchError("agents.list entries must have a string id")
+        agent = entry["id"]
+        if not agent or agent in result:
+            raise PatchError("agents.list has an empty or duplicate id: %r" % agent)
+        result[agent] = {k: v for k, v in entry.items() if k != "id"}
+    return result
+
+
+def generated_denies(agent, prefixes):
+    return {"%s__*" % prefix for name, prefix in prefixes.items() if name != agent}
+
+
+def unowned_agent_settings(entry, owned_denies):
+    """Copy native settings, excluding only fields/rules this apply owns."""
+    settings = copy.deepcopy({k: v for k, v in entry.items()
+                              if k not in AGENT_OWNED_FIELDS})
+    tools = settings.get("tools")
+    if isinstance(tools, dict) and "deny" in tools:
+        tools["deny"] = [rule for rule in tools["deny"] if rule not in owned_denies]
+        if not tools["deny"]:
+            del tools["deny"]
+        if not tools:
+            del settings["tools"]
+    return settings
+
+
 # --- binding classification ------------------------------------------------
 
 def _channel_binding(agent, channel):
@@ -480,25 +531,12 @@ def check_allow_from(existing_allow_from, bound_users):
 
 # --- generation ------------------------------------------------------------
 
-def build_agent(effort):
-    """One agents.list entry.
-
-    TOOL POLICY IS A DENY LIST, NOT AN ALLOW LIST, and that is not a style
-    choice. An agent-layer allowlist naming only this effort's MCP tools would
-    strip every built-in tool, and OpenClaw aborts a run whose allowlist leaves
-    nothing callable. Deny wins over allow at every layer, so denying the other
-    efforts' MCP tool prefixes is both strictly enforcing and additive-safe.
-
-    THIS IS A TOOL-VISIBILITY BOUNDARY, NOT A PROCESS ONE. mcp.servers is global
-    to the gateway; what makes an effort's tools unreachable from another agent is
-    this policy, not isolation of the MCP child.
-    """
-    name = effort["name"]
-    return {
-        "id": pe.agent_id(name),
-        "workspace": workspace_dir(pe.agent_id(name)),
-        "agentDir": agent_dir(pe.agent_id(name)),
-    }
+def build_agent(effort, existing, owned_denies):
+    """Retain matching native settings, then replace the effort-owned paths."""
+    agent = pe.agent_id(effort["name"])
+    entry = unowned_agent_settings(existing, owned_denies)
+    entry.update(id=agent, workspace=workspace_dir(agent), agentDir=agent_dir(agent))
+    return entry
 
 
 def fleet_fingerprint(efforts):
@@ -533,7 +571,7 @@ def fleet_fingerprint(efforts):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def build_patch(efforts, config, dm_bindings):
+def build_patch(efforts, config, dm_bindings, last_applied=None):
     agents = []
     bindings = []
     slack_channels = {}
@@ -541,11 +579,18 @@ def build_patch(efforts, config, dm_bindings):
 
     prefixes = {e["name"]: pe.mcp_tool_prefix(pe.mcp_server_name(e["name"]))
                 for e in efforts}
+    # The host persists effort names, from which the pinned prefix is derived.
+    previous = last_applied or {}
+    previous_prefixes = {name: pe.mcp_tool_prefix(pe.mcp_server_name(name))
+                         for name in previous.get("efforts", {})}
+    previous_prefixes.update(previous.get("toolPrefixes", {}))
+    existing = agent_entries(config)
 
     for index, effort in enumerate(efforts):
         name = effort["name"]
         agent = pe.agent_id(name)
-        entry = build_agent(effort)
+        owned_denies = generated_denies(agent, prefixes) | generated_denies(agent, previous_prefixes)
+        entry = build_agent(effort, existing.get(agent, {}), owned_denies)
         # Explicit ownership replaces the retired default marker. Keep its
         # existing surface owners. Older OpenClaw uses the marker below.
         # The default agent is stated rather than left to list position. OpenClaw
@@ -555,9 +600,10 @@ def build_patch(efforts, config, dm_bindings):
         # allowlist and the exact bindings below are generated from one list.
         if index == 0 and get_path(config, "agents.ownership") != "explicit":
             entry["default"] = True
-        deny = sorted(p for n, p in prefixes.items() if n != name)
+        deny = sorted(generated_denies(agent, prefixes))
         if deny:
-            entry["tools"] = {"deny": ["%s__*" % p for p in deny]}
+            tools = entry.setdefault("tools", {})
+            tools["deny"] = tools.get("deny", []) + deny
         agents.append(entry)
 
         if "slack_channel_id" in effort:
@@ -641,6 +687,8 @@ def build_patch(efforts, config, dm_bindings):
         "mcpServers": sorted(k for k, v in mcp_servers.items() if v is not None),
         "deactivatedMcpServers": sorted(k for k, v in mcp_servers.items() if v is None),
         "toolPrefixes": prefixes,
+        # Ownership metadata only. Native settings remain in the existing snapshot.
+        "previousToolPrefixes": previous_prefixes,
         "dmPolicy": get_path(patch, "channels.slack.dmPolicy"),
         "allowFrom": sorted(bound_users),
         "workspaces": {pe.agent_id(e["name"]): workspace_dir(pe.agent_id(e["name"]))
@@ -722,6 +770,7 @@ def cmd_generate(args):
     effort_channels = {e["slack_channel_id"]: pe.agent_id(e["name"])
                        for e in efforts if "slack_channel_id" in e}
 
+    state = {}
     # Retire only an unchanged binding recorded by the last successful apply.
     # Work on the loaded input, not the live configuration or rollback snapshot.
     if args.last_applied_state and os.path.isfile(args.last_applied_state):
@@ -753,7 +802,7 @@ def cmd_generate(args):
             " silently fix:\n%s"
             % (len(refusals), "\n".join("  - " + r for r in refusals)))
 
-    patch, manifest = build_patch(efforts, config, preserved)
+    patch, manifest = build_patch(efforts, config, preserved, state)
 
     os.makedirs(args.out_dir, exist_ok=True)
     patch_path = os.path.join(args.out_dir, "patch.json")
@@ -806,23 +855,35 @@ def cmd_verify(args):
     problems = []
 
     # --- what we own landed ---
-    roster = get_path(config, "agents") or {}
-    if "entries" in roster:
-        entries = roster["entries"]
-        if ("list" in roster or not isinstance(entries, dict)
-                or any(not isinstance(v, dict) or "id" in v for v in entries.values())):
-            problems.append("agents.entries is invalid or conflicts with agents.list")
-            live_agents = []
-        else:
-            live_agents = sorted(entries)
-        expected_agents = sorted(manifest["agents"])
-    else:
-        entries = roster.get("list", [])
-        live_agents = ([a.get("id") for a in entries if isinstance(a, dict)]
-                       if isinstance(entries, list) else [])
-        expected_agents = manifest["agents"]
+    try:
+        entries = agent_entries(config)
+    except PatchError as exc:
+        problems.append(str(exc))
+        entries = {}
+    live_agents = list(entries)
+    expected_agents = manifest["agents"]
+    if get_path(config, "agents.entries") is not None:
+        live_agents = sorted(live_agents)
+        expected_agents = sorted(expected_agents)
     if live_agents != expected_agents:
         problems.append("agent roster is %r, expected %r" % (live_agents, expected_agents))
+
+    before_entries = agent_entries(snapshot) if snapshot is not None else {}
+    prefixes = manifest.get("toolPrefixes", {})
+    previous = manifest.get("previousToolPrefixes", {})
+    for agent, entry in entries.items():
+        required = generated_denies(agent, prefixes)
+        if not required.issubset(get_path(entry, "tools.deny") or []):
+            problems.append("agent %s is missing required cross-effort denies" % agent)
+        if agent in before_entries:
+            owned_denies = required | generated_denies(agent, previous)
+            before = unowned_agent_settings(before_entries[agent], owned_denies)
+            after = unowned_agent_settings(entry, owned_denies)
+            if before != after:
+                changed = sorted(k for k in before.keys() | after.keys()
+                                 if before.get(k) != after.get(k))
+                problems.append("agent %s native settings changed: %s"
+                                % (agent, ", ".join(changed)))
 
     # MCP SERVERS, CHECKED THREE WAYS — and deliberately NOT as an equality on the
     # whole key set. This deployment owns the `pretorin-<effort>` entries and
@@ -1201,6 +1262,56 @@ def self_test():
     check(agents[1]["tools"]["deny"] == ["pretorin-crm-soc2__*"],
           "agent B denies exactly agent A's MCP tool prefix")
 
+    # Saved native settings belong to the matching declared agent, not its
+    # position in the roster. The declaration still owns paths and defaults.
+    saved = json.loads(json.dumps(patch))
+    saved["agents"]["ownership"] = "explicit"
+    native_settings = {
+        "model": {"primary": "fixture/agent-model", "fallbacks": []},
+        "name": "Saved fixture",
+        "identity": {"name": "Saved identity", "emoji": "F"},
+        "heartbeat": {"every": "1h"},
+        "skills": ["fixture-skill"],
+        "sandbox": {"mode": "off"},
+    }
+    saved_entry = saved["agents"]["list"][0]
+    saved_entry.update(native_settings)
+    saved_entry.update(workspace="/old-workspace", agentDir="/old-agent")
+    saved_entry["tools"] = {
+        "allow": ["read"], "fs": {"workspaceOnly": True},
+        "deny": ["browser", "pretorin-crm-hipaa__*",
+                 "pretorin-unrecorded__*", "pretorin-crm-hipaa__get_control"],
+    }
+    saved["agents"]["list"][1]["default"] = True
+    saved["agents"]["list"].append({"id": "native-only", "name": "Not declared"})
+    before_saved = json.dumps(saved, sort_keys=True)
+    saved_patch, saved_manifest = _gen(TWO_EFFORTS, saved)
+    retained = saved_patch["agents"]["list"][0]
+    check(all(retained.get(k) == v for k, v in native_settings.items()),
+          "saved model, name, identity and other native settings survive generation")
+    check(retained.get("tools", {}).get("allow") == ["read"] and
+          retained.get("tools", {}).get("fs") == {"workspaceOnly": True} and
+          set(retained.get("tools", {}).get("deny", [])) == set(saved_entry["tools"]["deny"]),
+          "native tools and administrator denies survive with the required deny")
+    check(retained["workspace"] == workspace_dir("crm-soc2") and
+          retained["agentDir"] == agent_dir("crm-soc2") and
+          not any("default" in a for a in saved_patch["agents"]["list"]),
+          "declared paths and explicit ownership replace stale owned fields")
+    check([a["id"] for a in saved_patch["agents"]["list"]] == manifest["agents"],
+          "retaining settings does not retain an undeclared agent")
+    check(json.dumps(saved, sort_keys=True) == before_saved,
+          "generation leaves the native snapshot unchanged")
+    saved_keyed = json.loads(json.dumps(saved))
+    saved_keyed["agents"] = {"ownership": "explicit", "entries": {
+        a["id"]: {k: v for k, v in a.items() if k != "id"}
+        for a in reversed(saved["agents"]["list"])}}
+    keyed_patch, _ = _gen(TWO_EFFORTS, saved_keyed)
+    check(keyed_patch == saved_patch,
+          "native keyed and legacy list settings produce the same patch")
+    reapplied, _ = _gen(TWO_EFFORTS, dict(saved_patch, agents={
+        "ownership": "explicit", "list": saved_patch["agents"]["list"]}))
+    check(reapplied == saved_patch, "reapply retains settings without duplicate generated denies")
+
     check(sorted(servers) == ["pretorin-crm-hipaa", "pretorin-crm-soc2"],
           "one named MCP server per effort")
     check(servers["pretorin-crm-soc2"]["command"] == servers["pretorin-crm-hipaa"]["command"]
@@ -1431,6 +1542,29 @@ def self_test():
                 lambda: _generate(removed_channel, patch, state),
                 "not declared in efforts.yaml")
 
+    # Only an exact generated rule in current/prior records is replaced.
+    removed_saved = json.loads(json.dumps(saved))
+    removed_saved["bindings"] = patch["bindings"]
+    # clawctl persists effort names, not the full generation manifest.
+    recorded_state = {"efforts": manifest["efforts"],
+                      "channelBindings": manifest["channelBindings"]}
+    shrunk_saved = _generate(one_effort, removed_saved, recorded_state)
+    remaining = shrunk_saved["agents"]["list"][0]
+    check(remaining.get("name") == "Saved fixture" and
+          remaining.get("tools", {}).get("deny") ==
+          ["browser", "pretorin-unrecorded__*", "pretorin-crm-hipaa__get_control"],
+          "effort removal retires only the recorded generated deny")
+    no_record = json.loads(json.dumps(removed_saved))
+    no_record["bindings"] = [patch["bindings"][0]]
+    unknown_saved = _generate(one_effort, no_record)
+    check("pretorin-crm-hipaa__*" in unknown_saved["agents"]["list"][0].get("tools", {}).get("deny", []),
+          "without prior ownership records an old deny is retained")
+    grown = _generate(TWO_EFFORTS, shrunk_saved)
+    check(grown["agents"]["list"][1].get("name") is None and
+          grown["agents"]["list"][0].get("name") == "Saved fixture" and
+          "pretorin-crm-hipaa__*" in grown["agents"]["list"][0].get("tools", {}).get("deny", []),
+          "a new effort receives no other agent's settings and restores required denies")
+
     # --- the legacy single-effort server is retired explicitly ---
     migrated, _ = _gen(TWO_EFFORTS, config={"mcp": {"servers": {"pretorin": {}}}})
     check(migrated["mcp"]["servers"]["pretorin"] is None,
@@ -1487,6 +1621,27 @@ def self_test():
                    "(it must not require equality on the whole key set)")
     if rc != 0:
         print("      " + out.strip().replace("\n", "\n      "))
+
+    saved_live = json.loads(json.dumps(saved))
+    saved_live["agents"] = {"ownership": "explicit", "entries": {
+        a["id"]: {k: v for k, v in a.items() if k not in ("id", "default")}
+        for a in saved_patch["agents"]["list"]}}
+    rc, out = _verify(saved_live, saved_manifest, saved)
+    check(rc == 0, "verify accepts retained settings after native roster canonicalization")
+    for field in native_settings:
+        lost = json.loads(json.dumps(saved_live))
+        lost["agents"]["entries"]["crm-soc2"].pop(field, None)
+        rc, out = _verify(lost, saved_manifest, saved)
+        check(rc == 1 and "crm-soc2" in out,
+              "verify rejects loss of saved agent " + field)
+    lost_deny = json.loads(json.dumps(saved_live))
+    denies = lost_deny["agents"]["entries"]["crm-soc2"]["tools"]["deny"]
+    lost_deny["agents"]["entries"]["crm-soc2"]["tools"]["deny"] = [d for d in denies if d != "browser"]
+    rc, out = _verify(lost_deny, saved_manifest, saved)
+    check(rc == 1, "verify rejects loss of an administrator deny")
+    lost_deny["agents"]["entries"]["crm-soc2"]["tools"]["deny"] = [d for d in denies if d != "pretorin-crm-hipaa__*"]
+    rc, out = _verify(lost_deny, saved_manifest, saved)
+    check(rc == 1, "verify rejects loss of a required cross-effort deny")
 
     # Candidate writes use keyed IDs and explicit ownership. JSON key order is
     # not a routing priority under explicit ownership.
