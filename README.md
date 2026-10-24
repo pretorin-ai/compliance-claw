@@ -128,10 +128,10 @@ vi secrets/runtime/openai-api-key         # matches the shipped default model
 #     effort's slack_channel_id in efforts.yaml)
 #  full checklist and per-service delivery matrix: docs/file-secrets.md
 
-# 5. onboard every effort with Pretorin and generate the agents, Slack bindings
-#    and per-effort MCP servers (idempotent; safe to re-run). apply works with no
-#    gateway container yet and brings one up on the result, so do NOT `up -d`
-#    first — that would only mean apply immediately recreating it.
+# 5. apply the effort configuration. With no gateway running, apply first runs
+#    native Doctor; this can change native configuration before effort onboarding.
+#    It then onboards each effort and generates agents, Slack bindings, and MCP
+#    servers. Do not `up -d` first: apply starts the gateway on the result.
 scripts/clawctl plan             # shows the whole change; starts no containers
 scripts/clawctl apply
 

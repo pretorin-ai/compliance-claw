@@ -1525,7 +1525,7 @@ clone_missing_targets() {
 
 run_efforts() {
   local dry="$1" only_effort="$2"
-  local effort system framework cred cpath hpath
+  local effort system framework cred cpath hpath running
   local -a targets
 
   [ -f "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} not found.
@@ -1550,6 +1550,19 @@ run_efforts() {
     require_launcher_in_image
     acquire_lock
     check_scope_mutations
+    # A CLI seed is not prepared native state. Settle native changes before
+    # onboarding and the effort transaction, not after its preservation snapshot.
+    running="$(docker compose ps --status running -q openclaw)" \
+      || die "could not check whether the gateway is running. Effort changes were not started."
+    if [ -z "$running" ]; then
+      log "preparing native state before effort onboarding"
+      # Unlike config commands, preparation must not run inside a live gateway.
+      if ! docker compose run --rm -T cli openclaw doctor --fix --non-interactive < /dev/null; then
+        die "native preparation failed. Native configuration may have changed.
+  Effort onboarding, workspaces, and the configuration transaction were not started.
+  Check the Doctor output above, correct the failure, then re-run apply."
+      fi
+    fi
     clone_missing_targets
   fi
 
