@@ -354,11 +354,25 @@ under the old name.
 
 ## What `apply` does to the OpenClaw configuration
 
-It **owns** a small named set of paths and regenerates them every run:
+It generates the declared agent roster and a small set of owned paths:
 `agents.list`, `bindings`, `channels.slack.channels`, `channels.slack.dmPolicy`,
 `channels.slack.allowFrom`, and `mcp.servers.pretorin-<effort>`.
 
-It **never names** anything else — `gateway`, `models`, `agents.defaults`,
+For each declared agent ID, it retains valid native settings from the matching
+entry, including model, display name, identity, and tool settings. It replaces
+only the ID, workspace, agent directory, generated default marker, and generated
+cross-effort MCP deny rules. Both native `agents.entries` and legacy
+`agents.list` inputs are supported. The declaration still determines which
+agents exist; an undeclared agent entry is not retained.
+
+Administrator deny rules remain. Apply replaces only exact generated
+`<other-effort-prefix>__*` rules identified by the current declaration or the
+last successful apply record. If ownership is unknown, the rule remains.
+Other tool settings are retained. Do not edit native configuration while apply
+runs. Plan uses the last-applied record without reading live settings; apply
+reads the live configuration before it generates the replacement entries.
+
+The patch does not name these other paths: `gateway`, `models`, `agents.defaults`,
 `tools`, **all of `plugins`**, `session`, `messages`, the Slack tokens, or
 `channels.slack.dm`. That rule is deliberate and load-bearing: `config patch`
 merges objects but *replaces* arrays, so naming an array you do not own empties
@@ -366,8 +380,9 @@ it. An earlier release lost `plugins.load.paths` exactly that way.
 
 Then it snapshots the configuration, validates the patch with OpenClaw's own
 `--dry-run`, applies it, recreates the gateway once, and verifies — health, the
-expected agents and bindings, the expected MCP servers, and that every path it
-does not own is unchanged. **If verification fails it restores the snapshot,
+expected agents and bindings, the expected MCP servers, retained native agent
+settings, required cross-effort denies, and that every other path it does not
+own is unchanged. **If verification fails it restores the snapshot,
 recreates, re-verifies and exits non-zero.** If the rollback also fails it prints
 the exact commands to recover by hand. It never reports success while unhealthy.
 
