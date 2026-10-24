@@ -805,8 +805,8 @@ oc_config_snapshot() {
       OC_SNAPSHOT=""
       die "could not snapshot ${OC_CONFIG}:
 $(printf '%s' "$out" | tail -4 | sed 's/^/  /')
-  Nothing has been changed. Refusing to touch the configuration without a
-  verified copy to return to." ;;
+  The effort patch was not applied. Native preparation may have changed configuration earlier.
+  Refusing to apply the patch without a verified copy to return to." ;;
   esac
   if [ "$OC_HAD_CONFIG" = 1 ]; then
     log "  snapshot: ${OC_SNAPSHOT} (in the openclaw-state volume)"
@@ -996,8 +996,8 @@ SH
   exactly as it is: an operator file that happens to share a target's name is
   not ours to replace.
 
-  The gateway is unchanged: no agent, Slack binding, MCP server or workspace was
-  created or changed, and ${STATE_FILE} was not written. Pretorin onboarding runs
+  The effort patch was not applied and ${STATE_FILE} was not updated.
+  Native preparation may have changed configuration earlier. Pretorin onboarding runs
   BEFORE this point, so any effort the audit above records as 'applied' has had
   its resolvers bound on the platform; that stands, and is idempotent.
 
@@ -1072,7 +1072,9 @@ SH
     *)
       WS_SNAPSHOT=""
       die "the managed-workspace snapshot reported success but produced no archive.
-  Nothing was changed. Refusing to proceed without a backup to return to." ;;
+  The effort patch was not applied and no managed workspace was rewritten.
+  Native preparation may have changed configuration earlier.
+  Refusing to proceed without a backup to return to." ;;
   esac
   return 0
 }
@@ -1181,7 +1183,7 @@ if config and p.get_path(config, "channels.slack") is None and any(
         "slack_channel_id" in e for e in p.pe.load(sys.argv[2])):
     sys.stderr.write(
         "clawctl: ERROR — an effort declares slack_channel_id, but Slack is not set up\n"
-        "  in this deployment. Nothing was changed. Supply the Slack tokens and restart\n"
+        "  in this deployment. The effort patch was not applied. Supply the Slack tokens and restart\n"
         "  the gateway, then follow the Slack setup steps it prints; run apply after.\n")
     raise SystemExit(1)
 PYTHON
@@ -1213,9 +1215,10 @@ validate_patch() {
   log "  validating the patch against OpenClaw's own schema (--dry-run)"
   oc_cli config patch --stdin --dry-run \
     ${flags[@]+"${flags[@]}"} < "${GEN_DIR}/patch.json" >&2 \
-    || die "the generated configuration did not validate. Nothing has been changed:
-  no workspace was written and ${OC_CONFIG} was not modified. The patch is at
-  ${GEN_DIR}/patch.json."
+    || die "the generated configuration did not validate.
+  The effort patch was not applied and no managed workspace was rewritten.
+  Native preparation may have changed configuration earlier.
+  The patch is at ${GEN_DIR}/patch.json."
 }
 
 apply_patch() {
@@ -1519,8 +1522,8 @@ clone_missing_targets() {
   CC_CLONE_ONLY=1 CC_EFFORTS_FILE="$EFFORTS_FILE" CC_TARGETS_DIR="$TARGETS_DIR" \
     bash scripts/bootstrap.sh --targets-only >&2 \
     || die "could not prepare the target repositories; see the messages above.
-  This runs before any Pretorin onboarding and before any gateway change, so
-  nothing at all has happened yet."
+  Effort onboarding and effort configuration were not started.
+  Native preparation may have changed configuration earlier."
 }
 
 run_efforts() {
@@ -1660,9 +1663,8 @@ run_efforts() {
   if [ "$dry" != 1 ] && [ -n "$FAILED_EFFORTS" ]; then
     printf '\n' >&2
     die "these effort(s) did not complete:${FAILED_EFFORTS}
-  The OpenClaw configuration was NOT generated and NOT applied: no agent, Slack
-  binding, MCP server or workspace was created or changed, and ${STATE_FILE}
-  was not written. The gateway is exactly as it was.
+  The effort patch was not generated or applied, and ${STATE_FILE} was not updated.
+  Native preparation may have changed configuration earlier.
 
   WHAT MAY ALREADY HAVE HAPPENED. Efforts are onboarded to Pretorin one at a
   time, before any of this, so an effort listed as 'applied' in the audit above
@@ -1685,8 +1687,8 @@ run_efforts() {
   if ! generate_patch "" "" "$dry"; then
     die "the OpenClaw configuration could not be generated (see above).
 
-  The gateway is unchanged: no agent, Slack binding, MCP server or workspace was
-  created or changed, and ${STATE_FILE} was not written. Pretorin onboarding runs
+  The effort patch was not applied and ${STATE_FILE} was not updated.
+  Native preparation may have changed configuration earlier. Pretorin onboarding runs
   BEFORE this point, so any effort the audit above records as 'applied' has had
   its resolvers bound on the platform; that stands, and is idempotent."
   fi
@@ -1719,9 +1721,9 @@ run_efforts() {
 
   # EVERYTHING THAT CAN REFUSE, BEFORE ANYTHING THAT CAN CHANGE.
   #
-  # Both snapshots and the schema validation only read. Running them first means a
-  # rejected patch or an unwritable backup stops the run with the deployment
-  # genuinely untouched, instead of after the workspaces have been rewritten.
+  # The effort transaction starts after native preparation and onboarding.
+  # Take its snapshots and validate before writing the patch or managed
+  # workspaces. Failure here does not undo those earlier steps.
   oc_config_snapshot
   validate_patch
   workspace_snapshot "$ws_agents"
@@ -1741,14 +1743,15 @@ run_efforts() {
       if workspace_restore "$ws_agents"; then
         die "${WS_FAIL_MSG}
 
-  The workspaces written before this point were restored, and the gateway
-  configuration was never touched. ${STATE_FILE} was not written."
+  The workspaces written by this transaction were restored.
+  The effort patch was not applied and ${STATE_FILE} was not updated.
+  Native preparation may have changed configuration earlier."
       fi
       warn "${WS_FAIL_MSG}"
       warn ""
-      warn "RESTORING THE EARLIER WORKSPACES ALSO FAILED. The gateway configuration"
-      warn "was never touched, so the deployment still serves the previous fleet — but"
-      warn "the managed workspace files may be a mixture of old and new."
+      warn "RESTORING THE EARLIER WORKSPACES ALSO FAILED. The effort patch was not applied."
+      warn "Native preparation may have changed configuration earlier."
+      warn "The managed workspace files may be a mixture of old and new."
       manual_recovery_note
       exit 1
     fi

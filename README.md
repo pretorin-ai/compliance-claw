@@ -132,7 +132,7 @@ vi secrets/runtime/openai-api-key         # matches the shipped default model
 #    native Doctor; this can change native configuration before effort onboarding.
 #    It then onboards each effort and generates agents, Slack bindings, and MCP
 #    servers. Do not `up -d` first: apply starts the gateway on the result.
-scripts/clawctl plan             # shows the whole change; starts no containers
+scripts/clawctl plan             # previews effort changes; starts no containers
 scripts/clawctl apply
 
 # 6. the gateway is now running on http://127.0.0.1:18789

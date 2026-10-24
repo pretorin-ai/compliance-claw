@@ -999,9 +999,35 @@ assert live["plugins"] == snapshot["plugins"]
 PYTHON
   then st_ok "native plugin preparation is in the transaction baseline"
   else st_bad "native plugin preparation precedes the snapshot"; fi
-  # Preparation can change native config even if it fails. Later effort state
-  # and the last successful record must remain untouched in that case.
+  # Later failures must not claim that native preparation changed nothing.
   cp "$OC" "${tmp}/prepared.json"
+  local phase failure ws_failure onboarding
+  for phase in cfgsnapshot dryrun workspace onboarding; do
+    cp "${tmp}/prepared.json" "$OC"
+    CC_CFG="$OC" python3 -c '
+import json, os
+path = os.environ["CC_CFG"]
+cfg = json.load(open(path))
+cfg["plugins"]["entries"].pop("openai", None)
+json.dump(cfg, open(path, "w"))
+'
+    failure="$phase"; ws_failure=""; onboarding=ok
+    [ "$phase" != workspace ] || { failure=""; ws_failure=snapshot; }
+    [ "$phase" != onboarding ] || { failure=""; onboarding=fail; }
+    if STUB_NATIVE_PREPARE=1 STUB_WS_FAIL="$ws_failure" st_fleet_apply "$failure" "$onboarding"; then
+      st_bad "$phase failure after preparation stops apply" "apply exited zero"
+    else
+      if CC_CFG="$OC" python3 -c 'import json, os; assert json.load(open(os.environ["CC_CFG"]))["plugins"]["entries"]["openai"]["enabled"] is True' \
+          && grep -q 'Native preparation may have changed configuration earlier' "$fleetlog" \
+          && ! grep -Eq 'Nothing (has been|was) changed|openclaw.json was not modified' "$fleetlog"; then
+        st_ok "$phase failure reports earlier native configuration changes"
+      else
+        st_bad "$phase failure reports earlier native configuration changes" "$(tail -8 "$fleetlog")"
+      fi
+    fi
+  done
+  cp "${tmp}/prepared.json" "$OC"
+  # A failed preparation must also stop later effort changes.
   local prepare_state prepare_ws
   mkdir -p "${tmp}/state" "${tmp}/ocstate"
   prepare_state="$(st_manifest "${tmp}/state")"
@@ -1696,8 +1722,11 @@ open(p, "w").write(re.sub(r"(\n        url: https://github\.com/\S+\n)",
   grep -v '^targets/simple-crm$' "${tmp}/ocstate/workspace-crm-soc2/.compliance-claw-managed" \
     > "${tmp}/mf.tmp" && mv "${tmp}/mf.tmp" "${tmp}/ocstate/workspace-crm-soc2/.compliance-claw-managed"
 
-  st_fleet_apply && st_bad "apply REFUSES to overwrite an operator file in targets/" "it exited 0" \
+  STUB_NATIVE_PREPARE=1 st_fleet_apply && st_bad "apply REFUSES to overwrite an operator file in targets/" "it exited 0" \
                  || st_ok "apply REFUSES to overwrite an operator file in targets/"
+  if grep -q 'Native preparation may have changed configuration earlier' "$fleetlog"       && ! grep -Eq 'exactly as it was|configuration was never touched' "$fleetlog"; then
+    st_ok "workspace write failure reports earlier native preparation"
+  else st_bad "workspace write failure reports earlier native preparation" "$(tail -8 "$fleetlog")"; fi
   case "$(cat "$fleetlog")" in
     *"targets/simple-crm"*) st_ok "  and names the exact path it will not touch" ;;
     *) st_bad "  and names the exact path" "$(tail -4 "$fleetlog")" ;;
