@@ -121,6 +121,8 @@ def merge(dst, src, path=""):
         else:
             dst[k] = v
 merge(cfg, patch)
+if os.environ.get("STUB_OC_FAIL") == "unowned":
+    cfg.setdefault("plugins", {}).setdefault("load", {}).setdefault("paths", []).append("/unowned-change")
 if cfg.get("agents", {}).get("ownership") == "explicit":
     entries = cfg["agents"].pop("list", None)
     if entries is not None:
@@ -193,6 +195,26 @@ esac
 STUB_OC_CONFIG="\${STUB_OC_CONFIG:-}"
 STUB_OC_FAIL="\${STUB_OC_FAIL:-}"
 
+# Model native preparation and the same normalization at gateway startup.
+# The opt-in fixture reproduces a plugin change AFTER an unprepared snapshot.
+st_native_prepare() {
+  if [ "\${STUB_NATIVE_PREPARE:-0}" = 1 ]; then
+    CC_CFG="\${STUB_OC_CONFIG}" python3 -c '
+import json, os
+path = os.environ["CC_CFG"]
+cfg = json.load(open(path))
+cfg.setdefault("plugins", {}).setdefault("entries", {})["openai"] = {"enabled": True}
+json.dump(cfg, open(path, "w"), indent=2, sort_keys=True)
+'
+  fi
+}
+case " \$* " in
+  *" cli openclaw doctor --fix --non-interactive "*)
+    st_native_prepare
+    [ "\${STUB_OC_FAIL}" = prepare ] && exit 1
+    exit 0 ;;
+esac
+
 # Reading and copying the config in the volume.
 #
 # SNAPSHOT AND RESTORE ARE THE SAME TWO PATHS IN THE OPPOSITE ORDER, so they are
@@ -237,6 +259,7 @@ esac
 case " \$* " in
   *" up -d --force-recreate openclaw "*)
     [ "\${STUB_OC_FAIL}" = restart ] && exit 1
+    st_native_prepare
     exit 0 ;;
   *" exec -T openclaw "*)
     case " \$* " in
@@ -935,6 +958,7 @@ BASE
         STUB_TARGETS="simple-crm other" STUB_ONBOARD="${2:-ok}" \
         STUB_WS_FAIL="${STUB_WS_FAIL:-}" \
         STUB_GATEWAY_RUNNING="${STUB_GATEWAY_RUNNING:-0}" \
+        STUB_NATIVE_PREPARE="${STUB_NATIVE_PREPARE:-0}" \
         bash "${root}/scripts/clawctl" apply ) >"$fleetlog" 2>&1
   }
   # Run the full apply path with no prior Slack config or recorded routes.
@@ -948,7 +972,7 @@ json.dump(c, open(p, "w"))
 text = open(e).readlines()
 open(e, "w").write("".join(line for line in text if "slack_channel_id:" not in line))
 PYTHON
-  if st_fleet_apply; then
+  if STUB_NATIVE_PREPARE=1 st_fleet_apply; then
     st_ok "full apply passes with Slack never configured (stub services)"
   else
     st_bad "full apply passes with Slack never configured" "$(tail -8 "$fleetlog")"
@@ -967,16 +991,79 @@ PYTHON
     *"Slack not configured"*) st_ok "patch summary distinguishes unconfigured Slack" ;;
     *) st_bad "patch summary distinguishes unconfigured Slack" "$(tail -8 "$fleetlog")" ;;
   esac
+  if python3 - "$OC" "${OC}.snap" <<'PYTHON'
+import json, sys
+live, snapshot = [json.load(open(p)) for p in sys.argv[1:]]
+assert live["plugins"]["entries"]["openai"]["enabled"] is True
+assert live["plugins"] == snapshot["plugins"]
+PYTHON
+  then st_ok "native plugin preparation is in the transaction baseline"
+  else st_bad "native plugin preparation precedes the snapshot"; fi
+  # Later failures must not claim that native preparation changed nothing.
+  cp "$OC" "${tmp}/prepared.json"
+  local phase failure ws_failure onboarding
+  for phase in cfgsnapshot dryrun workspace onboarding; do
+    cp "${tmp}/prepared.json" "$OC"
+    CC_CFG="$OC" python3 -c '
+import json, os
+path = os.environ["CC_CFG"]
+cfg = json.load(open(path))
+cfg["plugins"]["entries"].pop("openai", None)
+json.dump(cfg, open(path, "w"))
+'
+    failure="$phase"; ws_failure=""; onboarding=ok
+    [ "$phase" != workspace ] || { failure=""; ws_failure=snapshot; }
+    [ "$phase" != onboarding ] || { failure=""; onboarding=fail; }
+    if STUB_NATIVE_PREPARE=1 STUB_WS_FAIL="$ws_failure" st_fleet_apply "$failure" "$onboarding"; then
+      st_bad "$phase failure after preparation stops apply" "apply exited zero"
+    else
+      if CC_CFG="$OC" python3 -c 'import json, os; assert json.load(open(os.environ["CC_CFG"]))["plugins"]["entries"]["openai"]["enabled"] is True' \
+          && grep -q 'Native preparation may have changed configuration earlier' "$fleetlog" \
+          && ! grep -Eq 'Nothing (has been|was) changed|openclaw.json was not modified' "$fleetlog"; then
+        st_ok "$phase failure reports earlier native configuration changes"
+      else
+        st_bad "$phase failure reports earlier native configuration changes" "$(tail -8 "$fleetlog")"
+      fi
+    fi
+  done
+  cp "${tmp}/prepared.json" "$OC"
+  # A failed preparation must also stop later effort changes.
+  local prepare_state prepare_ws
+  mkdir -p "${tmp}/state" "${tmp}/ocstate"
+  prepare_state="$(st_manifest "${tmp}/state")"
+  prepare_ws="$(st_manifest "${tmp}/ocstate")"
+  rm -f "$record"
+  if STUB_NATIVE_PREPARE=1 st_fleet_apply prepare; then
+    st_bad "native preparation failure stops apply" "apply exited zero"
+  else
+    case "$(cat "$fleetlog")" in
+      *"native preparation failed"*"may have changed"*) st_ok "preparation failure reports possible native changes" ;;
+      *) st_bad "preparation failure names its stage and effects" "$(tail -8 "$fleetlog")" ;;
+    esac
+  fi
+  if ! grep -Eq 'preflight|pre-apply|--force-recreate' "$record" \
+      && [ "$prepare_state" = "$(st_manifest "${tmp}/state")" ] \
+      && [ "$prepare_ws" = "$(st_manifest "${tmp}/ocstate")" ]; then
+    st_ok "failed preparation stops before onboarding, snapshots and effort state changes"
+  else st_bad "failed preparation leaves later effort state untouched"; fi
+  cp "${tmp}/prepared.json" "$OC"
   cp "${tmp}/slack-base.json" "$OC"; cp "${tmp}/slack-efforts.yaml" "$E"
   if st_fleet_apply; then
     st_ok "full apply works before a gateway exists"
   else
     st_bad "full apply works before a gateway exists" "$(tail -8 "$fleetlog")"
   fi
+  rm -f "$record"
   if STUB_GATEWAY_RUNNING=1 st_fleet_apply; then
     st_ok "full apply uses the gateway PID namespace and entrypoint when running"
   else
     st_bad "full apply uses the gateway PID namespace and entrypoint when running" "$(tail -8 "$fleetlog")"
+  fi
+
+  if grep -q 'doctor' "$record"; then
+    st_bad "a running gateway receives no parallel native preparation"
+  else
+    st_ok "a running gateway receives no parallel native preparation"
   fi
 
   # --- agents ---
@@ -1171,6 +1258,20 @@ print(ch == bd == ['C0HIPAABB','C0SOC2AAA'])")" = "True" ]; then
   else
     st_bad "re-applying unchanged input is idempotent" "$(diff <(echo "$sig_before") <(echo "$sig_after") | head -3)"
   fi
+
+  if st_fleet_apply unowned; then
+    st_bad "an unexpected unowned plugin change fails apply" "apply exited zero"
+  else
+    case "$(cat "$fleetlog")" in
+      *"plugins changed"*"previous configuration"*"gateway is healthy"*)
+        st_ok "an unexpected unowned plugin change fails verification and rolls back" ;;
+      *) st_bad "unowned plugin change is detected and restored" "$(tail -15 "$fleetlog")" ;;
+    esac
+  fi
+  sig_after="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  if [ "$sig_before" = "$sig_after" ]; then
+    st_ok "unowned plugin rejection retains the original configuration"
+  else st_bad "unowned plugin rejection restores the original configuration"; fi
 
   # Reapply after candidate Doctor migration. Keep the legacy fixture for the
   # following checks, so both configuration formats remain under test.
@@ -1621,8 +1722,11 @@ open(p, "w").write(re.sub(r"(\n        url: https://github\.com/\S+\n)",
   grep -v '^targets/simple-crm$' "${tmp}/ocstate/workspace-crm-soc2/.compliance-claw-managed" \
     > "${tmp}/mf.tmp" && mv "${tmp}/mf.tmp" "${tmp}/ocstate/workspace-crm-soc2/.compliance-claw-managed"
 
-  st_fleet_apply && st_bad "apply REFUSES to overwrite an operator file in targets/" "it exited 0" \
+  STUB_NATIVE_PREPARE=1 st_fleet_apply && st_bad "apply REFUSES to overwrite an operator file in targets/" "it exited 0" \
                  || st_ok "apply REFUSES to overwrite an operator file in targets/"
+  if grep -q 'Native preparation may have changed configuration earlier' "$fleetlog"       && ! grep -Eq 'exactly as it was|configuration was never touched' "$fleetlog"; then
+    st_ok "workspace write failure reports earlier native preparation"
+  else st_bad "workspace write failure reports earlier native preparation" "$(tail -8 "$fleetlog")"; fi
   case "$(cat "$fleetlog")" in
     *"targets/simple-crm"*) st_ok "  and names the exact path it will not touch" ;;
     *) st_bad "  and names the exact path" "$(tail -4 "$fleetlog")" ;;

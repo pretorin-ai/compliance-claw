@@ -129,12 +129,18 @@ not enough, and the failure names which ones are attached.
 ### 4. Preview, then apply
 
 ```sh
-scripts/clawctl plan      # prints the exact commands; starts NO containers
+scripts/clawctl plan      # previews effort changes; starts no containers
 scripts/clawctl apply     # sweep -> bind -> verify -> provision -> assert, per effort
 ```
 
-`plan` and `apply` cannot drift: both render each command from the same data, so
-a printed line **is** the command, shell-quoted so you can paste it back.
+`plan` prints the effort onboarding commands and fleet changes. It does not
+run native preparation or read live gateway configuration.
+
+When the gateway is stopped, `apply` first runs OpenClaw Doctor. This can change
+native configuration before the effort transaction starts. The transaction
+snapshots that prepared configuration. If a later step fails, the earlier native
+changes can remain. Rollback restores the transaction snapshots; it does not
+undo native preparation.
 
 ---
 
