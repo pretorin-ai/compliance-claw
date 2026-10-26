@@ -21,25 +21,22 @@ attribution limit and the unsandboxed-tool-execution boundary.
 | Task | Start here |
 | --- | --- |
 | Install | [Requirements](#requirements), [Quickstart](#quickstart), and [image verification](#verifying-what-you-pulled) |
-| Administer the Claw | [Efforts and agents](docs/efforts.md), [providers/models](#the-model), [connections and secrets](docs/file-secrets.md), and [optional Slack](#slack) |
+| Administer the Claw | [Administrator guide](docs/administration.md), [effort schema](docs/efforts.md), and [secret delivery](docs/file-secrets.md) |
 | Use an agent | [Agent commands](docs/file-secrets.md#docker-compose-exec-does-not-see-these-secrets), [target sync](#keeping-targets-up-to-date), and [key permissions](#read-only-vs-write-enabled-keys) |
 | Upgrade or recover | [Deployment updates](#updating-an-existing-deployment), [CLI updates](#updating-the-pretorin-cli), [recovery](docs/upgrade.md), and [troubleshooting](#troubleshooting) |
 | Contribute | [CONTRIBUTING.md](CONTRIBUTING.md) and [coding-agent guide](AGENTS.md) |
 | Report a vulnerability | Private reporting contact in [SECURITY.md](SECURITY.md) |
 
-VM administrators deploy and maintain the runtime, persistent state, and network
-access. The gateway is published on host loopback. Claw administrators configure
-providers, connections, agents, and optional channels. Native UI administration
-is the intended path where verified; this checkout's effort setup uses
-`efforts.yaml` and host `clawctl` operations. The schema still requires a Slack
-channel ID even when Slack credentials are absent. This is a current setup limit,
-not a requirement of the intended product.
+VM operators deploy and maintain the runtime, state, network, declared efforts,
+repositories and file-based credentials. Claw administrators use verified native
+UI controls without SSH access. Slack is optional: omit `slack_channel_id` for a
+browser effort. Effort provisioning still needs the operator's `efforts.yaml`
+and host `clawctl` commands; native New agent does not provision that scope.
 
-`clawctl apply` regenerates [owned configuration](docs/efforts.md#what-apply-does-to-the-openclaw-configuration).
-Do not assume that manual UI edits to those fields will survive it. Complete
-native UI setup and channel-free effort setup still need evaluation; no new
-procedure for either is provided here. The plans under `docs/plans/` record
-historical work and test results, not a guarantee for every current deployment.
+See the [administrator guide](docs/administration.md) for edit paths and
+[configuration ownership](docs/efforts.md#what-apply-does-to-the-openclaw-configuration)
+for settings that apply retains or replaces. Historical plans under `docs/plans/`
+are not guarantees for every current deployment.
 
 ## Status
 
@@ -180,8 +177,10 @@ gateway over `127.0.0.1:18789`, and the `cli` service is a *different container*
 nothing on its own loopback — so there it silently falls back to running the agent
 embedded, where model resolution is stricter and fails with
 `Unknown model: ...`. Setting `OPENCLAW_GATEWAY_URL` does not help; resolution
-happens before dispatch. Everything else (`pretorin ...`, `openclaw mcp ...`,
-`openclaw config ...`) works fine under `run --rm cli`, because it needs no gateway.
+happens before dispatch. For configuration and MCP commands while the gateway
+runs, use its namespace and the secret-loading entrypoint. See
+[host command fallback](docs/administration.md#host-command-fallback).
+A one-off CLI container can fail the native state-owner check against live state.
 
 Two ordering rules, both of which bite silently if ignored:
 
@@ -690,114 +689,17 @@ and a message can be answered by whichever Claw happened to receive it.
 
 ### What lives where
 
-The **image** contains the pinned Slack plugin and the logic that generates the
-Slack configuration. It contains **no Slack credentials**, and no channel id.
-
-`SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are deployment-time values. The table
-above states the values required by each path. The full delivery matrix is in
-[File-backed runtime secrets](docs/file-secrets.md).
-
-On the recommended path the tokens come from mounted secret files rather than
-`.env`; on the legacy path every value is in `.env`. None is baked into the image.
-The tokens are never written into the state-volume config; channel ids are, as the
-allowlist keys.
-
-- On a **fresh** OpenClaw volume, Slack is configured **automatically** once the
-  credentials that path requires are present — the two tokens on the multi-effort
-  path, all three values on the legacy one. No manual JSON, no plugin editing. The
-  multi-effort seed writes the Slack half with an **empty** channel allowlist and
-  `dmPolicy: "disabled"`; `clawctl apply` fills in the channels, so a deployment
-  that never runs it stays closed rather than open.
-- An **existing** config volume is **never overwritten**. Adding the Slack
-  variables to a volume that was previously Slack-less does nothing on its own; the
-  container reports the missing configuration. Review the existing config and
-  the shipped template. Preserve both state volumes before repair, as described
-  in [upgrade and recovery](docs/upgrade.md). Do not delete them to add Slack.
-
-Verify:
-
-```sh
-docker compose logs openclaw | grep -i 'slack'
-#  [slack] channels resolved: C... -> your-channel
-#  [slack] socket mode connected
-```
-
-then `@Compliance Claw what targets are onboarded?` in that channel.
-
-**Slack connects outbound.** Socket Mode dials `slack.com` over a websocket, so
-there is no request URL, no inbound port and no reverse proxy. The gateway port
-stays published on `127.0.0.1` only, exactly as it is without Slack.
-
-The Slack seed disables DMs and requires an explicit mention in allowed
-channels. `clawctl apply` configures one channel per effort. Administrators can
-add [optional DM bindings](docs/efforts.md#optional-slack-dms); DMs remain disabled
-until configured.
-
-Slack uses the official OpenClaw plugin installer. Fresh Slack setup and a
-release that changes the Slack version need access to the npm registry. The
-installer pins the version from `versions.env` and checks the package integrity.
-The image retains the verified package for vulnerability scanning. OpenClaw stores
-the runtime installation in `openclaw-state`. Setup removes only the old Slack
-load path; it keeps other plugins, channel settings, and credentials.
-
-The Slack seed sets `plugins.allow`. OpenClaw can also enable required provider
-and memory plugins during migration. Do not use a fixed plugin count as an
-access control. Check the loaded plugins with `openclaw plugins list` after an
-upgrade. The local `pretorin-update` and `target-sync` plugins must remain loaded.
-
-> **Security, not a footnote.** Every member of that Slack channel acts with the
-> authority of the configured Pretorin key, and there is **no per-user
-> attribution**. Use a **read-only key for shared channels**. A write-enabled key
-> in a shared channel is explicitly warned against until RBAC exists — see
-> [SECURITY.md](SECURITY.md).
+See [Slack runtime administration](docs/administration.md#optional-slack) for
+configuration, state, verification and network requirements. Keep the app
+registration and reuse instructions above for initial app setup.
 
 ## The model
 
-`MODEL=openai/gpt-5.6-sol` in `versions.env` is baked into the config template at
-**image build time**. It is an image-build choice: changing that line needs a
-rebuild.
+<a id="changing-the-model-on-an-existing-deployment"></a>
 
-**No model credential is ever baked into the image.** API keys are read from the
-mounted secret files on every gateway start. A device-code login is different: it
-is stored in the OpenClaw state volume, survives `docker compose down`, and is
-destroyed by `down -v`.
-
-For VM deployments, OpenAI and Anthropic API keys can instead arrive through the
-file-secret overlay and remain outside Docker's configured environment. See
-[file-backed runtime secrets](docs/file-secrets.md). Model selection remains a
-separate runtime action (`openclaw models set`); supplying a credential does not
-silently change the selected model.
-
-File-backed model-provider credentials are the recommended VM path and were
-exercised during the fresh-deployment validation. OpenAI/ChatGPT **device-code**
-login remains supported for an interactive local deployment:
-
-```sh
-docker compose run --rm cli openclaw models auth login --provider openai --device-code
-docker compose restart openclaw
-```
-
-It needs a TTY, so run it yourself rather than from a script. Check it took with
-`openclaw models auth list` — but only an actual turn proves it reaches the model:
-
-Use the [file-secret-aware agent command](docs/file-secrets.md#docker-compose-exec-does-not-see-these-secrets)
-with your configured effort name and the prompt “Reply with exactly: OK”.
-
-### Changing the model on an existing deployment
-
-No rebuild required:
-
-```sh
-docker compose run --rm cli openclaw models set <provider/model>
-docker compose restart openclaw
-```
-
-`openclaw models list` shows what the authenticated provider offers.
-
-**Selecting the model from `.env` at runtime is not implemented.** `versions.env`'s
-`MODEL` is a build-time value and there is no runtime override — use
-`openclaw models set` above. Runtime model selection is recorded as internal-pilot
-/ product work, not a feature of this POC.
+See [providers and models](docs/administration.md#providers-and-models) for native
+controls, file-based credentials and the operator command fallback. Runtime model
+selection is available; the `.env` file does not override the build-time seed.
 
 ## Read-only vs write-enabled keys
 
@@ -1085,7 +987,7 @@ separate from updating a customer deployment or its active Pretorin CLI.
 - The image is **unsigned**; the digest pin is its integrity control. Azure Key
   Vault–backed signing, following the Pretorin CLI's approach, is planned
   production / internal-pilot work.
-- Runtime model selection from `.env` is **not implemented**. `MODEL` is a
-  build-time value; change an existing deployment with `openclaw models set`.
+- `MODEL` is the build-time seed. For runtime model changes, use the
+  [administrator guide](docs/administration.md#providers-and-models).
 - Outstanding hardening is tracked in [SECURITY.md](SECURITY.md), including Docker
   file-based secrets, RBAC before shared channels, and the sandbox boundary.

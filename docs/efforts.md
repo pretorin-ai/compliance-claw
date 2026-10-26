@@ -360,6 +360,9 @@ under the old name.
 
 ## What `apply` does to the OpenClaw configuration
 
+For routine native edits and the operator handoff, use the
+[administrator guide](administration.md). This section owns the apply rules.
+
 It generates the declared agent roster and a small set of owned paths:
 `agents.list`, `bindings`, `channels.slack.channels`, `channels.slack.dmPolicy`,
 `channels.slack.allowFrom`, and `mcp.servers.pretorin-<effort>`.
