@@ -6,7 +6,7 @@
 #   2. create any secret file this release added, write-if-absent, BEFORE
 #      anything stops — a missing one would otherwise fail `up` as an outage
 #   3. pull the pinned image            (docker compose pull)
-#   4. start and wait for the gateway  (Compose wait limit: 360 seconds)
+#   4. start and wait for the gateway  (Compose wait limit: 720 seconds)
 #   5. verify its image, health, and diagnostic result, then report
 #
 #   scripts/update.sh
@@ -251,10 +251,10 @@ EXPECTED_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$SELECTED_IMAGE")"
 [[ "$EXPECTED_IMAGE_ID" =~ ^sha256:[a-f0-9]{64}$ ]] \
   || die "the selected gateway image has no unambiguous local image ID."
 
-log "starting the gateway; Compose waits up to 360 seconds for health"
+log "starting the gateway; Compose waits up to 720 seconds for health"
 # Name the gateway so an enabled cli profile cannot start a second gateway or
 # make Compose wait for a one-shot command. All deployment selection is inherited.
-docker compose up -d --wait --wait-timeout 360 openclaw \
+docker compose up -d --wait --wait-timeout 720 openclaw \
   || die "gateway startup or the Compose health wait failed. Check: docker compose ps -a"
 
 # Use the selected container, never the host port or the diagnostic container.

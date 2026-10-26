@@ -59,7 +59,7 @@ elif a == ["compose", "config", "--format", "json"]:
         "cli": {"image": "registry.example/different-cli:old", "environment": {"SECRET": "CANARY-DO-NOT-PRINT"}}}})))
 elif a == ["compose", "pull", "--quiet"]: fail("quiet_pull_rc")
 elif a == ["compose", "pull"]: fail("pull_rc")
-elif a in (["compose", "up", "-d"], ["compose", "up", "-d", "--wait", "--wait-timeout", "360", "openclaw"]):
+elif a in (["compose", "up", "-d"], ["compose", "up", "-d", "--wait", "--wait-timeout", "720", "openclaw"]):
     fail("up_rc")
 elif a[:3] == ["image", "inspect", "--format"]:
     assert a[-1] == settings.get("image", "registry.example/customer-gateway:chosen"), a
@@ -128,7 +128,7 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("update: done.", self.output)
         self.assertIn("config is current", self.output)
         docker = [c for c in self.calls if c["tool"] == "docker"]
-        self.assertIn(["compose", "up", "-d", "--wait", "--wait-timeout", "360", "openclaw"],
+        self.assertIn(["compose", "up", "-d", "--wait", "--wait-timeout", "720", "openclaw"],
                       [c["args"] for c in docker])
         for call in docker:
             self.assertEqual(call["selection"], self.selection)
