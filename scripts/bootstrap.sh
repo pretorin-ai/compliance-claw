@@ -283,6 +283,9 @@ prepare_targets() {
 
 }
 
+. "${REPO_ROOT}/scripts/compose-selection.sh"
+compose_resolve_selection
+
 # --targets-only stops here: this is the whole of what clawctl needs.
 if [ "$TARGETS_ONLY" = 1 ]; then run_targets_only; fi
 
@@ -360,9 +363,7 @@ fi
 # ("... and ..._FILE are both set") and the gateway exits before serving. So on
 # that path this script deliberately generates nothing secret into .env.
 FILE_SECRETS=0
-case "${COMPOSE_FILE:-}" in
-  *compose.secrets.yaml*) FILE_SECRETS=1 ;;
-esac
+if compose_has_file compose.secrets.yaml; then FILE_SECRETS=1; fi
 if [ "$FILE_SECRETS" = 1 ]; then
   log "credential path: FILE-BACKED (compose.secrets.yaml selected)"
 else
@@ -482,14 +483,12 @@ prepare_targets
 # An operator already in the dev flow has COMPOSE_FILE exported, and pulling
 # `compliance-claw:local` from a registry can only fail. Treat an inherited build
 # overlay as --build rather than making them remember the flag every time.
-case "${COMPOSE_FILE:-}" in
-  *compose.build.yaml*)
+if compose_has_file compose.build.yaml; then
     if [ "$DO_BUILD" = 0 ]; then
       log "COMPOSE_FILE already selects the build overlay; building instead of pulling"
       DO_BUILD=1
     fi
-    ;;
-esac
+fi
 
 if [ "$DO_BUILD" = 1 ]; then
   # APPEND THE BUILD OVERLAY. NEVER REBUILD THIS VARIABLE.
@@ -517,12 +516,9 @@ if [ "$DO_BUILD" = 1 ]; then
   # COMPOSE_PATH_SEPARATOR is docker compose's own knob for this; honour it
   # rather than hardcoding a colon.
   SEP="${COMPOSE_PATH_SEPARATOR:-:}"
-  case "${SEP}${COMPOSE_FILE:-}${SEP}" in
-    *"${SEP}compose.build.yaml${SEP}"*)
-      : ;;                                    # already selected, leave it exactly as it is
-    *)
-      COMPOSE_FILE="${COMPOSE_FILE:-compose.yaml}${SEP}compose.build.yaml" ;;
-  esac
+  if ! compose_has_file compose.build.yaml; then
+    COMPOSE_FILE="${COMPOSE_FILE:-compose.yaml}${SEP}compose.build.yaml"
+  fi
   export COMPOSE_FILE
   log "--build: building locally (amd64; slow under emulation on first run)"
   log "  COMPOSE_FILE=${COMPOSE_FILE}"

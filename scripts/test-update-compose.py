@@ -2,6 +2,7 @@
 """Test host verification with real Compose and synthetic local containers.
 
 Usage: python3 scripts/test-update-compose.py LOCAL_IMAGE OTHER_LOCAL_IMAGE
+       python3 scripts/test-update-compose.py --selection-only (no daemon needed)
 Uses no registry, credentials, ports, or OpenClaw runtime. Git and image pulls
 are stubbed; Compose selection, startup, wait, and inspection are real.
 """
@@ -14,8 +15,104 @@ import sys
 import tempfile
 
 
+def selection_regression(root, docker, docker_env):
+    """Real Compose and callers; unreachable daemon, no credentials or services."""
+    with tempfile.TemporaryDirectory(prefix="cc-selection-") as tmp:
+        fixture = Path(tmp)
+        shutil.copytree(root / "scripts", fixture / "scripts")
+        for name in ("compose.yaml", "compose.secrets.yaml", "compose.efforts.yaml",
+                     "compose.build.yaml", ".env.example", "versions.env"):
+            shutil.copyfile(root / name, fixture / name)
+        (fixture / "efforts.yaml").write_text('''efforts:
+  - name: fixture
+    system_id: 11111111-1111-4111-8111-111111111111
+    framework_id: soc2
+    credential_ref: default
+    targets:
+      - name: fixture
+        url: https://example.com/fixture.git
+''')
+        (fixture / "deployment").mkdir()
+        overlay = fixture / "deployment/recovered.yaml"
+        overlay.write_text(json.dumps({"volumes": {
+            k: {"external": True, "name": "cc-selection-restored-" + k}
+            for k in ("openclaw-state", "pretorin-state")}}))
+        saved = ("COMPOSE_FILE='./compose.yaml;" + str(fixture / "compose.secrets.yaml") +
+                 ";./compose.efforts.yaml;deployment/recovered.yaml'\n"
+                 "COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_PROJECT_NAME=cc-selection-saved\nCOMPOSE_PROFILES=cli\n"
+                 "COMPLIANCE_CLAW_SECRET_DIR='./saved secrets=literal'\n"
+                 "UNRELATED_SECRET=CANARY-DO-NOT-PRINT\n")
+        (fixture / ".env").write_text(saved)
+        env = {**docker_env, "DOCKER_HOST": "unix:///nonexistent-cc-selection.sock"}
+        env.pop("DOCKER_CONTEXT", None)
+
+        def run(*args, extra=None, ok=True):
+            p = subprocess.run(args, cwd=fixture, env={**env, **(extra or {})},
+                               capture_output=True, text=True)
+            output = p.stdout + p.stderr
+            assert (p.returncode == 0) == ok, output
+            assert "CANARY-DO-NOT-PRINT" not in output, output
+            return p
+
+        def model(extra=None):
+            return json.loads(run(docker, "compose", "--profile", "*", "config",
+                                  "--format", "json", extra=extra).stdout)
+
+        run("bash", "-c", '. scripts/compose-selection.sh; compose_resolve_selection; '
+            'test -z "${UNRELATED_SECRET+x}" && test "$COMPOSE_PROFILES" = cli')
+        run("bash", "scripts/clawctl", "plan")
+        run("bash", "scripts/init-file-secrets.sh")
+        run("bash", "scripts/clawctl", "credential", "add", "fixture-key")
+        secret = fixture / "saved secrets=literal"
+        assert (secret / "pretorin/fixture-key").exists()
+        assert not (fixture / "secrets").exists()
+        before = (secret / "openclaw-gateway-token").read_bytes()
+        run("bash", "scripts/init-file-secrets.sh")
+        assert before == (secret / "openclaw-gateway-token").read_bytes()
+        config = model()
+        assert config["name"] == "cc-selection-saved"
+        assert all(v["external"] for v in config["volumes"].values())
+        assert all(v["name"].startswith("cc-selection-restored-") for v in config["volumes"].values())
+        assert all(str(secret) in v["file"] for v in config["secrets"].values())
+        assert config["services"]["openclaw"]["image"] == config["services"]["cli"]["image"]
+
+        override = {"COMPLIANCE_CLAW_SECRET_DIR": "./override secrets", "COMPOSE_PROJECT_NAME": "cc-selection-override",
+                    "COMPOSE_PATH_SEPARATOR": ":", "COMPOSE_FILE": "compose.yaml:compose.secrets.yaml:compose.efforts.yaml"}
+        run("bash", "scripts/init-file-secrets.sh", extra=override)
+        run("bash", "scripts/clawctl", "plan", extra=override)
+        config = model(override)
+        assert config["name"] == "cc-selection-override"
+        assert all(str(fixture / "override secrets") in v["file"] for v in config["secrets"].values())
+        literal = "./literal $(touch SHOULD_NOT_EXIST)"
+        run("bash", "scripts/init-file-secrets.sh", extra={"COMPLIANCE_CLAW_SECRET_DIR": literal})
+        assert (fixture / literal / "openclaw-gateway-token").exists()
+        assert not (fixture / "SHOULD_NOT_EXIST").exists()
+        # A customer overlay with the same basename is not the repository secret overlay.
+        (fixture / "deployment/compose.secrets.yaml").write_text("services: {}\n")
+        p = run("bash", "scripts/clawctl", "plan", extra={"COMPOSE_FILE": "compose.yaml;deployment/compose.secrets.yaml"}, ok=False)
+        assert "not on the file-backed" in p.stderr
+        # Saved build mode must refuse before Git fetch, daemon access or pull.
+        (fixture / ".env").write_text(saved.replace(";deployment/recovered.yaml", ";./compose.build.yaml"))
+        p = run("bash", "scripts/update.sh", ok=False)
+        assert "local build overlay" in p.stderr
+        # Missing saved overlay refuses all writers, without creating a fallback secret path.
+        (fixture / ".env").write_text(saved)
+        overlay.unlink()
+        for command in (("scripts/clawctl", "credential", "add", "never"),
+                        ("scripts/init-file-secrets.sh",), ("scripts/bootstrap.sh", "--targets-only"),
+                        ("scripts/update.sh",)):
+            p = run("bash", *command, ok=False)
+            assert "cannot resolve deployment settings" in p.stderr
+        assert not (secret / "pretorin/never").exists()
+        assert not (fixture / "secrets").exists()
+        # Data-only commands must still work when native Compose resolution cannot.
+        run("bash", "scripts/clawctl", "--help")
+        run("bash", "scripts/clawctl", "validate", "--schema-only")
+        print("PASS: saved/explicit native selection, recovered volumes, secret initialization, caller refusals and schema-only independence")
+
+
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 3 and sys.argv[1:] != ["--selection-only"]:
         sys.exit(__doc__)
     root = Path(__file__).resolve().parent.parent
     docker = shutil.which("docker")
@@ -26,6 +123,10 @@ def main():
     # and fixture files below are used; no existing container is addressed.
     docker_env = {k: v for k, v in os.environ.items()
                   if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG")}
+
+    selection_regression(root, docker, docker_env)
+    if sys.argv[1:] == ["--selection-only"]:
+        return
 
     def docker_run(*args, **kwargs):
         return subprocess.run([docker, *args], env=docker_env, text=True,
@@ -43,6 +144,7 @@ def main():
         (fixture / "targets/canary").write_text("retained target\n")
         (fixture / ".env").write_text("FIXTURE_ONLY=retained\n")
         shutil.copyfile(root / "scripts/update.sh", fixture / "scripts/update.sh")
+        shutil.copyfile(root / "scripts/compose-selection.sh", fixture / "scripts/compose-selection.sh")
         shutil.copyfile(root / "versions.env", fixture / "versions.env")
         (fixture / "bin/git").write_text('''#!/bin/bash
 case "$*" in

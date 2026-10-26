@@ -144,10 +144,27 @@ docker compose run --rm cli pretorin --json context show
 # docs/file-secrets.md under "docker compose exec does not see these secrets".
 ```
 
-**Keep `COMPOSE_FILE` exported for every later command.** It is how compose knows
-to mount the secret files; without it a `docker compose` in a new shell falls back
-to the legacy path and the deployment loses its credentials. `bootstrap.sh` prints
-the line to re-export.
+### Save deployment settings
+
+Save non-secret selection in the repository-root `.env` for later shells. For
+example, add these lines to the existing file; do not replace its other settings:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
+COMPOSE_PROJECT_NAME=compliance-claw
+COMPLIANCE_CLAW_SECRET_DIR=./secrets/runtime
+```
+
+Compose and the host setup, credential, plan/apply and update commands use this
+selection. Explicit shell values override saved values. Keep custom overlays in
+the required order. `COMPOSE_PATH_SEPARATOR` and `COMPOSE_PROFILES` also use native
+Compose rules. A relative secret directory must start with `./` (or use an
+absolute path). Never put credentials in these selection fields.
+
+Deployment commands require the Compose CLI. Local selection and `clawctl plan`
+do not need a running Docker daemon. Help, migration and `validate --schema-only`
+do not need Compose; schema-only validation does not check credentials. An
+invalid saved selection stops before host writes or container startup.
 
 <details>
 <summary>Legacy path — secret values in <code>.env</code></summary>
@@ -924,7 +941,7 @@ the two agree.
 
 `update.sh` refuses rather than guessing, and names the exact command each time:
 a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
-diverged from its upstream, or a shell with `COMPOSE_FILE` set to the local build
+diverged from its upstream, or a deployment selection that includes the local build
 overlay (that is a rebuild, not an update).
 
 ### What survives an update, and what does not

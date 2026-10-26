@@ -49,6 +49,11 @@ if pathlib.Path(sys.argv[0]).name == "git":
     elif a == ["fetch", "--quiet", "origin"]: fail("fetch_rc")
     elif a == ["rev-list", "--left-right", "--count", "origin/master...HEAD"]: out("0 0")
     else: sys.exit("unexpected git command: " + repr(a))
+elif a == ["compose", "config", "--environment"]:
+    fail("selection_rc")
+    out(settings.get("selection", "\n".join(k + "=" + v for k, v in os.environ.items()
+        if k in ("COMPOSE_FILE", "COMPOSE_PATH_SEPARATOR", "COMPOSE_PROJECT_NAME",
+                 "COMPOSE_PROFILES", "COMPLIANCE_CLAW_SECRET_DIR"))))
 elif a == ["compose", "up", "--help"]:
     fail("help_rc")
     out("--wait --wait-timeout" if not settings.get("unsupported_wait") else "--detach")
@@ -92,6 +97,9 @@ class UpdateTest(unittest.TestCase):
         (self.root / "scripts").mkdir()
         shutil.copyfile(SCRIPT, self.root / "scripts/update.sh")
         shutil.copyfile(ROOT / "versions.env", self.root / "versions.env")
+        shutil.copyfile(ROOT / "scripts/compose-selection.sh", self.root / "scripts/compose-selection.sh")
+        for name in ("compose.yaml", "compose.build.yaml", "compose.secrets.yaml"):
+            shutil.copyfile(ROOT / name, self.root / name)
         (self.root / "bin").mkdir()
         for tool in ("git", "docker"):
             p = self.root / "bin" / tool
@@ -135,6 +143,16 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(sum(c["args"][0] == "inspect" for c in docker), 2)
         self.assertNotIn("--force-recreate", str(docker))
         self.assertNotIn("down", str(docker))
+
+    def test_saved_build_selection_refuses_before_git_or_runtime(self):
+        self.assert_failure(selection="COMPOSE_FILE=./compose.yaml:./compose.build.yaml")
+        self.assertIn("local build overlay", self.output)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_selection_failure_stops_before_git_or_runtime(self):
+        self.assert_failure(selection_rc=19)
+        self.assertIn("cannot resolve deployment settings", self.output)
+        self.assertEqual(len(self.calls), 1)
 
     def test_startup_or_compose_timeout_stops_before_diagnostics(self):
         for rc in (1, 17):

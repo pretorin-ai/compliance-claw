@@ -7,8 +7,8 @@
 # what clawctl would run rather than on what it says it would run.
 #
 # The three properties worth proving: migrate converts a real targets.yaml and
-# refuses cleanly the second time; `plan` has NO side effects (not one docker
-# invocation, not one byte changed); and `apply` builds the right commands — the
+# refuses cleanly the second time; `plan` has NO side effects (only local Compose
+# selection, not one byte changed); and `apply` builds the right commands — the
 # scope pin and named credential on EVERY Pretorin invocation, `context set` on
 # none, and each echoed line byte-identical to the argv issued. The last would
 # otherwise rot silently: a `plan` that drifts from `apply` is worse than none.
@@ -32,6 +32,11 @@ st_write_stub_docker() {
   cat > "${dir}/docker" <<STUB
 #!/usr/bin/env bash
 STUB_ATTACHED="\${STUB_ATTACHED:-}"
+# Native selection reads no daemon/state and is allowed even in refuse mode.
+if [ "\$*" = 'compose config --environment' ]; then
+  env | LC_ALL=C awk '/^(COMPOSE_FILE|COMPOSE_PATH_SEPARATOR|COMPOSE_PROJECT_NAME|COMPOSE_PROFILES|COMPLIANCE_CLAW_SECRET_DIR)=/'
+  exit 0
+fi
 # DRAIN STDIN, BECAUSE REAL \`docker compose run\` DOES.
 #
 # Compose attaches the caller's stdin even with -T, so an unguarded call inside
@@ -434,6 +439,8 @@ clawctl_self_test() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/clawctl-selftest.XXXXXX")"
   bin="${tmp}/bin"
   record="${tmp}/docker-calls.txt"
+  st_write_stub_docker "$bin" "$record"
+  local PATH="${bin}:$PATH"
 
   local T="${tmp}/targets.yaml"
   local E="${tmp}/efforts.yaml"
@@ -681,9 +688,9 @@ SECOND
   after="$(st_manifest "$tmp")"
 
   if [ ! -s "$record" ]; then
-    st_ok "plan invoked docker ZERO times"
+    st_ok "plan made no daemon/runtime calls"
   else
-    st_bad "plan invoked docker ZERO times" "$(head -3 "$record")"
+    st_bad "plan made no daemon/runtime calls" "$(head -3 "$record")"
   fi
   if [ "$before" = "$after" ]; then
     st_ok "plan changed nothing on disk"

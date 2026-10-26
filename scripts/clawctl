@@ -90,27 +90,30 @@ die()  { printf 'clawctl: ERROR — %s\n' "$*" >&2; exit 1; }
 # credentials and no Slack. Honour COMPOSE_PATH_SEPARATOR rather than a colon.
 # check_only=1 reports without changing anything, so `plan` cannot report success
 # for a configuration `apply` would reject on its first line.
+resolve_deployment() {
+  . "${REPO_ROOT}/scripts/compose-selection.sh"
+  compose_resolve_selection
+  SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
+  CREDENTIAL_DIR="${SECRET_DIR}/pretorin"
+}
+
 ensure_compose_stack() {
+  resolve_deployment
   local check_only="${1:-0}"
   local sep="${COMPOSE_PATH_SEPARATOR:-:}"
   local current="${COMPOSE_FILE:-compose.yaml}"
 
-  case "${sep}${current}${sep}" in
-    *"${sep}compose.secrets.yaml${sep}"*) ;;
-    *)
+  if ! compose_has_file compose.secrets.yaml; then
       die "this deployment is not on the file-backed credential path, and named
   per-effort credentials only exist there. A .env deployment can carry exactly
   one Pretorin key by construction, so there is nothing for a credential_ref to
   name. Nothing was changed.
 
   Switch to file-backed secrets (see docs/file-secrets.md), then:
-    export COMPOSE_FILE=compose.yaml${sep}compose.secrets.yaml${sep}compose.efforts.yaml" ;;
-  esac
+    export COMPOSE_FILE=compose.yaml${sep}compose.secrets.yaml${sep}compose.efforts.yaml"
+  fi
 
-  case "${sep}${current}${sep}" in
-    *"${sep}compose.efforts.yaml${sep}"*)
-      COMPOSE_FILE="$current" ;;
-    *)
+  if ! compose_has_file compose.efforts.yaml; then
       if [ "$check_only" = 1 ]; then
         log "COMPOSE_FILE does not select compose.efforts.yaml; 'apply' would append it."
         log "    export COMPOSE_FILE=${current}${sep}compose.efforts.yaml"
@@ -120,8 +123,8 @@ ensure_compose_stack() {
       log "COMPOSE_FILE did not select compose.efforts.yaml; appending it."
       log "  That overlay only ADDS two read-only mounts, so appending cannot drop"
       log "  anything. Persist it in your shell with:"
-      log "    export COMPOSE_FILE=${COMPOSE_FILE}" ;;
-  esac
+      log "    export COMPOSE_FILE=${COMPOSE_FILE}"
+  fi
   export COMPOSE_FILE
 }
 
@@ -461,6 +464,7 @@ cmd_credential() {
   [ -n "$name" ] || die "usage: scripts/clawctl credential add <name>"
   [ "$#" -eq 1 ] || die "credential add takes exactly one name"
 
+  resolve_deployment
   [ "$name" = "default" ] && die "'default' is RESERVED: it already names the credential this
   deployment has, ${SECRET_DIR}/pretorin-api-key. A file at ${CREDENTIAL_DIR}/default
   would shadow it with no way to tell which one a process read. Nothing was created.
@@ -554,6 +558,12 @@ cmd_validate() {
   python3 "$PARSE_EFFORTS" validate "$EFFORTS_FILE" || exit 2
   log "schema: ${EFFORTS_FILE} is valid"
 
+  if [ "$schema_only" = 1 ]; then
+    log "--schema-only: deployment credentials were not checked; no container was started."
+    return 0
+  fi
+
+  ensure_compose_stack
   # The reserved name must not be shadowed by a real file.
   if [ -e "${CREDENTIAL_DIR}/default" ]; then
     die "${CREDENTIAL_DIR}/default exists, and 'default' is RESERVED for the
@@ -562,12 +572,6 @@ cmd_validate() {
   Remove or rename ${CREDENTIAL_DIR}/default."
   fi
 
-  if [ "$schema_only" = 1 ]; then
-    log "--schema-only: no credential was read and no container was started."
-    return 0
-  fi
-
-  ensure_compose_stack
   ensure_mount_sources
   require_launcher_in_image
 

@@ -261,3 +261,7 @@ For the pilot, replace the persistent host files yourself. A future Key Vault
 sync service would replace them from the latest secret versions before this
 restart. File changes are not automatically re-read by an already running
 process.
+
+Host initialization and credential commands also use the saved non-secret
+selection. See [Save deployment settings](../README.md#save-deployment-settings)
+for the shared directory, ordered files and explicit override rules.
