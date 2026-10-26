@@ -860,9 +860,39 @@ From Slack, use the command name registered for your app:
 @Compliance Claw update Pretorin
 ```
 
-**Automatic restart applies only to the owner Slack command.** Configure
-`commands.ownerAllowFrom` with the operator's verified Slack identity, for example
-`["slack:U0123456789"]`. Channel membership alone does not grant restart authority.
+**Both Slack update routes require native administrator authority.** For individual
+sign-in, use the person's existing Gateway profile and a role whose effective
+scopes include `operator.admin`. Browser-only users do not need a Slack link.
+For Slack users, an administrator calls `users.linkChannelIdentity` with:
+
+```json
+{
+  "profileId": "<existing-person-profile-id>",
+  "identity": {
+    "channelId": "slack",
+    "accountId": "default",
+    "senderId": "U0123456789"
+  }
+}
+```
+
+Use the exact configured Slack account ID and verified native user ID. Use
+`users.listChannelIdentities` with `profileId` to check the link. Display names,
+message text, and channel membership do not grant administrator authority.
+The shared Owner profile cannot receive a person link. These methods require
+an authenticated administrator Gateway connection; they do not create users
+or configure individual sign-in.
+
+To remove Slack authority, call `users.unlinkChannelIdentity` with the same
+`profileId` and `identity`, or remove the person's administrative role through
+`users.setRole`. Check the resulting effective role: clearing an assignment can
+restore a configured default. Remove any matching `commands.ownerAllowFrom`
+entry too; these legacy owner grants remain independent of profile links.
+Previously selected tools check current authority before starting an installer.
+An accepted installation keeps its normal verification and cleanup. Revocation
+prevents a new installation or automatic restart; it does not undo accepted work.
+
+**Automatic restart applies only to the owner Slack command.**
 The first reply reports installation and pending activation. The gateway restarts
 inside the running container. A final Slack message reports completion only after
 the expected CLI version, executable bytes, and real MCP calls are verified.

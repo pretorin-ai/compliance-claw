@@ -10,11 +10,10 @@
  *                                     runs, and no agent tool can invoke it, so
  *                                     a prompt-injected agent cannot reach it.
  *
- *   pretorin_update                   a model-visible tool, deliberately
- *                                     prompt-injectable in this trusted-repo
- *                                     pilot. Its blast radius is bounded to
- *                                     WHICH SIGNED VERSION installs: no command,
- *                                     path or URL is expressible.
+ *   pretorin_update                   an administrator's model-visible tool.
+ *                                     Native owner authority is required at
+ *                                     selection and process admission. Only a
+ *                                     signed version is expressible.
  *
  * This is plain ESM with zero imports from the host. `definePluginEntry` is a
  * plain-object factory and the loader accepts any object exposing `register`, so
@@ -32,10 +31,13 @@ const TIMEOUT_MS = 360_000;
  * has to mean something. The wrapper re-execs itself under `env -i` and keeps
  * only these two non-secret variables.
  */
-function runWrapper(arg, { requester, route }) {
+function runWrapper(arg, { requester, route, assertCurrent }) {
   return new Promise((resolve) => {
     const args = arg === undefined || arg === null || arg === "" ? [] : [String(arg)];
     let child;
+    // No await between the native authority check and process creation.
+    // Once accepted, the wrapper owns its normal verification and cleanup.
+    assertCurrent();
     try {
       child = spawn(WRAPPER, args, {
         // stderr is INHERITED on purpose. The wrapper writes its audit line to
@@ -83,8 +85,8 @@ const SHARED_INSTANCE_NOTE =
   "An owner can request a safe restart. Wait for the final activation message before treating the update as complete.";
 
 /** Shared by both routes so they cannot drift in what they promise. */
-async function performUpdate({ arg, requester, route, activation, ctx }) {
-  const res = await runWrapper(arg, { requester, route });
+async function performUpdate({ arg, requester, route, activation, ctx, assertCurrent }) {
+  const res = await runWrapper(arg, { requester, route, assertCurrent });
 
   if (!res.ok) {
     const detail = res.error ? ` (${res.error})` : ` (exit ${res.code})`;
@@ -105,6 +107,8 @@ async function performUpdate({ arg, requester, route, activation, ctx }) {
 
   if (route === "command") {
     try {
+      // Installation can outlive the caller's authority. Restart is a new action.
+      assertCurrent();
       if (await activation.request(version, ctx)) {
         return `Pretorin CLI ${version} installation succeeded. Gateway restart requested. Activation is unverified. A final Slack message will confirm activation or report the required operator action.`;
       }
@@ -151,6 +155,7 @@ export default {
           const res = await runWrapper("--status", {
             requester: ctx.senderId,
             route: "command",
+            assertCurrent: () => ctx.assertOwnerCurrent(),
           });
           return { text: "```\n" + (res.stdout || "(no output)").trim() + "\n```" };
         }
@@ -172,18 +177,18 @@ export default {
         if (updating || activation.hasPending()) return { text: "A Pretorin update is pending. Wait for its activation result. Use `/pretorin-update status` to check the installed file." };
         updating = true;
         try {
-          return { text: await performUpdate({ arg, requester, route: "command", activation, ctx }) };
+          return { text: await performUpdate({ arg, requester, route: "command", activation, ctx,
+            assertCurrent: () => ctx.assertOwnerCurrent() }) };
         } finally { updating = false; }
       },
     });
 
-    // FACTORY FORM IS MANDATORY for the tool route. The per-call execute context
-    // is only { api, signal, toolCallId, onUpdate } — it carries no identity at
-    // all. Trusted identity lives on the factory's context as requesterSenderId,
-    // which the host populates from the inbound envelope, so the only way to
-    // record who asked is to close over it here.
+    // Native identity selects the tool; the live invocation guard admits effects.
+    // Sender labels are audit fields, never authorization inputs.
     api.registerTool(
-      (toolContext) => ({
+      { contextVersion: 2, create(toolContext) {
+        if (toolContext.senderIsOwner !== true || typeof toolContext.assertInvocationCurrent !== "function") return null;
+        return {
         name: "pretorin_update",
         label: "Update Pretorin CLI",
         description:
@@ -215,10 +220,12 @@ export default {
             arg: requested,
             requester,
             route: "tool",
+            assertCurrent: () => toolContext.assertInvocationCurrent(),
           });
           return { content: [{ type: "text", text }] };
         },
-      }),
+        };
+      } },
       { name: "pretorin_update" },
     );
   },
