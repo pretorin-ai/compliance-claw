@@ -488,8 +488,8 @@ The token must be:
 - limited to **only the selected repositories** you review,
 - with **Repository permissions → Contents: Read-only** and nothing else.
 
-Then `export COMPOSE_FILE=compose.yaml:compose.secrets.yaml` and restart. The PAT
-is only available on the file-secret path; the legacy `.env` path has no PAT and
+Then select `compose.secrets.yaml` in the [saved deployment settings](#save-deployment-settings)
+and restart. The PAT is only available on the file-secret path; the legacy `.env` path has no PAT and
 a private target there reports `auth_failed` naming the fix.
 
 **Status: internal-pilot acceptable, not recommended.** The GitHub App is the

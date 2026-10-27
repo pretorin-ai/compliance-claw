@@ -35,6 +35,7 @@ Prepare files without replacing anything already present:
 
 ```sh
 scripts/init-file-secrets.sh --from-env
+# saved in .env for later shells; see README "Save deployment settings"
 export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml
 docker compose build
 docker compose up -d
@@ -220,11 +221,14 @@ to the operator, and point Compose at it. For example:
 /opt/compliance-claw-secrets/
 ```
 
-Start with:
+Save the selection in the repository-root `.env`, then start:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.secrets.yaml
+COMPLIANCE_CLAW_SECRET_DIR=/opt/compliance-claw-secrets
+```
 
 ```sh
-export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
-export COMPLIANCE_CLAW_SECRET_DIR=/opt/compliance-claw-secrets
 docker compose up -d
 ```
 
@@ -241,10 +245,10 @@ Compose starts. That automation is planned, not shipped by this repository.
 
 Enable Docker itself to start on boot. The gateway declares
 `restart: unless-stopped`, so once Docker is up Compose restores the container
-with the secret mounts it already had — no repeat of the two exports. Nothing is
-restored if the container was stopped deliberately, or if `docker compose down`
-removed it; in that case re-export the two variables above and run
-`docker compose up -d`.
+with the secret mounts it already had. Nothing is restored if the container was
+stopped deliberately, or if `docker compose down` removed it; in that case run
+`docker compose up -d` again. The saved `.env` selection supplies the files and
+the secret directory in any shell.
 
 The GitHub App private key is intentionally different: it stays host-only and is
 used by `scripts/bootstrap.sh` to clone private targets. It is never declared as
