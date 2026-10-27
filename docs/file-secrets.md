@@ -15,8 +15,9 @@ The existing `.env` path remains available for backward compatibility. Do not
 combine the two: the entrypoint refuses a secret supplied both directly and by a
 `*_FILE` variable.
 
-**Requires Docker Compose v2.24.0 or newer.** The overlay uses the `!reset` tag to
-drop the base file's `env_file`, and that tag was introduced in v2.24.0. An older
+**Requires Docker Compose v2.27.2 or newer.** The host selection helper needs
+`docker compose config --environment`, added in v2.27.2. The overlay uses the
+`!reset` tag to drop the base file's `env_file`, introduced in v2.24.0. An older
 Compose does not fail closed in a way that names the cause — it reports a schema
 error on `env_file`, or silently keeps the base value on versions that ignore
 unknown tags, which would put `.env` secrets back into `docker inspect` while the

@@ -14,8 +14,10 @@ plugins. There is no root package install or `make check` command.
 
 - Install Git, Bash, Python 3, and OpenSSL for host scripts.
 - Container checks need Docker with `linux/amd64` support. On Apple Silicon,
-  enable amd64 emulation. Use Compose 2.24.4 or newer for the test overlays'
-  [`!override` tag](https://docs.docker.com/reference/compose-file/merge/#replace-value).
+  enable amd64 emulation. Use Compose 2.27.2 or newer: the host selection
+  helper needs `docker compose config --environment` (v2.27.2), and the test
+  overlays need the
+  [`!override` tag](https://docs.docker.com/reference/compose-file/merge/#replace-value) (v2.24.4).
 - Node tests can use the runtime image. A separate host Node installation is
   not required for those commands.
 - Image builds need network access to pinned base images, release assets, and

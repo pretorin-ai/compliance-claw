@@ -7,7 +7,7 @@ compose_resolve_selection() {
     docker compose config --environment 2>/dev/null |
       LC_ALL=C awk '/^(COMPOSE_FILE|COMPOSE_PATH_SEPARATOR|COMPOSE_PROJECT_NAME|COMPOSE_PROFILES|COMPLIANCE_CLAW_SECRET_DIR)=/'
   )"; then
-    printf '%s\n' 'compose-selection: ERROR — cannot resolve deployment settings. Check Docker Compose, .env and the selected files. Nothing was started.' >&2
+    printf '%s\n' 'compose-selection: ERROR — cannot resolve deployment settings. Check Docker Compose (v2.27.2 or newer, for `config --environment`), .env and the selected files. Nothing was started.' >&2
     return 1
   fi
   while IFS='=' read -r name value; do
