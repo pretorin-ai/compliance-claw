@@ -84,6 +84,20 @@ const SHARED_INSTANCE_NOTE =
   "This changes the Pretorin CLI for EVERY user of this instance. " +
   "An owner can request a safe restart. Wait for the final activation message before treating the update as complete.";
 
+/**
+ * The native command context supplies assertOwnerCurrent on owner-capable
+ * ingress. Treat its absence as "authority cannot be confirmed" and refuse,
+ * rather than letting a TypeError stand in for a decision.
+ */
+function ownerGuard(ctx) {
+  return () => {
+    if (typeof ctx?.assertOwnerCurrent !== "function") {
+      throw new Error("Owner authority could not be confirmed for this command path; the update was not started.");
+    }
+    ctx.assertOwnerCurrent();
+  };
+}
+
 /** Shared by both routes so they cannot drift in what they promise. */
 async function performUpdate({ arg, requester, route, activation, ctx, assertCurrent }) {
   const res = await runWrapper(arg, { requester, route, assertCurrent });
@@ -155,7 +169,7 @@ export default {
           const res = await runWrapper("--status", {
             requester: ctx.senderId,
             route: "command",
-            assertCurrent: () => ctx.assertOwnerCurrent(),
+            assertCurrent: ownerGuard(ctx),
           });
           return { text: "```\n" + (res.stdout || "(no output)").trim() + "\n```" };
         }
@@ -178,7 +192,7 @@ export default {
         updating = true;
         try {
           return { text: await performUpdate({ arg, requester, route: "command", activation, ctx,
-            assertCurrent: () => ctx.assertOwnerCurrent() }) };
+            assertCurrent: ownerGuard(ctx) }) };
         } finally { updating = false; }
       },
     });

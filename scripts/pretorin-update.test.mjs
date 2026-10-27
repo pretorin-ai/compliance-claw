@@ -162,6 +162,16 @@ test('command revocation during installation prevents a new activation request',
   assert.deepEqual(requests, []);
 });
 
+test('command refuses when the host supplies no owner-authority guard', async () => {
+  const h = await harness();
+  for (const args of ['latest', 'status']) {
+    const pending = h.nativeCommand.handler({ args, senderId: 'UADMIN' });
+    if (h.children.length) h.finish(h.children.length - 1);
+    await assert.rejects(pending, /Owner authority could not be confirmed/);
+  }
+  assert.equal(h.calls.length, 0);
+});
+
 test('revoked command cannot start either installation or status', async () => {
   const h = await harness();
   for (const args of ['latest', 'status']) {
