@@ -167,7 +167,17 @@ case " $* " in
 esac
 
 # OpenClaw validates the selected authentication configuration. A retained
-# trusted-proxy configuration does not require a shared gateway token.
+# trusted-proxy configuration does not require a shared gateway token. The
+# default token configuration does: with neither credential loaded, OpenClaw
+# starts with a one-time runtime token nobody holds, and every local request
+# fails later. Say so here, once, without blocking proxy mode.
+if [ "$IS_GATEWAY" = 1 ] && [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ] && [ -z "${OPENCLAW_GATEWAY_PASSWORD:-}" ]; then
+  echo "compliance-claw: WARNING — no gateway token or local maintenance password was loaded." >&2
+  echo "  In the default token configuration the gateway will start with a one-time runtime" >&2
+  echo "  token and local clawctl/exec requests will fail. Check the gateway-token file" >&2
+  echo "  (file-secret path) or OPENCLAW_GATEWAY_TOKEN in .env (legacy path). A trusted-proxy" >&2
+  echo "  configuration with no local password can ignore this. See docs/file-secrets.md." >&2
+fi
 
 # --- Seed the active Pretorin CLI, and repair an interrupted update -------
 #
