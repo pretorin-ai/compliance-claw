@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import re
+import time
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,19 @@ def main():
                  for image in images]
     if image_ids[0] == image_ids[1]:
         sys.exit("The two fixture images must have different image IDs")
+
+    # Read the real service overrides, not a second production timing policy.
+    rendered = json.loads(docker_run("compose", "--profile", "*", "config", "--format", "json", cwd=root).stdout)
+    gateway = rendered["services"]["openclaw"]
+    schedule = gateway["healthcheck"]
+    def seconds(text):
+        return sum(float(n) * {"h": 3600, "m": 60, "s": 1}[u]
+                   for n, u in re.findall(r"([0-9.]+)([hms])", text))
+    assert seconds(schedule["interval"]) == 15, schedule
+    assert seconds(schedule["start_period"]) == 720, schedule
+    assert set(schedule) == {"interval", "start_period"}, schedule
+    assert seconds(gateway["stop_grace_period"]) == 330
+    assert "healthcheck" not in rendered["services"]["cli"]
     with tempfile.TemporaryDirectory(prefix="cc-update-compose-") as tmp:
         fixture = Path(tmp)
         (fixture / "scripts").mkdir()
@@ -56,10 +71,16 @@ esac
 ''')
         (fixture / "bin/docker").write_text('''#!/usr/bin/env python3
 import os, sys
+args = sys.argv[1:]
+# Scale only this synthetic fixture's wait; assert the real updater requested 720.
+if args[:3] == ["compose", "up", "-d"]:
+    pos = args.index("--wait-timeout")
+    assert args[pos + 1] == "720", args
+    args[pos + 1] = "15"
 # Local fixture images are already present. No registry call is part of this test.
 if sys.argv[1:] in (["compose", "pull", "--quiet"], ["compose", "pull"]):
     sys.exit(0)
-os.execv(os.environ["FIXTURE_DOCKER"], [os.environ["FIXTURE_DOCKER"], *sys.argv[1:]])
+os.execv(os.environ["FIXTURE_DOCKER"], [os.environ["FIXTURE_DOCKER"], *args])
 ''')
         for tool in ("git", "docker"):
             (fixture / "bin" / tool).chmod(0o700)
@@ -121,9 +142,23 @@ os.execv(os.environ["FIXTURE_DOCKER"], [os.environ["FIXTURE_DOCKER"], *sys.argv[
             assert compose(project, "ps", "-q", "openclaw").stdout.strip() == cid
             print("PASS: effective image override, healthy startup, and repeat without replacement")
 
-            configure(command=["sleep 3; touch /tmp/ready; exec sleep infinity"])
+            # Interval-only control: failed probes precede readiness, then Docker
+            # rejects the service before its marker can be written.
+            delayed = ["sleep 8; touch /tmp/ready; exec sleep infinity"]
+            configure(command=delayed, healthcheck={"start_period": "1s"})
+            update(False)
+            failed = compose(project, "ps", "--all", "-q", "openclaw").stdout.strip()
+            health = json.loads(docker_run("inspect", "--format", "{{json .State.Health}}", failed).stdout)
+            assert health["Status"] == "unhealthy", health
+            assert health["Log"] and all(p["ExitCode"] != 0 for p in health["Log"]), health
+            print("PASS: short-grace control fails before delayed readiness")
+
+            # Production grace scaled by 24; test interval and timeout are 1s.
+            # This tests native scheduling, not the full 720-second duration.
+            configure(command=delayed, healthcheck={
+                "start_period": str(seconds(schedule["start_period"]) / 24) + "s"})
             update(True)
-            print("PASS: delayed synthetic health")
+            print("PASS: delayed synthetic health survives startup grace")
 
             configure(command=["exit 17"])
             update(False)
@@ -131,11 +166,12 @@ os.execv(os.environ["FIXTURE_DOCKER"], [os.environ["FIXTURE_DOCKER"], *sys.argv[
             assert docker_run("inspect", "--format", "{{.State.Status}}", failed_cid).stdout.strip() == "exited"
             print("PASS: failed startup")
 
-            configure(command=["exec sleep infinity"])
+            configure(command=["exec sleep infinity"], healthcheck={"start_period": "30s"})
+            started = time.monotonic()
             update(False)
-            unhealthy_cid = compose(project, "ps", "--all", "-q", "openclaw").stdout.strip()
-            assert docker_run("inspect", "--format", "{{.State.Health.Status}}", unhealthy_cid).stdout.strip() == "unhealthy"
-            print("PASS: unhealthy startup")
+            elapsed = time.monotonic() - started
+            assert 12 <= elapsed < 30, elapsed
+            print("PASS: never-ready service fails the scaled finite native wait", round(elapsed, 1))
 
             configure()
             state = compose(project, "run", "--rm", "-T", "cli", "sh", "-c",

@@ -898,8 +898,12 @@ scripts/update.sh
 
 One command: fast-forward the checkout, pull the image this checkout pins, restart
 the selected gateway, then report anything you have to act on. Compose waits up
-to 360 seconds for startup. The script then verifies the selected container's
-running state, health, and actual image against the effective Compose selection,
+to 720 seconds for gateway health. The gateway uses a 15-second health interval
+and 720-second startup grace; the image's health command, timeout and retries
+stay unchanged. Customer overlays retain native precedence. This finite wait is
+not a startup guarantee or a limit for the whole update: Git, image pull and the
+separate 330-second stop grace can take more time. The script then verifies the
+selected container's running state, health, and actual image against Compose,
 including customer overlays. It checks the gateway again after diagnostics.
 It is idempotent: a second run does not force container replacement.
 

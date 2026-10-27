@@ -133,6 +133,12 @@ services:
     # lease before Docker sends SIGKILL. This applies to replacement and stop.
     stop_grace_period: 330s
 
+    # Keep slow valid startup inside native health grace. The image owns the
+    # health command, timeout and retries; only the schedule changes here.
+    healthcheck:
+      interval: 15s
+      start_period: 720s
+
     # RESTATED, NOT MERGED — and that is a property of YAML, not a style choice.
     # A `volumes:` key on the service REPLACES the one the merge key brought in;
     # it does not append to it. Writing only the two extra mounts here silently
