@@ -408,8 +408,8 @@ if [ -e .env ]; then
       fi
     done
   else
-    grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env \
-      || warn ".env has no OPENCLAW_GATEWAY_TOKEN value; the gateway will exit 1."
+    grep -qE '^OPENCLAW_GATEWAY_(TOKEN|PASSWORD)=.+' .env \
+      || warn "No local gateway credential in .env. OpenClaw validates the configured authentication mode."
   fi
 elif [ "$FILE_SECRETS" = 1 ]; then
   # NON-SECRETS ONLY. Copied verbatim from .env.example, which ships every secret
@@ -421,7 +421,7 @@ elif [ "$FILE_SECRETS" = 1 ]; then
   # Assert the shipped example really is value-free, rather than trusting it: a
   # future edit that pastes a placeholder secret in here would silently create the
   # dual-source conflict this branch exists to avoid.
-  if grep -qE '^(PRETORIN_API_KEY|OPENCLAW_GATEWAY_TOKEN|SLACK_APP_TOKEN|SLACK_BOT_TOKEN)=.+' .env; then
+  if grep -qE '^(PRETORIN_API_KEY|OPENCLAW_GATEWAY_TOKEN|OPENCLAW_GATEWAY_PASSWORD|SLACK_APP_TOKEN|SLACK_BOT_TOKEN)=.+' .env; then
     die "generated .env carries a secret value, which the file-secret path forbids —
   .env.example must ship these lines empty. Fix .env.example, then re-run."
   fi
@@ -433,18 +433,18 @@ else
       .env.example > .env )
   chmod 600 .env
   # The sed above is only correct while .env.example still carries that exact
-  # key. Assert rather than trust: a silently token-less .env fails much later,
-  # as an exit 1 from a container.
+  # key. Assert rather than trust: a silently token-less .env leaves the default
+  # token configuration with no value to resolve.
   grep -qE '^OPENCLAW_GATEWAY_TOKEN=[0-9a-f]{64}$' .env \
     || die "generated .env has no valid OPENCLAW_GATEWAY_TOKEN — did .env.example change?"
   log "  PRETORIN_API_KEY is empty. Add a key to .env before onboarding."
 fi
 
 # --- 2b. secret files (file-secret path only) ------------------------------
-# init-file-secrets.sh is write-if-absent and generates the gateway token when it
-# is empty, so running it here is what makes the documented Quickstart actually
-# complete: the operator is left with files to paste values into rather than a
-# deployment that exits 1 on the first `up`.
+# init-file-secrets.sh is write-if-absent and generates a missing gateway token,
+# so running it here is what makes the documented Quickstart actually
+# complete: the operator is left with files to paste values into, and the
+# default token configuration has a value to resolve on the first `up`.
 if [ "$FILE_SECRETS" = 1 ]; then
   log "preparing secret files (never overwrites an existing value)"
   bash "${REPO_ROOT}/scripts/init-file-secrets.sh" 2>&1 | sed 's/^/  /' ||     die "init-file-secrets.sh failed; see the output above."
@@ -463,8 +463,9 @@ if [ "$FILE_SECRETS" = 1 ]; then
     log "  still empty, and needed before an agent turn:"
     for n in "${NEEDS_VALUE[@]}"; do log "    ${SECRET_DIR}/${n}"; done
   fi
-  grep -qE '^[0-9a-f]{64}$' "${SECRET_DIR}/openclaw-gateway-token" 2>/dev/null \
-    || warn "${SECRET_DIR}/openclaw-gateway-token has no usable token; the gateway will exit 1."
+  if [ ! -s "${SECRET_DIR}/openclaw-gateway-token" ] && [ ! -s "${SECRET_DIR}/openclaw-gateway-password" ]; then
+    log "  no local gateway credential. OpenClaw validates the configured authentication mode."
+  fi
 fi
 
 # --- 3. targets ------------------------------------------------------------

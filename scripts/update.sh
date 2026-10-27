@@ -185,6 +185,7 @@ if compose_has_file compose.secrets.yaml; then
     done <<'SECRETS'
 pretorin-api-key
 openclaw-gateway-token
+openclaw-gateway-password
 slack-app-token
 slack-bot-token
 openai-api-key

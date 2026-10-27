@@ -115,6 +115,7 @@ load_secret_file() {
 for secret_name in \
   PRETORIN_API_KEY \
   OPENCLAW_GATEWAY_TOKEN \
+  OPENCLAW_GATEWAY_PASSWORD \
   SLACK_APP_TOKEN \
   SLACK_BOT_TOKEN \
   OPENAI_API_KEY \
@@ -155,28 +156,28 @@ else
 fi
 export OPENAI_REQUEST_ADAPTER
 
-# The gateway needs the token; `docker compose run --rm cli pretorin version`
-# does not, and must keep working on a fresh clone with no .env (compose marks
-# .env required:false). So the check is scoped to gateway invocations instead of
-# being global. OpenClaw would fail closed on its own anyway; this only replaces
-# a SecretRefResolutionError pointing at `openclaw gateway status --deep` with a
-# message naming the file the operator actually has to edit.
+# Gateway invocations are told apart from one-off CLI commands such as
+# `docker compose run --rm cli pretorin version`, which must keep working on a
+# fresh clone with no .env (compose marks .env required:false). The seed, repair
+# and Slack branches below use this flag. OpenClaw itself validates the selected
+# authentication configuration; no shared gateway token is required here.
 IS_GATEWAY=0
 case " $* " in
   *" gateway "*) IS_GATEWAY=1 ;;
 esac
 
-case " $* " in
-  *" gateway "*)
-    if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
-      echo "compliance-claw: OPENCLAW_GATEWAY_TOKEN is unset or empty." >&2
-      echo "  The gateway will not start without it." >&2
-      echo "  Set it directly for the legacy local path, or mount a secret and set" >&2
-      echo "  OPENCLAW_GATEWAY_TOKEN_FILE. See docs/file-secrets.md." >&2
-      exit 1
-    fi
-    ;;
-esac
+# OpenClaw validates the selected authentication configuration. A retained
+# trusted-proxy configuration does not require a shared gateway token. The
+# default token configuration does: with neither credential loaded, OpenClaw
+# starts with a one-time runtime token nobody holds, and every local request
+# fails later. Say so here, once, without blocking proxy mode.
+if [ "$IS_GATEWAY" = 1 ] && [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ] && [ -z "${OPENCLAW_GATEWAY_PASSWORD:-}" ]; then
+  echo "compliance-claw: WARNING — no gateway token or local maintenance password was loaded." >&2
+  echo "  In the default token configuration the gateway will start with a one-time runtime" >&2
+  echo "  token and local clawctl/exec requests will fail. Check the gateway-token file" >&2
+  echo "  (file-secret path) or OPENCLAW_GATEWAY_TOKEN in .env (legacy path). A trusted-proxy" >&2
+  echo "  configuration with no local password can ignore this. See docs/file-secrets.md." >&2
+fi
 
 # --- Seed the active Pretorin CLI, and repair an interrupted update -------
 #

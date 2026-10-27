@@ -29,8 +29,9 @@
 # its own empty cache and exits, leaving the gateway's children untouched.
 #
 # The gateway generates ~/.openclaw/openclaw.json into the state volume on first
-# start and never overwrites it. `.env` must supply OPENCLAW_GATEWAY_TOKEN or the
-# gateway exits 1; PRETORIN_API_KEY may be empty, which only costs platform
+# start and never overwrites it. The default token configuration uses
+# OPENCLAW_GATEWAY_TOKEN; native config selects authentication. PRETORIN_API_KEY
+# may be empty, which only costs platform
 # access. See .env.example, docs/plans/phase3.md and docs/plans/phase4.md.
 #
 # `docker compose down -v` deletes BOTH named volumes: the OpenClaw state volume

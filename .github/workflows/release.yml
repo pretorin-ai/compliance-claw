@@ -260,6 +260,11 @@ jobs:
           BUILD_REF: ${{ steps.pins.outputs.build_ref }}
         run: bash scripts/test-file-secrets.sh "$BUILD_REF"
 
+      - name: Native proxy authentication and local maintenance (isolated)
+        env:
+          BUILD_REF: ${{ steps.pins.outputs.build_ref }}
+        run: bash scripts/test-proxy-auth.sh "$BUILD_REF"
+
       # Exceptions printed BEFORE the gate, not buried in a file nobody opens.
       - name: Show the vulnerability exceptions being applied
         run: |

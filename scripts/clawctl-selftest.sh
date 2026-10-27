@@ -1178,10 +1178,10 @@ print(ch == bd == ['C0HIPAABB','C0SOC2AAA'])")" = "True" ]; then
   else
     st_bad "verification runs in the gateway container" "no exec call was recorded"
   fi
-  if grep -E 'exec -T openclaw' "$record" | grep -q 'openclaw_gateway_token'; then
-    st_ok "  and re-reads the gateway token INSIDE the container"
+  if grep -E 'exec -T openclaw' "$record" | grep -q 'OPENCLAW_GATEWAY_TOKEN OPENCLAW_GATEWAY_PASSWORD'; then
+    st_ok "  and includes both native credential loaders in the exec command"
   else
-    st_bad "  and re-reads the gateway token inside the container" "$(grep 'exec -T' "$record" | head -2)"
+    st_bad "  and includes both native credential loaders" "$(grep 'exec -T' "$record" | head -2)"
   fi
   if grep -E 'run .*cli openclaw (health|agents|mcp)' "$record" >/dev/null 2>&1; then
     st_bad "no gateway-bound command is issued through the cli container" \

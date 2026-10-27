@@ -71,7 +71,8 @@ points here rather than restating it, so the two cannot drift.
 | Host file under `secrets/runtime/` | Runtime variable | Required? | Delivered to |
 | --- | --- | --- | --- |
 | `pretorin-api-key` | `PRETORIN_API_KEY` | for any platform access | `openclaw`, `cli` |
-| `openclaw-gateway-token` | `OPENCLAW_GATEWAY_TOKEN` | **yes** — the gateway exits 1 without it | `openclaw` only |
+| `openclaw-gateway-token` | `OPENCLAW_GATEWAY_TOKEN` | default token authentication; empty for native proxy authentication | `openclaw` only |
+| `openclaw-gateway-password` | `OPENCLAW_GATEWAY_PASSWORD` | optional native local maintenance credential | `openclaw` only |
 | `slack-app-token` | `SLACK_APP_TOKEN` | only for Slack — **both tokens together** | `openclaw`, `cli` |
 | `slack-bot-token` | `SLACK_BOT_TOKEN` | only for Slack — **both tokens together** | `openclaw`, `cli` |
 | `openai-api-key` | `OPENAI_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
@@ -89,8 +90,11 @@ there is exactly one owner of the channel allowlist.
 The host-side GitHub App identifiers and private-key path also stay in `.env`;
 the overlay does not forward them into either container.
 
-An empty optional file means that provider is simply not configured. The gateway
-token is the one that fails closed.
+An empty optional file supplies no value. OpenClaw configuration selects and
+validates authentication; secret-file contents do not select a mode.
+Native token mode can generate a runtime token when none is configured. Default
+initialization still creates a persistent token. Native password mode rejects
+a missing password.
 
 ### Delivery is least privilege, not convenience
 
@@ -136,12 +140,11 @@ an outage over a credential the deployment does not even use.
 | Excluded from `cli` | Why |
 | --- | --- |
 | model API keys | agent turns run only in the gateway. Handing a one-off container a provider credential gives it spend authority it has no use for. |
-| `openclaw-gateway-token` | the entrypoint requires it only for gateway invocations, and `cli` is one-off by Compose profile. Without it, `cli` cannot start a second gateway against the same volumes. |
+| gateway token and password | local authenticated requests run with `exec` inside the gateway. The one-off `cli` service receives neither credential. |
 | `github-readonly-pat` | only the gateway carries the target-sync routes, and only the gateway has the writable maintenance mount. A git credential in a container with nothing to use it on is pure exposure. |
 
-If a `cli` invocation ever genuinely needs the gateway token, the entrypoint
-refuses with a message naming the file to mount, rather than failing somewhere
-deeper. `scripts/test-file-secrets.sh` asserts this matrix directly: it plants a
+Use the running gateway for local authenticated requests. Native authentication
+still applies. `scripts/test-file-secrets.sh` asserts this matrix directly: it plants a
 distinct canary in every secret file and checks that each container sees exactly
 its allowed set **and nothing more**, so over-delivery fails the gate rather than
 going unnoticed.
@@ -166,6 +169,44 @@ widening the credential's reach.
 
 An unset marker does not fall back to a default; it makes the whole config
 invalid. The export is unconditional for that reason.
+
+## Native proxy authentication and local maintenance
+
+The default installation still uses a gateway token. An existing deployment can
+use the pinned OpenClaw `trusted-proxy` authentication configuration after its
+administrator supplies an authenticated proxy. This repository does not deploy
+that proxy, choose an identity service, assign roles, or change network rules.
+
+Back up the configuration and both state volumes before a mode change. Keep the
+saved Compose selection and secret directory. Use supported native configuration
+commands; a file replacement is not a canonical configuration update. Remove
+`gateway.auth.token` completely, including a retained `${OPENCLAW_GATEWAY_TOKEN}`
+reference. Set `gateway.auth.mode` to `trusted-proxy` and configure the native
+proxy trust, identity headers and allowed origins. A TLS reverse proxy alone does
+not establish identity. Restrict direct remote Gateway access to the proxy.
+
+Keep `openclaw-gateway-token` present but empty. Initialization preserves an
+existing empty file; it generates a token only when that file is absent. Empty
+files do not change native authentication settings. An unresolved token reference
+can still prevent startup after the mode changes.
+
+For native local maintenance, put a password in `openclaw-gateway-password` with
+the documented file permissions and set `gateway.auth.password` to the literal
+`${OPENCLAW_GATEWAY_PASSWORD}` reference. Keep values out of configuration and
+command arguments. Recreate the selected gateway to refresh file mounts. The
+entrypoint and `clawctl` load the password inside that container. Local requests
+use native password authentication without proxy identity headers. This password
+is a shared VM maintenance credential, not an individual team identity.
+
+Verify startup and a local authenticated request before granting team access.
+The isolated `scripts/test-proxy-auth.sh` checks native startup and configuration
+requests with a canary password; it does not prove a deployed proxy, sign-in,
+role policy, or the complete multi-effort onboarding flow.
+
+For rollback, use native commands to restore the previous authentication settings
+and their matching credential files, then recreate only the selected gateway with the same
+volumes and Compose selection. Do not restore revoked credentials or use
+`down -v`. No startup script converts or overwrites retained auth settings.
 
 ## `docker compose exec` does not see these secrets
 
@@ -194,7 +235,10 @@ docker compose exec -T openclaw sh -c '
 ```
 
 Replace `crm-soc2` with a configured effort agent name. The gateway must be
-running. This example is for the file-secret path.
+running. This example is for token authentication on the file-secret path. With
+native proxy authentication, load `OPENCLAW_GATEWAY_PASSWORD` from
+`/run/secrets/openclaw_gateway_password` instead. `clawctl` reloads both configured
+file sources and refuses a missing, unreadable, or conflicting source.
 
 Do **not** use `docker compose exec -e OPENCLAW_GATEWAY_TOKEN="$(cat ...)"`: that
 reads the secret on the host and puts it in an argument list, which is visible to
