@@ -59,9 +59,6 @@ AGENTS_TEMPLATE="scripts/agents-md.template"
 # The OpenClaw config, inside the state volume both services mount.
 OC_CONFIG="/home/node/.openclaw/openclaw.json"
 OC_STATE="/home/node/.openclaw"
-# The gateway token, as a PATH. compose.secrets.yaml mounts it; an `exec`'d
-# process re-reads it from here because it inherits none of PID 1's exports.
-OC_TOKEN_FILE="/run/secrets/openclaw_gateway_token"
 
 # THE LAST-APPLIED RECORD, ON THE HOST.
 #
@@ -730,7 +727,7 @@ print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))'
 #            scar of a check written that way that reported skip for months.
 #
 # `exec` is a child of the daemon, not PID 1, so it inherits none of the
-# entrypoint's exports and re-reads the token inside the container — the idiom
+# entrypoint's exports and re-reads credentials inside the container — the idiom
 # smoke.sh and docs/file-secrets.md already use. NEVER
 # `exec -e TOKEN="$(cat ...)"`: that puts the secret in host argv.
 oc_cli() {
@@ -743,13 +740,24 @@ oc_cli() {
   fi
 }
 
-# The token reload, verbatim, as a prelude to every exec'd command. The -z guard
-# makes it a no-op on the legacy .env path, where env_file already supplied it.
+# Reload native local credentials for direct requests, with the same single-source
+# rule as the entrypoint. No values cross the Docker CLI argument boundary.
 OC_EXEC_PRELUDE='
-  if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ] && [ -r '"'${OC_TOKEN_FILE}'"' ]; then
-    OPENCLAW_GATEWAY_TOKEN="$(cat '"'${OC_TOKEN_FILE}'"')"
-    export OPENCLAW_GATEWAY_TOKEN
-  fi
+  for name in OPENCLAW_GATEWAY_TOKEN OPENCLAW_GATEWAY_PASSWORD; do
+    eval "value=\${${name}:-}"
+    eval "path=\${${name}_FILE:-}"
+    [ -n "$path" ] || continue
+    if [ -n "$value" ]; then
+      echo "clawctl: ${name} and ${name}_FILE are both set." >&2; exit 1
+    fi
+    if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+      echo "clawctl: ${name}_FILE is not a readable regular file." >&2; exit 1
+    fi
+    value="$(cat -- "$path")" || exit 1
+    [ -z "$value" ] || export "$name=$value"
+    unset value path
+  done
+  unset name
 '
 
 oc_exec() {
@@ -1276,10 +1284,10 @@ verify_apply() {
       break
     fi
     if oc_token_failure "$out"; then
-      VERIFY_DETAIL="the gateway token did not resolve in the exec path.
-      This is NOT a missing model key and NOT a bad token: an exec'd process is a
+      VERIFY_DETAIL="a local gateway credential did not resolve in the exec path.
+      This is NOT a missing model key: an exec'd process is a
       child of the docker daemon, not of PID 1, so it inherits none of the
-      entrypoint's exports and has to re-read ${OC_TOKEN_FILE} itself."
+      entrypoint's exports and must load the configured gateway credential file."
       return 1
     fi
     [ "$i" = "$tries" ] && {

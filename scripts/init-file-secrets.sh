@@ -84,7 +84,7 @@ while IFS='|' read -r name filename; do
   if [ "$FROM_ENV" = 1 ]; then
     value="$(env_value "$name")"
   fi
-  if [ "$name" = OPENCLAW_GATEWAY_TOKEN ] && [ -z "$value" ]; then
+  if [ "$name" = OPENCLAW_GATEWAY_TOKEN ] && [ ! -e "${SECRET_DIR}/${filename}" ] && [ -z "$value" ]; then
     command -v openssl >/dev/null 2>&1 || die "openssl is required to generate the gateway token"
     value="$(openssl rand -hex 32)"
   fi
@@ -94,6 +94,7 @@ while IFS='|' read -r name filename; do
 done <<'EOF'
 PRETORIN_API_KEY|pretorin-api-key
 OPENCLAW_GATEWAY_TOKEN|openclaw-gateway-token
+OPENCLAW_GATEWAY_PASSWORD|openclaw-gateway-password
 SLACK_APP_TOKEN|slack-app-token
 SLACK_BOT_TOKEN|slack-bot-token
 OPENAI_API_KEY|openai-api-key

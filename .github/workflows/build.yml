@@ -238,6 +238,9 @@ jobs:
       - name: File-secret contract (runtime behaviour)
         run: bash scripts/test-file-secrets.sh compliance-claw:local
 
+      - name: Native proxy authentication and local maintenance (isolated)
+        run: bash scripts/test-proxy-auth.sh compliance-claw:local
+
       # THE HALF THE SCHEMA SELF-TEST CANNOT SEE. parse-efforts.py proves the
       # credential LADDER resolves the right path; only a running container can
       # prove the value actually reaches the MCP child, that it stays out of

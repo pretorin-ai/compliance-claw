@@ -115,6 +115,7 @@ load_secret_file() {
 for secret_name in \
   PRETORIN_API_KEY \
   OPENCLAW_GATEWAY_TOKEN \
+  OPENCLAW_GATEWAY_PASSWORD \
   SLACK_APP_TOKEN \
   SLACK_BOT_TOKEN \
   OPENAI_API_KEY \
@@ -166,17 +167,8 @@ case " $* " in
   *" gateway "*) IS_GATEWAY=1 ;;
 esac
 
-case " $* " in
-  *" gateway "*)
-    if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
-      echo "compliance-claw: OPENCLAW_GATEWAY_TOKEN is unset or empty." >&2
-      echo "  The gateway will not start without it." >&2
-      echo "  Set it directly for the legacy local path, or mount a secret and set" >&2
-      echo "  OPENCLAW_GATEWAY_TOKEN_FILE. See docs/file-secrets.md." >&2
-      exit 1
-    fi
-    ;;
-esac
+# OpenClaw validates the selected authentication configuration. A retained
+# trusted-proxy configuration does not require a shared gateway token.
 
 # --- Seed the active Pretorin CLI, and repair an interrupted update -------
 #

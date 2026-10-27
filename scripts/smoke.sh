@@ -868,7 +868,7 @@ head2 "A4d. FILE-BACKED SECRET DEPLOYMENT"
 # base env_file entirely, mount every secret explicitly, and expose only *_FILE
 # paths plus documented non-secret configuration to Docker.
 FILE_SECRET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cc-file-secrets.XXXXXX")"
-for f in pretorin-api-key openclaw-gateway-token slack-app-token slack-bot-token \
+for f in pretorin-api-key openclaw-gateway-token openclaw-gateway-password slack-app-token slack-bot-token \
          openai-api-key anthropic-api-key github-readonly-pat; do
   : > "${FILE_SECRET_DIR}/${f}"
 done
@@ -883,7 +883,7 @@ fi
 FILE_SECRET_CHECK="$(printf '%s' "$FILE_SECRET_CONFIG" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)["services"]
-secret_names={"PRETORIN_API_KEY","OPENCLAW_GATEWAY_TOKEN","SLACK_APP_TOKEN","SLACK_BOT_TOKEN","OPENAI_API_KEY","ANTHROPIC_API_KEY"}
+secret_names={"PRETORIN_API_KEY","OPENCLAW_GATEWAY_TOKEN","OPENCLAW_GATEWAY_PASSWORD","SLACK_APP_TOKEN","SLACK_BOT_TOKEN","OPENAI_API_KEY","ANTHROPIC_API_KEY"}
 for name,svc in d.items():
     assert not svc.get("env_file"), f"{name} still has env_file"
     env=svc.get("environment",{})
@@ -898,7 +898,7 @@ for name,svc in d.items():
 # that hides: everything works, some container just holds a credential it never
 # needed, and nobody notices until it leaks. So each side is pinned exactly.
 want_openclaw={"pretorin_api_key","slack_app_token","slack_bot_token",
-               "openclaw_gateway_token","openai_api_key","anthropic_api_key",
+               "openclaw_gateway_token","openclaw_gateway_password","openai_api_key","anthropic_api_key",
                "github_readonly_pat"}
 want_cli={"pretorin_api_key","slack_app_token","slack_bot_token"}
 got_openclaw={x["source"] for x in d["openclaw"].get("secrets",[])}
@@ -908,7 +908,7 @@ assert got_cli == want_cli, f"cli secrets {sorted(got_cli)} != {sorted(want_cli)
 # Gateway-only, by env var too. A model key gives spend authority to a container
 # that runs no turns; the gateway token would let a one-off cli start a second
 # gateway against the same volumes.
-for gateway_only in ("OPENAI_API_KEY_FILE","ANTHROPIC_API_KEY_FILE","OPENCLAW_GATEWAY_TOKEN_FILE"):
+for gateway_only in ("OPENAI_API_KEY_FILE","ANTHROPIC_API_KEY_FILE","OPENCLAW_GATEWAY_TOKEN_FILE","OPENCLAW_GATEWAY_PASSWORD_FILE"):
     assert gateway_only in d["openclaw"].get("environment",{}), f"openclaw lacks {gateway_only}"
     assert gateway_only not in d["cli"].get("environment",{}), f"cli should not receive {gateway_only}"
 # THE PAT HAS NO ENVIRONMENT VARIABLE AT ALL, ON EITHER SERVICE, AND THAT IS THE
@@ -1379,15 +1379,14 @@ if [ -e .env ]; then
     else
       pass ".env carries NO gateway token value (file-secret path)"
     fi
-    if [ -s "${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}/openclaw-gateway-token" ]; then
-      pass "the gateway token lives in the mounted secret file instead"
+    if [ -f "${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}/openclaw-gateway-token" ]; then
+      pass "the gateway token file exists; native configuration selects authentication"
     else
       fail "the gateway token lives in the mounted secret file instead" \
-           "neither .env nor the secret file carries a token; the gateway would exit 1"
+           "gateway token file is missing; run scripts/init-file-secrets.sh"
     fi
   else
-    grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env && pass ".env carries a gateway token (legacy path)" \
-      || fail ".env carries a gateway token (legacy path)"
+    note "native OpenClaw configuration validates gateway authentication (legacy path)"
   fi
   ENV_BEFORE="$(digest .env)"
   HEAD_BEFORE="$(git -C "workspace/targets/${FIRST_TARGET}" rev-parse HEAD)"
@@ -1775,6 +1774,10 @@ PY
     if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ] && [ -r /run/secrets/openclaw_gateway_token ]; then
       OPENCLAW_GATEWAY_TOKEN="$(cat /run/secrets/openclaw_gateway_token)"
       export OPENCLAW_GATEWAY_TOKEN
+    fi
+    if [ -z "${OPENCLAW_GATEWAY_PASSWORD:-}" ] && [ -r /run/secrets/openclaw_gateway_password ]; then
+      OPENCLAW_GATEWAY_PASSWORD="$(cat /run/secrets/openclaw_gateway_password)"
+      export OPENCLAW_GATEWAY_PASSWORD
     fi
     openclaw agent --agent main -m "$CC_PROMPT"' 2>&1)"
   LOWT="$(printf '%s' "$TURN" | tr 'A-Z' 'a-z')"

@@ -21,6 +21,7 @@ VOL_PRETORIN="${PROJECT}-pretorin"
 CANARY_PRETORIN="CANARY-PRETORIN-FILE-31f9a6"
 CANARY_OPENAI="CANARY-OPENAI-FILE-7d2e4b"
 CANARY_GATEWAY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+CANARY_PASSWORD="CANARY-LOCAL-PASSWORD-9f31a2"
 
 cleanup() {
   docker rm -f "${PROJECT}-runtime" >/dev/null 2>&1 || true
@@ -36,6 +37,7 @@ mkdir -p "$TMP/secrets" "$TMP/targets"
 chmod 700 "$TMP/secrets"
 printf '%s' "$CANARY_PRETORIN" > "$TMP/secrets/pretorin-api-key"
 printf '%s' "$CANARY_GATEWAY"  > "$TMP/secrets/openclaw-gateway-token"
+printf '%s' "$CANARY_PASSWORD" > "$TMP/secrets/openclaw-gateway-password"
 printf '%s' ''                 > "$TMP/secrets/slack-app-token"
 printf '%s' ''                 > "$TMP/secrets/slack-bot-token"
 printf '%s' "$CANARY_OPENAI"  > "$TMP/secrets/openai-api-key"
@@ -51,12 +53,14 @@ docker run -d --platform linux/amd64 \
   --name "${PROJECT}-runtime" \
   -e PRETORIN_API_KEY_FILE=/run/secrets/pretorin_api_key \
   -e OPENCLAW_GATEWAY_TOKEN_FILE=/run/secrets/openclaw_gateway_token \
+  -e OPENCLAW_GATEWAY_PASSWORD_FILE=/run/secrets/openclaw_gateway_password \
   -e SLACK_APP_TOKEN_FILE=/run/secrets/slack_app_token \
   -e SLACK_BOT_TOKEN_FILE=/run/secrets/slack_bot_token \
   -e OPENAI_API_KEY_FILE=/run/secrets/openai_api_key \
   -e ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_api_key \
   --mount "type=bind,src=${TMP}/secrets/pretorin-api-key,dst=/run/secrets/pretorin_api_key,readonly" \
   --mount "type=bind,src=${TMP}/secrets/openclaw-gateway-token,dst=/run/secrets/openclaw_gateway_token,readonly" \
+  --mount "type=bind,src=${TMP}/secrets/openclaw-gateway-password,dst=/run/secrets/openclaw_gateway_password,readonly" \
   --mount "type=bind,src=${TMP}/secrets/slack-app-token,dst=/run/secrets/slack_app_token,readonly" \
   --mount "type=bind,src=${TMP}/secrets/slack-bot-token,dst=/run/secrets/slack_bot_token,readonly" \
   --mount "type=bind,src=${TMP}/secrets/openai-api-key,dst=/run/secrets/openai_api_key,readonly" \
@@ -68,6 +72,7 @@ docker run -d --platform linux/amd64 \
     test "$PRETORIN_API_KEY" = "CANARY-PRETORIN-FILE-31f9a6"
     test "$OPENAI_API_KEY" = "CANARY-OPENAI-FILE-7d2e4b"
     test "$OPENCLAW_GATEWAY_TOKEN" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    test "$OPENCLAW_GATEWAY_PASSWORD" = "CANARY-LOCAL-PASSWORD-9f31a2"
     sleep 300
   ' >/dev/null
 
@@ -83,10 +88,11 @@ esac
 printf '%s' "$CONFIG_ENV" | python3 -c '
 import json,sys
 env=json.load(sys.stdin)
-direct=("PRETORIN_API_KEY=","OPENCLAW_GATEWAY_TOKEN=","SLACK_APP_TOKEN=","SLACK_BOT_TOKEN=","OPENAI_API_KEY=","ANTHROPIC_API_KEY=")
+direct=("PRETORIN_API_KEY=","OPENCLAW_GATEWAY_TOKEN=","OPENCLAW_GATEWAY_PASSWORD=","SLACK_APP_TOKEN=","SLACK_BOT_TOKEN=","OPENAI_API_KEY=","ANTHROPIC_API_KEY=")
 assert not any(item.startswith(direct) for item in env)
 assert "PRETORIN_API_KEY_FILE=/run/secrets/pretorin_api_key" in env
 assert "OPENCLAW_GATEWAY_TOKEN_FILE=/run/secrets/openclaw_gateway_token" in env
+assert "OPENCLAW_GATEWAY_PASSWORD_FILE=/run/secrets/openclaw_gateway_password" in env
 # The PAT is delivered as a MOUNT ONLY. Every other secret here is exported into
 # PID 1 by the entrypoint, which unsandboxed tool execution then inherits; the
 # git credential helper reads this one from its path instead. A *_FILE variable
@@ -105,6 +111,36 @@ if docker run --rm --platform linux/amd64 \
   exit 1
 fi
 grep -q 'both set' "$TMP/conflict.log"
+
+for failure in conflict missing unreadable; do
+  args=(-e OPENCLAW_GATEWAY_PASSWORD_FILE=/run/secrets/password)
+  command=(pretorin version)
+  case "$failure" in
+    conflict) args+=(-e OPENCLAW_GATEWAY_PASSWORD="$CANARY_PASSWORD") ;;
+    unreadable)
+      # Change permissions inside the disposable container. Docker Desktop can
+      # reject a 000 host file before the entrypoint gets to check it.
+      args=(-e OPENCLAW_GATEWAY_PASSWORD_FILE=/tmp/unreadable-password --user 0 --entrypoint sh)
+      command=(-c 'printf canary > /tmp/unreadable-password; chmod 000 /tmp/unreadable-password; exec setpriv --reuid=1000 --regid=1000 --init-groups /usr/local/bin/compliance-claw-entrypoint pretorin version') ;;
+  esac
+  if [ "$failure" = conflict ]; then
+    args+=(--mount "type=bind,src=${TMP}/secrets/openclaw-gateway-password,dst=/run/secrets/password,readonly")
+  fi
+  if docker run --rm --platform linux/amd64 --network none "${args[@]}" "$IMAGE" "${command[@]}" >"$TMP/password-$failure.log" 2>&1; then
+    echo "file-secret-test: FAIL — password $failure accepted" >&2; exit 1
+  fi
+  if grep -q "$CANARY_PASSWORD" "$TMP/password-$failure.log"; then
+    echo 'file-secret-test: FAIL — password appeared in diagnostics' >&2; exit 1
+  fi
+  expected='readable regular file'
+  [ "$failure" != conflict ] || expected='both set'
+  if ! grep -q "$expected" "$TMP/password-$failure.log"; then
+    echo "file-secret-test: FAIL — unexpected $failure diagnostic" >&2
+    tail -6 "$TMP/password-$failure.log" | sed "s/$CANARY_PASSWORD/<redacted>/g" >&2
+    exit 1
+  fi
+  chmod 604 "$TMP/secrets/openclaw-gateway-password"
+done
 
 # ===========================================================================
 # DELIVERY MATRIX — each service sees exactly its allowed set, AND NOTHING MORE.
@@ -135,7 +171,7 @@ for name in ("openclaw", "cli"):
 [ -n "$MATRIX" ] || { echo "file-secret-test: FAIL — could not render the compose secret matrix" >&2; exit 1; }
 printf '%s\n' "$MATRIX" | sed 's/^/  wiring: /'
 
-EXPECT_OPENCLAW="anthropic_api_key,github_readonly_pat,openai_api_key,openclaw_gateway_token,pretorin_api_key,slack_app_token,slack_bot_token"
+EXPECT_OPENCLAW="anthropic_api_key,github_readonly_pat,openai_api_key,openclaw_gateway_password,openclaw_gateway_token,pretorin_api_key,slack_app_token,slack_bot_token"
 EXPECT_CLI="pretorin_api_key,slack_app_token,slack_bot_token"
 GOT_OPENCLAW="$(printf '%s\n' "$MATRIX" | awk '$1=="openclaw"{print $2}')"
 GOT_CLI="$(printf '%s\n' "$MATRIX" | awk '$1=="cli"{print $2}')"
@@ -179,6 +215,7 @@ docker run --rm --platform linux/amd64 \
     test -z "${OPENAI_API_KEY:-}"
     test -z "${ANTHROPIC_API_KEY:-}"
     test -z "${OPENCLAW_GATEWAY_TOKEN:-}"
+    test -z "${OPENCLAW_GATEWAY_PASSWORD:-}"
     if env | grep -qE "CANARY-OPENAI|CANARY-ANTHROPIC|0123456789abcdef"; then
       echo "a credential outside the allowed set reached the environment" >&2
       exit 1
@@ -258,7 +295,7 @@ FIXTURE
 
 # THE ASSERTION. Every secret line must be present-but-empty: present so the
 # operator can see what exists, empty so nothing collides with a mounted file.
-if grep -qE '^(PRETORIN_API_KEY|OPENCLAW_GATEWAY_TOKEN|SLACK_APP_TOKEN|SLACK_BOT_TOKEN)=.+' "$SCRATCH/.env"; then
+if grep -qE '^(PRETORIN_API_KEY|OPENCLAW_GATEWAY_TOKEN|OPENCLAW_GATEWAY_PASSWORD|SLACK_APP_TOKEN|SLACK_BOT_TOKEN)=.+' "$SCRATCH/.env"; then
   echo "file-secret-test: FAIL — .env carries a secret value on the file-secret path:" >&2
   grep -nE '^(PRETORIN_API_KEY|OPENCLAW_GATEWAY_TOKEN|SLACK_APP_TOKEN|SLACK_BOT_TOKEN)=.+' "$SCRATCH/.env"     | sed 's/=.*/=<redacted>/' >&2
   exit 1
@@ -270,11 +307,21 @@ grep -qE '^[0-9a-f]{64}$' "$SCRATCH/secrets/runtime/openclaw-gateway-token" || {
   echo "file-secret-test: FAIL — no generated gateway token in secrets/runtime/" >&2; exit 1; }
 echo "  gateway token generated into secrets/runtime/openclaw-gateway-token"
 
-for f in pretorin-api-key openclaw-gateway-token slack-app-token slack-bot-token          openai-api-key anthropic-api-key; do
+for f in pretorin-api-key openclaw-gateway-token openclaw-gateway-password slack-app-token slack-bot-token openai-api-key anthropic-api-key github-readonly-pat; do
   [ -f "$SCRATCH/secrets/runtime/$f" ] || {
     echo "file-secret-test: FAIL — secrets/runtime/${f} was not created" >&2; exit 1; }
 done
-echo "  all six secret files created"
+echo "  all eight secret files created"
+
+# A deliberately empty retained token must not require fresh random generation.
+: > "$SCRATCH/secrets/runtime/openclaw-gateway-token"
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\nexit 99\n' > "$TMP/bin/openssl"
+chmod +x "$TMP/bin/openssl"
+( cd "$SCRATCH" && PATH="$TMP/bin:$PATH" COMPOSE_FILE=compose.yaml:compose.secrets.yaml bash scripts/init-file-secrets.sh >init-retained.log 2>&1 )
+[ ! -s "$SCRATCH/secrets/runtime/openclaw-gateway-token" ]
+[ ! -s "$SCRATCH/secrets/runtime/openclaw-gateway-password" ]
+echo "  retained empty credentials stay empty without token generation"
 
 # It must also SAY what is still missing, by name. A silent empty key file becomes
 # an auth error three steps later, which is the worst place to learn it.
