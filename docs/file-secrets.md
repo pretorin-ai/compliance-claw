@@ -35,8 +35,7 @@ Prepare files without replacing anything already present:
 
 ```sh
 scripts/init-file-secrets.sh --from-env
-# saved in .env for later shells; see README "Save deployment settings"
-export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml
+export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml   # or save it in .env; see README "Save deployment settings"
 docker compose build
 docker compose up -d
 scripts/test-file-secrets.sh compliance-claw:local

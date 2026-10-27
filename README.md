@@ -85,7 +85,7 @@ provenance — see "Verifying what you pulled".
 - Docker Compose **v2.27.2 or newer**. The host commands resolve the saved
   deployment selection with `docker compose config --environment`, added in
   v2.27.2. The file-secret overlay uses the `!reset`
-  tag introduced in that release; older versions may retain `.env` unexpectedly.
+  tag introduced in v2.24.0; older versions may retain `.env` unexpectedly.
 - Docker Desktop (or another daemon) with **linux/amd64** support. Upstream ships
   no linux/arm64 Pretorin binary, so on Apple Silicon this runs emulated — enable
   Rosetta for amd64 in Docker Desktop settings. `bootstrap.sh` checks before it

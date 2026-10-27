@@ -531,7 +531,7 @@ if [ "$DO_BUILD" = 1 ]; then
     log "  image self-version: ${IMAGE_SELF_VERSION}"
   fi
   docker compose build
-  log "for later commands in this shell:  export COMPOSE_FILE=${COMPOSE_FILE}"
+  log "for later shells, save it in .env (README: Save deployment settings), or export it now:  export COMPOSE_FILE=${COMPOSE_FILE}"
 else
   # Read from the one place versions are declared, so the message cannot claim a
   # version the deployment does not use.
