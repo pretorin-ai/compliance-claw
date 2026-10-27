@@ -156,12 +156,11 @@ else
 fi
 export OPENAI_REQUEST_ADAPTER
 
-# The gateway needs the token; `docker compose run --rm cli pretorin version`
-# does not, and must keep working on a fresh clone with no .env (compose marks
-# .env required:false). So the check is scoped to gateway invocations instead of
-# being global. OpenClaw would fail closed on its own anyway; this only replaces
-# a SecretRefResolutionError pointing at `openclaw gateway status --deep` with a
-# message naming the file the operator actually has to edit.
+# Gateway invocations are told apart from one-off CLI commands such as
+# `docker compose run --rm cli pretorin version`, which must keep working on a
+# fresh clone with no .env (compose marks .env required:false). The seed, repair
+# and Slack branches below use this flag. OpenClaw itself validates the selected
+# authentication configuration; no shared gateway token is required here.
 IS_GATEWAY=0
 case " $* " in
   *" gateway "*) IS_GATEWAY=1 ;;

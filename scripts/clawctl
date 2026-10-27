@@ -727,8 +727,8 @@ print(" ".join(f.get("framework_id", "") for f in (d.get("frameworks") or [])))'
 #            scar of a check written that way that reported skip for months.
 #
 # `exec` is a child of the daemon, not PID 1, so it inherits none of the
-# entrypoint's exports and re-reads credentials inside the container — the idiom
-# smoke.sh and docs/file-secrets.md already use. NEVER
+# entrypoint's exports and re-reads credentials inside the container, with the
+# same single-source rules as the entrypoint. NEVER
 # `exec -e TOKEN="$(cat ...)"`: that puts the secret in host argv.
 oc_cli() {
   local running
