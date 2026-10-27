@@ -774,6 +774,18 @@ SECOND
       && st_ok "EVERY Pretorin invocation names the effort's credential file" \
       || st_bad "EVERY Pretorin invocation names the effort's credential file" "$missing_cred missing"
 
+    if grep ' cli pretorin ' "$record" | grep -vE 'PRETORIN_PLANS_DIR=/home/node/.pretorin/efforts/[^ /]+/plans' >/dev/null \
+       || grep ' cli pretorin ' "$record" | grep -vE 'PRETORIN_PREFLIGHT_DIR=/home/node/.pretorin/efforts/[^ /]+/preflight' >/dev/null; then
+      st_bad "every onboarding command uses the effort's protected store roots"
+    else
+      st_ok "every onboarding command uses the effort's protected store roots"
+    fi
+    for effort in crm-soc2 crm-hipaa; do
+      grep -q "PRETORIN_PLANS_DIR=/home/node/.pretorin/efforts/${effort}/plans" "$record" \
+        && st_ok "${effort} onboarding has its own Plan root" \
+        || st_bad "${effort} onboarding has its own Plan root"
+    done
+
     # THE ONE THAT MATTERS MOST. Stored context is a single global and cannot
     # describe more than one effort; the whole architecture is that the effort
     # path never touches it.

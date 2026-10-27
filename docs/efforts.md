@@ -1,14 +1,15 @@
 # Compliance efforts
 
 One Compliance Claw deployment can serve several **efforts**. An effort is one
-**system + one framework**, with its own review targets and its own Pretorin
-credential.
+**named system/framework scope**, with its own review targets, local task
+records and Pretorin credential.
 
-That pairing is not a convention this repository invented. Pretorin keys
-preflight state and the active recipe set on system + framework, so the same
-system under SOC 2 and under HIPAA is **two separate compliance efforts** with
-two separate sets of bound repositories and two separate recipe sets. `efforts.yaml`
-declares them; `scripts/clawctl` validates, migrates and applies them.
+Pretorin keys each local preflight artifact by system/framework. Claw selects a
+separate store parent for each effort name, so even two efforts on the same
+platform scope keep separate Plans, source bindings and active recipe sets.
+Platform records and API-key permissions are still shared according to Pretorin
+authorization. `efforts.yaml` declares efforts; `scripts/clawctl` validates and
+applies them.
 
 > **`efforts.yaml` is the runtime authority.** Each effort gets its own OpenClaw
 > agent — its own workspace, sessions, memory, instructions, Pretorin MCP server
@@ -141,6 +142,30 @@ native configuration before the effort transaction starts. The transaction
 snapshots that prepared configuration. If a later step fails, the earlier native
 changes can remain. Rollback restores the transaction snapshots; it does not
 undo native preparation.
+
+---
+
+## Local task and source records
+
+MCP launch and host onboarding use the same parser-derived parent:
+`/home/node/.pretorin/efforts/<effort-name>`. `PRETORIN_PLANS_DIR` selects its
+`plans` directory; `PRETORIN_PREFLIGHT_DIR` selects `preflight`. Plan resume
+index, journal and lock files live beside `plans`, inside that effort parent.
+Inherited root settings cannot redirect the launcher. The existing
+`pretorin-state` volume persists these records across container replacement.
+
+HOME, the active CLI binary, credentials, configuration, administrator recipes
+and other CLI stores such as Campaign orchestration do not move. External
+platform/provider data and native OpenClaw session storage are not separated by
+these two overrides. This is local store routing,
+not OS/process isolation or a person's session permission. An administrator or
+unrestricted same-UID command can still reach the files.
+
+For retained installations, complete the
+[stopped-state record transfer](upgrade.md#transfer-existing-effort-records)
+before starting this runtime or applying onboarding. Empty new roots do not
+mean the old records are gone. There is no automatic migration. Use a new effort
+name for a new identity; changing or removing an effort does not erase its files.
 
 ---
 

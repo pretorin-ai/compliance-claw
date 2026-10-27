@@ -9,11 +9,12 @@
 #   scripts/clawctl plan
 #   scripts/clawctl apply
 #
-# WHAT AN EFFORT IS. One system + one framework. Pretorin keys preflight state
-# and the active recipe set on that pair, so the same system under two frameworks
-# is two separate compliance efforts, each with its own bound repositories, its
-# own recipe set, and its own credential. That is why `efforts:` is a list and
-# why system_id + framework_id must be unique across it.
+# WHAT AN EFFORT IS. A named system/framework scope with its own bound
+# repositories, its own local Plan and preflight records, and its own
+# credential. The name is the identity: the same system under two frameworks is
+# two efforts, and two names may share one platform scope because their local
+# records live under separate effort parents. Platform records and API-key
+# permissions stay shared under Pretorin authorization.
 #
 # NO TOKEN EVER APPEARS HERE. `credential_ref` is a NAME. This file is safe to
 # commit; a real efforts.yaml is gitignored only because it names your systems,

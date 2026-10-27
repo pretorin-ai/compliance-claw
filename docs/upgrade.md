@@ -151,3 +151,86 @@ shows who changed the CLI, when, and to which version. It is not tamper-evident:
 the agent uses the same container user, and deleting the state volume removes the
 file. Chat routes also keep a copy in the gateway container log. See the limits
 in [SECURITY.md](../SECURITY.md).
+
+## Transfer existing effort records
+
+Do this **before** starting an image that selects per-effort Plan/preflight roots
+or running its `clawctl apply`. The runtime does not move or adopt old records.
+Keep the same HOME, active CLI, credentials and `pretorin-state` volume.
+
+1. Stop the gateway with the shutdown limit above. Stop any one-off CLI/MCP
+   writer too. Record the old image, Compose selection, volume names, declarations
+   and active CLI version/hash. Back up matching host inputs and both stopped
+   volumes as described above. Keep the old image and protected originals.
+2. Inventory **all** entries in the old Plan and preflight directories, normally
+   `/home/node/.pretorin/plans` and `/home/node/.pretorin/preflight`. Check any
+   previously configured root overrides. A recent Plan list is not an inventory:
+   it has a limit and skips corrupt files. Report links, corrupt files, duplicate
+   scope records, Campaign records, and unknown formats for manual resolution.
+3. Validate each supported Plan with the current native CLI's `--json plan show
+   PLAN_UUID`, using its old root. Validate a preflight record with `--json
+   preflight show --system SYSTEM_UUID --framework FRAMEWORK_ID`, using its old
+   root. Require the expected record/scope, not just exit 0: an absent preflight
+   can return `exists: false`. Use explicit roots in the container, for example:
+
+   ```sh
+   docker compose run --rm -T \
+     -e PRETORIN_PLANS_DIR=/home/node/.pretorin/plans \
+     -e PRETORIN_PREFLIGHT_DIR=/home/node/.pretorin/preflight \
+     cli pretorin --json plan show PLAN_UUID
+   ```
+
+   Compare every record's scope with the declarations. Assign a record only when
+   its owner is confirmed. If two efforts share that scope, the pair alone is
+   insufficient: stop for an explicit operator ownership decision. Never guess,
+   delete, silently archive or copy a shared record into every effort. Resolve
+   unsupported/corrupt/conflicting records before activation. Keep that decision
+   and the inventory private; they can contain customer data.
+4. Select the validated effort and copy each approved **original** regular record
+   to its corresponding subdirectory. Do not import displayed JSON: preflight
+   output can redact stored values. Do not copy old indexes, journals or locks.
+   Set the source/target filenames from the checked inventory; keep each Plan UUID
+   and the preflight filename. For example, after replacing `PLAN_UUID`:
+
+   ```sh
+   EFFORT=crm-soc2
+   EFFORT_RECORD_ROOT="$(python3 scripts/parse-efforts.py state-root "$EFFORT")"
+   RECORD_SOURCE=/home/node/.pretorin/plans/PLAN_UUID.json
+   RECORD_TARGET="${EFFORT_RECORD_ROOT}/plans/PLAN_UUID.json"
+   docker compose run --rm -T cli sh -eu -c '
+     test -f "$1"
+     test ! -L "$1"
+     test ! -e "$2"
+     test ! -L "$2"
+     umask 077
+     mkdir -p "$(dirname "$2")"
+     cp -p "$1" "$2"
+     cmp "$1" "$2"
+   ' sh "$RECORD_SOURCE" "$RECORD_TARGET"
+   ```
+
+   Use the same guarded copy for each approved preflight file, with its target
+   under `${EFFORT_RECORD_ROOT}/preflight/`. Inspect parents for links first;
+   keep existing record modes/owner and protect new directories. An existing
+   target or a failed comparison is a conflict, not permission to overwrite it.
+5. With explicit new root overrides, use native Plan show/list and preflight show
+   to verify IDs, content, steps, history, source bindings and active recipes.
+   Resume a known nonterminal Plan through its effort MCP and check that only its
+   own records are offered. Native resume lookup rebuilds a missing index from
+   the validated Plan files; do not hand-edit or copy a global index. Reapply
+   onboarding only after record ownership/validation is complete. It can update
+   derived source bindings, so compare the resulting profile deliberately.
+6. Start the gateway and verify own-effort reads, other-effort denials, restart
+   and container replacement with the same volumes. Keep protected originals
+   until the transfer and recovery checks pass. The CLI/config/recipe library,
+   Campaign orchestration and platform data remain shared; this is not OS or
+   person isolation.
+
+On a failed validation/copy/resume or interrupted transfer, stop. Do not start
+writers against a partial transfer. Keep the failed state for diagnosis, restore
+the matching stopped backup into new volumes, and select the previous image and
+Compose route as described above. Verify the original Plan/profile before
+returning work. Restoring only config or starting old and new writers against
+one volume is not rollback. Keep current issuer/person revocations effective;
+restoring a backup must not restore removed authority. No migration command,
+adoption flag or separate state registry is required by this procedure.

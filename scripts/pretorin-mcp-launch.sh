@@ -101,6 +101,14 @@ if ! CREDENTIAL_PATH="$(python3 "$PARSE" credential-path "$EFFORT" "$EFFORTS_FIL
   ${CREDENTIAL_PATH}"
 fi
 
+# Use the same effort-derived parent as host onboarding. Never inherit another
+# store root from the gateway or a hand-edited MCP environment. HOME/bin/key stay.
+if ! STATE_ROOT="$(python3 "$PARSE" state-root "$EFFORT" "$EFFORTS_FILE" 2>&1)"; then
+  die "state root for effort '${EFFORT}' could not be resolved: ${STATE_ROOT}"
+fi
+export PRETORIN_PLANS_DIR="${STATE_ROOT}/plans"
+export PRETORIN_PREFLIGHT_DIR="${STATE_ROOT}/preflight"
+
 # Presence AND non-emptiness. An empty file means "not configured" everywhere
 # else in this deployment, and it must mean the same here rather than becoming
 # an empty key that authenticates as nobody.

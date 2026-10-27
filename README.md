@@ -508,11 +508,12 @@ silently substituting a longer-lived credential.
 
 ## Multiple compliance efforts
 
-One deployment serves several. An **effort** is one system + one framework, with
-its own targets, its own named Pretorin credential and its own Slack channel. That
-pairing is Pretorin's own: preflight state and the active recipe set are keyed on
-system + framework, so the same system under SOC 2 and under HIPAA is two separate
-compliance efforts.
+One deployment serves several. An **effort** is a named system/framework scope
+with its own targets, its own named Pretorin credential, its own local Plan and
+preflight records, and an optional Slack channel. The same system under SOC 2 and
+under HIPAA is two efforts. Two efforts may also share one platform scope: Claw
+keeps their local records under separate effort parents, while platform records
+and API-key permissions stay shared under Pretorin authorization.
 
 ```text
 One VM
