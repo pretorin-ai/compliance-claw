@@ -196,8 +196,10 @@ cannot be reached by a prompt-injected agent. The tool routes can be,
 deliberately, in this trusted-repository pilot, and each has a bounded blast
 radius:
 
-- `pretorin_update` — *which signed Pretorin version installs*. No command, path
-  or URL is expressible.
+- `pretorin_update` — *which signed Pretorin version installs*. The tool requires
+  native owner authority and checks the current invocation before starting the
+  installer. No command, path or URL is expressible. This route check does not
+  isolate unsandboxed shell or file access inside the container.
 - `target_sync` — *which already-declared target fast-forwards*. Only `all` or a
   name declared for **the calling agent's own effort** in the mounted
   `efforts.yaml` is accepted; no URL, ref, path, flag or shell fragment is

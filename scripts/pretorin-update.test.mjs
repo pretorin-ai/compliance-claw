@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, readdir, mkdtemp, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import vm from 'node:vm';
+import { pathToFileURL } from 'node:url';
 const activationSource = await readFile(new URL('../plugins/pretorin-update/activation.js', import.meta.url), 'utf8');
 const { createActivation, MANUAL_RESTART, verifyLoadedMcp, configuredProbes } = await import(`data:text/javascript;base64,${Buffer.from(activationSource).toString('base64')}`);
 import { createHash } from 'node:crypto';
@@ -45,10 +46,14 @@ async function harness({ spawnError, clock, activation = { hasPending: () => fal
   });
   await module.evaluate();
   let command;
+  let nativeCommand;
   let factory;
   module.namespace.default.register({
     on: (...value) => hooks.push(value),
-    registerCommand: (value) => { command = value; },
+    registerCommand: (value) => {
+      nativeCommand = value;
+      command = { ...value, handler: (ctx) => value.handler({ assertOwnerCurrent() {}, ...ctx }) };
+    },
     registerTool: (value) => { factory = value; },
     runtime: { gateway: { request: async (...args) => {
       rpc.push(args);
@@ -56,7 +61,12 @@ async function harness({ spawnError, clock, activation = { hasPending: () => fal
     } } },
   });
   return {
-    command, factory, calls, children, rpc, hooks,
+    command, nativeCommand, registration: factory,
+    factory: (ctx = {}) => {
+      const current = { senderIsOwner: true, assertInvocationCurrent() {}, ...ctx };
+      return typeof factory === 'function' ? factory(current) : factory.create(current);
+    },
+    calls, children, rpc, hooks,
     finish(index = 0, { stdout = 'ACTIVE_VERSION=0.30.4\n', code = 0 } = {}) {
       children[index].stdout.emit('data', stdout);
       children[index].emit('close', code);
@@ -92,6 +102,150 @@ test('command waits for installation and returns the final restart instructions'
   assert.equal(h.calls[0].options.env.PRETORIN_UPDATE_REQUESTER, 'slack:U123');
   assert.equal(h.calls[0].options.env.PRETORIN_UPDATE_ROUTE, 'command');
   assert.equal(h.calls[0].options.stdio[2], 'inherit');
+});
+
+test('tool uses the native version 2 factory and excludes callers without owner authority', async () => {
+  const h = await harness();
+  assert.equal(h.registration.contextVersion, 2);
+  for (const senderIsOwner of [false, undefined, 'true']) {
+    assert.equal(h.factory({ senderIsOwner, requesterSenderId: 'UADMIN', senderName: 'Administrator' }), null);
+  }
+  assert.equal(h.factory({ assertInvocationCurrent: undefined }), null);
+  assert.equal(h.calls.length, 0);
+});
+
+test('retained tool checks current authority before starting the installer', async () => {
+  const h = await harness();
+  let current = true;
+  const tool = h.factory({ assertInvocationCurrent() { if (!current) throw Error('authority changed'); } });
+  current = false;
+  const pending = tool.execute('revoked', { version: 'latest' });
+  if (h.children.length) h.finish(); // Settle an incorrectly admitted child on the old implementation.
+  await assert.rejects(pending, /authority changed/);
+  assert.equal(h.calls.length, 0);
+});
+
+test('authority is checked after argument preparation at the process boundary', async () => {
+  const h = await harness();
+  let current = true;
+  const tool = h.factory({ assertInvocationCurrent() { if (!current) throw Error('authority changed'); } });
+  const version = { toString() { current = false; return 'latest'; } };
+  const pending = tool.execute('revoked', { version });
+  if (h.children.length) h.finish();
+  await assert.rejects(pending, /authority changed/);
+  assert.equal(h.calls.length, 0);
+});
+
+test('accepted installation finishes normally after revocation but cannot start another update', async () => {
+  const h = await harness();
+  let current = true;
+  const tool = h.factory({ assertInvocationCurrent() { if (!current) throw Error('authority changed'); } });
+  const pending = tool.execute('accepted', { version: 'latest' });
+  current = false;
+  h.finish();
+  assertRestartRequired((await pending).content[0].text);
+  assert.deepEqual(h.children[0].kills, []);
+  const refused = tool.execute('revoked', { version: 'latest' });
+  if (h.children.length > 1) h.finish(1);
+  await assert.rejects(refused, /authority changed/);
+  assert.equal(h.calls.length, 1);
+});
+
+test('command revocation during installation prevents a new activation request', async () => {
+  const requests = [];
+  const h = await harness({ activation: { hasPending: () => false, request: async (...args) => { requests.push(args); return true; } } });
+  let current = true;
+  const pending = h.command.handler({ args: 'latest', assertOwnerCurrent() { if (!current) throw Error('authority changed'); } });
+  current = false;
+  h.finish();
+  assertRestartRequired((await pending).text);
+  assert.deepEqual(requests, []);
+});
+
+test('command refuses when the host supplies no owner-authority guard', async () => {
+  const h = await harness();
+  for (const args of ['latest', 'status']) {
+    const pending = h.nativeCommand.handler({ args, senderId: 'UADMIN' });
+    if (h.children.length) h.finish(h.children.length - 1);
+    await assert.rejects(pending, /Owner authority could not be confirmed/);
+  }
+  assert.equal(h.calls.length, 0);
+});
+
+test('revoked command cannot start either installation or status', async () => {
+  const h = await harness();
+  for (const args of ['latest', 'status']) {
+    const pending = h.command.handler({ args, assertOwnerCurrent() { throw Error('authority changed'); } });
+    if (h.children.length) h.finish(h.children.length - 1);
+    await assert.rejects(pending, /authority changed/);
+  }
+  assert.equal(h.calls.length, 0);
+});
+
+// The candidate-image CI lane runs this check against the pinned native identity
+// store and command dispatcher. The installer remains simulated. No live Slack.
+test('native linked administrator, analyst, account, and removal authority', { skip: process.platform !== 'linux' }, async () => {
+  const modules = await readdir('/app/dist');
+  const native = async (prefix) => {
+    const name = modules.find((name) => name.startsWith(prefix) && name.endsWith('.mjs'));
+    assert.ok(name, `Pinned OpenClaw module missing: ${prefix}`);
+    return import(pathToFileURL(`/app/dist/${name}`));
+  };
+  const { n: ensureProfile } = await native('user-profiles-TnhRRQbQ');
+  const { c: setRole } = await native('user-profile-writes-B1SBdDHz');
+  const { a: link, f: unlink } = await native('user-channel-identities-');
+  const { r: prepareOwner } = await native('command-auth-CgunTpMG');
+  const { executeRegisteredPluginCommand: dispatch } = await native('plugin-command-execution-Z3W9SKd9');
+  const root = await mkdtemp(join(tmpdir(), 'cc-updater-native-'));
+  const options = { path: join(root, 'openclaw.sqlite') };
+  try {
+    const admin = ensureProfile('admin@updater.invalid', options);
+    const analyst = ensureProfile('analyst@updater.invalid', options);
+    await setRole(admin.id, 'administrator', options);
+    const identity = { channelId: 'slack', accountId: 'default', senderId: 'UTESTADMIN' };
+    link(admin.id, identity, options);
+    link(analyst.id, { ...identity, senderId: 'UTESTANALYST' }, options);
+    const cfg = { gateway: { roles: { default: 'analyst', definitions: {
+      administrator: { scopes: ['operator.admin'] }, analyst: { scopes: ['operator.read'] },
+    } } } };
+    const h = await harness();
+    const captured = [];
+    for (const [accountId, senderId, allowed] of [
+      ['default', 'UTESTADMIN', true], ['default', 'UTESTANALYST', false],
+      ['default', 'UTESTUNKNOWN', false], ['different', 'UTESTADMIN', false],
+    ]) {
+      const authority = await prepareOwner(cfg, { channel: 'slack', accountId, senderId }, options);
+      const assertCurrent = () => { assert.equal(authority.isCurrent(cfg), true, 'native owner authority changed'); };
+      assert.equal(authority.isCurrent(cfg), allowed);
+      const tool = h.factory({ senderIsOwner: authority.isCurrent(cfg), assertInvocationCurrent: assertCurrent });
+      assert.equal(Boolean(tool), allowed);
+      if (tool) captured.push(tool);
+      const before = h.calls.length;
+      const command = { ...h.nativeCommand, pluginId: 'pretorin-update' };
+      const pending = dispatch({ channels: [], commands: [command] }, {
+        command, args: 'status', channel: 'slack', accountId, senderId, isAuthorizedSender: true,
+        senderIsOwner: authority.isCurrent(cfg), assertOwnerCurrent: assertCurrent, config: cfg,
+      });
+      if (h.calls.length > before) h.finish(before);
+      await pending;
+      assert.equal(h.calls.length - before, allowed ? 1 : 0);
+    }
+    const installation = captured[0].execute('native-admin', { version: 'latest' });
+    h.finish(h.calls.length - 1);
+    assertRestartRequired((await installation).content[0].text);
+    unlink(admin.id, identity, options);
+    const before = h.calls.length;
+    await assert.rejects(captured[0].execute('after-unlink', { version: 'latest' }), /authority changed/);
+    assert.equal(h.calls.length, before);
+    link(admin.id, identity, options);
+    const authority = await prepareOwner(cfg, { channel: 'slack', ...identity }, options);
+    const tool = h.factory({ assertInvocationCurrent() {
+      assert.equal(authority.isCurrent(cfg), true, 'native owner authority changed');
+    } });
+    await setRole(admin.id, 'analyst', options);
+    await assert.rejects(tool.execute('after-demotion', { version: 'latest' }), /authority changed/);
+    assert.equal(h.calls.length, before);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 // A permissive RPC is the strongest trap: the tool must not use it even when
