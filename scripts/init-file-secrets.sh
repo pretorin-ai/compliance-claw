@@ -20,7 +20,6 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
 FROM_ENV=0
 
 case "${1:-}" in
@@ -33,6 +32,10 @@ esac
 
 log() { printf 'file-secrets: %s\n' "$*"; }
 die() { printf 'file-secrets: ERROR — %s\n' "$*" >&2; exit 1; }
+
+. "${REPO_ROOT}/scripts/compose-selection.sh"
+compose_resolve_selection
+SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
 
 mkdir -p "$SECRET_DIR"
 chmod 700 "$SECRET_DIR"

@@ -52,6 +52,22 @@ and gateway health before you return traffic. An image rollback alone cannot
 reverse changes to the config or SQLite schema. A copy of `openclaw.json`
 alone is not a full state backup.
 
+After a manual restore, keep the final native Compose overlay at a stable private
+path outside the temporary backup directory. Retain the exact external names of
+both restored volumes and the previous image references for both services. Save
+the ordered files and project in the existing `.env`, as described in
+[Save deployment settings](../README.md#save-deployment-settings). Include that
+overlay last, for example:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml:/private/path/restored.yaml
+```
+
+Run `docker compose --profile '*' config` and check the image and both state mounts
+by destination before startup. This output can contain private configuration;
+keep it local. A missing saved overlay must stop the command; do not remove it
+to fall back to the original volumes. No script renames or adopts volumes.
+
 `scripts/update.sh` retains the volumes. It does not create a backup or perform
 state recovery. The OpenClaw container adapter runs Doctor before the gateway
 and can migrate retained state. Stop and verify the backup before you use the

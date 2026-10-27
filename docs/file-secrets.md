@@ -15,8 +15,9 @@ The existing `.env` path remains available for backward compatibility. Do not
 combine the two: the entrypoint refuses a secret supplied both directly and by a
 `*_FILE` variable.
 
-**Requires Docker Compose v2.24.0 or newer.** The overlay uses the `!reset` tag to
-drop the base file's `env_file`, and that tag was introduced in v2.24.0. An older
+**Requires Docker Compose v2.27.2 or newer.** The host selection helper needs
+`docker compose config --environment`, added in v2.27.2. The overlay uses the
+`!reset` tag to drop the base file's `env_file`, introduced in v2.24.0. An older
 Compose does not fail closed in a way that names the cause — it reports a schema
 error on `env_file`, or silently keeps the base value on versions that ignore
 unknown tags, which would put `.env` secrets back into `docker inspect` while the
@@ -34,7 +35,7 @@ Prepare files without replacing anything already present:
 
 ```sh
 scripts/init-file-secrets.sh --from-env
-export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml
+export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml   # or save it in .env; see README "Save deployment settings"
 docker compose build
 docker compose up -d
 scripts/test-file-secrets.sh compliance-claw:local
@@ -219,11 +220,14 @@ to the operator, and point Compose at it. For example:
 /opt/compliance-claw-secrets/
 ```
 
-Start with:
+Save the selection in the repository-root `.env`, then start:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.secrets.yaml
+COMPLIANCE_CLAW_SECRET_DIR=/opt/compliance-claw-secrets
+```
 
 ```sh
-export COMPOSE_FILE=compose.yaml:compose.secrets.yaml
-export COMPLIANCE_CLAW_SECRET_DIR=/opt/compliance-claw-secrets
 docker compose up -d
 ```
 
@@ -240,10 +244,10 @@ Compose starts. That automation is planned, not shipped by this repository.
 
 Enable Docker itself to start on boot. The gateway declares
 `restart: unless-stopped`, so once Docker is up Compose restores the container
-with the secret mounts it already had — no repeat of the two exports. Nothing is
-restored if the container was stopped deliberately, or if `docker compose down`
-removed it; in that case re-export the two variables above and run
-`docker compose up -d`.
+with the secret mounts it already had. Nothing is restored if the container was
+stopped deliberately, or if `docker compose down` removed it; in that case run
+`docker compose up -d` again. The saved `.env` selection supplies the files and
+the secret directory in any shell.
 
 The GitHub App private key is intentionally different: it stays host-only and is
 used by `scripts/bootstrap.sh` to clone private targets. It is never declared as
@@ -261,3 +265,7 @@ For the pilot, replace the persistent host files yourself. A future Key Vault
 sync service would replace them from the latest secret versions before this
 restart. File changes are not automatically re-read by an already running
 process.
+
+Host initialization and credential commands also use the saved non-secret
+selection. See [Save deployment settings](../README.md#save-deployment-settings)
+for the shared directory, ordered files and explicit override rules.

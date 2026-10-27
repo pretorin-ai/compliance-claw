@@ -14,8 +14,10 @@ plugins. There is no root package install or `make check` command.
 
 - Install Git, Bash, Python 3, and OpenSSL for host scripts.
 - Container checks need Docker with `linux/amd64` support. On Apple Silicon,
-  enable amd64 emulation. Use Compose 2.24.4 or newer for the test overlays'
-  [`!override` tag](https://docs.docker.com/reference/compose-file/merge/#replace-value).
+  enable amd64 emulation. Use Compose 2.27.2 or newer: the host selection
+  helper needs `docker compose config --environment` (v2.27.2), and the test
+  overlays need the
+  [`!override` tag](https://docs.docker.com/reference/compose-file/merge/#replace-value) (v2.24.4).
 - Node tests can use the runtime image. A separate host Node installation is
   not required for those commands.
 - Image builds need network access to pinned base images, release assets, and
@@ -122,6 +124,7 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | Config patch | `python3 scripts/openclaw-patch.py --self-test` | Python 3; no running gateway. |
 | `clawctl` | `bash scripts/clawctl --self-test` | Host tools; uses stub Docker and temporary files. |
 | Host image update | `python3 scripts/test-update.py` | Host tools; runs the real updater with isolated Git and Docker stubs. Does not prove live readiness or Compose merging. |
+| Saved deployment selection | `python3 scripts/test-update-compose.py --selection-only` | Real Compose CLI, no daemon, no credentials; covers saved/explicit settings, restored volumes, secret initialization and refusals. |
 | Host image update with Compose | `python3 scripts/test-update-compose.py LOCAL_IMAGE OTHER_LOCAL_IMAGE` | Two cached images with `sh`, `sleep`, and `test`; synthetic containers, two disposable projects, no registry or service credentials. Does not run OpenClaw or prove channel/MCP operation. |
 | Target sync | `bash scripts/sync-targets.sh --self-test` | Bash, Git, Python 3; creates temporary local repositories. |
 | Shell diagnostic text | `python3 scripts/lint-heredocs.py scripts/*.sh` | Local static check; not a separate build CI step. |

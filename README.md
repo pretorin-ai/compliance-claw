@@ -82,8 +82,10 @@ provenance — see "Verifying what you pulled".
 
 ## Requirements
 
-- Docker Compose **v2.24.0 or newer**. The file-secret overlay uses the `!reset`
-  tag introduced in that release; older versions may retain `.env` unexpectedly.
+- Docker Compose **v2.27.2 or newer**. The host commands resolve the saved
+  deployment selection with `docker compose config --environment`, added in
+  v2.27.2. The file-secret overlay uses the `!reset`
+  tag introduced in v2.24.0; older versions may retain `.env` unexpectedly.
 - Docker Desktop (or another daemon) with **linux/amd64** support. Upstream ships
   no linux/arm64 Pretorin binary, so on Apple Silicon this runs emulated — enable
   Rosetta for amd64 in Docker Desktop settings. `bootstrap.sh` checks before it
@@ -144,10 +146,27 @@ docker compose run --rm cli pretorin --json context show
 # docs/file-secrets.md under "docker compose exec does not see these secrets".
 ```
 
-**Keep `COMPOSE_FILE` exported for every later command.** It is how compose knows
-to mount the secret files; without it a `docker compose` in a new shell falls back
-to the legacy path and the deployment loses its credentials. `bootstrap.sh` prints
-the line to re-export.
+### Save deployment settings
+
+Save non-secret selection in the repository-root `.env` for later shells. For
+example, add these lines to the existing file; do not replace its other settings:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
+COMPOSE_PROJECT_NAME=compliance-claw
+COMPLIANCE_CLAW_SECRET_DIR=./secrets/runtime
+```
+
+Compose and the host setup, credential, plan/apply and update commands use this
+selection. Explicit shell values override saved values. Keep custom overlays in
+the required order. `COMPOSE_PATH_SEPARATOR` and `COMPOSE_PROFILES` also use native
+Compose rules. A relative secret directory must start with `./` (or use an
+absolute path). Never put credentials in these selection fields.
+
+Deployment commands require the Compose CLI. Local selection and `clawctl plan`
+do not need a running Docker daemon. Help, migration and `validate --schema-only`
+do not need Compose; schema-only validation does not check credentials. An
+invalid saved selection stops before host writes or container startup.
 
 <details>
 <summary>Legacy path — secret values in <code>.env</code></summary>
@@ -469,8 +488,8 @@ The token must be:
 - limited to **only the selected repositories** you review,
 - with **Repository permissions → Contents: Read-only** and nothing else.
 
-Then `export COMPOSE_FILE=compose.yaml:compose.secrets.yaml` and restart. The PAT
-is only available on the file-secret path; the legacy `.env` path has no PAT and
+Then select `compose.secrets.yaml` in the [saved deployment settings](#save-deployment-settings)
+and restart. The PAT is only available on the file-secret path; the legacy `.env` path has no PAT and
 a private target there reports `auth_failed` naming the fix.
 
 **Status: internal-pilot acceptable, not recommended.** The GitHub App is the
@@ -907,7 +926,7 @@ selected container's running state, health, and actual image against Compose,
 including customer overlays. It checks the gateway again after diagnostics.
 It is idempotent: a second run does not force container replacement.
 
-Use Docker Compose 2.24.0 or newer, with `--wait` and `--wait-timeout` support,
+Use Docker Compose 2.27.2 or newer, with `--wait` and `--wait-timeout` support,
 and Python 3. Keep the deployment's `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, and
 profiles selected. Only the gateway and its Compose dependencies are started;
 the one-shot `cli` service is used for diagnostics.
@@ -928,7 +947,7 @@ the two agree.
 
 `update.sh` refuses rather than guessing, and names the exact command each time:
 a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
-diverged from its upstream, or a shell with `COMPOSE_FILE` set to the local build
+diverged from its upstream, or a deployment selection that includes the local build
 overlay (that is a rebuild, not an update).
 
 ### What survives an update, and what does not

@@ -70,8 +70,9 @@ done
 # The build overlay and this script want opposite things: it deploys an image
 # built from local source, and `docker compose pull` on `compliance-claw:local`
 # can only fail. An operator in the dev loop wants a rebuild, not an update.
-case "${COMPOSE_FILE:-}" in
-  *compose.build.yaml*)
+. "${REPO_ROOT}/scripts/compose-selection.sh"
+compose_resolve_selection
+if compose_has_file compose.build.yaml; then
     die "COMPOSE_FILE selects the local build overlay, so there is nothing to pull.
 
   This script updates a deployment that runs the PUBLISHED image. To rebuild
@@ -79,9 +80,9 @@ case "${COMPOSE_FILE:-}" in
 
     docker compose build && docker compose up -d
 
-  To switch this shell back to the published image:  unset COMPOSE_FILE"
-    ;;
-esac
+  Remove compose.build.yaml from the saved .env selection, or set an explicit
+  COMPOSE_FILE selection that uses the published image and your required overlays."
+fi
 
 git rev-parse --git-dir >/dev/null 2>&1 \
   || die "not a git checkout, so there is nothing to fast-forward.
@@ -175,8 +176,7 @@ log "this checkout pins ${IMAGE_REF}"
 # valid empty and "create an empty file" is not a decision an operator needs to
 # be consulted about. If it cannot, it stops here, with the deployment still
 # running and the exact command named.
-case "${COMPOSE_FILE:-}" in
-  *compose.secrets.yaml*)
+if compose_has_file compose.secrets.yaml; then
     SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
     MISSING=""
     while IFS= read -r f; do
@@ -209,16 +209,15 @@ SECRETS
       done
       log "  secret files are complete; continuing"
     fi
-    ;;
-esac
+fi
 
 log "For an OpenClaw upgrade, verify a backup of both state volumes first. See docs/upgrade.md."
 # Check support before replacing a running gateway. Compose owns the wait;
-# this script only verifies its result. Customer deployments need Compose 2.24.0+.
+# this script only verifies its result. Customer deployments need Compose 2.27.2+ (see scripts/compose-selection.sh).
 UP_HELP="$(docker compose up --help)" || die "could not check Compose wait support."
 case "$UP_HELP" in
   *--wait-timeout*) ;;
-  *) die "Docker Compose must support --wait and --wait-timeout. Install Compose 2.24.0 or newer." ;;
+  *) die "Docker Compose must support --wait and --wait-timeout. Install Compose 2.27.2 or newer." ;;
 esac
 
 # Read only the selected project and gateway image from Compose's merged model.
