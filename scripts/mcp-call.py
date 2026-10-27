@@ -84,7 +84,7 @@ def main(argv):
         proc.stdin.write(json.dumps(payload) + "\n")
         proc.stdin.flush()
 
-    def recv():
+    def recv(expected_id):
         # The server may interleave non-JSON banner lines; skip anything that is
         # not a JSON object rather than treating it as a protocol error.
         while True:
@@ -95,9 +95,12 @@ def main(argv):
             if not line:
                 continue
             try:
-                return json.loads(line)
+                response = json.loads(line)
             except ValueError:
                 continue
+            # Dynamic catalogues can emit notifications before the tool result.
+            if isinstance(response, dict) and response.get("id") == expected_id:
+                return response
 
     try:
         send({
@@ -108,14 +111,14 @@ def main(argv):
                 "clientInfo": {"name": "compliance-claw-smoke", "version": "1"},
             },
         })
-        if recv() is None:
+        if recv(1) is None:
             fail("mcp-serve exited during initialize (is PRETORIN_API_KEY set?)")
         send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         send({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": tool, "arguments": arguments},
         })
-        response = recv()
+        response = recv(2)
     finally:
         signal.alarm(0)
         proc.kill()

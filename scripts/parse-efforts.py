@@ -9,6 +9,7 @@
     parse-efforts.py agents           [FILE]        -> "<effort>\\t<agent>\\t<mcp>\\t<prefix>\\t<ref>\\t<channel>"
     parse-efforts.py credentials      [FILE]        -> "<effort>\\t<ref>\\t<host_path>\\t<container_path>"
     parse-efforts.py credential-path EFFORT [FILE] [--container]
+    parse-efforts.py state-root EFFORT [FILE]      -> protected container store parent
     parse-efforts.py --self-test
 
 THIS FILE OWNS TWO THINGS, AND OWNING BOTH IS THE POINT.
@@ -135,9 +136,8 @@ def _check_system_uuid(value, owner, lineno):
         '13c1f44e-b66d-417c-8604-4ac7b988b411 / soc2' without explicit
         scope override.
 
-    So a friendly name here rejects legitimate writes. It also defeats the
-    duplicate-pair check below, which compares literals: 'Fathom' and the UUID
-    are the same system and would not be seen as one.
+    A friendly name here rejects legitimate writes. Canonical IDs also let
+    operators compare each retained record's scope with its declaration.
 
     Refused, not resolved. Resolving would mean a name lookup on every parse,
     which turns a pure offline validator into something that needs a credential.
@@ -315,6 +315,11 @@ def mcp_tool_prefix(server_name):
     if not re.match(r"^[A-Za-z]", normalized):
         normalized = "mcp-" + normalized
     return normalized[:MCP_PREFIX_MAX]
+
+
+def container_state_root(effort_name):
+    """Protected store parent for an already validated effort name."""
+    return "/home/node/.pretorin/efforts/%s" % effort_name
 
 
 # --- the credential ladder (ONE definition) --------------------------------
@@ -499,7 +504,6 @@ def validate(efforts):
         raise ParseError(0, "no efforts defined; at least one is required")
 
     seen_effort_names = {}
-    seen_pairs = {}
     seen_channels = {}
     # sanitized MCP tool prefix -> (effort name, lineno)
     seen_prefixes = {}
@@ -578,21 +582,8 @@ def validate(efforts):
         if channel is not None:
             seen_channels[channel] = (name, line)
 
-        # One preflight artifact is keyed on system+framework. Two efforts on the
-        # same pair are the same compliance effort wearing two names, and they
-        # would sweep and bind over each other's resolvers forever.
-        pair = (effort["system_id"], effort["framework_id"])
-        if pair in seen_pairs:
-            other, other_line = seen_pairs[pair]
-            raise ParseError(
-                line,
-                "effort '%s' has the same system_id + framework_id as effort '%s'"
-                " (line %d). Pretorin keys preflight state and the active recipe set"
-                " on that pair, so these are one compliance effort, not two — they"
-                " would overwrite each other's resolvers. Merge them."
-                % (name, other, other_line),
-            )
-        seen_pairs[pair] = (name, line)
+        # Local Plan/preflight stores are now selected by effort name. The
+        # same platform pair can therefore have separate local source bindings.
 
         if not effort["targets"]:
             raise ParseError(line, "effort '%s' has no targets" % name)
@@ -699,8 +690,8 @@ def find_effort(efforts, name):
 # Every case is a real failure mode. This file's values become directory names,
 # container paths, credential file paths and process environment, so the table
 # leans on the injection shapes and on the two rules that are genuinely new:
-# the system+framework pair being unique, and the global target namespace with
-# its equal-definition exemption.
+# independent effort identities and the global target namespace with its
+# equal-definition exemption.
 
 GOOD = """
 # a comment
@@ -758,10 +749,6 @@ CASES = [
     ("no efforts", "efforts:\n", "no efforts defined"),
     ("indented line before efforts:", "  stray: 1\nefforts:\n", "before 'efforts:'"),
     ("duplicate effort name", _e("a") + _e("a").replace("efforts:\n", ""), "duplicate effort name"),
-    ("duplicate system+framework pair",
-     "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000102\n    targets:\n      - name: t1\n        url: https://e/r.git\n"
-     "  - name: b\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000103\n    targets:\n      - name: t2\n        url: https://e/r.git\n",
-     "same system_id + framework_id"),
     ("missing system_id", "efforts:\n  - name: a\n    framework_id: f\n    credential_ref: c\n    slack_channel_id: C0000104\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no system_id"),
     ("missing framework_id", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    credential_ref: c\n    slack_channel_id: C0000105\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no framework_id"),
     ("missing credential_ref", "efforts:\n  - name: a\n    system_id: 11111111-1111-4111-8111-111111111111\n    framework_id: f\n    slack_channel_id: C0000106\n    targets:\n      - name: t\n        url: https://e/r.git\n", "has no credential_ref"),
@@ -885,8 +872,14 @@ def self_test():
 
     browser = parse(re.sub(r"    slack_channel_id: [^\n]+\n", "", GOOD))
     mixed = parse(GOOD.replace("    slack_channel_id: C0HIPAABB\n", ""))
+    same_scope = parse(GOOD.replace("framework_id: hipaa", "framework_id: soc2"))
 
     checks = [
+        (len(same_scope) == 2, "two effort names can share platform scope"),
+        (container_state_root(same_scope[0]["name"]) != container_state_root(same_scope[1]["name"]),
+         "same platform scope has separate effort store parents"),
+        (container_state_root("crm-soc2") == "/home/node/.pretorin/efforts/crm-soc2",
+         "state root stays inside the existing Pretorin volume"),
         (len(browser) == 2 and all("slack_channel_id" not in e for e in browser),
          "two browser efforts need no channel"),
         (mixed[0]["slack_channel_id"] == "C0SOC2AAA" and "slack_channel_id" not in mixed[1],
@@ -991,7 +984,7 @@ def main(argv):
     if mode in ("validate", "efforts", "credentials", "targets-all", "agents"):
         path = args[1] if len(args) > 1 else default_file
         effort_name = None
-    elif mode in ("scope", "list", "credential-path"):
+    elif mode in ("scope", "list", "credential-path", "state-root"):
         if len(args) < 2:
             sys.stderr.write("parse-efforts: %s needs an effort name\n" % mode)
             return 2
@@ -1000,7 +993,7 @@ def main(argv):
     else:
         sys.stderr.write(
             "parse-efforts: unknown mode '%s' (expected validate / efforts / scope /"
-            " list / targets-all / agents / credentials / credential-path)\n" % mode)
+            " list / targets-all / agents / credentials / credential-path / state-root)\n" % mode)
         return 2
 
     efforts = load(path)
@@ -1041,6 +1034,9 @@ def main(argv):
 
     effort = find_effort(efforts, effort_name)
 
+    if mode == "state-root":
+        print(container_state_root(effort["name"]))
+        return 0
     if mode == "scope":
         print("%s\t%s\t%s" % (
             effort["system_id"], effort["framework_id"], effort["credential_ref"]))

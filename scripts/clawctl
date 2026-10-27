@@ -1487,18 +1487,22 @@ ${out}"
 }
 
 # Build the per-effort `docker compose run` flags. THE SCOPE PIN AND THE NAMED
-# CREDENTIAL, and nothing that carries a value: PRETORIN_API_KEY_FILE names a
-# path, the entrypoint reads it inside the container.
+# CREDENTIAL AND LOCAL STORE ROOTS, with no credential value in argv. The
+# entrypoint reads PRETORIN_API_KEY_FILE inside the container; parser-derived
+# roots match the MCP launcher and keep indexes under each effort parent.
 #
 # There is no PRETORIN_API_KEY= blanking here and none is needed:
 # compose.secrets.yaml resets env_file, so no .env value reaches the container,
 # and ensure_compose_stack refuses to run without that overlay.
 effort_run_env() {
-  local system="$1" framework="$2" container_path="$3"
+  local effort="$1" system="$2" framework="$3" container_path="$4" state_root
+  state_root="$(python3 "$PARSE_EFFORTS" state-root "$effort" "$EFFORTS_FILE")" || return 1
   printf '%s\n' \
     -e "PRETORIN_SYSTEM_ID=${system}" \
     -e "PRETORIN_FRAMEWORK_ID=${framework}" \
-    -e "PRETORIN_API_KEY_FILE=${container_path}"
+    -e "PRETORIN_API_KEY_FILE=${container_path}" \
+    -e "PRETORIN_PLANS_DIR=${state_root}/plans" \
+    -e "PRETORIN_PREFLIGHT_DIR=${state_root}/preflight"
 }
 
 # THE CLONE STEP, WHICH IS bootstrap.sh's AND NOT THIS FILE'S.
@@ -1635,8 +1639,10 @@ run_efforts() {
     OL_LABEL="effort ${effort}"
     OL_DRY_RUN="$dry"
     OL_RUN_ENV=()
-    while read -r flag; do OL_RUN_ENV+=("$flag"); done \
-      < <(effort_run_env "$system" "$framework" "$cpath")
+    local run_env
+    run_env="$(effort_run_env "$effort" "$system" "$framework" "$cpath")" \
+      || die "could not resolve local stores for effort ${effort}"
+    while read -r flag; do OL_RUN_ENV+=("$flag"); done <<< "$run_env"
 
     if [ "$dry" = 1 ]; then
       ol_sweep; ol_bind; ol_verify; ol_provision; ol_assert
