@@ -40,10 +40,10 @@ are not guarantees for every current deployment.
 
 ## Status
 
-Baseline operation was verified against the published image, pulled by digest,
-on a fresh clone. Target synchronization and the fresh Slack-seeding fix were
-then verified in isolation and in CI. They are included in the v0.5.1 image
-pinned by this checkout.
+The table below records earlier published-image and isolated validation.
+Target synchronization and the fresh Slack-seeding fix were included in v0.5.1.
+This checkout now pins v0.5.2. The table is not evidence that every current-source
+change passed a live service test.
 
 | | |
 | --- | --- |
