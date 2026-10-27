@@ -100,6 +100,7 @@ no DM binding is configured. Removing them is untested against the plugin.
 | --- | --- | --- | --- |
 | `PRETORIN_API_KEY` | value in container env | `/run/secrets/pretorin_api_key` | no |
 | `OPENCLAW_GATEWAY_TOKEN` | value in container env | `/run/secrets/openclaw_gateway_token` | no |
+| `OPENCLAW_GATEWAY_PASSWORD` | value in container env | `/run/secrets/openclaw_gateway_password` | no |
 | Slack tokens | values in container env | two `/run/secrets/*` mounts | no |
 | Model API keys | values in container env | provider `/run/secrets/*` mount | no |
 | GitHub App private key | host only | host only | no |

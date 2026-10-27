@@ -154,6 +154,24 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("cannot resolve deployment settings", self.output)
         self.assertEqual(len(self.calls), 1)
 
+    def test_missing_release_secret_file_is_created_before_pull(self):
+        # A deployment from before this release has every secret file except the
+        # new password file. The updater must create it, write-if-absent, before
+        # `compose pull`/`up`, or `up` fails on the missing secret source.
+        shutil.copyfile(ROOT / "scripts/init-file-secrets.sh", self.root / "scripts/init-file-secrets.sh")
+        secrets = self.root / "secrets/runtime"
+        secrets.mkdir(parents=True)
+        for name in ("pretorin-api-key", "openclaw-gateway-token", "slack-app-token", "slack-bot-token",
+                     "openai-api-key", "anthropic-api-key", "github-readonly-pat"):
+            (secrets / name).write_text("")
+        self.selection["COMPOSE_FILE"] = "compose.yaml:compose.secrets.yaml:compose.efforts.yaml"
+        self.assertEqual(self.run_update(), 0, self.output)
+        self.assertIn("openclaw-gateway-password", self.output)
+        self.assertTrue((secrets / "openclaw-gateway-password").exists(), self.output)
+        self.assertEqual((secrets / "openclaw-gateway-token").read_text(), "")
+        pull_index = self.output.index("pulling") if "pulling" in self.output else len(self.output)
+        self.assertLess(self.output.index("secret files are complete"), pull_index)
+
     def test_startup_or_compose_timeout_stops_before_diagnostics(self):
         for rc in (1, 17):
             with self.subTest(rc=rc):
