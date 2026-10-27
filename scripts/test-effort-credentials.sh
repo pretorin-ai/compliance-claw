@@ -43,7 +43,10 @@ bad() { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m  %s\n' "$1"
         [ -n "${2:-}" ] && printf '        %s\n' "$2"; return 0; }
 head1() { printf '\n%s\n' "$1"; }
 
-cleanup() { rm -rf "$TMP"; }
+cleanup() {
+  if [ -n "${ROTATION_NAME:-}" ]; then docker rm -fv "$ROTATION_NAME" >/dev/null 2>&1 || true; fi
+  rm -rf "$TMP"
+}
 trap cleanup EXIT INT TERM
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 \
@@ -264,6 +267,30 @@ OUT="$(docker run --rm --platform "$PLATFORM" \
   "$IMAGE" uses-named 2>&1 || true)"
 refuses "$OUT" "a missing parser fails closed (no inherited credential)"
 
+# Create an unreadable file inside Linux, avoiding host bind ownership masking
+# on Docker Desktop. The real launcher runs as uid 1000 with a valid legacy key.
+OUT="$(docker run --rm --platform "$PLATFORM" --network none --user 0 \
+  --entrypoint python3 -e PRETORIN_API_KEY="$CANARY_LEGACY" \
+  -e CC_PRETORIN_BIN=/probe.sh \
+  --mount "type=bind,src=${TMP}/efforts.yaml,dst=/etc/compliance-claw/efforts.yaml,readonly" \
+  --mount "type=bind,src=${TMP}/probe.sh,dst=/probe.sh,readonly" \
+  "$IMAGE" -c '
+import os
+from pathlib import Path
+root = Path("/run/compliance-claw/credentials")
+root.mkdir(parents=True, exist_ok=True)
+key = root / "hipaa-key"
+key.write_text("CANARY-UNREADABLE")
+key.chmod(0o600)
+os.setgid(1000); os.setuid(1000)
+os.execv("/opt/compliance-claw/pretorin-mcp-launch", ["pretorin-mcp-launch", "uses-named"])
+' 2>&1 || true)"
+refuses "$OUT" "an UNREADABLE credential refuses instead of using the inherited key"
+case "$OUT" in
+  *"not readable"*) ok "the unreadable-source refusal identifies the permission error" ;;
+  *) bad "the unreadable-source refusal identifies the permission error" ;;
+esac
+
 head1 "D. containment — the value never leaves the file"
 
 # `docker inspect` on a container started the way the launcher is used. The key
@@ -307,6 +334,143 @@ case "$LOGLINES" in
   *"$CANARY_EFFORT"*) bad "no log line contains the value" ;;
   *) ok "no log line contains the value" ;;
 esac
+
+head1 "E. replacement, child activation and issuer revocation are distinct"
+
+# Real launcher + CLI seed; only the HTTP issuer is synthetic. No host port or
+# external network. Both default (individual file bind) and named (directory
+# bind) keys must change only when the documented new process generation starts.
+mkdir -p "$TMP/control"
+chmod 777 "$TMP/control"
+cat > "$TMP/rotation.py" <<'PYROTATE'
+import json, os, selectors, subprocess, threading, time, urllib.error, urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+old = ["CANARY-EFFORT-KEY-6b21f4", "CANARY-LEGACY-KEY-9de07c"]
+new = ["CANARY-EFFORT-REPLACED", "CANARY-LEGACY-REPLACED"]
+accepted = set(old + new)
+seen = {}
+class Issuer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        key = self.headers.get("Authorization", "").removeprefix("Bearer ")
+        status = 200 if key in accepted else 401
+        system = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
+        seen[system] = key
+        data = {"id": system, "name": "rotation-fixture", "frameworks": []} if status == 200 else {"detail": "revoked credential"}
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+    def log_message(self, *args): pass
+server = HTTPServer(("127.0.0.1", 0), Issuer)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+url = "http://127.0.0.1:" + str(server.server_port)
+env = {**os.environ, "PRETORIN_API_BASE_URL": url, "PRETORIN_PLATFORM_API_BASE_URL": url,
+       "PRETORIN_DISABLE_UPDATE_CHECK": "1", "CC_PRETORIN_BIN": "/opt/compliance-claw/pretorin-seed/pretorin"}
+children = []
+def rpc(child, method, params):
+    proc, sel, count = child
+    child[2] += 1
+    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": count, "method": method, "params": params}) + "\n")
+    proc.stdin.flush()
+    until = time.monotonic() + 30
+    while time.monotonic() < until:
+        if sel.select(1):
+            line = proc.stdout.readline()
+            assert line, "MCP child exited"
+            response = json.loads(line)
+            if response.get("id") == count: return response["result"]
+    raise AssertionError("MCP response timeout")
+def start(effort):
+    proc = subprocess.Popen(["/opt/compliance-claw/pretorin-mcp-launch", effort], env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    sel = selectors.DefaultSelector(); sel.register(proc.stdout, selectors.EVENT_READ)
+    child = [proc, sel, 1]; children.append(child)
+    rpc(child, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "rotation-test", "version": "1"}})
+    proc.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n'); proc.stdin.flush()
+    return child
+systems = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"]
+def reads():
+    seen.clear()
+    for child, system in zip(children, systems):
+        result = rpc(child, "tools/call", {"name": "get_system", "arguments": {"system_id": system}})
+        assert not result.get("isError"), "authenticated MCP read failed"
+        assert json.loads(result["content"][0]["text"])["id"] == system
+phase = os.sys.argv[1]
+try:
+    start("uses-named"); start("uses-default"); reads()
+    expected = old if phase == "before" else new
+    assert all(seen.get(system) == key for system, key in zip(systems, expected)), "wrong loaded credential generation"
+    if phase == "before":
+        Path("/control/loaded").touch()
+        until = time.monotonic() + 30
+        while not Path("/control/replaced").exists():
+            assert time.monotonic() < until, "host replacement timed out"
+            time.sleep(0.1)
+        reads()
+        assert all(seen.get(system) == key for system, key in zip(systems, old)), "live MCP children falsely adopted changed files"
+    else:
+        accepted.difference_update(old)
+        reads()
+        assert all(seen.get(system) == key for system, key in zip(systems, new)), "replacement failed after issuer revocation"
+        for key in old:
+            request = urllib.request.Request(url + "/systems/" + systems[0], headers={"Authorization": "Bearer " + key})
+            try: urllib.request.urlopen(request)
+            except urllib.error.HTTPError as exc: assert exc.code == 401
+            else: raise AssertionError("issuer accepted revoked credential")
+    print("rotation-test: " + phase + " authenticated generation checks passed")
+finally:
+    for proc, sel, _ in children:
+        proc.terminate()
+        try: proc.wait(timeout=5)
+        except subprocess.TimeoutExpired: proc.kill(); proc.wait()
+        sel.close()
+    server.shutdown()
+PYROTATE
+ROTATION_NAME="cc-effort-rotation-$$"
+rotation_run() {
+  docker run -d --platform "$PLATFORM" --network none --name "$ROTATION_NAME" \
+    -e PRETORIN_API_KEY_FILE=/run/secrets/pretorin_api_key \
+    --mount "type=bind,src=${TMP}/efforts.yaml,dst=/etc/compliance-claw/efforts.yaml,readonly" \
+    --mount "type=bind,src=${TMP}/credentials,dst=/run/compliance-claw/credentials,readonly" \
+    --mount "type=bind,src=${TMP}/legacy-key,dst=/run/secrets/pretorin_api_key,readonly" \
+    --mount "type=bind,src=${TMP}/rotation.py,dst=/rotation.py,readonly" \
+    --mount "type=bind,src=${TMP}/control,dst=/control" \
+    "$IMAGE" python3 /rotation.py "$1" >/dev/null
+}
+rotation_wait() {
+  local code
+  code="$(docker wait "$ROTATION_NAME")"
+  docker logs "$ROTATION_NAME" >"$TMP/rotation-$1.log" 2>&1
+  if [ "$code" != 0 ]; then cat "$TMP/rotation-$1.log" >&2; exit 1; fi
+  # Only file paths, never key values, may be in container configuration/argv/logs.
+  docker inspect "$ROTATION_NAME" >"$TMP/rotation-inspect.json"
+  if grep -Eq 'CANARY-(EFFORT|LEGACY)' "$TMP/rotation-inspect.json" "$TMP/rotation-$1.log"; then
+    bad "rotation does not expose credentials in inspect or diagnostics"; exit 1
+  fi
+  docker rm -v "$ROTATION_NAME" >/dev/null
+}
+rotation_run before
+for ((i=0; i<300; i++)); do
+  [ ! -f "$TMP/control/loaded" ] || break
+  [ "$(docker inspect --format '{{.State.Running}}' "$ROTATION_NAME")" = true ] || break
+  sleep 0.1
+done
+[ -f "$TMP/control/loaded" ] || { docker logs "$ROTATION_NAME" >&2; exit 1; }
+printf '%s' CANARY-EFFORT-REPLACED >"$TMP/credentials/.replacement"
+printf '%s' CANARY-LEGACY-REPLACED >"$TMP/.replacement"
+chmod 604 "$TMP/credentials/.replacement" "$TMP/.replacement"
+mv "$TMP/credentials/.replacement" "$TMP/credentials/hipaa-key"
+mv "$TMP/.replacement" "$TMP/legacy-key"
+touch "$TMP/control/replaced"
+rotation_wait before
+ok "live default/named MCP children keep their loaded keys after atomic replacement"
+rotation_run after
+rotation_wait after
+ok "recreated mounts and real MCP children authenticate with only replacement keys"
+ok "synthetic issuer rejects both old keys and accepts both replacements"
+ok "rotation values stay out of container configuration, argv and diagnostics"
 
 printf '\n'
 printf 'effort-credential test: %d pass, %d fail\n' "$PASS" "$FAIL"

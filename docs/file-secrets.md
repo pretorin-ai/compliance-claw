@@ -255,16 +255,70 @@ a Compose secret or mounted into the agent container.
 
 ## Rotation
 
-Update the backing files atomically, then restart the gateway:
+A changed file, a process that uses the replacement, and issuer revocation are
+three separate results. Running processes keep values loaded at startup or MCP
+child creation. `check_context` reads local context; it does not authenticate.
 
-```sh
-docker compose restart openclaw
-```
+Use this sequence for the file-secret path. The VM operator changes the files;
+the service owner supplies and revokes credentials. Schedule an interruption.
 
-For the pilot, replace the persistent host files yourself. A future Key Vault
-sync service would replace them from the latest secret versions before this
-restart. File changes are not automatically re-read by an already running
-process.
+1. Confirm the current Compose files, project, secret directory and both state
+   volumes. Keep the same image and volume selection. Use the
+   [stopped-state backup procedure](upgrade.md) where recovery is required.
+2. Obtain a replacement with the required issuer scopes. For Pretorin, check
+   the affected effort's `credential_ref`: `default` uses `pretorin-api-key`;
+   a named reference uses `pretorin/<name>`. List all efforts that share that
+   reference. Do not change a different effort's file or put a value in argv,
+   `.env`, gateway configuration or a support report.
+3. Prepare the replacement beside the current file. Keep the current owner and
+   the documented file and parent-directory modes. Use an approved secret-input
+   method, then rename the replacement over the current file on the same
+   filesystem. Do not truncate the current file in place. `clawctl credential
+   add` is write-if-absent; it does not replace an existing value.
+4. Recreate the gateway with the same Compose selection:
+
+   ```sh
+   docker compose stop --timeout 330 openclaw
+   docker compose up -d --force-recreate --wait --wait-timeout 720 openclaw
+   ```
+
+   Keep both volumes; do not use `down -v`. Recreation refreshes individual
+   file bind mounts and starts new gateway/MCP processes. A running individual
+   bind mount can still refer to the old file after atomic replacement. A named
+   key directory can expose the new file to a new child, but an existing child
+   still uses its loaded value. Do not use either fact as activation proof.
+   `--wait` checks native health; adjust its finite startup allowance for the
+   supported deployment if needed. Health alone does not verify a service key.
+5. Through each affected effort's running Pretorin MCP, make a harmless
+   authenticated system read and confirm the expected system. Use the selected
+   model/Slack service's equivalent check for those credentials. A separate CLI
+   process proves only its own credential; it does not prove a retained MCP
+   child changed. Device-code model login and gateway access/session removal
+   have their own lifecycle and are not rotated by a Pretorin file change.
+6. After the replacement works, revoke the old credential at its issuer. Use
+   the issuer's audit or an approved isolated client to confirm that the old
+   authority is rejected and the replacement still works. Do not reinstall an
+   old credential in Claw merely to check rejection. Restart is not revocation.
+
+If readiness or authentication fails, keep the old credential valid only when
+safe, stop affected work and check the selected file, permissions, issuer scope
+and new process generation. Correct the file and recreate again. Do not fall
+back to another effort's key or a direct environment value. For a compromised
+credential, revoke first, accept an interruption, then replace, recreate and
+verify. Never restore revoked authority as a recovery step.
+
+Revocation stops future authorized reads when it takes effect. It does not erase
+prior copies in sessions, memory, logs, evidence, providers or backups. The VM
+and service owners must apply their retention/deletion rules to those copies;
+protect recovery archives as described in [upgrade and recovery](upgrade.md).
+Treat logs as sensitive: an upstream error can include a masked key fingerprint.
+Review logs before sharing them; this procedure does not promise automatic
+redaction or deletion of prior evidence.
+
+`scripts/test-effort-credentials.sh` uses the real launcher and CLI seed against
+an isolated synthetic issuer. It checks old loaded children, replacement mounts,
+new authenticated children and revocation. It does not rotate a real credential
+or prove live provider, Slack or issuer behavior.
 
 Host initialization and credential commands also use the saved non-secret
 selection. See [Save deployment settings](../README.md#save-deployment-settings)
