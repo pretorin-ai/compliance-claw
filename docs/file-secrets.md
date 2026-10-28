@@ -25,6 +25,29 @@ mounted files were also present. Check with `docker compose version` before
 deploying, and note this when provisioning the Azure VM, where the distribution's
 packaged Compose is often older than Docker Desktop's.
 
+## Legacy path: secret values in `.env`
+
+Still supported, and still what an existing deployment uses. Omit step 1, and
+`bootstrap.sh` then generates a gateway token into `.env` and asks you to add the
+Pretorin key there:
+
+```sh
+scripts/bootstrap.sh
+vi .env                          # PRETORIN_API_KEY=...  (+ Slack, + GitHub App)
+scripts/onboard-targets.sh       # LEGACY single-effort onboarding
+docker compose up -d
+```
+
+> **Legacy.** This path serves one effort and cannot build per-effort agents:
+> `scripts/clawctl` needs the file-backed credential path. The [Quickstart](../README.md#quickstart) is
+> the supported route.
+
+The cost is that compose's `env_file` hands every value in `.env` to the container
+**and to `docker inspect`**, so anyone who can query the daemon can read them. To
+migrate an existing deployment, `scripts/init-file-secrets.sh` copies what is
+already in `.env` into the secret files; then blank the secret lines in `.env`,
+because supplying a credential both ways is refused rather than silently resolved.
+
 ## Local proof before Azure
 
 For contributor testing, use the [isolated setup](../CONTRIBUTING.md#isolated-container-testing).
