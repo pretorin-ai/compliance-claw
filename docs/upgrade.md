@@ -1,4 +1,207 @@
-# OpenClaw upgrade and recovery
+# Update, upgrade and recovery
+
+This guide covers the routine deployment update, the Pretorin CLI update, the
+OpenClaw image upgrade with state backup, recovery, and the destructive reset.
+Run every command from the repository root with the deployment's saved
+[Compose selection](../README.md#save-deployment-settings).
+
+## Routine deployment update
+
+```sh
+scripts/update.sh
+```
+
+One command: fast-forward the checkout, pull the image this checkout pins, restart
+the selected gateway, then report anything you have to act on. Compose waits up
+to 720 seconds for the gateway to report healthy (15-second probe interval,
+720-second startup grace). Your own Compose overlays still take precedence over
+these values. The wait covers gateway startup only: the Git fetch, the image
+pull and the 330-second stop grace add their own time. The script then checks
+that the running container is healthy and runs the pinned image, with your
+overlays applied, and checks the gateway again after diagnostics. A second run
+changes nothing.
+
+Use Docker Compose 2.27.2 or newer, with `--wait` and `--wait-timeout` support,
+and Python 3. Keep the deployment's `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, and
+profiles selected. Only the gateway and its Compose dependencies are started;
+the one-shot `cli` service is used for diagnostics.
+
+Exit 0 means gateway image and health verification and the configuration
+diagnostic succeeded. Configuration-drift warnings are reported but do not fail the run.
+Startup, wait, inspection, image mismatch, and diagnostic failures return nonzero
+without a completion report. A failed diagnostic reports configuration status as
+unknown. Inspect the reported error and `docker compose ps -a` with the same
+deployment selection. No automatic recovery is attempted. Gateway health does
+not prove that Slack or Pretorin MCP calls succeed.
+
+On `master` the digest pin and `IMAGE_VERSION` are already set to the current
+release, so updating means pulling `master` rather than editing anything. To move
+to a *specific* release instead, point `compose.yaml` at that digest and set the
+matching `IMAGE_VERSION` in `versions.env` before running it — `smoke.sh` asserts
+the two agree.
+
+`update.sh` refuses rather than guessing, and names the exact command each time:
+a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
+diverged from its upstream, or a deployment selection that includes the local build
+overlay (that is a rebuild, not an update).
+
+### What survives an update, and what does not
+
+| | Survives `update.sh` | Survives `down -v` |
+| --- | --- | --- |
+| The image | replaced — that is the point | n/a |
+| **The Pretorin CLI** (`pretorin-state`) | **yes — `update.sh` does not touch it** | **no — reverts to the image seed** |
+| Model login (`openclaw-state`) | **yes** | **no** |
+| Seeded config, sessions, `AGENTS.md` | **yes** | **no** |
+| Pretorin context, resolvers, recipes (`pretorin-state`) | **yes** | **no** |
+| `.env` | **yes** | **yes** — never touched by either |
+| `workspace/targets` clones | **yes** | **yes** — bind-mounted, not a volume |
+
+OpenClaw can migrate the stored configuration and databases at startup. Before
+an upgrade, stop the gateway and back up both state volumes and deployment
+files. See [OpenClaw image upgrade and state backup](#openclaw-image-upgrade-and-state-backup).
+An older image can require
+the matching pre-upgrade state; changing the image alone is not a full rollback.
+
+**Two notes on the CLI row.** `down -v` deletes
+`pretorin-state`, so the next start re-seeds the CLI from the image and every
+update you had applied is gone. Reserve this command for intentional state
+deletion; it is not routine configuration repair. And rolling the *image* backwards
+does **not** roll the CLI backwards: the volume keeps whatever version it has.
+The CLI moves in exactly one way, `scripts/pretorin-update.sh`.
+
+Re-run
+`scripts/clawctl apply` only after `down -v`, or when `efforts.yaml` changes; it
+is idempotent either way.
+
+`smoke.sh` also reports this state on its own:
+
+```
+NOTE  deployment is behind the repo pin: run scripts/update.sh
+      running sha256:58690e31...
+      pinned  sha256:e123bf53...
+```
+
+A warning, not a failure — being mid-update is not being broken.
+
+**The image does not decide which Pretorin CLI you run.** It ships a *seed*;
+the CLI a deployment actually uses lives in the `pretorin-state` volume, and
+`update.sh` does not touch volumes. So pulling a newer image gives you a newer
+seed and the same CLI. Move the CLI with:
+
+```sh
+scripts/pretorin-update.sh --status     # what is installed, and what the image seeds
+scripts/pretorin-update.sh latest       # update to the latest stable release
+```
+
+**Templates do not replace an existing configuration.** OpenClaw can migrate its
+schema; other template changes require administrator review. The container
+reports a template revision difference:
+
+```
+compliance-claw: WARNING — this volume's config predates the image.
+  volume template version 2, image ships 3.
+```
+
+For a template change, merge the change by hand — diff your
+`~/.openclaw/openclaw.json` against
+`/opt/compliance-claw/openclaw-config.template.json` in the image, then
+`echo 3 > ~/.openclaw/.compliance-claw-templates`. Back up the state before
+repair. Do not delete volumes to apply a template change.
+
+There is a second, Slack-specific version of this warning, because the
+template-version message says nothing about Slack:
+
+```
+compliance-claw: WARNING — Slack credentials are supplied but NOT in this volume's config.
+```
+
+That means the Slack credentials this deployment requires — both tokens on the
+multi-effort path, all three variables on the legacy one — are set while the
+existing config predates them. It names the managed install and configuration
+steps. It does not replace the existing configuration.
+
+## Updating the Pretorin CLI
+
+The active CLI is `/home/node/.pretorin/bin/pretorin` in `pretorin-state`.
+It survives image upgrades. A CLI update affects **every agent and user of this
+instance** and does not require an image release. The shared installer verifies
+signatures and refuses downgrades and prereleases.
+
+From the deployment host:
+
+```sh
+scripts/pretorin-update.sh              # installed version, seed, and last update
+scripts/pretorin-update.sh latest       # latest stable release
+scripts/pretorin-update.sh 0.28.7       # exact version
+scripts/pretorin-update.sh --dry-run    # inspect without changes
+```
+
+From Slack, use the command name registered for your app:
+
+```
+/compliance-claw /pretorin-update latest
+/compliance-claw /pretorin-update 0.28.7
+/compliance-claw /pretorin-update status
+@Compliance Claw update Pretorin
+```
+
+**Both Slack update routes require native administrator authority.** For individual
+sign-in, use the person's existing Gateway profile and a role whose effective
+scopes include `operator.admin`. Browser-only users do not need a Slack link.
+For Slack users, an administrator calls `users.linkChannelIdentity` with:
+
+```json
+{
+  "profileId": "<existing-person-profile-id>",
+  "identity": {
+    "channelId": "slack",
+    "accountId": "default",
+    "senderId": "U0123456789"
+  }
+}
+```
+
+Use the exact configured Slack account ID and verified native user ID. Use
+`users.listChannelIdentities` with `profileId` to check the link. Display names,
+message text, and channel membership do not grant administrator authority.
+The shared Owner profile cannot receive a person link. These methods require
+an authenticated administrator Gateway connection; they do not create users
+or configure individual sign-in.
+
+To remove Slack authority, call `users.unlinkChannelIdentity` with the same
+`profileId` and `identity`, or remove the person's administrative role through
+`users.setRole`. Check the resulting effective role: clearing an assignment can
+restore a configured default. Remove any matching `commands.ownerAllowFrom`
+entry too; these legacy owner grants remain independent of profile links.
+Previously selected tools check current authority before starting an installer.
+An accepted installation keeps its normal verification and cleanup. Revocation
+prevents a new installation or automatic restart; it does not undo accepted work.
+
+**Automatic restart applies only to the owner Slack command.**
+The first reply reports installation and pending activation. The gateway restarts
+inside the running container. A final Slack message reports completion only after
+the expected CLI version, executable bytes, and real MCP calls are verified.
+
+**The conversational model tool requires an operator restart.** Disabled restart
+and unsupported reply routes also return **OPERATOR RESTART REQUIRED**. With the
+deployment's Compose project and overlays selected, run:
+
+```sh
+docker compose restart openclaw
+docker compose exec -T openclaw pretorin version
+```
+
+The version command checks the installed file. Confirm that the restart and next
+Pretorin MCP call succeed before treating the update as complete. Failed automatic
+verification reports installation success with unverified activation.
+
+Automatic verification supports the pinned OpenClaw `2026.10.5` Linux container,
+the canonical Pretorin MCP command, and the shipped effort launcher. See
+[activation, pending results, and recovery limits](#pretorin-cli-activation-and-results)
+and the [update audit record](#pretorin-cli-update-audit).
+
+## OpenClaw image upgrade and state backup
 
 The build pins OpenClaw 2026.10.5 and Pretorin CLI seed 0.30.4. A fresh
 installation uses this seed. An image upgrade keeps the active CLI in the
@@ -96,7 +299,7 @@ live state.
 
 ## Pretorin CLI activation and results
 
-The [CLI update commands](../README.md#updating-the-pretorin-cli) share the signed
+The [CLI update commands](#updating-the-pretorin-cli) share the signed
 installer. Only the owner Slack command requests automatic activation. It uses
 `openclaw gateway restart --safe --json`, the `gateway_start` hook, and the public
 Slack outbound adapter. It does not use restricted Gateway RPC or delegated
@@ -234,3 +437,17 @@ returning work. Restoring only config or starting old and new writers against
 one volume is not rollback. Keep current issuer/person revocations effective;
 restoring a backup must not restore removed authority. No migration command,
 adoption flag or separate state registry is required by this procedure.
+
+## Resetting (destructive)
+
+`docker compose down` retains the named volumes. Adding `-v` deliberately deletes
+both: OpenClaw config, sessions, agent workspaces, model login, and the managed
+Slack installation; and Pretorin context, resolvers, recipes, active CLI, and
+volume audit files. Bind-mounted target clones and host files such as `.env`
+and secret files remain.
+
+Do not use `down -v` for routine setup or troubleshooting. Before intentional
+state deletion, select the correct Compose project and files and follow the
+[backup procedure](#openclaw-image-upgrade-and-state-backup) to preserve verified backups. Bootstrap
+and `clawctl apply` can create initial state; they cannot restore deleted sessions
+or prior configuration. Restore from a verified recovery set when state matters.

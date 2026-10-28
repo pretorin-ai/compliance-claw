@@ -1,7 +1,7 @@
 # How to publish a release
 
 This is a maintainer procedure. For a deployment update, use the
-[customer update guide](../README.md#updating-an-existing-deployment).
+[customer update guide](upgrade.md#routine-deployment-update).
 For contribution checks, use [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Prerequisites
@@ -59,4 +59,4 @@ gh workflow run release.yml -f dry_run=true
 
 A dry run does not verify the registry push/tag steps. Publishing an image does
 not update an existing deployment or its active CLI. See
-[upgrade and recovery](upgrade.md) and [CLI updates](../README.md#updating-the-pretorin-cli).
+[update, upgrade and recovery](upgrade.md) and [CLI updates](upgrade.md#updating-the-pretorin-cli).
