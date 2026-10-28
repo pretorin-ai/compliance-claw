@@ -1,6 +1,6 @@
 # Repository access and synchronization
 
-This guide owns how review targets are declared, how private repositories are
+This guide covers how review targets are declared, how private repositories are
 reached, and how clones are kept up to date. Run every command from the
 repository root. Effort declarations themselves are in the
 [effort guide](efforts.md); credential files are in the
@@ -17,11 +17,9 @@ is a host action: edit `efforts.yaml`, then run `scripts/clawctl apply`.
 
 ## Legacy `targets.yaml` (single effort)
 
-> This is the single-effort format. It is still the shape `scripts/clawctl
-> migrate` reads, and the per-target rules below are unchanged in `efforts.yaml`,
-> but `efforts.yaml` takes precedence on the multi-effort path. `targets.yaml`
-> remains mounted for the legacy target-sync fallback. A multi-effort deployment
-> declares its targets under each effort in `efforts.yaml`.
+> Single-effort format, read by `scripts/clawctl migrate`. Once `efforts.yaml`
+> exists it takes precedence; `targets.yaml` stays mounted only for the legacy
+> target-sync fallback.
 
 ```yaml
 system_id: 7b74d8f3-d77c-49e4-8792-c372dd154d38   # UUID or system name
@@ -37,9 +35,7 @@ targets:
   #   private: true                               # needs a GitHub App
 ```
 
-One system and framework for the whole file; one or many targets. `bootstrap.sh`
-clones each into `workspace/targets/<name>`, which compose bind-mounts
-**read-only** at `/workspace/targets`.
+One system and framework for the whole file; one or many targets.
 
 `ref` is a **branch name** — not a tag and not a SHA. Synchronization
 fast-forwards a branch to its upstream, and a detached checkout at a tag has no
@@ -172,11 +168,7 @@ URL or `argv`, neither is ever written into a clone's `.git/config` (asserted
 after every clone, and independently by `scripts/smoke.sh`), and neither is ever
 mounted into a container.
 
-#### The PAT fallback, and the invariant it relaxes
-
-Earlier releases said the container never holds a git credential at all. **That
-is no longer true**, and this section says so rather than leaving the old
-sentence standing.
+#### The PAT fallback
 
 Synchronizing a private target from Slack happens *inside* the container, and the
 App private key deliberately never goes there — so that path uses a

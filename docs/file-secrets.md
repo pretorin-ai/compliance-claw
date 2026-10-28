@@ -27,8 +27,8 @@ packaged Compose is often older than Docker Desktop's.
 
 ## Legacy path: secret values in `.env`
 
-Still supported, and still what an existing deployment uses. Omit step 1, and
-`bootstrap.sh` then generates a gateway token into `.env` and asks you to add the
+Still supported, and still what an existing deployment uses. Omit the
+`COMPOSE_FILE` selection (Quickstart step 1), and `bootstrap.sh` then generates a gateway token into `.env` and asks you to add the
 Pretorin key there:
 
 ```sh

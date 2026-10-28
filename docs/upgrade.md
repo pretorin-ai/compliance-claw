@@ -1,6 +1,6 @@
 # Update, upgrade and recovery
 
-This guide owns the routine deployment update, the Pretorin CLI update, the
+This guide covers the routine deployment update, the Pretorin CLI update, the
 OpenClaw image upgrade with state backup, recovery, and the destructive reset.
 Run every command from the repository root with the deployment's saved
 [Compose selection](../README.md#save-deployment-settings).
@@ -13,14 +13,13 @@ scripts/update.sh
 
 One command: fast-forward the checkout, pull the image this checkout pins, restart
 the selected gateway, then report anything you have to act on. Compose waits up
-to 720 seconds for gateway health. The gateway uses a 15-second health interval
-and 720-second startup grace; the image's health command, timeout and retries
-stay unchanged. Customer overlays retain native precedence. This finite wait is
-not a startup guarantee or a limit for the whole update: Git, image pull and the
-separate 330-second stop grace can take more time. The script then verifies the
-selected container's running state, health, and actual image against Compose,
-including customer overlays. It checks the gateway again after diagnostics.
-It is idempotent: a second run does not force container replacement.
+to 720 seconds for the gateway to report healthy (15-second probe interval,
+720-second startup grace). Your own Compose overlays still take precedence over
+these values. The wait covers gateway startup only: the Git fetch, the image
+pull and the 330-second stop grace add their own time. The script then checks
+that the running container is healthy and runs the pinned image, with your
+overlays applied, and checks the gateway again after diagnostics. A second run
+changes nothing.
 
 Use Docker Compose 2.27.2 or newer, with `--wait` and `--wait-timeout` support,
 and Python 3. Keep the deployment's `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, and
@@ -28,7 +27,7 @@ profiles selected. Only the gateway and its Compose dependencies are started;
 the one-shot `cli` service is used for diagnostics.
 
 Exit 0 means gateway image and health verification and the configuration
-diagnostic succeeded. Recognized configuration-drift warnings remain warnings.
+diagnostic succeeded. Configuration-drift warnings are reported but do not fail the run.
 Startup, wait, inspection, image mismatch, and diagnostic failures return nonzero
 without a completion report. A failed diagnostic reports configuration status as
 unknown. Inspect the reported error and `docker compose ps -a` with the same
@@ -51,7 +50,7 @@ overlay (that is a rebuild, not an update).
 | | Survives `update.sh` | Survives `down -v` |
 | --- | --- | --- |
 | The image | replaced — that is the point | n/a |
-| **The Pretorin CLI** (`pretorin-state`) | **yes — `update.sh` no longer moves it** | **no — reverts to the image seed** |
+| **The Pretorin CLI** (`pretorin-state`) | **yes — `update.sh` does not touch it** | **no — reverts to the image seed** |
 | Model login (`openclaw-state`) | **yes** | **no** |
 | Seeded config, sessions, `AGENTS.md` | **yes** | **no** |
 | Pretorin context, resolvers, recipes (`pretorin-state`) | **yes** | **no** |
@@ -60,10 +59,11 @@ overlay (that is a rebuild, not an update).
 
 OpenClaw can migrate the stored configuration and databases at startup. Before
 an upgrade, stop the gateway and back up both state volumes and deployment
-files. See the backup procedure above. An older image can require
+files. See [OpenClaw image upgrade and state backup](#openclaw-image-upgrade-and-state-backup).
+An older image can require
 the matching pre-upgrade state; changing the image alone is not a full rollback.
 
-**Two things about the CLI row, because both surprise people.** `down -v` deletes
+**Two notes on the CLI row.** `down -v` deletes
 `pretorin-state`, so the next start re-seeds the CLI from the image and every
 update you had applied is gone. Reserve this command for intentional state
 deletion; it is not routine configuration repair. And rolling the *image* backwards
@@ -84,7 +84,7 @@ NOTE  deployment is behind the repo pin: run scripts/update.sh
 
 A warning, not a failure — being mid-update is not being broken.
 
-**The image no longer decides which Pretorin CLI you run.** It ships a *seed*;
+**The image does not decide which Pretorin CLI you run.** It ships a *seed*;
 the CLI a deployment actually uses lives in the `pretorin-state` volume, and
 `update.sh` does not touch volumes. So pulling a newer image gives you a newer
 seed and the same CLI. Move the CLI with:
@@ -94,14 +94,9 @@ scripts/pretorin-update.sh --status     # what is installed, and what the image 
 scripts/pretorin-update.sh latest       # update to the latest stable release
 ```
 
-**Historical note:** on v0.2.x and earlier the CLI *was* welded to the image, so
-an image upgrade did move it — that is how a v0.1.x deployment went from 0.26.14
-to 0.28.2. From this release on, the two are independent.
-
 **Templates do not replace an existing configuration.** OpenClaw can migrate its
-schema, and this release replaces the obsolete Slack load path with a managed
-installation. Other template changes still require administrator review. The
-container reports a template revision difference:
+schema; other template changes require administrator review. The container
+reports a template revision difference:
 
 ```
 compliance-claw: WARNING — this volume's config predates the image.
@@ -452,7 +447,7 @@ volume audit files. Bind-mounted target clones and host files such as `.env`
 and secret files remain.
 
 Do not use `down -v` for routine setup or troubleshooting. Before intentional
-state deletion, select the correct Compose project and files and follow
-[upgrade and recovery](upgrade.md) to preserve verified backups. Bootstrap
+state deletion, select the correct Compose project and files and follow the
+[backup procedure](#openclaw-image-upgrade-and-state-backup) to preserve verified backups. Bootstrap
 and `clawctl apply` can create initial state; they cannot restore deleted sessions
 or prior configuration. Restore from a verified recovery set when state matters.

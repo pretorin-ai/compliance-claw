@@ -79,16 +79,12 @@ provenance — see [Verifying the image you pulled](docs/image-verification.md).
 
 ### Source versus the published image
 
-This checkout pins the published **v0.5.2** image and ships newer host scripts
-and guides. Host-side changes apply as soon as you pull `master`: the saved
-Compose selection, the 720-second update wait and health schedule, and the
-update script creating release-added secret files. Changes that live inside the
-image reach a deployment only with the next published release, or with a local
-build (`scripts/bootstrap.sh --build`): efforts without a Slack channel,
-per-effort Plan and preflight records, native proxy authentication with the
-local maintenance password, native administrator authority for the Slack CLI
-update command, and the startup warning for a missing gateway credential. The
-guides describe the source behavior and say where the published image differs.
+This checkout pins the published **v0.5.2** image but its host scripts and
+guides are newer. Script changes (saved Compose selection, the 720-second
+update wait, secret-file creation during update) apply as soon as you pull
+`master`. Changes inside the image (efforts without a Slack channel, per-effort
+records, proxy authentication, Slack CLI-update authority) arrive with the next
+release, or now with `scripts/bootstrap.sh --build`.
 
 ## Requirements
 
@@ -470,7 +466,7 @@ before using it.
 | Agent answers with no sources bound | Wrong channel for the effort | Each agent serves one effort and refuses to switch; ask in that effort's own channel |
 | Loaded plugin set differs after an upgrade | OpenClaw can change bundled and required provider plugins | Inspect the loaded set and compare it with your configured allowlist |
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
-| An image upgrade did not change the CLI | By design since this release | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
+| An image upgrade did not change the CLI | By design | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
 | Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`, then check the next MCP call. `--status` reports the installed binary only |
 | `/compliance-claw /pretorin-update` does nothing in Slack | Existing slash-command configuration or missing owner authority | Check startup warnings, the registered command name, and `commands.ownerAllowFrom`. Preserve state before configuration repair; see [CLI updates](docs/upgrade.md#updating-the-pretorin-cli). |
 
