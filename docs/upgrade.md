@@ -665,8 +665,10 @@ that state.
    Copy the saved file back, or keep the current one only after you check that
    the restored state supports it. If the switch removed a file that was
    private at the backup, for example an overlay that the candidate revision
-   added to Git, the block stops with `no such file or directory` for that
-   path. Copy its verified saved copy back with
+   added to Git, the block stops: Compose reports `no such file or directory`
+   for a removed overlay, and the `host-inputs.txt` comparison reports a
+   difference for a removed bind-mounted file. Copy its verified saved copy
+   back with
    `cp -p -- "$(saved_input FILE)" FILE` and run this block again. The
    comparison skips the restore overlay, because step 1 wrote it again for this
    restore.
