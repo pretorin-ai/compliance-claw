@@ -166,7 +166,10 @@ The command creates only missing files. A missing gateway token gets a new
 random value; the other new files are empty. An existing file keeps its bytes,
 owner, and mode, also when it is empty: an intentionally empty token stays
 empty. Modes are set only on the files and the directory that the command
-creates. The `.env` path does not create secret files. `scripts/update.sh` also
+creates. If an existing file is not readable by the container user (uid/gid
+1000), the command stops and names the fix (`0400` owned by `1000:1000` on the
+VM, or `0604` with the local helper); it does not change that file. The `.env`
+path does not create secret files. `scripts/update.sh` also
 stops before downtime when a secret file that a customer overlay names does not
 exist; create that file yourself with the documented mode.
 

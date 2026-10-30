@@ -324,16 +324,17 @@ chmod +x "$TMP/bin/openssl"
 echo "  retained empty credentials stay empty without token generation"
 
 # Existing files keep their bytes and modes, and so does the directory. Only a
-# file the helper creates gets its mode. 0400 is the documented VM file mode;
-# the old helper changed it to 0604 for every host user except uid 1000.
+# file the helper creates gets its mode. The old helper changed every existing
+# file to 0604 (or 0600 for uid 1000), so a documented 0400 file became
+# readable by other host users.
 file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 printf '%s' "$CANARY_PRETORIN" > "$SCRATCH/secrets/runtime/pretorin-api-key"
-chmod 400 "$SCRATCH/secrets/runtime/pretorin-api-key"
+chmod 644 "$SCRATCH/secrets/runtime/pretorin-api-key"
 chmod 750 "$SCRATCH/secrets/runtime"
 rm -f "$SCRATCH/secrets/runtime/openclaw-gateway-password"
 ( cd "$SCRATCH" && PATH="$TMP/bin:$PATH" COMPOSE_FILE=compose.yaml:compose.secrets.yaml bash scripts/init-file-secrets.sh >init-modes.log 2>&1 )
 [ "$(cat "$SCRATCH/secrets/runtime/pretorin-api-key")" = "$CANARY_PRETORIN" ] \
-  && [ "$(file_mode "$SCRATCH/secrets/runtime/pretorin-api-key")" = 400 ] \
+  && [ "$(file_mode "$SCRATCH/secrets/runtime/pretorin-api-key")" = 644 ] \
   && [ "$(file_mode "$SCRATCH/secrets/runtime")" = 750 ] || {
   echo "file-secret-test: FAIL — an existing secret file or directory changed mode or bytes" >&2; exit 1; }
 EXPECT_NEW_MODE=604
@@ -344,8 +345,23 @@ EXPECT_NEW_MODE=604
 if grep -q "$CANARY_PRETORIN" "$SCRATCH/init-modes.log"; then
   echo "file-secret-test: FAIL — a secret value appeared in the helper output" >&2; exit 1
 fi
+# The trailer keeps the saved selection: no build overlay and no early `up`.
+if grep -qE 'compose\.build\.yaml|docker compose up' "$SCRATCH/init-modes.log" \
+   || ! grep -q 'scripts/clawctl apply' "$SCRATCH/init-modes.log"; then
+  echo "file-secret-test: FAIL — the helper trailer names a build overlay or an early up" >&2; exit 1
+fi
+# A file the container user cannot read stops the helper with the fix; the
+# helper does not change it.
+chmod 000 "$SCRATCH/secrets/runtime/pretorin-api-key"
+if ( cd "$SCRATCH" && PATH="$TMP/bin:$PATH" COMPOSE_FILE=compose.yaml:compose.secrets.yaml bash scripts/init-file-secrets.sh >init-unreadable.log 2>&1 ); then
+  echo "file-secret-test: FAIL — an unreadable existing secret file was accepted" >&2; exit 1
+fi
+grep -q 'chown 1000:1000' "$SCRATCH/init-unreadable.log" \
+  && [ "$(file_mode "$SCRATCH/secrets/runtime/pretorin-api-key")" = 0 ] || {
+  echo "file-secret-test: FAIL — an unreadable file was changed, or the fix was not named" >&2; exit 1; }
+chmod 600 "$SCRATCH/secrets/runtime/pretorin-api-key"
 chmod 700 "$SCRATCH/secrets/runtime"
-echo "  existing files and directory keep bytes and modes; a missing file is created empty"
+echo "  existing files keep bytes and modes; an unreadable file stops with the fix; trailer keeps the selection"
 
 # It must also SAY what is still missing, by name. A silent empty key file becomes
 # an auth error three steps later, which is the worst place to learn it.

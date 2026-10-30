@@ -8,6 +8,8 @@
 # Existing destination files are never overwritten. Values are never printed.
 # Modes are set only on the directory and files this script creates: an existing
 # file keeps its bytes, owner and mode (for example 0400 owned by 1000:1000).
+# An existing file that the container user (uid/gid 1000) cannot read stops the
+# script with the owner/mode fix; the script never changes that file itself.
 #
 # RUN IT AGAIN AFTER AN UPGRADE THAT ADDS A SECRET. compose.secrets.yaml resolves
 # every secret source at `up` time, so a file this script has not created yet
@@ -86,6 +88,7 @@ container_readable_mode() {
   fi
 }
 
+EXISTING=()
 while IFS='|' read -r name filename; do
   [ -n "$name" ] || continue
   value=""
@@ -100,6 +103,8 @@ while IFS='|' read -r name filename; do
   fi
   if write_new "${SECRET_DIR}/${filename}" "$value"; then
     container_readable_mode "${SECRET_DIR}/${filename}"
+  else
+    EXISTING+=("${SECRET_DIR}/${filename}")
   fi
   unset value
 done <<'EOF'
@@ -113,6 +118,28 @@ ANTHROPIC_API_KEY|anthropic-api-key
 GITHUB_READONLY_PAT|github-readonly-pat
 EOF
 
-log "ready. Use:"
-log "  export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.build.yaml"
-log "  docker compose up -d"
+# Compose file secrets are bind mounts: the container's uid-1000 user reads the
+# host file with the host owner and mode. Report a file it cannot read, with the
+# documented fixes, instead of a later authentication error that blames the key.
+if [ "${#EXISTING[@]}" -gt 0 ]; then
+  UNREADABLE="$(python3 -c '
+import os, stat, sys
+for path in sys.argv[1:]:
+    st = os.stat(path)
+    if not ((st.st_uid == 1000 and st.st_mode & stat.S_IRUSR)
+            or (st.st_gid == 1000 and st.st_mode & stat.S_IRGRP)
+            or st.st_mode & stat.S_IROTH):
+        print(path)
+' "${EXISTING[@]}")" || die "could not check the existing secret files"
+  if [ -n "$UNREADABLE" ]; then
+    printf 'file-secrets: ERROR — the container user (uid 1000) cannot read:\n' >&2
+    printf '%s\n' "$UNREADABLE" | sed 's/^/  /' >&2
+    printf '%s\n' "  Existing files were not changed. Fix each file with ONE of the documented modes:" \
+      "    sudo chown 1000:1000 FILE && sudo chmod 0400 FILE   # VM: docs/file-secrets.md" \
+      "    chmod 0604 FILE                                      # local helper mode" >&2
+    exit 1
+  fi
+fi
+
+log "ready. Keep the saved Compose selection (README: Save deployment settings)."
+log "  Next: scripts/clawctl plan, then scripts/clawctl apply"

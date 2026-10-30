@@ -64,7 +64,10 @@ def selection_regression(root, docker, docker_env):
         run("bash", "-c", '. scripts/compose-selection.sh; compose_resolve_selection; '
             'test -z "${UNRELATED_SECRET+x}" && test "$COMPOSE_PROFILES" = cli')
         run("bash", "scripts/clawctl", "plan")
-        run("bash", "scripts/init-file-secrets.sh")
+        init = run("bash", "scripts/init-file-secrets.sh").stdout
+        # The trailer keeps the saved selection: no build overlay, no early `up`.
+        assert "compose.build.yaml" not in init and "docker compose up" not in init, init
+        assert "scripts/clawctl apply" in init, init
         run("bash", "scripts/clawctl", "credential", "add", "fixture-key")
         secret = fixture / "saved secrets=literal"
         assert (secret / "pretorin/fixture-key").exists()
@@ -158,7 +161,8 @@ def release_repo(base, root, docker_env, digest, populate,
                                             image_repository=repository)
     # The neutral overlay reserves the release overlay's place in COMPOSE_FILE.
     (repo / "compose.release.yaml").write_text("services: {}\n")
-    return repo, git, old, new, {**git_env, "TMPDIR": str(base)}, image
+    # The shim's stand-in for a later verified signature; see test-update.py.
+    return repo, git, old, new, {**git_env, "TMPDIR": str(base), "CC_TEST_RELEASE_SIGNED": "1"}, image
 
 
 def release_regression(root, docker, docker_env):
@@ -198,9 +202,9 @@ def release_regression(root, docker, docker_env):
                            for p in repo.rglob("*") if ".git" not in p.parts)
             return git("rev-parse", "HEAD"), git("for-each-ref"), files
 
-        def update(*args, rc):
+        def update(*args, rc, extra=None):
             p = subprocess.run(["bash", "scripts/update.sh", "--release", "v0.6.0", *args],
-                               cwd=repo, env=env, capture_output=True, text=True)
+                               cwd=repo, env={**env, **(extra or {})}, capture_output=True, text=True)
             output = p.stdout + p.stderr
             assert p.returncode == rc, output
             assert "CANARY-DO-NOT-PRINT" not in output, output
@@ -208,6 +212,10 @@ def release_regression(root, docker, docker_env):
             return output
 
         before = state()
+        # Every release set is unsigned today: preview shows it, apply refuses.
+        output = update("--preview", rc=2, extra={"CC_TEST_RELEASE_SIGNED": "0"})
+        assert "UNVERIFIED: publisher authenticity not checked" in output, output
+        assert state() == before
         output = update("--preview", rc=0)
         for text in (new_image, "cc-release-restored-openclaw-state", "cc-release-saved",
                      "./compose.yaml;compose.release.yaml;./compose.secrets.yaml;./compose.efforts.yaml;"

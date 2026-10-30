@@ -7,6 +7,8 @@
 #   scripts/update.sh --release vX.Y.Z             # apply that release
 #   scripts/update.sh --release vX.Y.Z --effort-records-ready
 #                       # apply after the effort-record transfer is complete
+#   scripts/update.sh --release vX.Y.Z --save-selection
+#                       # also save the release overlay in .env COMPOSE_FILE
 #
 # BRANCH ROUTE (no options): fast-forward the checkout's upstream branch and
 # pull the image that branch pins. This is the explicit custom route. It is not
@@ -75,9 +77,13 @@ log()  { printf 'update: %s\n' "$*"; }
 warn() { printf 'update: WARNING — %s\n' "$*" >&2; }
 die()  { printf 'update: ERROR — %s\n' "$*" >&2; exit 1; }
 
+# A shell value overrides .env in Compose; remember it before the selection
+# helper exports the saved values.
+SHELL_COMPOSE_FILE="${COMPOSE_FILE+set}"
 RELEASE_TAG=""
 PREVIEW=0
 RECORDS_READY=0
+SAVE_SELECTION=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
@@ -90,11 +96,12 @@ while [ "$#" -gt 0 ]; do
       [ -n "$RELEASE_TAG" ] || die "--release needs a release tag, for example: --release v0.6.0" ;;
     --preview) PREVIEW=1; shift ;;
     --effort-records-ready) RECORDS_READY=1; shift ;;
+    --save-selection) SAVE_SELECTION=1; shift ;;
     *) die "unknown argument '$1'. See: scripts/update.sh --help" ;;
   esac
 done
-if [ -z "$RELEASE_TAG" ] && { [ "$PREVIEW" = 1 ] || [ "$RECORDS_READY" = 1 ]; }; then
-  die "--preview and --effort-records-ready apply only to a release. Add --release vX.Y.Z."
+if [ -z "$RELEASE_TAG" ] && { [ "$PREVIEW" = 1 ] || [ "$RECORDS_READY" = 1 ] || [ "$SAVE_SELECTION" = 1 ]; }; then
+  die "--preview, --effort-records-ready and --save-selection apply only to a release. Add --release vX.Y.Z."
 fi
 
 # THE RELEASE SET. scripts/release-assets.py is the one verifier: it downloads
@@ -110,17 +117,88 @@ RELEASE_HELPER="${REPO_ROOT}/scripts/release-assets.py"
 EFFORT_RECORD_TRANSITION=770969c5348a17d7c120c70c23927b0f978be5a0
 
 # On a failure after the release route changed a file, name what restores the
-# previous files. Nothing here restores them automatically.
+# previous files. Only the saved COMPOSE_FILE line is put back automatically,
+# and only before the gateway is replaced; nothing else is restored.
 RECOVERY_NOTE=""
 RELEASE_CACHE=""
+ENV_OLD_LINE=""
+DOWNTIME=0
 on_exit() {
   local rc=$?
+  if [ "$rc" != 0 ] && [ -n "$ENV_OLD_LINE" ] && [ "$DOWNTIME" = 0 ]; then
+    if env_selection restore "$ENV_OLD_LINE" >/dev/null; then
+      printf 'update: restored the previous COMPOSE_FILE line in .env\n' >&2
+    else
+      printf 'update: could NOT restore .env; set this line again by hand:\n  %s\n' \
+        "${ENV_OLD_LINE#line:}" >&2
+    fi
+  fi
   if [ "$rc" != 0 ] && [ -n "$RECOVERY_NOTE" ]; then
     printf '%s\n' "$RECOVERY_NOTE" >&2
   fi
   [ -z "$RELEASE_CACHE" ] || rm -rf "$RELEASE_CACHE"
   return "$rc"
 }
+
+# The saved COMPOSE_FILE line in .env: check that it can be changed, replace or
+# add it, or put the old line back. Changes no other byte, keeps the mode and
+# owner, and replaces the file atomically. `write` prints the old line as
+# "line:<text>" or "absent". The selection holds no credential, but the rest of
+# .env can: nothing else from the file is printed.
+ENV_SELECTION_PY="$(cat <<'PY'
+import os, re, sys, tempfile
+mode, path, value = sys.argv[1], sys.argv[2], sys.argv[3]
+def fail(message):
+    sys.exit("update: .env: " + message)
+if os.path.islink(path) or not os.path.isfile(path):
+    fail("is not a regular file in the repository root")
+st = os.stat(path)
+if os.geteuid() not in (0, st.st_uid):
+    fail("is owned by another user; this user cannot keep its owner")
+with open(path, "rb") as f:
+    data = f.read()
+lines = data.split(b"\n")
+named = [i for i, l in enumerate(lines) if re.match(rb"\s*(export\s+)?COMPOSE_FILE\s*=", l)]
+if len(named) > 1 or any(not lines[i].startswith(b"COMPOSE_FILE=") for i in named):
+    fail("has more than one COMPOSE_FILE line, or one in another form")
+old = "line:" + lines[named[0]].rstrip(b"\r").decode("utf-8", "surrogateescape") if named else "absent"
+if mode == "check":
+    sys.exit(0)
+if mode == "write":
+    if any(c in value for c in "'\n\r"):
+        fail("the new value cannot be written safely")
+    quote = re.search(r"[^A-Za-z0-9_./:;,@+=-]", value) or (named and lines[named[0]][13:14] == b"'")
+    new = ("COMPOSE_FILE=" + ("'%s'" % value if quote else value)).encode()
+else:
+    new = None if value == "absent" else value[len("line:"):].encode("utf-8", "surrogateescape")
+if named:
+    cr = b"\r" if lines[named[0]].endswith(b"\r") else b""
+    if new is None:
+        del lines[named[0]]
+    else:
+        lines[named[0]] = new + cr
+elif new is not None:
+    if lines and lines[-1] == b"":
+        lines.insert(len(lines) - 1, new)
+    else:
+        lines.append(new)
+fd, tmp = tempfile.mkstemp(prefix=".env.update.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"\n".join(lines))
+    os.chmod(tmp, st.st_mode & 0o7777)
+    if os.geteuid() == 0:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, path)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
+if mode == "write":
+    print(old)
+PY
+)"
+env_selection() { python3 -c "$ENV_SELECTION_PY" "$1" "${REPO_ROOT}/.env" "${2:-}"; }
 trap on_exit EXIT
 
 # ---------------------------------------------------------------------------
@@ -163,8 +241,8 @@ try:
             continue
         summary["images"][service] = spec["image"]
         summary["mounts"][service] = {
-            m["target"]: [volumes.get(m["source"], {}).get("name", m["source"]),
-                          bool(volumes.get(m["source"], {}).get("external", False))]
+            m["target"]: [volumes.get(m.get("source"), {}).get("name", m.get("source", "")),
+                          bool(volumes.get(m.get("source"), {}).get("external", False))]
             for m in spec.get("volumes", []) if m.get("type") == "volume"}
     # Only the fields the release helper checks: never pass on the whole model.
     summary["selection"] = {"services": {
@@ -203,14 +281,16 @@ print("" if value is None else (json.dumps(value, sort_keys=True) if isinstance(
 }
 
 # Helper exit codes: 1 release data, 3 source checkout, 4 image selection,
-# 5 a tool (download, git, Compose) could not run.
+# 5 a tool (download, git, Compose) could not run, 6 the release set is unsigned
+# or its signature is not verified. Only reads pass --allow-unsigned; the apply
+# gate never does, and there is no option or variable that bypasses it.
 release_helper() { python3 "$RELEASE_HELPER" "$@"; }
 
 # The version of the release set installed in the repository root, if valid.
 installed_release_version() {
   local summary
   [ -f "$RELEASE_HELPER" ] || return 1
-  summary="$(release_helper check --dir "$REPO_ROOT" --stage any --json 2>/dev/null)" || return 1
+  summary="$(release_helper check --dir "$REPO_ROOT" --stage any --allow-unsigned --json 2>/dev/null)" || return 1
   json_field "$summary" version
 }
 
@@ -255,18 +335,24 @@ resolve_release() {
   R_COMMIT="$(git rev-parse --verify --quiet 'FETCH_HEAD^{commit}')" \
     || die "tag ${tag} does not name a commit."
   local_tag="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" || true)"
+  R_LOCAL_TAG="$local_tag"
   if [ -n "$local_tag" ] && [ "$local_tag" != "$R_COMMIT" ]; then
     blocker "the local tag ${tag} names ${local_tag}, but ${RELEASE_REMOTE} names ${R_COMMIT}. Inspect both; do not delete either without review."
   fi
 
-  # The helper downloads a FINAL release set only and checks every asset.
+  # The helper downloads a FINAL release set only and checks every asset. The
+  # read accepts an unsigned set so that preview can show it; the gate below
+  # decides whether apply may use it.
   log "downloading and verifying the release set"
   rc=0
-  r_json="$(release_helper fetch --version "$R_VERSION" --dir "${RELEASE_CACHE}/assets" --json)" || rc=$?
+  r_json="$(release_helper fetch --version "$R_VERSION" --dir "${RELEASE_CACHE}/assets" --allow-unsigned --json)" || rc=$?
   case "$rc" in
     0) ;;
     5) die "could not download the release set for ${tag} (see the reason above). Check network access. Nothing was changed." ;;
-    *) die "${tag} has no valid final release set (see the reason above). A release before release sets has none; use the branch route. Nothing was changed." ;;
+    *) die "${tag} has no valid final release set (see the reason above). A release before release sets has none; use the branch route.
+  A candidate on a draft release is qualified by maintainers with:
+    scripts/release-assets.py check --dir DIR --stage candidate --version ${R_VERSION}
+  Nothing was changed." ;;
   esac
   [ "$(json_field "$r_json" commit)" = "$R_COMMIT" ] && [ "$(json_field "$r_json" tag)" = "$tag" ] \
     || die "the release record names another source than tag ${tag} on ${RELEASE_REMOTE} (${R_COMMIT}). Nothing was changed."
@@ -275,6 +361,16 @@ resolve_release() {
   [ -n "$R_IMAGE" ] || die "the release verifier returned no image reference."
   R_OVERLAY="${RELEASE_CACHE}/assets/${RELEASE_OVERLAY}"
   R_RECORD="${RELEASE_CACHE}/assets/${RELEASE_RECORD}"
+
+  # AUTHENTICITY. Apply needs a verified publisher signature. Until signing and
+  # its verifier exist, every release set is unsigned and apply refuses it.
+  rc=0
+  release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" = 6 ] || [ "$R_SIGNATURE" = unsigned ]; then
+    blocker "UNVERIFIED: publisher authenticity not checked (signature ${R_SIGNATURE}); apply will refuse this release until signing/verification exists."
+  elif [ "$rc" != 0 ]; then
+    die "the release set for ${tag} did not pass the apply check (exit ${rc}). Nothing was changed."
+  fi
 
   git archive --format=tar "$R_COMMIT" | tar -x -C "${RELEASE_CACHE}/src" \
     || die "could not read the source of ${tag}."
@@ -305,10 +401,12 @@ root, sep = os.path.realpath(env["REPO_ROOT"]), env["SEP"]
 tracked = set(p for p in sys.stdin.read().split("\0") if p)
 stable = env["STABLE"]
 candidate, final, selected, problems = [], [], "0", []
+stable_entry = os.path.basename(stable)
 for index, entry in enumerate(env["CF"].split(sep)):
     path = entry if os.path.isabs(entry) else os.path.join(env["REPO_ROOT"], entry)
     if os.path.lexists(stable) and os.path.exists(path) and os.path.samefile(path, stable):
         selected = "1" if index == 1 else "misplaced"
+        stable_entry = entry
         continue
     relative = os.path.relpath(os.path.realpath(path), root)
     if relative in tracked:
@@ -323,11 +421,11 @@ for index, entry in enumerate(env["CF"].split(sep)):
         if relative != "compose.yaml":
             problems.append("COMPOSE_FILE must start with compose.yaml for a release")
         candidate.append(env["OVERLAY"])
-        final.append(os.path.basename(stable))
+        final.append(None)
 if any(sep in p for p in candidate):
     problems.append("a temporary path contains the Compose path separator")
 print(sep.join(candidate))
-print(sep.join(final))
+print(sep.join(stable_entry if f is None else f for f in final))
 print(selected)
 for problem in problems:
     print(problem)
@@ -338,11 +436,26 @@ for problem in problems:
     IFS= read -r R_OVERLAY_SELECTED
     while IFS= read -r f; do blocker "$f"; done
   } <<< "$mapping"
+  # FIRST ADOPTION. The saved selection must name the release overlay directly
+  # after compose.yaml. The COMPOSE_FILE line in .env is customer-written, so
+  # apply changes it only with --save-selection, and only that one line.
+  R_SAVE_SELECTION=0
   case "$R_OVERLAY_SELECTED" in
     1) ;;
     misplaced) blocker "${RELEASE_OVERLAY} must come directly after compose.yaml in COMPOSE_FILE." ;;
-    *) blocker "the saved COMPOSE_FILE does not select ${RELEASE_OVERLAY}. Apply creates a neutral placeholder once and stops; then save this line in .env:
-      COMPOSE_FILE=${R_FINAL_FILES}" ;;
+    *)
+      if [ "$SHELL_COMPOSE_FILE" = set ]; then
+        blocker "this shell exports COMPOSE_FILE, which overrides .env. Unset it (unset COMPOSE_FILE) to use the saved selection, or export: COMPOSE_FILE=${R_FINAL_FILES}"
+      elif [ -n "${COMPOSE_ENV_FILES:-}" ]; then
+        blocker "COMPOSE_ENV_FILES selects other environment files. Save this line in the file that sets COMPOSE_FILE: COMPOSE_FILE=${R_FINAL_FILES}"
+      elif ! selection_err="$(env_selection check 2>&1)"; then
+        blocker "${selection_err#update: } Save this line by hand: COMPOSE_FILE=${R_FINAL_FILES}"
+      elif [ "$SAVE_SELECTION" = 1 ]; then
+        R_SAVE_SELECTION=1
+        required "apply saves the release overlay in .env (only the COMPOSE_FILE line; the old line is printed and restored if a step fails before the gateway is replaced)."
+      else
+        blocker "the saved COMPOSE_FILE does not select ${RELEASE_OVERLAY}. Confirm the change of this .env line with --save-selection, or save it by hand: COMPOSE_FILE=${R_FINAL_FILES}"
+      fi ;;
   esac
 
   R_CURRENT="$(model_summary)" || die "could not read the current Compose selection."
@@ -354,10 +467,10 @@ for problem in problems:
     || blocker "the state-volume selection would change. A restored or recovered volume selection must stay; review the overlays and ${tag} before you continue."
   rc=0
   selection_err="$(json_field "$R_CANDIDATE" selection \
-    | release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" --rendered - 2>&1 >/dev/null)" || rc=$?
+    | release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" --allow-unsigned --rendered - 2>&1 >/dev/null)" || rc=$?
   case "$rc" in
     0) ;;
-    4) blocker "the effective openclaw or cli image is not the release image. A later overlay overrides it; that is a custom selection, which the release route does not apply." ;;
+    4) blocker "the effective openclaw or cli image is not the release image: a later overlay sets image (for example a restore overlay). That is a custom selection, which the release route does not apply. Take a new backup, then remove only the two image lines from that overlay and keep its volume lines." ;;
     *) printf '%s\n' "$selection_err" >&2; die "could not check the release image selection. Nothing was changed." ;;
   esac
 
@@ -444,11 +557,19 @@ print_release_report() {
     "$(git rev-list --count "${R_HEAD}..${R_COMMIT}" 2>/dev/null || echo '?')"
   printf '  version:       %s -> %s\n' "$R_CURRENT_VERSION" "$R_VERSION"
   printf '  image:         %s -> %s\n' "$(json_field "$R_CURRENT" images openclaw)" "$R_IMAGE"
+  printf '  checked:       tag commit, asset checksums, image digest, effective image\n'
   printf '  signature:     %s\n' "$R_SIGNATURE"
   if [ "$R_SIGNATURE" = unsigned ]; then
-    printf '                 verified: tag commit, asset checksums, image digest; not a publisher signature\n'
+    printf '                 UNVERIFIED: not signed; publisher authenticity not checked\n'
   fi
-  printf '  COMPOSE_FILE:  %s\n' "$R_FINAL_FILES"
+  if R_BRANCH="$(git symbolic-ref --quiet --short HEAD)"; then
+    printf '  checkout:      branch %s -> detached tag %s (release mode; the branch route then refuses)\n' \
+      "$R_BRANCH" "$R_TAG"
+  fi
+  printf '  COMPOSE_FILE:  %s\n' "${COMPOSE_FILE:-compose.yaml}"
+  if [ "${COMPOSE_FILE:-compose.yaml}" != "$R_FINAL_FILES" ]; then
+    printf '            ->   %s\n' "$R_FINAL_FILES"
+  fi
   printf '  project:       %s\n' "$(json_field "$R_CANDIDATE" project)"
   printf '  state volumes: %s\n' "$(json_field "$R_CANDIDATE" mounts openclaw)"
   printf '  downloads:     image %s\n' "$R_IMAGE"
@@ -479,24 +600,10 @@ if [ -n "$RELEASE_TAG" ]; then
       exit 2
     fi
     log "preview: no blockers. Nothing was changed. To apply:"
-    log "  scripts/update.sh --release ${R_TAG}$([ "$RECORDS_READY" = 1 ] && printf ' --effort-records-ready')"
+    log "  scripts/update.sh --release ${R_TAG}$([ "$RECORDS_READY" = 1 ] && printf ' --effort-records-ready')$([ "$SAVE_SELECTION" = 1 ] && printf ' --save-selection')"
     exit 0
   fi
 
-  # FIRST ADOPTION. A saved COMPOSE_FILE that names a missing file stops every
-  # command, so reserve the path with an overlay that changes nothing, and let
-  # the operator save the selection. The gateway is not touched.
-  if [ "$R_OVERLAY_SELECTED" = 0 ] && [ "${#BLOCKERS[@]}" = 1 ]; then
-    if [ -e "${REPO_ROOT}/${RELEASE_OVERLAY}" ] || [ -L "${REPO_ROOT}/${RELEASE_OVERLAY}" ]; then
-      die "${RELEASE_OVERLAY} exists but the saved COMPOSE_FILE does not select it. Inspect it; nothing was changed."
-    fi
-    printf '%s\n' "# Compliance Claw release overlay. scripts/update.sh --release replaces it." \
-      "services: {}" > "${REPO_ROOT}/${RELEASE_OVERLAY}"
-    printf 'update: created the neutral %s. Nothing was stopped or pulled.\n' "$RELEASE_OVERLAY" >&2
-    printf 'update: save this line in .env, then run the same command again:\n' >&2
-    printf '  COMPOSE_FILE=%s\n' "$R_FINAL_FILES" >&2
-    exit 3
-  fi
   if [ "${#BLOCKERS[@]}" -gt 0 ]; then
     die "${#BLOCKERS[@]} blocker(s) above. Nothing was changed and the gateway was not stopped."
   fi
@@ -513,21 +620,28 @@ if [ -n "$RELEASE_TAG" ]; then
   docker image inspect --format '{{.Id}}' "$R_IMAGE" >/dev/null \
     || die "${R_IMAGE} is not available locally after the pull. Nothing was changed."
 
-  if [ -n "$R_INSTALLED" ]; then
-    PREVIOUS_SET="restore release set ${R_INSTALLED}: scripts/release-assets.py fetch --version ${R_INSTALLED} --dir <new empty directory>,
-    then copy ${RELEASE_RECORD} and ${RELEASE_OVERLAY} from it into the repository root"
-  else
-    PREVIOUS_SET="replace ${RELEASE_OVERLAY} with the neutral overlay (one line: services: {}) and remove ${RELEASE_RECORD}"
+  # The helper checks the source through the tag, so record the fetched tag.
+  # An existing local tag already names this commit (otherwise a blocker).
+  if [ -z "$R_LOCAL_TAG" ]; then
+    git fetch --quiet --no-tags "$RELEASE_REMOTE" "refs/tags/${R_TAG}:refs/tags/${R_TAG}" \
+      || die "could not record tag ${R_TAG} locally. Nothing was changed."
   fi
-  RECOVERY_NOTE="update: RECOVERY — no automatic recovery was attempted. To return the files:
+
+  # The previous record and overlay are one recovery input: keep them together.
+  if [ -f "${REPO_ROOT}/${RELEASE_RECORD}" ] && [ -f "${REPO_ROOT}/${RELEASE_OVERLAY}" ]; then
+    PREVIOUS_SET="restore the previous release set: move ${RELEASE_RECORD}.previous and
+    ${RELEASE_OVERLAY}.previous back to ${RELEASE_RECORD} and ${RELEASE_OVERLAY}"
+  else
+    PREVIOUS_SET="remove ${RELEASE_RECORD} and ${RELEASE_OVERLAY} (no release set was installed before)"
+  fi
+  RECOVERY_NOTE="update: RECOVERY — no automatic recovery was attempted except the COMPOSE_FILE line
+  before the gateway was replaced. To return the files:
     git checkout --detach ${R_HEAD}
     ${PREVIOUS_SET}
+    previous saved selection: COMPOSE_FILE=${COMPOSE_FILE:-compose.yaml}
   If the gateway was replaced, select the previous images and restore the verified
   backup of both state volumes: docs/upgrade.md#openclaw-image-upgrade-and-state-backup"
 
-  # The helper checks the source through the tag, so record the fetched tag.
-  git fetch --quiet --no-tags "$RELEASE_REMOTE" "refs/tags/${R_TAG}:refs/tags/${R_TAG}" \
-    || die "could not record tag ${R_TAG} locally. The gateway was not stopped."
   if [ "$R_HEAD" != "$R_COMMIT" ]; then
     log "checking out ${R_TAG} (${R_COMMIT})"
     git checkout --quiet --detach "$R_COMMIT" \
@@ -538,6 +652,11 @@ if [ -n "$RELEASE_TAG" ]; then
   if cmp -s "$R_OVERLAY" "${REPO_ROOT}/${RELEASE_OVERLAY}" && cmp -s "$R_RECORD" "${REPO_ROOT}/${RELEASE_RECORD}"; then
     log "the ${R_TAG} release set is already installed"
   else
+    if [ -f "${REPO_ROOT}/${RELEASE_RECORD}" ] && [ -f "${REPO_ROOT}/${RELEASE_OVERLAY}" ]; then
+      for f in "$RELEASE_RECORD" "$RELEASE_OVERLAY"; do
+        cp -p "${REPO_ROOT}/${f}" "${REPO_ROOT}/${f}.previous"
+      done
+    fi
     # The record first, then the overlay that Compose reads; each replaced atomically.
     for f in "$RELEASE_RECORD" "$RELEASE_OVERLAY"; do
       cp "${RELEASE_CACHE}/assets/${f}" "${REPO_ROOT}/${f}.new"
@@ -547,8 +666,19 @@ if [ -n "$RELEASE_TAG" ]; then
     log "installed the ${R_TAG} release set"
   fi
 
+  if [ "$R_SAVE_SELECTION" = 1 ]; then
+    ENV_OLD_LINE="$(env_selection write "$R_FINAL_FILES")" \
+      || die "could not save COMPOSE_FILE in .env. The gateway was not stopped."
+    log "saved in .env: COMPOSE_FILE=${R_FINAL_FILES}"
+    log "  previous line: ${ENV_OLD_LINE#line:}"
+    # The value exported from .env would hide the new line.
+    unset COMPOSE_FILE
+  fi
+
   # Apply rechecks: the installed set, the tag and HEAD, and the saved selection.
   compose_resolve_selection
+  [ "${COMPOSE_FILE:-compose.yaml}" = "$R_FINAL_FILES" ] \
+    || die "the saved COMPOSE_FILE is not the verified selection after the change. The gateway was not stopped."
   release_helper check --dir "$REPO_ROOT" --version "$R_VERSION" --source "$REPO_ROOT" --compose \
     || die "the installed release set, source or selection did not verify after checkout. The gateway was not stopped."
   APPLIED="$(model_summary)" || die "could not read the Compose selection after checkout. The gateway was not stopped."
@@ -703,6 +833,7 @@ EXPECTED_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$SELECTED_IMAGE")"
 log "starting the gateway; Compose waits up to 720 seconds for health"
 # Name the gateway so an enabled cli profile cannot start a second gateway or
 # make Compose wait for a one-shot command. All deployment selection is inherited.
+DOWNTIME=1
 docker compose up -d --wait --wait-timeout 720 openclaw \
   || die "gateway startup or the Compose health wait failed. Check: docker compose ps -a"
 

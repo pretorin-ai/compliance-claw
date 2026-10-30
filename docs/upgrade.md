@@ -26,8 +26,11 @@ directory and checks the record and asset checksums. The updater compares the
 record with the tag commit. Preview then renders the release with your saved
 Compose files, in order. It shows:
 
-- the source commit, version, and image changes, and the signature status;
-- the `COMPOSE_FILE` value, project, and both state volumes after the update;
+- the source commit, version, and image changes, what was checked, and the
+  signature status;
+- the checkout change: a branch checkout moves to a detached release tag. That
+  is a deliberate change to release mode; the branch route then refuses;
+- the current and the new `COMPOSE_FILE` value, project, and both state volumes;
 - the secret files that apply creates empty;
 - the required steps: a backup before an OpenClaw version change, npm access
   for a managed Slack package change, and the
@@ -49,7 +52,11 @@ conditions stops apply before it changes a file or stops the gateway:
 
 - the release has no valid final release set (a candidate on a draft release,
   or a release before release sets), or its record, asset checksums, or source
-  commit does not verify. The record is unsigned; see
+  commit does not verify;
+- the release set is unsigned or its signature is not verified. **Today every
+  release set is unsigned, so apply refuses every release** until publisher
+  signing and its verifier exist. Preview still shows the release, marked
+  `UNVERIFIED`. There is no option that bypasses this. See
   [what the checks prove](image-verification.md#what-this-does-and-does-not-prove);
 - tracked files have local changes, or the release adds a file at a path where a
   local file (also an ignored file) already exists;
@@ -57,25 +64,40 @@ conditions stops apply before it changes a file or stops the gateway:
   older than the current release (no downgrade over migrated state). A checkout
   that follows `master` past a release tag can only move to a later release;
 - a later overlay changes the release image (a custom selection), or the release
-  changes the project or a state-volume source, for example a restored volume;
+  changes the project or a state-volume source, for example a restored volume.
+  For a [restore overlay](#select-and-save-the-restored-volumes), take a new
+  backup, then remove only its two image lines and keep its volume lines;
 - a secret file that a customer overlay names does not exist;
-- the effort-record transfer is necessary and not confirmed.
+- the effort-record transfer is necessary and not confirmed;
+- the saved `COMPOSE_FILE` does not select the release overlay, and the change
+  is not confirmed with `--save-selection` (see below).
 
 After these checks, apply pulls the release image. Then it records the tag,
 checks out the tag (detached `HEAD`), and installs the release set
 (`compliance-claw-release.json` and `compose.release.yaml`) in the repository
-root. It checks the installed set, the source, and the saved selection again
+root. It keeps the previous set as `compliance-claw-release.json.previous` and
+`compose.release.yaml.previous`. It checks the installed set, the source, and the saved selection again
 with the release helper, and stops if the result differs from the verified
 result. Then it continues with the [shared steps](#shared-update-steps).
 Apply of the release that is already installed changes no file, and Compose
 does not replace the running gateway.
 
 The saved `COMPOSE_FILE` must select `compose.release.yaml` directly after
-`compose.yaml`. If it does not, apply writes a neutral `compose.release.yaml`
-that changes nothing, prints the `COMPOSE_FILE` line to save, and exits 3.
-Nothing is stopped or pulled. Save that line in `.env`, as described in
-[Save deployment settings](../README.md#save-deployment-settings), and run the
-same command again.
+`compose.yaml`. On a deployment that does not select it yet, preview shows the
+current and the new line. Apply changes that line in `.env` only when you add
+`--save-selection`:
+
+```sh
+scripts/update.sh --release vX.Y.Z --preview --save-selection
+scripts/update.sh --release vX.Y.Z --save-selection
+```
+
+Apply changes only the `COMPOSE_FILE` line, after all checks above, and keeps
+every other line, the file mode, and the owner. It prints the previous line. If
+a later step fails before the gateway is replaced, it puts the previous line
+back. A `COMPOSE_FILE` exported in the shell overrides `.env`, so apply refuses
+and names the value to use. You can also save the line by hand, as described in
+[Save deployment settings](../README.md#save-deployment-settings).
 
 A release that adds per-effort Plan and preflight roots requires the
 [effort-record transfer](#transfer-existing-effort-records). Do the transfer
@@ -87,9 +109,10 @@ Before apply, stop the gateway and verify a backup of both state volumes:
 [OpenClaw image upgrade and state backup](#openclaw-image-upgrade-and-state-backup).
 
 If a step fails after the checkout, the script names the recovery inputs: the
-previous commit, the previous release set (download it again with
-`scripts/release-assets.py fetch`), the previous images, and the verified
-backup. It does not recover automatically. The release route does not
+previous commit, the previous release set (the `.previous` files), the previous
+`COMPOSE_FILE` line, the previous images, and the verified backup. Apart from
+the `COMPOSE_FILE` line before the gateway is replaced, it does not recover
+automatically. The release route does not
 change the active Pretorin CLI.
 
 ### Branch route
@@ -173,9 +196,9 @@ is idempotent either way.
 `smoke.sh` also reports this state on its own:
 
 ```
-NOTE  deployment is behind the repo pin: run scripts/update.sh
-      running sha256:58690e31...
-      pinned  sha256:e123bf53...
+NOTE  deployment is not running the selected image: run scripts/update.sh
+        running  sha256:58690e31...
+        selected sha256:e123bf53...
 ```
 
 A warning, not a failure — being mid-update is not being broken.

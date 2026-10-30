@@ -39,3 +39,6 @@ efforts.yaml
 # the publisher attaches them to the GitHub Release. Host-local, not source.
 compliance-claw-release.json
 compose.release.yaml
+# scripts/update.sh keeps the previous release set beside it, as one recovery input.
+compliance-claw-release.json.previous
+compose.release.yaml.previous

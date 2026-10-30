@@ -432,7 +432,10 @@ scripts/update.sh --release vX.Y.Z
 Preview shows the source, image, and volume selection, the required steps,
 the recovery set, and the blockers. Apply checks everything again, pulls the
 image before it stops anything, then restarts the selected gateway, verifies,
-and reports. `scripts/update.sh` with no options follows a Git branch instead.
+and reports. Apply refuses an unsigned release, so today it refuses every
+release until release signing exists; preview marks it `UNVERIFIED`. Add
+`--save-selection` once to let apply add the release overlay to the saved
+`COMPOSE_FILE` line. `scripts/update.sh` with no options follows a Git branch instead.
 The first use, blockers, what survives an update, the health wait, and the
 template warnings are in
 [Routine deployment update](docs/upgrade.md#routine-deployment-update). For an
