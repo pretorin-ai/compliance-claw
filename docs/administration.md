@@ -36,7 +36,7 @@ gateway is healthy.
 
 | Item | Required result | Procedure |
 | --- | --- | --- |
-| Host | Linux VM with Docker Engine, Compose 2.27.2 or newer and `linux/amd64` support; `git`, `python3` and `openssl` on the host; Docker starts at boot. | [Requirements](../README.md#requirements) and [VM secret files](file-secrets.md#azure-pilot-mapping) |
+| Host | Linux VM with Docker Engine, Compose 2.27.2 or newer and `linux/amd64` support; `git`, `python3` and `openssl` on the host; Docker starts at boot. On a host where the operator UID is not 1000, the top `workspace/targets` directory must be writable by UID 1000 for target refresh; otherwise refresh reports that another synchronization is in progress. | [Requirements](../README.md#requirements), [VM secret files](file-secrets.md#azure-pilot-mapping) and [target refresh](repositories.md#keeping-targets-up-to-date) |
 | Image-pull trust | The host Docker daemon can pull the pinned digest. The registry credential stays in the host Docker login. No container receives it. | [Image verification](image-verification.md) |
 | Container application trust | Pretorin, model, Slack and GitHub credentials are files in the secret directory with the documented owner and mode. They are separate from the registry credential. | [Secret checklist](file-secrets.md#the-checklist--every-secret-file-in-one-place) |
 | Saved selection | `.env` holds the Compose files, project and secret directory. Private overlays come last. | [Save deployment settings](../README.md#save-deployment-settings) |
