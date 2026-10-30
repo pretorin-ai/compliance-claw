@@ -241,8 +241,8 @@ names the person who must keep it:
 
 Prepare the shell first, and again in each new shell. This block resolves the
 saved [Compose selection](../README.md#save-deployment-settings). It defines the
-state list, the selection check, the path of each saved host file and two copy
-functions:
+state list, the selection check, the path of each saved host file, the rule for
+files that Git tracks at a commit, and two copy functions:
 
 ```sh
 umask 077
@@ -271,6 +271,9 @@ for kind, path in sorted(inputs):
 saved_input() {
   python3 -c 'import os, sys; print(sys.argv[3] + os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))' \
     "$PWD" "$1" "$BACKUP_DIR/host-inputs"
+}
+tracked_at() {
+  test -n "$(git ls-tree --name-only "$1" -- "$2" 2>/dev/null)"
 }
 state_sh() {
   docker run --rm -i --network none --platform linux/amd64 --user 0:0 \
@@ -347,6 +350,7 @@ repository, the target directory or a shared directory.
    private record and the checksums:
 
    ```sh
+   SOURCE_REVISION="$(git rev-parse HEAD)" &&
    state_sh "$OPENCLAW_VOLUME" "$STATE_LIST" readonly > "$BACKUP_DIR/openclaw-state.list" &&
    state_sh "$OPENCLAW_VOLUME" 'tar --numeric-owner -cpf - .' readonly > "$BACKUP_DIR/openclaw-state.tar" &&
    state_sh "$PRETORIN_VOLUME" "$STATE_LIST" readonly > "$BACKUP_DIR/pretorin-state.list" &&
@@ -355,9 +359,8 @@ repository, the target directory or a shared directory.
      while IFS= read -r f; do s="$(saved_input "$f")" &&
        mkdir -p -- "${s%/*}" && cp -p -- "$f" "$s" || exit 1; done &&
    (set -f; IFS="${COMPOSE_PATH_SEPARATOR:-:}"; for f in ${COMPOSE_FILE:-compose.yaml}; do
-     git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || { s="$(saved_input "$f")" &&
+     tracked_at "$SOURCE_REVISION" "$f" || { s="$(saved_input "$f")" &&
        mkdir -p -- "${s%/*}" && cp -p -- "$f" "$s"; } || exit 1; done) &&
-   SOURCE_REVISION="$(git rev-parse HEAD)" &&
    printf '%s=%s\n' \
      SET_ID "$SET_ID" \
      SOURCE_REVISION "$SOURCE_REVISION" \
@@ -372,8 +375,8 @@ repository, the target directory or a shared directory.
      OPENCLAW_VOLUME "$OPENCLAW_VOLUME" \
      PRETORIN_VOLUME "$PRETORIN_VOLUME" \
      > "$BACKUP_DIR/recovery-set.env" &&
-   backup_sh 'sha256sum openclaw-state.tar openclaw-state.list pretorin-state.tar pretorin-state.list recovery-set.env' \
-     > "$BACKUP_DIR/SHA256SUMS" &&
+   backup_sh 'sha256sum openclaw-state.tar openclaw-state.list pretorin-state.tar pretorin-state.list recovery-set.env host-inputs.txt &&
+     find host-inputs -type f -exec sha256sum {} +' > "$BACKUP_DIR/SHA256SUMS" &&
    echo "OK: recovery set $SET_ID is in $BACKUP_DIR"
    ```
 
@@ -382,14 +385,18 @@ repository, the target directory or a shared directory.
    no secret value. Compose secret files and bind-mounted directories are not
    copied. Each bind-mounted single file is copied, so a private overlay that
    mounts a key file puts that key in the set. Read `host-inputs.txt` before
-   this step.
+   this step. An overlay is copied when Git does not track it at the current
+   commit, also when it is only staged. `SHA256SUMS` covers the archives, the
+   file lists, the record, `host-inputs.txt` and each saved host file.
 
 4. Verify the recovery set. The same block is the first step of a restore:
 
    ```sh
    grep -qx "SET_ID=$SET_ID" "$BACKUP_DIR/recovery-set.env" &&
    grep -Eq '^SOURCE_REVISION=[0-9a-f]{40}$' "$BACKUP_DIR/recovery-set.env" &&
-   backup_sh "sha256sum --strict -c SHA256SUMS &&
+   backup_sh "test -s host-inputs.txt &&
+     grep -qx '[0-9a-f]\{64\}  host-inputs.txt' SHA256SUMS &&
+     sha256sum --strict -c SHA256SUMS &&
      tar -tf openclaw-state.tar ./openclaw.json >/dev/null &&
      tar -tf pretorin-state.tar ./bin/pretorin >/dev/null &&
      mkdir /tmp/openclaw-state /tmp/pretorin-state &&
@@ -400,8 +407,9 @@ repository, the target directory or a shared directory.
    echo "OK: recovery set $SET_ID is complete and matches its file lists"
    ```
 
-   This stops on a missing or changed file, a record from a different set, and
-   an archive of the wrong volume. Write down the `SET_ID` and `BACKUP_DIR`
+   This stops on a missing or changed file, an empty or unchecked
+   `host-inputs.txt`, a missing or changed saved host file, a record from a
+   different set, and an archive of the wrong volume. Write down the `SET_ID` and `BACKUP_DIR`
    values outside the shell. A complete and readable set does not prove that an
    image is compatible with it. Only the recorded image is a compatible image.
 
@@ -495,21 +503,23 @@ that state.
    candidate before both blocks print their `OK:` lines:
 
    ```sh
-   test -f "$BACKUP_DIR/host-inputs.txt" &&
+   test -s "$BACKUP_DIR/host-inputs.txt" &&
    SOURCE_REVISION="$(record SOURCE_REVISION)" && git cat-file -e "$SOURCE_REVISION^{commit}" &&
    SEPARATOR="$(record COMPOSE_PATH_SEPARATOR)" && SAVED_FILES="$(record COMPOSE_FILE)" &&
    { awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" &&
      (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
        test "$f" = "$RESTORE_OVERLAY" || printf '%s\n' "$f"; done); } |
      while IFS= read -r f; do
-       test -n "$(git ls-tree --name-only "$SOURCE_REVISION" -- "$f" 2>/dev/null)" && continue
+       tracked_at "$SOURCE_REVISION" "$f" && continue
        s="$(saved_input "$f")" && cmp -s -- "$f" "$s" ||
          { printf 'STOP: %s differs from its saved copy. To copy it back: cp -p -- %q %q\n' "$f" "$s" "$f"; exit 1; }
      done &&
    echo "OK: the host inputs match set $SET_ID"
    ```
 
-   The block skips files that Git tracks at the recorded revision. Step 3 of
+   The block skips files that Git tracks at the recorded revision, because the
+   candidate revision can change them. The verification block checked their
+   saved copies, and step 3 of
    [Select and save the restored volumes](#select-and-save-the-restored-volumes)
    compares them after the checkout returns to that revision. A `STOP:` line
    names the first file that differs and prints the command that copies the
@@ -614,7 +624,7 @@ that state.
    awk -F '\t' '$1 == "file" { print $2 }' "$RESTORE_DIR/host-inputs.txt" |
      while IFS= read -r f; do cmp -- "$f" "$(saved_input "$f")" || exit 1; done &&
    (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
-     test "$f" = "$RESTORE_OVERLAY" || git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 ||
+     test "$f" = "$RESTORE_OVERLAY" || tracked_at "$SOURCE_REVISION" "$f" ||
        cmp -- "$f" "$(saved_input "$f")" || exit 1; done) &&
    echo "OK: the saved selection uses $IMAGE_REF with the restored volumes"
    ```
