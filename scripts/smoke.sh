@@ -24,6 +24,10 @@
 # removed by the exit trap. Section B does run real onboarding — it is the same
 # idempotent command the operator runs.
 set -uo pipefail
+# Under pipefail, `producer | grep -q` fails when grep exits on its first match
+# while the producer still writes (EPIPE or SIGPIPE). Coreutils that flush each
+# line, as on Ubuntu 26.04, make that common. So a check gives grep a
+# here-string, or uses `case`, and its result depends only on the match.
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -468,7 +472,7 @@ fi
 rm -rf "$HD_TMP"
 
 head2 "A4. gateway starts, config and templates are seeded"
-if docker compose ps --status running --services 2>/dev/null | grep -qx openclaw; then
+if grep -qx openclaw <<<"$(docker compose ps --status running --services 2>/dev/null)"; then
   note "gateway already running; leaving it up at the end"
 else
   GATEWAY_STARTED=1
@@ -572,7 +576,7 @@ CFG="$(val cat /home/node/.openclaw/openclaw.json)"
 CFG_LIVE="$(printf '%s\n' "$CFG" | sed 's|^[[:space:]]*//.*$||')"
 CFG_RAW="$CFG"
 SLACK_PROFILE=0
-if val node /opt/compliance-claw/managed-slack.mjs status 2>/dev/null | grep -qx configured; then
+if grep -qx configured <<<"$(val node /opt/compliance-claw/managed-slack.mjs status 2>/dev/null)"; then
   SLACK_PROFILE=1
 fi
 
@@ -586,11 +590,10 @@ if [ -z "$PLUGIN_LINE" ]; then
 else
   PLUGIN_NAMES="$(printf '%s' "$PLUGIN_LINE" | sed -E 's/^\([0-9]+ plugins?: //; s/\)$//; s/;.*$//')"
   for p in pretorin-update target-sync openai memory-core; do
-    if printf '%s' "$PLUGIN_NAMES" | tr ',' '\n' | tr -d ' ' | grep -qx "$p"; then
-      pass "required runtime plugin loaded: ${p}"
-    else
-      fail "required runtime plugin loaded: ${p}" "$PLUGIN_LINE"
-    fi
+    case ",${PLUGIN_NAMES// /}," in
+      *",${p},"*) pass "required runtime plugin loaded: ${p}" ;;
+      *) fail "required runtime plugin loaded: ${p}" "$PLUGIN_LINE" ;;
+    esac
   done
   if [ "$SLACK_PROFILE" = 1 ]; then
     has "Slack plugin loaded for the Slack profile" "slack" "$PLUGIN_NAMES"
@@ -683,8 +686,8 @@ has "config carries the MCP cwd fix" '/opt/compliance-claw/no-repo' "$CFG"
 # and no Slack to show for it, and nothing in the log explains why. The two must
 # move together.
 HAS_ALLOW=0; HAS_CHAN=0
-printf '%s' "$CFG" | grep -q '"allow"' && HAS_ALLOW=1
-printf '%s' "$CFG" | grep -qE '"slack"[[:space:]]*:[[:space:]]*\{' && HAS_CHAN=1
+grep -q '"allow"' <<<"$CFG" && HAS_ALLOW=1
+grep -qE '"slack"[[:space:]]*:[[:space:]]*\{' <<<"$CFG" && HAS_CHAN=1
 if [ "$HAS_ALLOW" = "$HAS_CHAN" ]; then
   pass "plugins.allow and channels.slack are both-or-neither (allow=${HAS_ALLOW} slack=${HAS_CHAN})"
 else
@@ -1062,7 +1065,7 @@ hasnt "config holds no Slack app-token substitution" '${SLACK_APP_TOKEN}' "$CFG"
 # described the opposite of what happened. Found by the credentialed acceptance
 # run; this is the property most worth proving on the path the README recommends.
 CANARY_RC=0
-if printf '%s' "${COMPOSE_FILE:-}" | grep -q 'compose\.secrets\.yaml'; then
+if grep -q 'compose\.secrets\.yaml' <<<"${COMPOSE_FILE:-}"; then
   # Canaries go in FILES, in a throwaway secret dir compose resolves at run time.
   CANARY_DIR="$(mktemp -d)"
   cp "${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"/* "$CANARY_DIR"/ 2>/dev/null || true
@@ -1119,7 +1122,7 @@ ok    "container runs as node"             bash -c '[ "$(docker compose run --rm
 # `cli` deliberately has neither, so both are checked through the gateway. The
 # assessment mount must stay read-only THERE too — it is the same container the
 # agent runs in, and the row above only proves it for `cli`.
-if [ "$GATEWAY_STARTED" = 1 ] || docker compose ps --status running --services 2>/dev/null | grep -qx openclaw; then
+if [ "$GATEWAY_STARTED" = 1 ] || grep -qx openclaw <<<"$(docker compose ps --status running --services 2>/dev/null)"; then
   notok "gateway: /workspace/targets is read-only (the assessment path)" \
         docker compose exec -T openclaw touch /workspace/targets/.smoke-assess-canary
   if docker compose exec -T openclaw test -d /var/lib/compliance-claw/targets >/dev/null 2>&1; then
@@ -1372,7 +1375,7 @@ if [ -e .env ]; then
   # the value in .env is the whole mechanism. Asserting "a token is present"
   # unconditionally is what made the acceptance run fail on the path the README
   # now recommends.
-  if printf '%s' "${COMPOSE_FILE:-}" | grep -q 'compose\.secrets\.yaml'; then
+  if grep -q 'compose\.secrets\.yaml' <<<"${COMPOSE_FILE:-}"; then
     if grep -qE '^OPENCLAW_GATEWAY_TOKEN=.+' .env; then
       fail ".env carries NO gateway token value (file-secret path)" \
            "a value is in .env AND a file is mounted; the entrypoint refuses that dual source"
@@ -1605,7 +1608,7 @@ head1 "SECTION B — credentialed integration test"
 if [ "$NO_CREDS" = 1 ]; then
   skip "entire credentialed section" "--no-creds was passed"
 elif ! AUTH="$(val pretorin --json whoami)" \
-     || ! printf '%s' "$AUTH" | grep -q '"authenticated": *true'; then
+     || ! grep -q '"authenticated": *true' <<<"$AUTH"; then
   skip "entire credentialed section" "PRETORIN_API_KEY is absent or does not authenticate"
 else
   printf '  key authenticates; write posture stated for this run: %s\n' "$WRITE_POSTURE"
@@ -1652,12 +1655,12 @@ else
   # would look identical to a server-side one.
   #
   # So first prove nothing local is in the way, whatever the key is.
-  if printf '%s' "$CFG_LIVE" | grep -q 'toolFilter'; then
+  if grep -q 'toolFilter' <<<"$CFG_LIVE"; then
     fail "no local tool filter is configured" "mcp.servers.pretorin.toolFilter is set; a rejection would be ambiguous"
   else
     pass "no local tool filter is configured"
   fi
-  if printf '%s' "$CFG_LIVE" | grep -qE '"?deny"?[[:space:]]*:'; then
+  if grep -qE '"?deny"?[[:space:]]*:' <<<"$CFG_LIVE"; then
     fail "no local tools.deny is configured" "a deny list is set; a rejection would be ambiguous"
   else
     pass "no local tools.deny is configured"
