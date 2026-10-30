@@ -513,7 +513,8 @@ class ReleaseTest(unittest.TestCase):
             shutil.copyfile(ROOT / "scripts" / name, self.repo / "scripts" / name)
         install_release_helper(self.repo, self.fixture / "releases",
                                shim=not self._testMethodName.endswith("_real_helper"))
-        (self.repo / ".gitignore").write_text(".env\nsecrets/\ncompose.release.yaml*\n")
+        # The repository's own ignore rules, so generated files behave as on a host.
+        shutil.copyfile(ROOT / ".gitignore", self.repo / ".gitignore")
         (self.repo / "versions.env").write_text(
             "OPENCLAW_VERSION=2026.10.5\nSLACK_PLUGIN_VERSION=2026.10.5\n"
             "IMAGE_REPO=ghcr.io/example/cc\nIMAGE_VERSION=0.5.2\n")
@@ -733,6 +734,20 @@ class ReleaseTest(unittest.TestCase):
         self.publish_v070((self.repo / "compose.yaml").read_text() + "volume: /var/cache/release=release-cache\n")
         self.assertEqual(self.run_update("--release", "v0.7.0", "--preview"), 0, self.output)
         self.assertNotIn("state-volume selection would change", self.output)
+
+    def test_generated_bytecode_does_not_block_the_branch_route(self):
+        # A normal parse-efforts.py run on Linux writes scripts/__pycache__/.
+        shutil.rmtree(self.repo / "deployment")
+        self.selection["COMPOSE_FILE"] = "compose.yaml:compose.release.yaml:compose.secrets.yaml"
+        (self.repo / "scripts/__pycache__").mkdir()
+        (self.repo / "scripts/__pycache__/parse-targets.cpython-311.pyc").write_bytes(b"\x00")
+        self.assertNotEqual(self.run_update(), 0, self.output)
+        self.assertNotIn("uncommitted changes", self.output)
+        self.assertIn("has no upstream", self.output)
+        # A real untracked customer file still stops it.
+        (self.repo / "local-notes.txt").write_text("customer file\n")
+        self.assertNotEqual(self.run_update(), 0, self.output)
+        self.assertIn("uncommitted changes", self.output)
 
     def test_local_commit_not_in_release_blocks(self):
         (self.repo / "local.txt").write_text("customer commit\n")
