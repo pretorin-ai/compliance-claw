@@ -518,10 +518,11 @@ that state.
    ```
 
    The block skips files that Git tracks at the recorded revision, because the
-   candidate revision can change them. The verification block checked their
-   saved copies, and step 3 of
+   candidate revision can change them. For a tracked declaration such as
+   `targets.yaml`, the verification block checked its saved copy, and step 3 of
    [Select and save the restored volumes](#select-and-save-the-restored-volumes)
-   compares them after the checkout returns to that revision. A `STOP:` line
+   compares it after the checkout returns to that revision. A tracked overlay
+   has no saved copy; that checkout restores it. A `STOP:` line
    names the first file that differs and prints the command that copies the
    saved file back. Copy it back and run the block again. Keep a changed file
    only after you check that the restored state supports it; then copy the
