@@ -269,10 +269,8 @@ for kind, path in sorted(inputs):
     print("%s\t%s" % (kind, path))
 '
 saved_input() {
-  case "$1" in
-    /*) printf '%s\n' "$BACKUP_DIR/host-inputs$1" ;;
-    *) printf '%s\n' "$BACKUP_DIR/host-inputs$PWD/$1" ;;
-  esac
+  python3 -c 'import os, sys; print(sys.argv[3] + os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))' \
+    "$PWD" "$1" "$BACKUP_DIR/host-inputs"
 }
 state_sh() {
   docker run --rm -i --network none --platform linux/amd64 --user 0:0 \
@@ -356,7 +354,7 @@ repository, the target directory or a shared directory.
    awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" |
      while IFS= read -r f; do s="$(saved_input "$f")" &&
        mkdir -p -- "${s%/*}" && cp -p -- "$f" "$s" || exit 1; done &&
-   (IFS="${COMPOSE_PATH_SEPARATOR:-:}"; for f in ${COMPOSE_FILE:-compose.yaml}; do
+   (set -f; IFS="${COMPOSE_PATH_SEPARATOR:-:}"; for f in ${COMPOSE_FILE:-compose.yaml}; do
      git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || { s="$(saved_input "$f")" &&
        mkdir -p -- "${s%/*}" && cp -p -- "$f" "$s"; } || exit 1; done) &&
    SOURCE_REVISION="$(git rev-parse HEAD)" &&
@@ -492,8 +490,28 @@ that state.
    image.
 
 2. Run the [verification block](#back-up-the-recovery-set) from step 4 of the
-   backup. Continue only after its `OK:` line. Do not stop the candidate before
-   you know that the set is usable.
+   backup. Continue only after its `OK:` line. Then compare the declarations and
+   private overlays of the set with their saved copies. Do not stop the
+   candidate before both blocks print their `OK:` lines:
+
+   ```sh
+   test -f "$BACKUP_DIR/host-inputs.txt" &&
+   SEPARATOR="$(record COMPOSE_PATH_SEPARATOR)" && SAVED_FILES="$(record COMPOSE_FILE)" &&
+   { awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" &&
+     (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
+       test "$f" = "$RESTORE_OVERLAY" || git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 ||
+         printf '%s\n' "$f"; done); } |
+     while IFS= read -r f; do s="$(saved_input "$f")" && cmp -s -- "$f" "$s" ||
+       { printf 'STOP: %s differs from its saved copy. To copy it back: cp -p -- "%s" "%s"\n' "$f" "$s" "$f"; exit 1; }; done &&
+   echo "OK: the host inputs match set $SET_ID"
+   ```
+
+   A `STOP:` line names the first file that differs and prints the command that
+   copies the saved file back. Copy it back and run the block again. Keep a
+   changed file only after you check that the restored state supports it; then
+   copy the current file over its saved copy, so that this block and step 3 of
+   [Select and save the restored volumes](#select-and-save-the-restored-volumes)
+   compare with it.
 
 3. Stop the candidate and keep its state. The candidate logs and container
    record go to a new private directory:
@@ -590,7 +608,7 @@ that state.
    cmp "$BACKUP_DIR/host-inputs.txt" "$RESTORE_DIR/host-inputs.txt" &&
    awk -F '\t' '$1 == "file" { print $2 }' "$RESTORE_DIR/host-inputs.txt" |
      while IFS= read -r f; do cmp -- "$f" "$(saved_input "$f")" || exit 1; done &&
-   (IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
+   (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
      test "$f" = "$RESTORE_OVERLAY" || git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 ||
        cmp -- "$f" "$(saved_input "$f")" || exit 1; done) &&
    echo "OK: the saved selection uses $IMAGE_REF with the restored volumes"
