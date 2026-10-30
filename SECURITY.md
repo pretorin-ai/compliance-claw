@@ -157,10 +157,10 @@ What is still true, and enforced:
 
 What is **not** true: that this puts the token beyond a prompt-injected agent.
 The agent's native file and command tools refuse the file (see
-[native access limits](#native-access-limits-for-effort-agents)), but Pretorin MCP
-file operations and plugins run in the gateway process as the same uid and can
-read it. The containment that actually bounds the damage is GitHub's: read-only,
-one permission, only the selected repositories.
+[native access limits](#native-access-limits-for-effort-agents)). Those limits
+apply to native agent tools only; gateway-side MCP file operations are outside
+this policy and remain unresolved. The containment that actually bounds the
+damage is GitHub's: read-only, one permission, only the selected repositories.
 The GitHub App remains the recommended mechanism for anything past this pilot,
 and moving the synchronizer into its own container is the fix — see the ledger.
 
@@ -223,9 +223,10 @@ every evidence citation comes from, stays read-only.
 effort agent's native tools can no longer run the wrapper, replace the binary or
 rewrite the audit file: its file tools stay in its workspace and `exec` runs only
 the fixed git grants. Code in the gateway process is not limited that way —
-plugins and Pretorin MCP children run there as the same uid — and the container
-has no sandbox (see below). What the updater provides is a *narrow,
-identity-bearing, audited path for the supported routes*.
+plugins and Pretorin MCP children run there as the same uid, and gateway-side MCP
+file operations remain unresolved — and the container has no sandbox (see
+below). What the updater provides is a *narrow, identity-bearing, audited path
+for the supported routes*.
 
 ### Separating one effort from another — say it plainly
 
@@ -278,12 +279,10 @@ should be able to act in that compliance scope.
   masked prefix/suffix in OpenClaw's error log. Full canary values remained
   absent, but log access and export still require access control and redaction.
 - **A malicious or compromised review target.** The container has **no
-  sandbox** (`sandbox` is off). Native agent tools are limited by policy, but
-  Pretorin MCP file operations and plugins run in the gateway process with its
-  file access. See the boundary statement below — this is the single most
-  important limitation in this document. A prompt-injected agent can still reach
-  the credential files, the read-only GitHub PAT and the writable maintenance
-  mount through a Pretorin MCP file argument.
+  sandbox** (`sandbox` is off). These controls restrict native OpenClaw agent
+  tools. Gateway-side MCP file operations are outside this policy and remain
+  unresolved. See the boundary statement below — this is the single most
+  important limitation in this document.
 - **Any Slack channel member.** Everyone in the allowlisted channel has the same
   authority. There is no per-user policy and no attribution.
 - **A hostile operator.** Anyone who can edit `.env`, `efforts.yaml` or the state
@@ -316,9 +315,9 @@ against the real handlers with fake keys.
 
 | Control | Effect |
 | --- | --- |
-| `tools.fs.workspaceOnly: true` | `read`, `write`, `edit`, `ls`, `apply_patch` and local media sends stay in the agent's own workspace. Credential files, `openclaw.json`, `/proc`, `..` escapes, other workspaces, the maintenance mount and the `targets/` links are refused. |
+| `tools.fs.workspaceOnly: true` | `read`, `write`, `edit`, `ls`, `apply_patch` and local media sends stay in the agent's own workspace. Paths outside it are refused, including `..` escapes and the `targets/` links. |
 | `tools.exec.mode: "allowlist"` | `exec` runs only grants in OpenClaw's exec approvals store, without a prompt. Anything else is refused: other commands, shell operators, command substitution, redirection. OpenClaw also refuses `GIT_*` and loader environment overrides. |
-| Four git grants per own target | `git -c safe.directory=<target> -C <target>` with `remote get-url origin`, `rev-parse HEAD`, `ls-tree [-r] --name-only <full-sha>[:<dir>]` or `show <full-sha>:<path>`, where `<target>` is `/workspace/targets/<own target>`. `safe.directory` names only that target, because the clone is owned by the host user. No other `-c` value, option, short ref, other repository or maintenance path matches. |
+| Four git grants per own target | `git -c safe.directory=<target> -C <target>` with `remote get-url origin`, `rev-parse HEAD`, `ls-tree [-r] --name-only <full-sha>[:<dir>]` or `show <full-sha>:<path>`, where `<target>` is `/workspace/targets/<own target>`. `safe.directory` names only that target, because the clone is owned by the host user. Each grant uses OpenClaw's NUL-separated argument form, so `<full-sha>:<path>` is one argument and the path can hold spaces. No other argument, `-c` value, option, short ref, `..` segment, other repository or maintenance path matches. |
 | `tools.deny`: `gateway`, `openclaw` | No configuration reads and no delegated configuration changes from an agent turn. |
 
 `clawctl` owns these fields. A stricter `tools.exec.mode: "deny"` that an
@@ -330,17 +329,14 @@ target loses only the exact grant the last apply recorded.
 
 What these limits do **not** cover:
 
-- **Pretorin MCP file operations.** Each Pretorin MCP child runs in the gateway
-  container as the same uid, outside the agent's tool policy. Most Pretorin tools
-  are reached through `invoke_tool`, so OpenClaw cannot filter the inner tool or
-  its path argument. Measured with fake keys: `upload_evidence` with another
-  effort's credential file as `file_path` sent that file to the platform as
-  evidence. `export_stig_checklist`, `upload_vendor_document` and
-  `import_vendor_crm` also take local paths. Ledger item 4.
+- **Gateway-side MCP file operations.** These controls restrict native OpenClaw
+  agent tools. Gateway-side MCP file operations are outside this policy and
+  remain unresolved. This change does not complete credential isolation or
+  issue #55. Detailed synthetic findings are retained privately. Ledger item 4.
 - **Plugin tools.** `target_sync` and `pretorin_update` run in the gateway
   process. Their own argument rules (above) are what bound them.
-- **The gateway process environment.** PID 1 still exports credentials. An
-  agent cannot read `/proc` or run `env`, but code in the gateway process can.
+- **The gateway process environment.** Credentials are still in the gateway
+  process environment (ledger: move secrets out of the environment).
 - **Administrator overrides.** An administrator who sets a session to Full
   permission, edits these fields, or adds broad exec grants removes the limit.
   Agents that `clawctl` does not generate get no limits from it.
@@ -349,7 +345,7 @@ What these limits do **not** cover:
   configuration, has its own tool surface and is not covered by this check.
 
 > **Required hardening before onboarding third-party or untrusted repositories:**
-> close the Pretorin MCP file-operation path, evaluate an enforced boundary for
+> resolve gateway-side MCP file operations, evaluate an enforced boundary for
 > the gateway process, and move secrets out of the environment. Until all three
 > are done, only review repositories your organisation already trusts.
 
@@ -377,19 +373,14 @@ Ordered roughly by how much it matters, not by effort.
    on start, or having the updater verify the signed `SHA256SUMS` itself with a
    vendored anchor — which would mean adding cosign to the runtime image and
    maintaining a second verification path alongside the CLI's own.
-4. **Close the Pretorin MCP file-operation path.** Native agent tools are now
+4. **Resolve gateway-side MCP file operations.** Native agent tools are now
    limited (see [native access limits](#native-access-limits-for-effort-agents)):
    workspace-only file tools, `exec` in allowlist mode with fixed git grants, and
-   no `gateway` or `openclaw` tool. The remaining path is gateway-side: a
-   Pretorin MCP child can read or write any local path the gateway user can,
-   through `upload_evidence`, `export_stig_checklist` and similar tools behind
-   `invoke_tool`. That includes the credential files, the PAT, the CLI binary and
-   the writable maintenance mount. OpenClaw policy cannot see these inner calls.
-   **Smallest proposed correction:** the Pretorin CLI refuses MCP file arguments
-   outside roots that the effort launcher sets (the effort workspace and its own
-   targets). That is a CLI change and needs its own reviewed proposal. A
-   separate uid or container for MCP children is the broader alternative.
-   **Required before production.**
+   no `gateway` or `openclaw` tool. These controls restrict native OpenClaw agent
+   tools. Gateway-side MCP file operations are outside this policy and remain
+   unresolved, so credential isolation between efforts is not complete. A
+   correction needs its own reviewed proposal. Detailed synthetic findings are
+   retained privately. **Required before production.**
 
 4b. **Move the synchronizer out of the agent's container.** Today the wrapper, the
    writable maintenance mount and the PAT all live in the gateway container as the

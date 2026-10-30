@@ -227,8 +227,9 @@ argument for per-system keys, not for a setting here. Measured against CLI
 0.28.7; the evidence is in [plans/effort-config.md](plans/effort-config.md).
 
 **The container has no sandbox.** An effort agent's native file and command tools
-cannot read the credential files, but Pretorin MCP children and plugins run as the
-same container user and can. See
+cannot read the credential files. These controls restrict native OpenClaw agent
+tools. Gateway-side MCP file operations are outside this policy and remain
+unresolved. See
 [native access limits](../SECURITY.md#native-access-limits-for-effort-agents).
 
 ---
@@ -327,7 +328,8 @@ instructions state its fixed scope and refuse to switch. That is a
 tool-visibility and prompt boundary, plus native file and command limits: an
 agent's file tools stay in its own workspace, and `exec` runs only fixed git reads
 of its own targets. It is **not** a process boundary: `mcp.servers` is global to
-the gateway, and Pretorin MCP file operations run as the gateway user. What
+the gateway, and gateway-side MCP file operations are outside this policy and
+remain unresolved. What
 actually protects another system's data is the Pretorin API key's own server-side
 scopes and the platform's cross-scope write guard.
 

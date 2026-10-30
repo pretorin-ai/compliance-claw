@@ -195,7 +195,8 @@ person's identity, expires on a human's schedule, is harder to scope, and —
 unlike the App — is a git credential that lives inside the container. It is never
 an environment variable, never in a URL, `.git/config`, a log, an audit line or a
 Slack message. An agent's native tools cannot read the file, but the container
-has no sandbox: a Pretorin MCP file operation runs as the same user and can. Read
+has no sandbox, and gateway-side MCP file operations are outside that policy and
+remain unresolved. Read
 [SECURITY.md](../SECURITY.md#the-pat-is-a-deliberately-relaxed-invariant-not-an-oversight)
 before enabling it.
 
@@ -281,8 +282,9 @@ synchronizer writes through a second mount of the same host directory,
 
 That is process-level separation inside one container, **not a security
 boundary**: the wrapper, plugins and Pretorin MCP children run as the same uid.
-An agent's native file and command tools refuse the writable path, but a Pretorin
-MCP file operation can still reach it. What the split buys is that the assessment
+An agent's native file and command tools refuse the writable path. Gateway-side
+MCP file operations are outside that policy and remain unresolved. What the split
+buys is that the assessment
 path — the one every evidence citation comes from — stays read-only, so an
 accidental write fails instead of silently succeeding. See
 [SECURITY.md](../SECURITY.md#the-sandbox-boundary--say-it-plainly).
