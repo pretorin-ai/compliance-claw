@@ -7,9 +7,12 @@ with a fixture release set made by the real helper. Docker, bootstrap.sh and
 the other clawctl commands are stubs that record their calls. These tests prove
 input handling, ordering, refusals and rerun preservation only. They do not
 prove an image pull, a clone, Compose merging, gateway startup, a provider or
-Pretorin call, a customer task, or release authenticity (fixture sets are
-unsigned, as every set is today). CC_TEST_INSTALL_SCRIPT can select another
-script to show that a test rejects a removed check.
+Pretorin call, a customer task, or release authenticity. Every release set is
+unsigned today and the real helper refuses it (exit 6); one test runs the real
+helper to prove the installer stops there. The other tests replace the helper
+in the fixture checkout with HELPER_SHIM, which admits the unsigned fixture and
+serves `fetch` from a local directory. CC_TEST_INSTALL_SCRIPT can select
+another script to show that a test rejects a removed check.
 """
 import json
 import os
@@ -110,6 +113,21 @@ CLAWCTL = '''#!/usr/bin/env bash
 python3 "$FIXTURE/stub.py" clawctl "$@" || exit $?
 [ "$1" != migrate ] || exec bash "$(dirname "$0")/clawctl.real" "$@"
 '''
+# TEST ONLY. Stands in for the signature gate, which no release can pass yet,
+# and records each call so a test can show the installer never relaxes it.
+HELPER_SHIM = '''#!/usr/bin/env python3
+import json, os, shutil, sys
+a = sys.argv[1:]
+with open(os.path.join(os.environ["FIXTURE"], "helper.jsonl"), "a") as f:
+    f.write(json.dumps(a) + "\\n")
+if a[:1] == ["fetch"]:
+    shutil.copytree(os.environ["CC_TEST_FETCH_FROM"], a[a.index("--dir") + 1])
+    sys.exit(0)
+if a[:1] == ["check"]:
+    a = ["check", "--allow-unsigned"] + a[1:]
+real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-assets.real.py")
+os.execv(sys.executable, [sys.executable, real] + a)
+'''
 BOOTSTRAP = '''#!/usr/bin/env bash
 exec python3 "$FIXTURE/stub.py" bootstrap "$@"
 '''
@@ -124,8 +142,10 @@ class InstallTest(unittest.TestCase):
         (self.root / "scripts").mkdir(parents=True)
         shutil.copyfile(SCRIPT, self.root / "scripts/install.sh")
         for name in ("compose-selection.sh", "init-file-secrets.sh",
-                     "parse-efforts.py", "parse-targets.py", "onboard-lib.sh", "release-assets.py"):
+                     "parse-efforts.py", "parse-targets.py", "onboard-lib.sh"):
             shutil.copyfile(ROOT / "scripts" / name, self.root / "scripts" / name)
+        shutil.copyfile(ROOT / "scripts/release-assets.py", self.root / "scripts/release-assets.real.py")
+        (self.root / "scripts/release-assets.py").write_text(HELPER_SHIM)
         shutil.copyfile(ROOT / "scripts/clawctl", self.root / "scripts/clawctl.real")
         (self.root / "scripts/clawctl").write_text(CLAWCTL)
         (self.root / "scripts/bootstrap.sh").write_text(BOOTSTRAP)
@@ -162,7 +182,7 @@ class InstallTest(unittest.TestCase):
             self.git("tag", "v" + VERSION)
         sbom = self.base / f"sbom-{version}.spdx.json"
         sbom.write_text(json.dumps({"spdxVersion": "SPDX-2.3", "packages": [{"name": "x"}]}))
-        helper = [sys.executable, str(self.root / "scripts/release-assets.py")]
+        helper = [sys.executable, str(self.root / "scripts/release-assets.real.py")]
         subprocess.run([*helper, "prepare", "--version", version, "--commit", self.git("rev-parse", "HEAD"),
                         "--repository", "pretorin-ai/compliance-claw",
                         "--image-repository", "ghcr.io/pretorin-ai/compliance-claw",
@@ -192,6 +212,7 @@ class InstallTest(unittest.TestCase):
     def run_install(self, args, env=None, **settings):
         (self.base / "settings.json").write_text(json.dumps(settings))
         (self.base / "calls.jsonl").write_text("")
+        (self.base / "helper.jsonl").write_text("")
         p = subprocess.run(["bash", str(self.root / "scripts/install.sh"), *args],
                            env={**self.env, **(env or {})}, cwd=self.base,
                            text=True, capture_output=True, stdin=subprocess.DEVNULL)
@@ -199,6 +220,9 @@ class InstallTest(unittest.TestCase):
         self.calls = [json.loads(s) for s in (self.base / "calls.jsonl").read_text().splitlines()]
         self.check_no_secret()
         return p.returncode
+
+    def helper_calls(self):
+        return [json.loads(s) for s in (self.base / "helper.jsonl").read_text().splitlines()]
 
     def check_no_secret(self):
         self.assertNotIn("unexpected docker command", self.output, self.output)
@@ -239,7 +263,10 @@ class InstallTest(unittest.TestCase):
                 self.assertTrue(call["placed"], call)
         for name in RELEASE_FILES:
             self.assertEqual((self.root / name).read_bytes(), (self.release / name).read_bytes())
-        self.assertIn("release record          unsigned", self.output)
+        self.assertIn("release set             ok", self.output)
+        # The installer itself never relaxes the signature gate.
+        self.assertTrue(self.helper_calls())
+        self.assertFalse(any("--allow-unsigned" in c for c in self.helper_calls()))
         efforts = (self.root / "efforts.yaml").read_text()
         self.assertIn("name: crm-soc2", efforts)
         self.assertIn(f"system_id: {SYSTEM}", efforts)
@@ -437,6 +464,21 @@ class InstallTest(unittest.TestCase):
         self.assert_refused_without_change(self.full_args(), "would not run the release image",
                                            image="ghcr.io/example/other:1@sha256:" + "e" * 64)
 
+    def test_real_helper_refuses_every_unsigned_release_before_any_write(self):
+        shutil.copyfile(ROOT / "scripts/release-assets.py", self.root / "scripts/release-assets.py")
+        self.assert_refused_without_change(self.full_args(), "is refused: it is not signed")
+        self.assertIn("manual installation", self.output)
+        self.assertNotIn("UNVERIFIED", self.output)
+
+    def test_release_is_fetched_by_the_helper_when_no_directory_is_given(self):
+        args = ["--release", VERSION, *self.full_args()[4:]]
+        self.assertEqual(self.run_install(args, env={"CC_TEST_FETCH_FROM": str(self.release)}), 0, self.output)
+        fetch = [c for c in self.helper_calls() if c[:1] == ["fetch"]]
+        self.assertEqual(len(fetch), 1)
+        self.assertNotIn(str(self.root), fetch[0][fetch[0].index("--dir") + 1])
+        for name in RELEASE_FILES:
+            self.assertEqual((self.root / name).read_bytes(), (self.release / name).read_bytes())
+
     def test_checkout_not_at_the_release_commit_is_refused(self):
         (self.root / "NOTE").write_text("later\n")
         self.git("add", "NOTE")
@@ -479,6 +521,7 @@ class InstallTest(unittest.TestCase):
     def test_terminal_prompt_reads_keys_without_echo(self):
         (self.base / "settings.json").write_text("{}")
         (self.base / "calls.jsonl").write_text("")
+        (self.base / "helper.jsonl").write_text("")
         master, slave = pty.openpty()
         proc = subprocess.Popen(["bash", str(self.root / "scripts/install.sh"), *self.rel(), *self.declaration()],
                                 env=self.env, cwd=self.base, stdin=slave, stdout=slave,

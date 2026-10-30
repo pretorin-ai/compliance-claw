@@ -10,14 +10,16 @@
 #   scripts/install.sh [OPTIONS]           # install, then report readiness
 #
 # The release set, required on the first run:
-#   --release X.Y.Z --release-dir DIR   (DIR holds compliance-claw-release.json and
-#                                        compose.release.yaml for that release)
-# scripts/release-assets.py checks the record, the overlay checksum and that this
-# checkout is the recorded tag commit before any write and before any other
-# script from this checkout runs. This script and the helper come from the same
-# checkout, so the manual git/sha256sum check in README.md comes first. The
-# record is unsigned: the checks bind the files together; they do not prove
-# who made them.
+#   --release X.Y.Z [--release-dir DIR]   (without DIR, the helper downloads it;
+#                                          DIR holds compliance-claw-release.json
+#                                          and compose.release.yaml)
+# scripts/release-assets.py checks the record, the overlay checksum, the
+# signature and that this checkout is the recorded tag commit, before any
+# write and before any other script from this checkout runs. This script and
+# the helper come from the same checkout, so the manual git/sha256sum check in
+# README.md comes first. THE SIGNATURE CHECK FAILS CLOSED: release sets are
+# unsigned today and there is no verifier yet, so every release is refused.
+# There is deliberately no option to accept an unsigned set here.
 #
 # Declaration, only for a new efforts.yaml. A rerun with the same values reuses it:
 #   --effort NAME --system-id UUID --framework-id ID
@@ -92,6 +94,8 @@ done
 
 [ -z "$RELEASE_DIR" ] || [ -n "$RELEASE" ] \
   || die "--release-dir needs --release X.Y.Z, the version you chose."
+[ -z "$RELEASE" ] || [[ "$RELEASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || die "--release needs a version such as 1.2.3, without a leading v."
 [ -z "$OPENAI_KEY_FILE" ] || [ -z "$ANTHROPIC_KEY_FILE" ] \
   || die "give one model key file, not both. The other provider stays unconfigured."
 
@@ -184,19 +188,35 @@ release_check() {  # DIR [ARGS] -> the helper's exit code; its messages in CHECK
     ${RELEASE:+--version "$RELEASE"} "${@:2}" 2>&1)" || rc=$?
   return "$rc"
 }
+RELEASE_SRC=""
 if [ -n "$RELEASE_DIR" ]; then
   [ -d "$RELEASE_DIR" ] || die "${RELEASE_DIR} is not a directory. Nothing was changed."
   RELEASE_SRC="$(cd -- "$RELEASE_DIR" && pwd)"
 else
-  RELEASE_SRC=""
   for f in $RELEASE_FILES; do [ ! -e "$f" ] || RELEASE_SRC="$REPO_ROOT"; done
-  [ -n "$RELEASE_SRC" ] || die "no release set was given. Download the release you chose and give:
-    --release X.Y.Z --release-dir DIR
+fi
+if [ -z "$RELEASE_SRC" ]; then
+  [ -n "$RELEASE" ] || die "no release set was given. Give the release you chose:
+    --release X.Y.Z
   See README.md#guided-installation-on-a-linux-amd64-vm. Nothing was changed."
+  # Into scratch space only. The download is data; nothing in it runs.
+  RELEASE_SRC="${WORK_DIR}/release"
+  rc=0
+  CHECK_OUT="$(python3 "$RELEASE_HELPER" fetch --version "$RELEASE" --dir "$RELEASE_SRC" 2>&1)" || rc=$?
+  [ "$rc" = 0 ] || die "could not download release ${RELEASE} (exit ${rc}):
+$(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
+  Check the version and this VM's route to github.com, or download the set and
+  give --release-dir DIR. Nothing was changed."
+  log "downloaded release ${RELEASE} into scratch space"
 fi
 rc=0; release_check "$RELEASE_SRC" --source . || rc=$?
 case "$rc" in
-  0) log "release set in ${RELEASE_SRC}: final record, overlay checksum and source commit match (unsigned)" ;;
+  0) log "release set: final record, overlay checksum, signature and source commit pass" ;;
+  6) die "release ${RELEASE:-set} is refused: it is not signed, or its signature cannot be verified.
+$(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
+  Release sets are unsigned until signing and its verifier exist, so the guided
+  installation cannot install any release yet. Do not edit or re-sign the files.
+  Use the manual installation (README.md#manual-installation). Nothing was changed." ;;
   3) die "this checkout is not the source of the release:
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   Check out the release tag, repeat the trust check, then re-run. Nothing was changed." ;;
@@ -391,7 +411,7 @@ stage "3/10 image access"
 # (a later overlay that sets image is refused), and that image must be present
 # or reachable. The merged model is never printed: it can contain credentials.
 rc=0
-release_check "$RELEASE_SRC" --rendered /dev/stdin \
+release_check "$RELEASE_SRC" --rendered - \
   < <(COMPOSE_FILE="$CHECKED_FILE" docker compose --profile cli config --format json 2>/dev/null) || rc=$?
 [ "$rc" = 0 ] || die "Compose would not run the release image with this selection (exit ${rc}):
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
@@ -591,7 +611,7 @@ printf '\n'
 log "gateway health          ${GATEWAY}  (container running and healthy)"
 log "model configuration     ${MODEL}  (local check; the provider was not contacted)"
 log "Pretorin scope/transport ok  (scoped read probe passed in validate; writes not tested)"
-log "release record          unsigned (checksums and source commit match; not signed)"
+log "release set             ok  (record, checksums, signature and source commit)"
 log "first useful task       NOT VERIFIED — still required"
 printf '\n'
 [ "$GATEWAY" = ok ] || log "  gateway: docker compose ps -a; docker compose logs openclaw. Keep the volumes; ${GUIDE_RECOVERY}"

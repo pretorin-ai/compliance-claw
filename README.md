@@ -117,8 +117,13 @@ chosen release. It does not build source. It checks the release set with
 `clawctl migrate` for a new declaration, `init-file-secrets.sh`, `bootstrap.sh`,
 `clawctl validate`, `clawctl plan` and, after your approval, `clawctl apply`.
 It needs a release that publishes a release set
-([checking a release set](docs/image-verification.md#checking-a-release-set));
-for an earlier release, use the manual installation.
+([checking a release set](docs/image-verification.md#checking-a-release-set)).
+
+> **Not available yet.** Every published release set is unsigned, and no
+> signature verifier exists. The installer refuses an unsigned set before any
+> write, and it has no option to accept one. Until signing and verification
+> exist, use the [manual installation](#manual-installation). The steps below
+> describe the guided route for that time.
 
 **1. Get the release and check it before you run any script from it.** Use
 only Git and a SHA-256 tool that are already on the VM:
@@ -143,7 +148,7 @@ equal. These checks show that the clone, the record and the overlay agree. The
 record is **not signed** and all of these files come from GitHub, so the checks
 do not prove who published the release. A downloaded checker cannot prove its
 own origin; signing is planned work. The installer repeats these checks with the
-helper, but the helper comes from the same clone.
+helper and adds the signature check, but the helper comes from the same clone.
 
 **2. Run the installer.** Put each credential in a file that only you can read
 (`chmod 600`). The installer copies a value into an empty secret file only. It
@@ -155,6 +160,7 @@ cd ~/compliance-claw
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
 
 # Check the host, the release set, the existing files and image access. No writes.
+# Without --release-dir, the helper downloads the set into scratch space.
 scripts/install.sh --check --release X.Y.Z --release-dir ~/cc-release \
   --effort crm-soc2 --system-id <system-uuid> --framework-id soc2 \
   --target simple-crm=https://github.com/pretorin-ai/simple-crm.git#main \
@@ -164,9 +170,9 @@ scripts/install.sh --check --release X.Y.Z --release-dir ~/cc-release \
 # and asks before apply; add --yes when no terminal is attached.
 ```
 
-The installer stops before any write when the release set fails a check, the
-checkout is not the release commit, or a later Compose overlay selects another
-image. It places `compose.release.yaml` and `compliance-claw-release.json` in
+The installer stops before any write when the release set fails a check (an
+unsigned set included), the checkout is not the release commit, or a later
+Compose overlay selects another image. It places `compose.release.yaml` and `compliance-claw-release.json` in
 the checkout and saves this selection in `.env`:
 `COMPOSE_FILE=compose.yaml:compose.release.yaml:compose.secrets.yaml:compose.efforts.yaml`.
 A saved selection must list `compose.release.yaml` directly after
@@ -195,8 +201,8 @@ and run the same command again. To rotate a credential, use the
 
 The last stage reports separate results: gateway health, a local model
 configuration check (the provider is not contacted), the Pretorin scope probe
-from `clawctl validate` (writes are not tested), the unsigned release record,
-and the first useful task. The installer cannot do that task. A healthy
+from `clawctl validate` (writes are not tested), the release set check, and the
+first useful task. The installer cannot do that task. A healthy
 container or a saved key does not show that the Claw works. The Claw
 administrator then follows the
 [duties and handoff](docs/administration.md#duties-and-handoff) section to test
