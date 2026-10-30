@@ -1,0 +1,35 @@
+# compose.fixture.yaml — test-only overlay for tests/internal-ai-ca/run.sh.
+#
+# It selects the candidate image, adds a mock AI endpoint, and puts the project
+# on an INTERNAL network: no container in this project can reach the internet,
+# so a pass cannot come from a real provider. Not for customer use.
+
+services:
+  openclaw:
+    image: "${INTERNAL_AI_TEST_IMAGE:?set INTERNAL_AI_TEST_IMAGE}"
+  cli:
+    image: "${INTERNAL_AI_TEST_IMAGE:?set INTERNAL_AI_TEST_IMAGE}"
+
+  mock-ai:
+    image: "${INTERNAL_AI_TEST_IMAGE:?set INTERNAL_AI_TEST_IMAGE}"
+    platform: linux/amd64
+    entrypoint: ["node", "/fixture/mock-openai.mjs"]
+    # The image health command checks a gateway; this container is not one.
+    healthcheck:
+      disable: true
+    environment:
+      MOCK_CERT_DIR: /fixture-certs/${INTERNAL_AI_TEST_CERT_SET:-approved}
+      MOCK_CERT_SET: ${INTERNAL_AI_TEST_CERT_SET:-approved}
+      MOCK_EXPECTED_KEY_FILE: /fixture-key/internal-ai-api-key
+    volumes:
+      - "./tests/internal-ai-ca/mock-openai.mjs:/fixture/mock-openai.mjs:ro"
+      - "${INTERNAL_AI_TEST_DIR:?set INTERNAL_AI_TEST_DIR}/certs:/fixture-certs:ro"
+      - "${COMPLIANCE_CLAW_SECRET_DIR:?set COMPLIANCE_CLAW_SECRET_DIR}:/fixture-key:ro"
+    networks:
+      default:
+        aliases:
+          - ai.internal.test
+
+networks:
+  default:
+    internal: true

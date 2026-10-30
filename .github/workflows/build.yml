@@ -262,6 +262,13 @@ jobs:
       - name: Fresh deployment configures Slack by itself (isolated project)
         run: bash scripts/test-fresh-slack-seed.sh
 
+      # The internal AI endpoint example: the committed overlay and native patch
+      # against a generated test CA and a mock endpoint on an internal network.
+      # Approved CA must complete a tool round trip; another CA must be refused.
+      # Its own isolated project, canary values, no credentials.
+      - name: Internal AI endpoint with a private CA (isolated project)
+        run: bash tests/internal-ai-ca/run.sh compliance-claw:local
+
       - name: Gateway logs on failure
         if: failure()
         run: docker compose logs --no-color openclaw || true

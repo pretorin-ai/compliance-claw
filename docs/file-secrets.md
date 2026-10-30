@@ -101,6 +101,7 @@ points here rather than restating it, so the two cannot drift.
 | `openai-api-key` | `OPENAI_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
 | `anthropic-api-key` | `ANTHROPIC_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
 | `github-readonly-pat` | *(none — see below)* | only to sync a **private** target from Slack | `openclaw` only |
+| `internal-ai-api-key` | *(none — native file reference)* | only with the [internal AI endpoint overlay](#internal-ai-endpoint-credential) | `openclaw` only |
 
 **Slack needs two files here, not three.** On the multi-effort path those two
 tokens are the whole of what this table owns: which channels are served comes from
@@ -145,6 +146,21 @@ App remains the recommended mechanism for anything past the internal pilot.
 
 Leave the file **empty** if you have no private targets. Empty means "no
 credential"; a private target then reports `auth_failed` and names both fixes.
+
+### Internal AI endpoint credential
+
+The [internal AI endpoint example](administration.md#internal-ai-endpoint-with-a-private-ca)
+adds `internal-ai-api-key` through its own private overlay. The entrypoint does
+not export it. OpenClaw reads it with a native file reference when the gateway
+loads the provider. The base overlay and `scripts/init-file-secrets.sh` do not
+create this file; create it only when you select that overlay.
+
+The native file reference has stricter checks than the other files here. The
+file must belong to UID 1000 and other users must not be able to read it: use
+mode `0400`. The `0604` mode that the local helper uses for other files on a
+host user other than UID 1000 is refused as too open. Prepare and replace the
+file with the same method as the other files, then recreate the gateway. The
+one-off `cli` service does not receive this credential.
 
 ### Upgrading a deployment that predates a secret
 
