@@ -22,9 +22,15 @@ services:
     image: "${INTERNAL_AI_TEST_IMAGE:?set INTERNAL_AI_TEST_IMAGE}"
     platform: linux/amd64
     entrypoint: ["node", "/fixture/mock-openai.mjs"]
-    # The image health command checks a gateway; this container is not one.
+    # Its own health command: the image's checks a gateway. `up --wait` needs
+    # one (Compose 2.38 refuses a service without it), and it proves the mock
+    # listens before the first model request.
     healthcheck:
-      disable: true
+      test: ["CMD", "node", "-e", "require('net').connect(8443, '127.0.0.1').on('connect', () => process.exit(0)).on('error', () => process.exit(1))"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
     environment:
       MOCK_CERT_DIR: /fixture-certs/${INTERNAL_AI_TEST_CERT_SET:-approved}
       MOCK_CERT_SET: ${INTERNAL_AI_TEST_CERT_SET:-approved}
