@@ -90,8 +90,13 @@ chmod 0604 "$TMP"/secrets/*
 # OpenClaw file SecretRef providers require a private file that belongs to the
 # process user: UID 1000, mode 0400. This is the documented VM setting.
 chmod 0400 "$TMP/secrets/internal-ai-api-key" "$INTERNAL_AI_CA_FILE"
-docker run --rm --platform linux/amd64 --network none --user 0 --entrypoint chown \
-  -v "$TMP:/fixture" "$IMAGE" 1000:1000 /fixture/secrets/internal-ai-api-key /fixture/internal-ai-ca.pem
+# Docker Desktop already shows bind-mounted files as UID 1000 and refuses chown.
+owner="$(docker run --rm --platform linux/amd64 --network none --entrypoint stat \
+  -v "$TMP:/fixture:ro" "$IMAGE" -c %u /fixture/internal-ai-ca.pem)"
+if [ "$owner" != 1000 ]; then
+  docker run --rm --platform linux/amd64 --network none --user 0 --entrypoint chown \
+    -v "$TMP:/fixture" "$IMAGE" 1000:1000 /fixture/secrets/internal-ai-api-key /fixture/internal-ai-ca.pem
+fi
 
 # --- Rendered Compose selection ---------------------------------------------
 log "checking the rendered Compose selection"

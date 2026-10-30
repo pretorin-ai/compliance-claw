@@ -40,9 +40,9 @@ gateway is healthy.
 | Image-pull trust | The host Docker daemon can pull the pinned digest. The registry credential stays in the host Docker login. No container receives it. | [Image verification](image-verification.md) |
 | Container application trust | Pretorin, model, Slack and GitHub credentials are files in the secret directory with the documented owner and mode. They are separate from the registry credential. | [Secret checklist](file-secrets.md#the-checklist--every-secret-file-in-one-place) |
 | Saved selection | `.env` holds the Compose files, project and secret directory. Private overlays come last. | [Save deployment settings](../README.md#save-deployment-settings) |
-| Private gateway access | The gateway port stays published on `127.0.0.1` only. People reach it through an SSH tunnel or a customer TLS proxy. Do not publish it on all interfaces. | This section |
+| Private gateway access | The gateway port stays published on `127.0.0.1` only. People reach it through an SSH tunnel or a customer TLS proxy. Do not publish it on all interfaces. | Text after this table |
 | Native authentication | The default token, or the native trusted-proxy mode with its local maintenance password. | [Native proxy authentication](file-secrets.md#native-proxy-authentication-and-local-maintenance) |
-| Allowed origins | `gateway.controlUi.allowedOrigins` lists each exact browser origin (scheme, host and port). The seed allows `http://127.0.0.1:18789` and `http://localhost:18789` only. | This section |
+| Allowed origins | `gateway.controlUi.allowedOrigins` lists each exact browser origin (scheme, host and port). The seed allows `http://127.0.0.1:18789` and `http://localhost:18789` only. | Text after this table |
 | Trusted proxy, where used | Native proxy trust, identity headers and allowed origins are set. Only the proxy can reach the gateway port. | [Native proxy authentication](file-secrets.md#native-proxy-authentication-and-local-maintenance) |
 | Network approvals | Each required connection in [Network connections](#network-connections) is approved for its purpose. | [Network connections](#network-connections) |
 | Efforts | Schema validation, plan and full apply pass. | [Effort procedure](efforts.md#the-main-event-adding-a-second-effort) |
@@ -160,8 +160,8 @@ placeholders, no credential and no private name.
    endpoint certificate.
 2. Put the CA file at a private host path. Put the credential in the secret
    directory as `internal-ai-api-key`. Both files must belong to UID 1000 and
-   have mode `0400`. OpenClaw file references refuse a file that other users
-   can read. For example:
+   have an owner-only mode, `0400` or `0600`. OpenClaw file references refuse a
+   file that the group or other users can read. For example:
 
    ```sh
    sudo install -o 1000 -g 1000 -m 0400 ca.pem /opt/compliance-claw-trust/internal-ai-ca.pem
@@ -206,7 +206,7 @@ and mode, then recreate the gateway. To replace the credential, follow
 | Message | Cause | Action |
 | --- | --- | --- |
 | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` in the gateway log; the turn reports that it could not connect | The endpoint certificate does not chain to the configured CA, or `request.tls.ca` is missing | Check the CA file, the chain and the provider setting. Do not disable verification. |
-| `permissions are too open` for a `secrets.providers` path | The file is readable by other users | Set owner UID 1000 and mode `0400`, then recreate the gateway. |
+| `permissions are too open` for a `secrets.providers` path | The group or other users can read the file | Set owner UID 1000 and mode `0400`, then recreate the gateway. |
 | `is not readable` for `/run/secrets/internal_ai_api_key` | The overlay is not selected, the file is missing, or the command ran in `cli` | Check the saved selection and run the command in the gateway. |
 | `Provider transport overrides do not allow insecureSkipVerify` | The bypass field is present | Remove it with `openclaw config unset`, then recreate the gateway. |
 
@@ -322,9 +322,10 @@ in the volumes it archives.
 
 | Copy | Location | Owner | Inspect and remove, or limit |
 | --- | --- | --- | --- |
-| Gateway configuration, sessions and transcripts, agent workspaces and memory, model login, managed Slack package, native support bundles | `openclaw-state` volume | VM operator; Claw administrator for sessions and agent files | `openclaw sessions list` and `openclaw sessions delete <key>` through the gateway. Delete keeps a `.jsonl.deleted.<timestamp>` transcript archive; memory needs `openclaw memory forget`. Complete removal is deletion of the volume (see [Resetting](upgrade.md#resetting-destructive)). |
+| Gateway configuration, sessions and transcripts, agent workspaces and memory, model login, managed Slack package, native and automatic-triage support bundles (`logs/support`) | `openclaw-state` volume | VM operator; Claw administrator for sessions and agent files | `openclaw sessions list` and `openclaw sessions delete <key>` in the gateway container, with the gateway credential loaded as for [agent commands](file-secrets.md#docker-compose-exec-does-not-see-these-secrets). Delete keeps a compressed `<session>.jsonl.deleted.<timestamp>` transcript archive in the volume; indexed memory needs `openclaw memory forget`. Complete removal is deletion of the volume (see [Resetting](upgrade.md#resetting-destructive)). |
 | Active Pretorin CLI, context, preflight resolvers, Plan records, recipes, CLI update and target-sync audit files | `pretorin-state` volume | VM operator | Inspect with the [record procedure](upgrade.md#transfer-existing-effort-records) and `scripts/pretorin-update.sh --status`. This repository has no per-record delete command; complete removal is deletion of the volume. |
 | Gateway file log (`/tmp/openclaw/openclaw-<date>.log`) | Container writable layer | VM operator | Removed when the container is recreated or removed. |
+| Doctor pre-repair captures of configuration and databases | `/home/node/.openclaw.update-captures`, container writable layer, outside both volumes | VM operator | Startup Doctor can create them. Removed when the container is recreated or removed. A volume backup does not include them. |
 | Container output log | Docker log driver on the host | VM operator | `docker compose logs openclaw`. Removed with the container. Docker daemon settings set its rotation. |
 | Target clones | `workspace/targets` on the host | VM operator | Remove the target from `efforts.yaml`, apply, then delete the clone directory. Volume deletion does not remove it. |
 | Host deployment files and private overlays | Checkout, secret directory, private paths | VM operator | Delete the files. Revoke credentials at their issuers first. |
@@ -350,14 +351,18 @@ files, `.env`, state volume archives, transcripts, heap snapshots or rendered
    scripts/pretorin-update.sh --status
    ```
 
-2. The native sanitized bundle. OpenClaw omits prompts, tool output and
-   credentials from it by design, but it still summarizes logs and host state:
+2. The native sanitized bundle. OpenClaw designs it to omit prompts, tool
+   output and credentials. In the local fixture it held no credential, but it
+   held a short model reply in a log line and the configured endpoint host
+   name. Review it before you send it:
 
    ```sh
    docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint \
      openclaw gateway diagnostics export --output /tmp/openclaw-diagnostics.zip
    docker compose cp openclaw:/tmp/openclaw-diagnostics.zip ./openclaw-diagnostics.zip
    ```
+
+   The copy in the container stays until the container is recreated.
 
 3. A short gateway log excerpt for the failure time, for example
    `docker compose logs --since 30m openclaw`. Remove credential fragments:
