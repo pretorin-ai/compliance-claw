@@ -1216,9 +1216,11 @@ if config and p.get_path(config, "channels.slack") is None and any(
 PYTHON
   fi
 
-  local -a args=(generate --efforts "$EFFORTS_FILE" --config "$live" --out-dir "$GEN_DIR")
+  # The last-applied record names the grants this deployment owns. Offline, it
+  # is also how plan reports a grant that would retire.
+  local -a args=(generate --efforts "$EFFORTS_FILE" --config "$live" --out-dir "$GEN_DIR"
+                 --last-applied-state "$STATE_FILE")
   if [ "$offline" != 1 ]; then
-    args+=(--last-applied-state "$STATE_FILE")
     # THE EXEC APPROVALS DOCUMENT, the second half of the native access state.
     # It is in OpenClaw's SQLite state, not in openclaw.json, so the config
     # snapshot does not cover it. This reply is its pre-apply snapshot.
@@ -1229,9 +1231,6 @@ PYTHON
       return 1
     fi
     args+=(--approvals "${GEN_DIR}/approvals-before.json")
-  else
-    # Offline: the grants recorded by the last apply, to report retirements.
-    args+=(--last-applied-state "$STATE_FILE")
   fi
   [ -n "$dm_add" ] && args+=(--dm-add "$dm_add")
   [ -n "$dm_remove" ] && args+=(--dm-remove "$dm_remove")
@@ -1451,7 +1450,7 @@ rollback_apply() {
   # manifest of the change being undone, so a correct rollback could only fail.
   # The question here is the opposite: is it back?
   if verify_rollback; then
-    warn "the previous configuration and the managed workspaces are back, and the"
+    warn "the previous configuration, exec approvals and managed workspaces are back, and the"
     warn "  gateway is healthy. None of the gateway-side change this run intended"
     warn "  was applied."
     warn "  Pretorin onboarding is NOT part of this rollback: any effort the audit"
@@ -1854,8 +1853,8 @@ run_efforts() {
   if ! apply_patch || ! apply_approvals; then
     warn "applying the configuration patch or the exec approvals failed; restoring what was there before."
     restore_both || exit 1
-    die "the gateway configuration and the managed workspaces are back as they were,
-  and ${STATE_FILE} was not written. Pretorin onboarding runs before this point, so
+    die "the gateway configuration, the exec approvals and the managed workspaces
+  are back as they were, and ${STATE_FILE} was not written. Pretorin onboarding runs before this point, so
   any effort recorded as 'applied' above is bound on the platform; that stands, and
   is idempotent."
   fi
@@ -2165,7 +2164,7 @@ dm_apply() {
   if ! apply_patch || ! apply_approvals; then
     warn "applying failed; restoring what was there before."
     restore_both || exit 1
-    die "the gateway configuration and the managed workspaces are back as they were."
+    die "the gateway configuration, the exec approvals and the managed workspaces are back as they were."
   fi
   local restarted=1
   restart_gateway || restarted=0
