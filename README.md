@@ -222,9 +222,12 @@ supply. Those need a Connected Source on the platform side, which is future work
 ## Verifying what you pulled
 
 Pull by digest, not by tag; the pair this checkout deploys is in
-[compose.yaml](compose.yaml). The image is **unsigned**: the digest pin, the
-per-release SBOM, the release-time scan and recorded provenance are its integrity
-controls. Commands and what they do and do not prove:
+[compose.yaml](compose.yaml). A release can also carry a release set: a record,
+a `compose.release.yaml` overlay that selects its digest, and the SBOM. Check it
+with `scripts/release-assets.py check`. The image and the record are
+**unsigned**: the digest pin, the asset checksums, the per-release SBOM, the
+release-time scan and recorded provenance are its integrity controls. Commands
+and what they do and do not prove:
 [Verifying the image you pulled](docs/image-verification.md).
 
 ## Repositories and targets
@@ -482,8 +485,10 @@ scripts/onboard-targets.sh --verify-only # LEGACY single-effort deployments only
 
 ## Releasing
 
-Maintainers use [How to publish a release](docs/releasing.md). Publishing is
-separate from updating a customer deployment or its active Pretorin CLI.
+Maintainers use [How to publish a release](docs/releasing.md): tag, prepare a
+draft candidate, then publish the same bytes without a rebuild. Publishing is
+separate from updating a customer deployment or its active Pretorin CLI. To learn
+about new releases, use GitHub **Watch → Custom → Releases**.
 
 ## Notes
 
