@@ -7,7 +7,7 @@
     release-assets.py finalize --dir DIR
     release-assets.py check    [--dir DIR] [--stage final|candidate|any]
                                [--version X.Y.Z] [--all-assets]
-                               [--source DIR [--tag-only]]
+                               [--source DIR [--tag-only]] [--allow-unsigned]
                                [--compose | --rendered FILE|-] [--json]
     release-assets.py fetch    --version X.Y.Z --dir DIR [--json]
     release-assets.py --self-test
@@ -31,17 +31,22 @@ this version). They must not parse the record themselves: one resolver, one
 set of rules.
 
 `fetch` downloads the three assets of a PUBLISHED release of the fixed public
-repository (no credential, no draft), into an empty directory, and then runs
-the same checks as `check --stage final --all-assets`.
+repository (no credential, no draft), into an empty directory, and then checks
+their INTEGRITY as `check --stage final --all-assets` does. It reports the
+signature status and does not judge it: the signature gate is in `check` alone.
 
 THE RENDERED COMPOSE MODEL IS NEVER PRINTED OR WRITTEN. A legacy `.env`
 selection renders secret values into it. `check --compose` keeps it in memory;
 `--rendered -` reads it from stdin so a caller needs no temporary file. On a
 selection mismatch only the image references are printed.
 
-SIGNATURES. This version has no verifier, so `check` refuses every
-`signature.status` other than "unsigned". A claimed signature is never treated
-as verified.
+SIGNATURES FAIL CLOSED. This version has no verifier, so `check` refuses every
+release by default (exit 6): customer install and apply must not run a release
+whose publisher nobody has verified. `--allow-unsigned` admits "unsigned" only,
+and prints "UNVERIFIED: publisher authenticity not checked". Preparation,
+publication, update preview and fixtures pass it; customer install and apply
+never do. Any other status stays refused even with the flag: a claimed
+signature is never treated as verified.
 
 THE OVERLAY IS GENERATED FROM THE RECORD, BYTE FOR BYTE. `check` regenerates it
 and compares, so a key added by hand (a port, a volume, an environment value)
@@ -75,6 +80,8 @@ EXIT CODES (every subcommand):
        (overlay not selected, or a later overlay overrides it)
     5  a required tool or download cannot run (git, docker compose, the
        release download)
+    6  the release is not signed or its signature is not verified (every
+       release in this version, unless --allow-unsigned admits "unsigned")
 """
 import argparse
 import hashlib
@@ -94,9 +101,9 @@ RECORD_SIGNATURE = RECORD + ".sig"
 PLATFORM = "linux/amd64"
 SCHEMA = 1
 STAGES = ("candidate", "final")
-# Later signing adds its own status values. Until then an unknown value is
-# refused rather than guessed at.
-SIGNATURE_STATUSES = ("unsigned",)
+# Later signing adds its own status values and a verifier. Until then `check`
+# refuses every value except "unsigned", and that one only with --allow-unsigned.
+SIGNATURE_STATUS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 SERVICES = ("openclaw", "cli")
 # fetch reads only published releases of this repository.
 RELEASE_REPOSITORY = "pretorin-ai/compliance-claw"
@@ -112,7 +119,8 @@ REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 IMAGE_REPOSITORY_RE = re.compile(
     r"^[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)+$")
 
-DATA, USAGE, SOURCE, SELECTION, TOOL = 1, 2, 3, 4, 5
+DATA, USAGE, SOURCE, SELECTION, TOOL, UNSIGNED = 1, 2, 3, 4, 5, 6
+UNVERIFIED = "UNVERIFIED: publisher authenticity not checked"
 
 
 class ReleaseError(Exception):
@@ -253,9 +261,7 @@ def validate_record(record):
 
     signature = record["signature"]
     require_keys(signature, ("status", "record_signature_asset"), "signature")
-    require(isinstance(signature["status"], str) and signature["status"] in SIGNATURE_STATUSES,
-            "signature.status is %r: signature present but no verifier in this version"
-            % (signature["status"],))
+    require_match(SIGNATURE_STATUS_RE, signature["status"], "signature.status")
     require(signature["record_signature_asset"] == RECORD_SIGNATURE,
             "signature.record_signature_asset is %r, expected %r"
             % (signature["record_signature_asset"], RECORD_SIGNATURE))
@@ -453,8 +459,18 @@ def finalize(directory):
     return record, True
 
 
+def check_signature(record, allow_unsigned):
+    status = record["signature"]["status"]
+    require(status == "unsigned",
+            "signature.status is %r: signature present but no verifier in this version; "
+            "customer install/apply refuses it" % status, UNSIGNED)
+    require(allow_unsigned,
+            "release %s is not signed or the signature is not verified; customer "
+            "install/apply refuses it" % record["version"], UNSIGNED)
+
+
 def check(directory, stage="final", version=None, all_assets=False, source=None,
-          model=None, tag_only=False):
+          model=None, tag_only=False, allow_unsigned=False, gate_signature=True):
     record = load_record(directory)
     if stage != "any":
         require(record["stage"] == stage,
@@ -463,6 +479,8 @@ def check(directory, stage="final", version=None, all_assets=False, source=None,
         require(record["version"] == version,
                 "release record is version %s, expected %s" % (record["version"], version))
     verify_assets(directory, record, all_assets)
+    if gate_signature:
+        check_signature(record, allow_unsigned)
     if source is not None:
         check_source(source, record, tag_only)
     if model is not None:
@@ -491,7 +509,8 @@ def fetch(version, directory, base=RELEASE_DOWNLOAD):
             raise ReleaseError(TOOL, "cannot download %s: %s" % (url, getattr(exc, "reason", exc)))
         require(len(data) <= FETCH_LIMIT, "%s is larger than %d bytes" % (url, FETCH_LIMIT))
         write_atomic(os.path.join(directory, name), data)
-    return check(directory, stage="final", version=version, all_assets=True)
+    return check(directory, stage="final", version=version, all_assets=True,
+                 gate_signature=False)
 
 
 def read_model(rendered):
@@ -512,6 +531,11 @@ def read_model(rendered):
 # --------------------------------------------------------------------------
 def self_test():
     failures = 0
+
+    def ck(*args, **kw):
+        # Fixtures are unsigned; the signature gate has its own tests below.
+        kw.setdefault("allow_unsigned", True)
+        return check(*args, **kw)
 
     def ok(cond, label):
         nonlocal failures
@@ -601,12 +625,12 @@ def self_test():
         ok(load_record(good)["image"]["digest"] == digest, "a refused replacement leaves the set unchanged")
 
         # check: stages, assets, checksums.
-        ok(check(good, stage="candidate", all_assets=True)["stage"] == "candidate",
+        ok(ck(good, stage="candidate", all_assets=True)["stage"] == "candidate",
            "check accepts the candidate with --stage candidate")
         refuses("check refuses a candidate by default (customer flows need final)", DATA,
-                lambda: check(good), "is a candidate")
+                lambda: ck(good), "is a candidate")
         refuses("check refuses a version mismatch", DATA,
-                lambda: check(good, stage="any", version="1.2.4"), "expected 1.2.4")
+                lambda: ck(good, stage="any", version="1.2.4"), "expected 1.2.4")
 
         def variant(name, mutate):
             d = os.path.join(tmp, name)
@@ -632,19 +656,19 @@ def self_test():
 
         d = variant("ports", append(OVERLAY, '    ports: ["0.0.0.0:18789:18789"]\n'))
         refuses("check refuses an overlay with an added key", DATA,
-                lambda: check(d, stage="any"), "does not match")
+                lambda: ck(d, stage="any"), "does not match")
         d = variant("sbom", append("sbom-1.2.3.spdx.json", " "))
-        refuses("check refuses a changed SBOM", DATA, lambda: check(d, stage="any"), "sbom-1.2.3")
+        refuses("check refuses a changed SBOM", DATA, lambda: ck(d, stage="any"), "sbom-1.2.3")
         d = variant("nosbom", lambda d: os.unlink(os.path.join(d, "sbom-1.2.3.spdx.json")))
-        ok(check(d, stage="any")["version"] == "1.2.3", "check accepts a host set without the SBOM")
+        ok(ck(d, stage="any")["version"] == "1.2.3", "check accepts a host set without the SBOM")
         refuses("check --all-assets requires the SBOM", DATA,
-                lambda: check(d, stage="any", all_assets=True), "missing")
+                lambda: ck(d, stage="any", all_assets=True), "missing")
         d = variant("nooverlay", lambda d: os.unlink(os.path.join(d, OVERLAY)))
-        refuses("check always requires the overlay", DATA, lambda: check(d, stage="any"), "missing")
+        refuses("check always requires the overlay", DATA, lambda: ck(d, stage="any"), "missing")
         d = variant("norecord", lambda d: os.unlink(os.path.join(d, RECORD)))
-        refuses("check refuses a missing record", DATA, lambda: check(d, stage="any"), "cannot read")
+        refuses("check refuses a missing record", DATA, lambda: ck(d, stage="any"), "cannot read")
         d = variant("noncanonical", edit_record(lambda r: None, canonical=False))
-        refuses("check refuses a non-canonical record", DATA, lambda: check(d, stage="any"), "canonical")
+        refuses("check refuses a non-canonical record", DATA, lambda: ck(d, stage="any"), "canonical")
         for name, fn, needle in (
             ("schema", lambda r: r.update(schema=2), "schema"),
             ("schema-bool", lambda r: r.update(schema=True), "schema"),
@@ -657,13 +681,13 @@ def self_test():
             ("checksum", lambda r: r["assets"][1].update(sha256="0" * 64), "sbom-1.2.3"),
             ("extra-asset", lambda r: r["assets"].append(dict(r["assets"][1])), "exactly"),
             ("no-assets", lambda r: r.update(assets=[]), "exactly"),
-            ("signed", lambda r: r["signature"].update(status="signed"), "no verifier"),
+            ("status", lambda r: r["signature"].update(status="Signed!"), "signature.status"),
             ("name-type", lambda r: r["assets"][0].update(name=["x"]), "must be strings"),
             ("extra-field", lambda r: r.update(customer="acme"), "record fields"),
         ):
             d = variant("rec-" + name, edit_record(fn))
             refuses("check refuses a record with a bad %s" % name, DATA,
-                    lambda d=d: check(d, stage="any"), needle)
+                    lambda d=d: ck(d, stage="any"), needle)
 
         # finalize changes only the stage; the overlay and SBOM bytes are reused.
         before = {n: read_bytes(os.path.join(good, n)) for n in (OVERLAY, "sbom-1.2.3.spdx.json")}
@@ -675,9 +699,20 @@ def self_test():
         ok(all(read_bytes(os.path.join(good, n)) == b for n, b in before.items()),
            "finalize reuses the overlay and SBOM bytes")
         ok(finalize(good)[1] is False, "finalize is idempotent on a final set")
-        ok(check(good)["stage"] == "final", "check accepts the final set by default")
+        ok(ck(good)["stage"] == "final", "check accepts the final set by default")
         d = variant("final-nosbom", lambda d: os.unlink(os.path.join(d, "sbom-1.2.3.spdx.json")))
         refuses("finalize requires every asset", DATA, lambda: finalize(d), "missing")
+
+        # The signature gate fails closed.
+        refuses("check refuses an unsigned release by default (exit 6)", UNSIGNED,
+                lambda: check(good), "customer install/apply refuses it")
+        d = variant("signed", edit_record(lambda r: r["signature"].update(status="signed")))
+        refuses("check refuses a claimed signature even with allow_unsigned", UNSIGNED,
+                lambda: check(d, allow_unsigned=True), "no verifier")
+        refuses("check refuses a claimed signature by default", UNSIGNED,
+                lambda: check(d), "no verifier")
+        refuses("the data checks run before the signature gate", DATA,
+                lambda: check(variant("unsigned-bad", append(OVERLAY, "#\n"))), "does not match")
 
         # Effective selection.
         def model(openclaw=ref, cli=ref, **extra):
@@ -688,15 +723,15 @@ def self_test():
                 services["cli"] = {"image": cli, "platform": PLATFORM}
             return {"services": services}
 
-        ok(check(good, model=model())["version"] == "1.2.3", "check accepts a model that selects the release")
+        ok(ck(good, model=model())["version"] == "1.2.3", "check accepts a model that selects the release")
         refuses("check reports a later overlay that overrides openclaw", SELECTION,
-                lambda: check(good, model=model(openclaw="compliance-claw:local")), "openclaw")
+                lambda: ck(good, model=model(openclaw="compliance-claw:local")), "openclaw")
         refuses("check reports a later overlay that overrides cli", SELECTION,
-                lambda: check(good, model=model(cli=repo + ":1.2.2@sha256:" + "e" * 64)), "cli")
+                lambda: ck(good, model=model(cli=repo + ":1.2.2@sha256:" + "e" * 64)), "cli")
         refuses("check reports a model without the cli service", SELECTION,
-                lambda: check(good, model=model(cli=None)), "no cli service")
+                lambda: ck(good, model=model(cli=None)), "no cli service")
         refuses("check reports a changed platform", SELECTION,
-                lambda: check(good, model=model(platform="linux/arm64")), "platform")
+                lambda: ck(good, model=model(platform="linux/arm64")), "platform")
 
         # Source binding.
         if shutil.which("git") is None:
@@ -725,18 +760,18 @@ def self_test():
             refuses("prepare --source refuses a tag at another commit", SOURCE,
                     lambda: prep(os.path.join(tmp, "s2"), commit=second, source=gitdir), first)
             refuses("check --source refuses a tag at another commit", SOURCE,
-                    lambda: check(srcset, stage="any", source=gitdir), first)
+                    lambda: ck(srcset, stage="any", source=gitdir), first)
             g("tag", "-f", "-a", "-m", "annotated", "v1.2.3", second)
-            ok(check(srcset, stage="any", source=gitdir)["source"]["commit"] == second,
+            ok(ck(srcset, stage="any", source=gitdir)["source"]["commit"] == second,
                "check --source accepts an annotated tag and HEAD at the record commit")
             g("checkout", "-q", first)
             refuses("check --source refuses HEAD at another commit", SOURCE,
-                    lambda: check(srcset, stage="any", source=gitdir), "Check out v1.2.3")
-            ok(check(srcset, stage="any", source=gitdir, tag_only=True)["version"] == "1.2.3",
+                    lambda: ck(srcset, stage="any", source=gitdir), "Check out v1.2.3")
+            ok(ck(srcset, stage="any", source=gitdir, tag_only=True)["version"] == "1.2.3",
                "check --source --tag-only accepts the tag without moving HEAD")
             g("tag", "-d", "v1.2.3")
             refuses("check --source --tag-only still refuses a missing tag", SOURCE,
-                    lambda: check(srcset, stage="any", source=gitdir, tag_only=True), "no tag")
+                    lambda: ck(srcset, stage="any", source=gitdir, tag_only=True), "no tag")
 
         # fetch: a published set from a release download location (file:// here).
         published = os.path.join(tmp, "published", "v1.2.3")
@@ -765,6 +800,12 @@ def self_test():
         refuses("fetch refuses a tampered overlay", DATA,
                 lambda: fetch("1.2.3", os.path.join(tmp, "f4"), "file://" + os.path.dirname(tampered)),
                 "does not match")
+        signedpub = os.path.join(tmp, "signedpub", "v1.2.3")
+        shutil.copytree(good, signedpub)
+        edit_record(lambda r: r["signature"].update(status="signed"))(signedpub)
+        ok(fetch("1.2.3", os.path.join(tmp, "f6"), "file://" + os.path.dirname(signedpub))
+           ["signature"]["status"] == "signed",
+           "fetch checks integrity only and reports the signature status")
         refuses("fetch refuses a malformed version", DATA,
                 lambda: fetch("v1.2.3", os.path.join(tmp, "f5"), base), "--version")
 
@@ -774,25 +815,29 @@ def self_test():
         def cli(*args):
             return subprocess.run((sys.executable, me) + args, capture_output=True, text=True)
 
-        p = cli("check", "--dir", good, "--json")
-        ok(p.returncode == 0 and json.loads(p.stdout)["image_reference"] == ref,
-           "check --json prints the summary on stdout")
+        p = cli("check", "--dir", good, "--json", "--allow-unsigned")
+        ok(p.returncode == 0 and json.loads(p.stdout)["image_reference"] == ref
+           and UNVERIFIED in p.stderr,
+           "check --allow-unsigned --json prints the summary and the UNVERIFIED line")
+        p = cli("check", "--dir", good)
+        ok(p.returncode == UNSIGNED and "customer install/apply refuses it" in p.stderr,
+           "check exits 6 on an unsigned release without --allow-unsigned")
         rendered = os.path.join(tmp, "rendered.json")
         with open(rendered, "w") as f:
             json.dump(model(openclaw="compliance-claw:local"), f)
-        ok(cli("check", "--dir", good, "--rendered", rendered).returncode == SELECTION,
+        ok(cli("check", "--dir", good, "--rendered", rendered, "--allow-unsigned").returncode == SELECTION,
            "check --rendered exits 4 on an override")
         secret_model = model(openclaw="compliance-claw:local")
         secret_model["services"]["openclaw"]["environment"] = {"X": "CANARY-MODEL-SECRET"}
-        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-"),
+        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-", "--allow-unsigned"),
                            input=json.dumps(secret_model), capture_output=True, text=True)
         ok(p.returncode == SELECTION and "CANARY-MODEL-SECRET" not in p.stdout + p.stderr
            and "compliance-claw:local" in p.stderr and ref in p.stderr,
            "check --rendered - reads stdin and prints only image references on exit 4")
-        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-"),
+        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-", "--allow-unsigned"),
                            input=json.dumps(model()), capture_output=True, text=True)
         ok(p.returncode == 0, "check --rendered - accepts a matching model from stdin")
-        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-"),
+        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-", "--allow-unsigned"),
                            input='{"secret": "CANARY-MODEL-SECRET"', capture_output=True, text=True)
         ok(p.returncode == USAGE and "CANARY-MODEL-SECRET" not in p.stderr,
            "an unreadable model exits 2 without echoing it")
@@ -832,6 +877,8 @@ def main(argv):
     chk.add_argument("--version")
     chk.add_argument("--all-assets", action="store_true")
     chk.add_argument("--source")
+    chk.add_argument("--allow-unsigned", action="store_true",
+                     help="admit an unsigned release (preparation, preview, fixtures only)")
     chk.add_argument("--tag-only", action="store_true",
                      help="with --source: check only that the tag names the record commit")
     how = chk.add_mutually_exclusive_group()
@@ -865,7 +912,8 @@ def main(argv):
             record = fetch(args.version, args.dir)
             if args.json:
                 print(json.dumps(summary(record), sort_keys=True))
-            print("release-assets: fetched and checked final %s %s into %s (%s)"
+            print("release-assets: fetched final %s %s into %s; integrity checked. "
+                  "signature.status: %s (not verified here; check decides)"
                   % (record["version"], record["image"]["reference"], args.dir,
                      record["signature"]["status"]), file=sys.stderr)
         else:
@@ -877,7 +925,8 @@ def main(argv):
             elif args.compose:
                 model = render_compose()
             record = check(args.dir, args.stage, args.version, args.all_assets,
-                           args.source, model, args.tag_only)
+                           args.source, model, args.tag_only, args.allow_unsigned)
+            print("release-assets: %s" % UNVERIFIED, file=sys.stderr)
             if args.json:
                 print(json.dumps(summary(record), sort_keys=True))
             print("release-assets: %s %s %s is valid%s (%s)"

@@ -53,7 +53,9 @@
 #
 # THE IMAGE AND THE RELEASE RECORD ARE NOT SIGNED. Integrity comes from the
 # immutable digest, the release-time vulnerability scan, the SBOM and the asset
-# checksums. The record reserves `compliance-claw-release.json.sig` and says
+# checksums. Every `check` here passes --allow-unsigned and prints UNVERIFIED:
+# the publisher prepares and publishes unsigned sets, and customer install and
+# apply refuse them (release-assets.py exit 6) until signing and a verifier exist. The record reserves `compliance-claw-release.json.sig` and says
 # `signature.status: unsigned`; signing (SECURITY.md hardening ledger, image
 # signing) is later work and will sign this record rather than a second format.
 #
@@ -515,7 +517,7 @@ jobs:
             --commit "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY" \
             --image-repository "$IMAGE_REPO" --digest "$DIGEST" \
             --sbom "sbom-${VERSION}.spdx.json" --out release-set --source .
-          python3 scripts/release-assets.py check --dir release-set --stage candidate \
+          python3 scripts/release-assets.py check --allow-unsigned --dir release-set --stage candidate \
             --all-assets --version "$VERSION" --source .
           ls -l release-set
 
@@ -650,7 +652,7 @@ jobs:
               echo "::error::cannot read release $1: ${out}"; exit 1
             fi
           }
-          python3 scripts/release-assets.py check --dir release-set --stage candidate \
+          python3 scripts/release-assets.py check --allow-unsigned --dir release-set --stage candidate \
             --all-assets --version "$VERSION"
           release_state "$TAG"
           case "$STATE" in
@@ -727,18 +729,18 @@ jobs:
 
           if [ "$STATE" = false ]; then
             # Already published: confirm, change nothing. Downstream jobs only verify.
-            python3 scripts/release-assets.py check --dir release-set --stage final \
+            python3 scripts/release-assets.py check --allow-unsigned --dir release-set --stage final \
               --all-assets --version "$VERSION" --source .
             echo "completed=true" >> "$GITHUB_OUTPUT"
           else
             # A candidate, or a final record from an earlier attempt that stopped
             # before the release was un-drafted.
-            python3 scripts/release-assets.py check --dir release-set --stage any \
+            python3 scripts/release-assets.py check --allow-unsigned --dir release-set --stage any \
               --all-assets --version "$VERSION" --source .
             python3 scripts/release-assets.py finalize --dir release-set
             echo "completed=false" >> "$GITHUB_OUTPUT"
           fi
-          SUMMARY="$(python3 scripts/release-assets.py check --dir release-set \
+          SUMMARY="$(python3 scripts/release-assets.py check --allow-unsigned --dir release-set \
             --all-assets --version "$VERSION" --source . --json)"
           REC_DIGEST="$(printf '%s' "$SUMMARY" | jq -r .digest)"
           [ "$REC_DIGEST" = "$QUALIFIED" ] \
@@ -827,7 +829,7 @@ jobs:
           VERSION: ${{ needs.final-assets.outputs.version }}
         run: |
           set -euo pipefail
-          python3 scripts/release-assets.py check --dir release-set --all-assets --version "$VERSION"
+          python3 scripts/release-assets.py check --allow-unsigned --dir release-set --all-assets --version "$VERSION"
           STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
           if [ "$STATE" = true ]; then
             # Only the record changes (stage: final); the overlay and SBOM on the
@@ -843,7 +845,7 @@ jobs:
             cmp "$f" "published/$(basename "$f")" \
               || { echo "::error::release asset $(basename "$f") differs from the checked set"; exit 1; }
           done
-          python3 scripts/release-assets.py check --dir published --all-assets --version "$VERSION"
+          python3 scripts/release-assets.py check --allow-unsigned --dir published --all-assets --version "$VERSION"
           if [ "$STATE" = true ]; then
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
             echo "published release ${TAG}"

@@ -58,20 +58,33 @@ The source tag `vX.Y.Z` can still pin the previous image in `compose.yaml`. That
 pin moves only in the commit after the release. The release overlay is what
 selects the release image for the tagged source.
 
-Download and check a published set (no credential is needed; the directory
-must be empty or absent), then check the checkout of the release tag:
+**A published set is unsigned today.** Nothing proves who published it. For
+that reason, `check` refuses every release by default with exit 6, and the
+customer install and update tools must refuse it until signing and signature
+verification exist. Final trust acceptance is pending. Do not install a release
+set by hand to work around this.
+
+To inspect a published set without installing it, download it (no credential
+is needed; the directory must be empty or absent) and check it against a
+checkout of the release tag:
 
 ```sh
 python3 scripts/release-assets.py fetch --version X.Y.Z --dir /tmp/cc-vX.Y.Z
-python3 scripts/release-assets.py check --dir /tmp/cc-vX.Y.Z --version X.Y.Z --source .
+python3 scripts/release-assets.py check --allow-unsigned --dir /tmp/cc-vX.Y.Z --version X.Y.Z --source .
 ```
 
-The check refuses a candidate or draft record, a changed or extended overlay, an
+`fetch` checks the download integrity only and reports the signature status.
+`check` refuses a candidate or draft record, a changed or extended overlay, an
 asset whose SHA-256 or size differs from the record, and a checkout whose tag or
 `HEAD` is not the recorded commit. `--source . --tag-only` checks only that the
 tag names the recorded commit, without a requirement for the checkout to be
-there. It reports `unsigned`: the record is not signed yet, and any other status
-is refused because this version has no signature verifier.
+there. `--allow-unsigned` admits the status `unsigned` only, and prints
+`UNVERIFIED: publisher authenticity not checked`. It is for preparation,
+preview and inspection; customer install and apply never use it. Any other
+signature status is refused because this version has no signature verifier.
+
+The rest of this section describes the selection that the install and update
+tools will check after verification exists.
 
 The verified record and overlay belong in the repository root, where both names
 are gitignored. Select the overlay directly after `compose.yaml`, so that secret,
@@ -84,13 +97,13 @@ COMPOSE_FILE=compose.yaml:compose.release.yaml:compose.secrets.yaml:compose.effo
 Then confirm what Compose will run (no daemon is needed):
 
 ```sh
-python3 scripts/release-assets.py check --compose
+python3 scripts/release-assets.py check --allow-unsigned --compose
 ```
 
 The check keeps the rendered Compose model in memory and prints only image
 references. A legacy `.env` selection renders secret values into that model, so
 do not save it to a file. A caller that already renders it can pipe it:
-`docker compose --profile cli config --format json | python3 scripts/release-assets.py check --rendered -`.
+`docker compose --profile cli config --format json | python3 scripts/release-assets.py check --allow-unsigned --rendered -`.
 
 | Exit | Meaning |
 | --- | --- |
@@ -99,6 +112,9 @@ do not save it to a file. A caller that already renders it can pipe it:
 | 3 | The checkout is not at the recorded commit, or the tag names another commit. |
 | 4 | Compose selects another image: the overlay is not selected, or a later overlay (for example a restore overlay) sets `image`. The check prints the expected and effective references and changes nothing. |
 | 5 | Git, Docker Compose, or the download cannot run, or the selection does not render. |
+| 6 | The release is not signed, or its signature is not verified. In this version every release gets exit 6 unless `--allow-unsigned` admits `unsigned`. Customer install and apply refuse it. |
+
+Exit 2 is a usage error.
 
 `scripts/update.sh` in this version does not download, check, or replace a
 release set. While `compose.release.yaml` is selected, it keeps selecting its own
@@ -130,7 +146,8 @@ as a workflow artifact and as an asset on the GitHub Release. See the
 
 The release record is not signed. Anyone who can publish a release can publish
 a record that agrees with itself. The record binds the files together; it is no
-proof of who made them.
+proof of who made them. That is why `release-assets.py check` refuses unsigned
+sets by default (exit 6).
 
 **Planned, not implemented:** image and record signing backed by **Azure Key
 Vault**, following the approach the Pretorin CLI already uses for its own

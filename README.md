@@ -223,9 +223,10 @@ supply. Those need a Connected Source on the platform side, which is future work
 
 Pull by digest, not by tag; the pair this checkout deploys is in
 [compose.yaml](compose.yaml). A release can also carry a release set: a record,
-a `compose.release.yaml` overlay that selects its digest, and the SBOM. Check it
-with `scripts/release-assets.py check`. The image and the record are
-**unsigned**: the digest pin, the asset checksums, the per-release SBOM, the
+a `compose.release.yaml` overlay that selects its digest, and the SBOM. It is
+unsigned today, so `scripts/release-assets.py check` and the customer install
+and update tools refuse it until signing and verification exist. The image and
+the record are **unsigned**: the digest pin, the asset checksums, the per-release SBOM, the
 release-time scan and recorded provenance are its integrity controls. Commands
 and what they do and do not prove:
 [Verifying the image you pulled](docs/image-verification.md).

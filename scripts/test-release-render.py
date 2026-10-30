@@ -110,7 +110,7 @@ def main():
                 shutil.copyfile(release / name, dest / name)
 
         def check(cwd, compose_file):
-            return run([sys.executable, str(HELPER), "check", "--compose"], cwd, compose_file)
+            return run([sys.executable, str(HELPER), "check", "--allow-unsigned", "--compose"], cwd, compose_file)
 
         # 1. The old tag: the original fault, then the generated selection.
         old = project(tmp / "v0.5.2", [(OLD_TAG / n, n) for n in
@@ -135,6 +135,10 @@ def main():
            "v0.5.2 release overlay renders the v0.5.2 digest for both services", str(after))
         p = check(old, old_rel_sel)
         ok(p.returncode == 0, "check --compose accepts the v0.5.2 release selection", p.stderr)
+
+        p = run([sys.executable, str(HELPER), "check", "--compose"], old, old_rel_sel)
+        ok(p.returncode == 6 and "customer install/apply refuses it" in p.stderr,
+           "check --compose without --allow-unsigned refuses the unsigned set (exit 6)", p.stderr)
 
         # 2. Current files, full ordered selection, plus customer overlays.
         cur = project(tmp / "current", [(ROOT / n, n) for n in
@@ -207,24 +211,24 @@ def main():
            "restart policy unchanged (gateway only)")
 
         # 3. check --compose on good, missing and overridden selections.
-        p = run([sys.executable, str(HELPER), "check", "--compose", "--json"], cur,
+        p = run([sys.executable, str(HELPER), "check", "--allow-unsigned", "--compose", "--json"], cur,
                 "compose.yaml:compose.release.yaml:" + customer, extra)
         ok(p.returncode == 0 and json.loads(p.stdout)["image_reference"] == want,
            "check --compose accepts the full customer selection", p.stderr)
-        p = run([sys.executable, str(HELPER), "check", "--compose"], cur, "compose.yaml:" + customer, extra)
+        p = run([sys.executable, str(HELPER), "check", "--allow-unsigned", "--compose"], cur, "compose.yaml:" + customer, extra)
         ok(p.returncode == 4 and "compose.release.yaml" in p.stderr,
            "check --compose exits 4 when the overlay is not selected", p.stderr)
-        p = run([sys.executable, str(HELPER), "check", "--compose"], cur,
+        p = run([sys.executable, str(HELPER), "check", "--allow-unsigned", "--compose"], cur,
                 "compose.yaml:compose.release.yaml:" + customer + ":deployment/pin-image.yaml", extra)
         ok(p.returncode == 4 and "compliance-claw:local" in p.stderr and "openclaw" in p.stderr,
            "check --compose exits 4 and names a later image override", p.stderr)
-        p = run([sys.executable, str(HELPER), "check", "--compose"], cur,
+        p = run([sys.executable, str(HELPER), "check", "--allow-unsigned", "--compose"], cur,
                 "compose.yaml:compose.release.yaml:" + customer + ":deployment/restore.yaml", extra)
         ok(p.returncode == 4 and "restore overlay" in p.stderr and previous in p.stderr
            and want in p.stderr and "cc-restore" not in p.stderr,
            "check --compose exits 4 on a later restore overlay and prints only image references",
            p.stderr)
-        p = run(["bash", "-c", '"$1" compose --profile cli config --format json | "$2" "$3" check --rendered -',
+        p = run(["bash", "-c", '"$1" compose --profile cli config --format json | "$2" "$3" check --allow-unsigned --rendered -',
                  "_", docker, sys.executable, str(HELPER)],
                 cur, "compose.yaml:compose.release.yaml:" + customer, extra)
         ok(p.returncode == 0 and CANARY not in p.stdout + p.stderr,
@@ -232,14 +236,14 @@ def main():
         # Legacy .env selection: the model itself holds the canary secret value.
         legacy = model(cur, "compose.yaml:compose.release.yaml:deployment/pin-image.yaml")
         ok(CANARY in json.dumps(legacy), "the legacy selection renders the .env value into the model")
-        p = run([sys.executable, str(HELPER), "check", "--compose"], cur,
+        p = run([sys.executable, str(HELPER), "check", "--allow-unsigned", "--compose"], cur,
                 "compose.yaml:compose.release.yaml:deployment/pin-image.yaml")
         ok(p.returncode == 4 and CANARY not in p.stdout + p.stderr,
            "check --compose never prints the rendered model's secret values", p.stderr)
-        p = run([sys.executable, str(HELPER), "check", "--compose"], cur,
+        p = run([sys.executable, str(HELPER), "check", "--allow-unsigned", "--compose"], cur,
                 "compose.yaml:compose.release.yaml:missing.yaml", extra)
         ok(p.returncode == 5, "check --compose exits 5 when Compose cannot render the selection", p.stderr)
-        p = run([sys.executable, str(HELPER), "check", "--compose", "--json"], cur,
+        p = run([sys.executable, str(HELPER), "check", "--allow-unsigned", "--compose", "--json"], cur,
                 "compose.yaml;compose.release.yaml;" + customer.replace(":", ";"),
                 dict(extra, COMPOSE_PATH_SEPARATOR=";"))
         ok(p.returncode == 0, "check --compose honours COMPOSE_PATH_SEPARATOR", p.stderr)

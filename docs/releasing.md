@@ -38,8 +38,15 @@ it in this version.
 
 The record says `signature.status: unsigned`. The name
 `compliance-claw-release.json.sig` is reserved for a later record signature.
-Nothing signs the record or the image yet, and `check` refuses any other status
-because this version has no signature verifier.
+Nothing signs the record or the image yet.
+
+**A published set is unsigned today, and customer install and update refuse
+it** until signing and signature verification exist: `check` exits 6 unless
+`--allow-unsigned` is given. Final trust acceptance is pending. The workflow,
+update preview and test fixtures pass `--allow-unsigned`, which admits
+`unsigned` only and prints `UNVERIFIED: publisher authenticity not checked`.
+Customer install and apply never pass it. Any other status is refused because
+this version has no signature verifier.
 
 ## Steps
 
@@ -84,7 +91,7 @@ Replace `X.Y.Z` with the intended release version.
 
    ```sh
    gh release download vX.Y.Z --dir /tmp/cc-vX.Y.Z
-   python3 scripts/release-assets.py check --dir /tmp/cc-vX.Y.Z \
+   python3 scripts/release-assets.py check --allow-unsigned --dir /tmp/cc-vX.Y.Z \
      --stage candidate --all-assets --version X.Y.Z --source .
    ```
 
@@ -164,7 +171,9 @@ notify subscribers. There is no other notification service.
 ## Limits
 
 The image and the release record are not signed. A digest and the asset
-checksums give integrity, not authenticity. Signing, a customer-side signature
+checksums give integrity, not authenticity. Publication therefore does not make
+a release installable by the customer tools: they refuse it until verification
+exists. Signing, a customer-side signature
 check, and a required qualification gate that blocks publish are later work;
 see the hardening ledger in [SECURITY.md](../SECURITY.md). Do not describe a
 release as signed or as verified by a customer signature check.
