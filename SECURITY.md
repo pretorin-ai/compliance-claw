@@ -156,9 +156,11 @@ What is still true, and enforced:
 - `cli` does not get it. Only the gateway carries the sync routes.
 
 What is **not** true: that this puts the token beyond a prompt-injected agent.
-Tool execution here is unsandboxed and runs as the same uid, so the file is
-readable by anything the agent can run. The containment that actually bounds the
-damage is GitHub's: read-only, one permission, only the selected repositories.
+The agent's native file and command tools refuse the file (see
+[native access limits](#native-access-limits-for-effort-agents)), but Pretorin MCP
+file operations and plugins run in the gateway process as the same uid and can
+read it. The containment that actually bounds the damage is GitHub's: read-only,
+one permission, only the selected repositories.
 The GitHub App remains the recommended mechanism for anything past this pilot,
 and moving the synchronizer into its own container is the fix — see the ledger.
 
@@ -217,13 +219,13 @@ process-level separation inside one container, not a boundary** — the agent ru
 as the same uid and can reach it. What it buys is that the assessment path, which
 every evidence citation comes from, stays read-only.
 
-**Neither route is a boundary, and the docs must not imply otherwise.** Tool
-execution in this container is unsandboxed (see below), so an agent can already
-run the wrapper directly, replace the binary in the volume without it, and
-rewrite the audit file afterwards. What the updater provides is a *narrow,
-identity-bearing, audited path for the supported routes* — and it adds no
-LLM-reachable capability that `exec` did not already provide. Closing that gap is
-ledger item 4.
+**Neither route is a boundary, and the docs must not imply otherwise.** An
+effort agent's native tools can no longer run the wrapper, replace the binary or
+rewrite the audit file: its file tools stay in its workspace and `exec` runs only
+the fixed git grants. Code in the gateway process is not limited that way —
+plugins and Pretorin MCP children run there as the same uid — and the container
+has no sandbox (see below). What the updater provides is a *narrow,
+identity-bearing, audited path for the supported routes*.
 
 ### Separating one effort from another — say it plainly
 
@@ -239,9 +241,12 @@ What it actually consists of:
   prefix, so another effort's tools are not in its catalogue and a call to one is
   refused. This is real and is enforced by OpenClaw, but `mcp.servers` is
   **gateway-wide**: the isolation is in the policy, not in the process.
-- Each agent's workspace holds a `targets/` view of only its own repositories.
-  Tool execution is unsandboxed and runs as the same uid, so an absolute path
-  still reaches another effort's clone. The view is a scoping aid.
+- Each agent's native file tools stay in its own workspace, and its `exec`
+  grants name only its own targets, so a native tool call cannot read another
+  effort's clone, workspace or credential. This is enforced by OpenClaw, but it
+  is a tool policy, not process isolation: Pretorin MCP children and plugins run
+  in the one gateway process as the same uid (see
+  [native access limits](#native-access-limits-for-effort-agents)).
 - Each Pretorin MCP child is started by a launcher that pins
   `PRETORIN_SYSTEM_ID` / `PRETORIN_FRAMEWORK_ID` from the read-only mounted
   `efforts.yaml` and loads that effort's own credential file. It fails closed
@@ -272,11 +277,13 @@ should be able to act in that compliance scope.
 - **Provider error fingerprints in logs.** An invalid OpenAI key produces a
   masked prefix/suffix in OpenClaw's error log. Full canary values remained
   absent, but log access and export still require access control and redaction.
-- **A malicious or compromised review target.** Tool execution inside the
-  container is **unsandboxed** (`sandbox` is off). See the boundary statement
-  below — this is the single most important limitation in this document. Since
-  target synchronization landed, this also means the read-only GitHub PAT and the
-  writable maintenance mount are both reachable by a prompt-injected agent.
+- **A malicious or compromised review target.** The container has **no
+  sandbox** (`sandbox` is off). Native agent tools are limited by policy, but
+  Pretorin MCP file operations and plugins run in the gateway process with its
+  file access. See the boundary statement below — this is the single most
+  important limitation in this document. A prompt-injected agent can still reach
+  the credential files, the read-only GitHub PAT and the writable maintenance
+  mount through a Pretorin MCP file argument.
 - **Any Slack channel member.** Everyone in the allowlisted channel has the same
   authority. There is no per-user policy and no attribution.
 - **A hostile operator.** Anyone who can edit `.env`, `efforts.yaml` or the state
@@ -292,17 +299,59 @@ should be able to act in that compliance scope.
 
 ### The sandbox boundary — say it plainly
 
-OpenClaw's sandbox is **not enabled**. Tools that execute commands do so directly
-inside the container as `node` (uid 1000), with the target repositories mounted
+OpenClaw's sandbox is **not enabled**. It needs a Docker or Podman backend,
+which would mean giving the gateway the Docker socket. Everything in the gateway
+container runs as `node` (uid 1000), with the target repositories mounted
 read-only for assessment, both state volumes writable, and — on the gateway — a
 writable maintenance alias of the target directory plus a mounted read-only
 GitHub PAT that target synchronization needs. Same uid, same container: the split
 between those paths is separation of *purpose*, not of *privilege*.
 
+### Native access limits for effort agents
+
+`scripts/clawctl apply` gives every effort agent the pinned OpenClaw runtime's
+own file and command controls. OpenClaw enforces them for direct tool calls and
+for Tool Search `tool_call`. `scripts/test-agent-access.sh` checks each one
+against the real handlers with fake keys.
+
+| Control | Effect |
+| --- | --- |
+| `tools.fs.workspaceOnly: true` | `read`, `write`, `edit`, `ls`, `apply_patch` and local media sends stay in the agent's own workspace. Credential files, `openclaw.json`, `/proc`, `..` escapes, other workspaces, the maintenance mount and the `targets/` links are refused. |
+| `tools.exec.mode: "allowlist"` | `exec` runs only grants in OpenClaw's exec approvals store, without a prompt. Anything else is refused: other commands, shell operators, command substitution, redirection. OpenClaw also refuses `GIT_*` and loader environment overrides. |
+| Four git grants per own target | `remote get-url origin`, `rev-parse HEAD`, `ls-tree [-r] --name-only <full-sha>[:<dir>]`, `show <full-sha>:<path>` in `/workspace/targets/<own target>`. No option, short ref, other repository or maintenance path matches. |
+| `tools.deny`: `gateway`, `openclaw` | No configuration reads and no delegated configuration changes from an agent turn. |
+
+`clawctl` owns these fields. A stricter `tools.exec.mode: "deny"` that an
+administrator sets is kept. A weaker value, or legacy `tools.exec.security` /
+`ask` on an effort agent, stops `plan` and `apply` with the exact field before
+anything changes. The grants are applied, verified and rolled back with the
+configuration. An administrator's own grants and settings are kept; a removed
+target loses only the exact grant the last apply recorded.
+
+What these limits do **not** cover:
+
+- **Pretorin MCP file operations.** Each Pretorin MCP child runs in the gateway
+  container as the same uid, outside the agent's tool policy. Most Pretorin tools
+  are reached through `invoke_tool`, so OpenClaw cannot filter the inner tool or
+  its path argument. Measured with fake keys: `upload_evidence` with another
+  effort's credential file as `file_path` sent that file to the platform as
+  evidence. `export_stig_checklist`, `upload_vendor_document` and
+  `import_vendor_crm` also take local paths. Ledger item 4.
+- **Plugin tools.** `target_sync` and `pretorin_update` run in the gateway
+  process. Their own argument rules (above) are what bound them.
+- **The gateway process environment.** PID 1 still exports credentials. An
+  agent cannot read `/proc` or run `env`, but code in the gateway process can.
+- **Administrator overrides.** An administrator who sets a session to Full
+  permission, edits these fields, or adds broad exec grants removes the limit.
+  Agents that `clawctl` does not generate get no limits from it.
+- **Other runtimes.** The limits are OpenClaw policy for the embedded runtime that
+  this deployment pins. A Codex app-server runtime, or another customer runtime
+  configuration, has its own tool surface and is not covered by this check.
+
 > **Required hardening before onboarding third-party or untrusted repositories:**
-> trim the tool surface, evaluate and enable OpenClaw's sandbox, and move secrets
-> out of the environment. Until all three are done, only review repositories your
-> organisation already trusts.
+> close the Pretorin MCP file-operation path, evaluate an enforced boundary for
+> the gateway process, and move secrets out of the environment. Until all three
+> are done, only review repositories your organisation already trusts.
 
 The Slack seed uses `plugins.allow` to limit plugin activation. OpenClaw can add
 required provider and memory plugins during migration. Inspect the actual loaded
@@ -328,27 +377,24 @@ Ordered roughly by how much it matters, not by effort.
    on start, or having the updater verify the signed `SHA256SUMS` itself with a
    vendored anchor — which would mean adding cosign to the runtime image and
    maintaining a second verification path alongside the CLI's own.
-4. **Trim agent tool execution, or sandbox it.** Tool execution is unsandboxed and
-   the config sets no `tools.profile`, so `exec` is available to every agent turn.
-   That predates this release, but the CLI moving into a writable volume widens
-   what `exec` can reach: an agent can replace the active binary directly and
-   rewrite the update audit file. The wrapper's audit therefore covers the
-   supported routes only. `tools.exec.security: "allowlist"` with a host approvals
-   file is the narrow fix; enabling the sandbox is the broad one. **Required
-   before production** — the provenance workflow in the deployed agent instructions
-   (`scripts/agents-md.template`) currently depends
-   on `git`, so neither can simply be switched on without replacing that path.
-
-   Target synchronization widens the same gap again, and in two specific ways
-   worth naming rather than folding into the sentence above: the gateway now has
-   a **writable** alias of the target directory, and a **mounted git credential**.
-   Both are reachable by anything the agent can execute. The narrow fix is the
-   same allowlist; the real fix is item 4b.
+4. **Close the Pretorin MCP file-operation path.** Native agent tools are now
+   limited (see [native access limits](#native-access-limits-for-effort-agents)):
+   workspace-only file tools, `exec` in allowlist mode with fixed git grants, and
+   no `gateway` or `openclaw` tool. The remaining path is gateway-side: a
+   Pretorin MCP child can read or write any local path the gateway user can,
+   through `upload_evidence`, `export_stig_checklist` and similar tools behind
+   `invoke_tool`. That includes the credential files, the PAT, the CLI binary and
+   the writable maintenance mount. OpenClaw policy cannot see these inner calls.
+   **Smallest proposed correction:** the Pretorin CLI refuses MCP file arguments
+   outside roots that the effort launcher sets (the effort workspace and its own
+   targets). That is a CLI change and needs its own reviewed proposal. A
+   separate uid or container for MCP children is the broader alternative.
+   **Required before production.**
 
 4b. **Move the synchronizer out of the agent's container.** Today the wrapper, the
    writable maintenance mount and the PAT all live in the gateway container as the
-   same uid as unsandboxed tool execution, so the read-only assessment mount is a
-   separation of purpose rather than of privilege. A sidecar with its own uid —
+   same uid as the Pretorin MCP children and plugins, so the read-only assessment
+   mount is a separation of purpose rather than of privilege. A sidecar with its own uid —
    holding the credential and the writable mount, reached over a socket that
    accepts only `all` or a declared target name — is what would make it a boundary.
    Deliberately out of scope for the internal pilot; **required before a customer

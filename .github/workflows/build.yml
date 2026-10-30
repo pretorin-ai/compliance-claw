@@ -253,6 +253,11 @@ jobs:
       - name: Per-effort credential containment (runtime behaviour)
         run: bash scripts/test-effort-credentials.sh compliance-claw:local
 
+      # Native agent limits, checked on the real handlers with a scripted model,
+      # a synthetic Pretorin API and fake keys. No network and no credentials.
+      - name: Agent file and command access (runtime behaviour)
+        run: bash scripts/test-agent-access.sh compliance-claw:local
+
       # THE INTERACTION NEITHER OF THE GATES ABOVE CAN SEE. test-file-secrets.sh
       # points bootstrap at an unreachable target, so it dies at the clone and
       # never reaches the image phase; smoke's Slack rows invoke the image with

@@ -37,6 +37,8 @@ do not name what you do not own. `plugins` appears nowhere below.
 
     OWNED, regenerated
       agents.list IDs and effort-owned fields (keyed on new OpenClaw)
+        including the native access fields: tools.fs.workspaceOnly,
+        tools.exec.mode and the access denies (see ACCESS_DENIES)
       bindings                             (array, --replace-path)
       channels.slack.channels              (map,   --replace-path)
       channels.slack.dmPolicy              derived from the direct bindings
@@ -54,6 +56,11 @@ do not name what you do not own. `plugins` appears nowhere below.
 
     PRESERVED, copied into replacement entries
       matching agents' settings, except effort-owned fields/generated denies
+
+    THE EXEC APPROVALS DOCUMENT IS NOT openclaw.json. OpenClaw keeps it in its
+    SQLite state. `approvals` below reads the live document and returns a
+    complete replacement in which only exact Claw-owned git grants change. Every
+    other default, agent setting, allowlist entry and MCP grant is copied as is.
 
 THE BINDINGS ARRAY HAS TWO OWNERS, AND THAT IS THE WHOLE DESIGN.
 
@@ -355,18 +362,293 @@ def generated_denies(agent, prefixes):
     return {"%s__*" % prefix for name, prefix in prefixes.items() if name != agent}
 
 
+# --- native access controls ------------------------------------------------
+#
+# Every effort agent gets the pinned runtime's own file and command controls.
+# They are native settings, enforced by OpenClaw for direct calls and for Tool
+# Search `tool_call`; the generated AGENTS.md only describes them.
+#
+#   tools.fs.workspaceOnly  read/write/edit/ls/apply_patch and local media paths
+#                           stay in the agent's own workspace. The targets/ view
+#                           symlinks lead out of it, so target files are read
+#                           through the git grants below, at a full commit SHA.
+#   tools.exec.mode         "allowlist": only exec approvals grants run, with no
+#                           prompt. A stricter "deny" that an administrator set
+#                           is kept.
+#   ACCESS_DENIES           `gateway` reads configuration; `openclaw` delegates
+#                           persistent configuration changes. Neither is needed
+#                           for compliance work.
+#
+# This is not a sandbox. Pretorin MCP and plugin tools run in the gateway
+# process with its file access; SECURITY.md records that remaining path.
+ACCESS_DENIES = ("gateway", "openclaw")
+EXEC_MODES_KEPT = ("allowlist", "deny")
+# Legacy exec policy fields. OpenClaw refuses a config patch that mixes them
+# with tools.exec.mode, so an agent that has them is a conflict to resolve first.
+LEGACY_EXEC_FIELDS = ("security", "ask")
+
+
+def access_conflicts(agent, entry):
+    """Administrator settings that would weaken an owned access field.
+
+    Reported before anything changes. A stricter value is not a conflict.
+    """
+    tools = entry.get("tools")
+    if tools is None:
+        return []
+    if not isinstance(tools, dict):
+        return ["agent %s: tools is not an object" % agent]
+    out = []
+    fs_cfg = tools.get("fs")
+    if fs_cfg is not None and not isinstance(fs_cfg, dict):
+        out.append("agent %s: tools.fs is not an object" % agent)
+    elif isinstance(fs_cfg, dict) and fs_cfg.get("workspaceOnly", True) is not True:
+        out.append("agent %s: tools.fs.workspaceOnly is %s. Compliance Claw owns this"
+                   " field and requires true." % (agent, json.dumps(fs_cfg["workspaceOnly"])))
+    exec_cfg = tools.get("exec")
+    if exec_cfg is not None and not isinstance(exec_cfg, dict):
+        out.append("agent %s: tools.exec is not an object" % agent)
+    elif isinstance(exec_cfg, dict):
+        mode = exec_cfg.get("mode", "allowlist")
+        if mode not in EXEC_MODES_KEPT:
+            out.append("agent %s: tools.exec.mode is %s. Compliance Claw owns this field"
+                       " and requires \"allowlist\" (or a stricter \"deny\")."
+                       % (agent, json.dumps(mode)))
+        for field in LEGACY_EXEC_FIELDS:
+            if field in exec_cfg:
+                out.append("agent %s: tools.exec.%s is set. Compliance Claw owns"
+                           " tools.exec.mode for this agent; remove tools.exec.%s."
+                           % (agent, field, field))
+    return out
+
+
+def owned_access(entry):
+    """The owned access values for an agent, keeping a stricter exec mode."""
+    mode = get_path(entry, "tools.exec.mode")
+    return {"workspaceOnly": True,
+            "execMode": mode if mode in EXEC_MODES_KEPT else "allowlist"}
+
+
 def unowned_agent_settings(entry, owned_denies):
     """Copy native settings, excluding only fields/rules this apply owns."""
     settings = copy.deepcopy({k: v for k, v in entry.items()
                               if k not in AGENT_OWNED_FIELDS})
     tools = settings.get("tools")
-    if isinstance(tools, dict) and "deny" in tools:
-        tools["deny"] = [rule for rule in tools["deny"] if rule not in owned_denies]
+    if not isinstance(tools, dict):
+        return settings
+    owned = set(owned_denies) | set(ACCESS_DENIES)
+    if "deny" in tools:
+        tools["deny"] = [rule for rule in tools["deny"] if rule not in owned]
         if not tools["deny"]:
             del tools["deny"]
-        if not tools:
-            del settings["tools"]
+    for section, field in (("fs", "workspaceOnly"), ("exec", "mode")):
+        sub = tools.get(section)
+        if isinstance(sub, dict):
+            sub.pop(field, None)
+            if not sub:
+                del tools[section]
+    if not tools:
+        del settings["tools"]
     return settings
+
+
+def apply_access(entry, access):
+    tools = entry.setdefault("tools", {})
+    tools.setdefault("fs", {})["workspaceOnly"] = access["workspaceOnly"]
+    tools.setdefault("exec", {})["mode"] = access["execMode"]
+    tools["deny"] = tools.get("deny", []) + [d for d in ACCESS_DENIES
+                                             if d not in tools.get("deny", [])]
+
+
+# --- exec approvals: the fixed git grants ----------------------------------
+#
+# The only commands an effort agent can run. Each grant is one exact argument
+# shape for /usr/bin/git in ONE of the effort's own read-only targets:
+#
+#   remote get-url origin                       repository URL
+#   rev-parse HEAD                              full commit SHA
+#   ls-tree [-r] --name-only <sha>[:<dir>]      tree listing at a full SHA
+#   show <sha>:<path>                           one blob at a full SHA
+#
+# OpenClaw matches argPattern (ECMAScript) against the parsed argv after argv[0],
+# joined with single spaces, and runs a match without a prompt. Allowlist mode
+# rejects command substitution, redirection and any segment that is not itself
+# a grant, and the host blocks GIT_* / loader environment overrides. Paths are
+# relative, use a conservative character set and contain no `.` or `..`
+# segment, so no option, other repository or maintenance path can be named.
+GIT_BIN = "/usr/bin/git"
+TARGET_ROOT = "/workspace/targets"
+GRANT_ID_PREFIX = "compliance-claw:"
+_SHA = r"[0-9a-f]{40}"
+_PATH = (r"(?:(?!\.{1,2}(?:/|$))[A-Za-z0-9._@+-]+/)*"
+         r"(?!\.{1,2}$)[A-Za-z0-9._@+-]+")
+GIT_OPERATIONS = (
+    ("url", r"remote get-url origin"),
+    ("head", r"rev-parse HEAD"),
+    ("tree", r"ls-tree (?:-r )?--name-only %s(?::%s)?" % (_SHA, _PATH)),
+    ("blob", r"show %s:%s" % (_SHA, _PATH)),
+)
+# Fields this deployment writes on a grant. OpenClaw adds usage fields such as
+# lastUsedAt and lastResolvedPath; those are never compared.
+GRANT_FIELDS = ("id", "pattern", "argPattern")
+
+
+def target_grants(agent, targets):
+    out = []
+    for target in sorted(targets):
+        # Target names are [A-Za-z0-9._-]; only `.` is special in a pattern.
+        root = "%s/%s" % (TARGET_ROOT, target.replace(".", r"\."))
+        for op, args in GIT_OPERATIONS:
+            out.append({"id": "%s%s:%s:%s" % (GRANT_ID_PREFIX, agent, target, op),
+                        "pattern": GIT_BIN,
+                        "argPattern": "^-C %s %s$" % (root, args)})
+    return out
+
+
+def _grant_key(entry):
+    return tuple(entry.get(f) for f in GRANT_FIELDS) if isinstance(entry, dict) else None
+
+
+def _approval_agents(doc):
+    agents = doc.get("agents", {}) if isinstance(doc, dict) else None
+    if not isinstance(agents, dict):
+        raise PatchError("the exec approvals document has no agents object")
+    return agents
+
+
+def build_approvals(efforts, live, previous_grants):
+    """Return (document, grants, retired) or raise PatchError on a conflict.
+
+    live:             the current approvals document (`approvals get --json`.file)
+    previous_grants:  {agent: [grant, ...]} recorded by the last successful apply
+
+    A grant is retired only when it still exactly matches what the last apply
+    recorded. An entry with a Claw grant id that matches neither that record nor
+    the new generation was changed by someone else; it is refused by name.
+    """
+    doc = copy.deepcopy(live) if live else {"version": 1, "defaults": {}, "agents": {}}
+    agents = _approval_agents(doc)
+    grants = {pe.agent_id(e["name"]): target_grants(pe.agent_id(e["name"]),
+                                                    [t["name"] for t in e["targets"]])
+              for e in efforts}
+    # Ownership is per agent: the same grant under another agent is not ours.
+    wanted = {(a, _grant_key(g)) for a, gs in grants.items() for g in gs}
+    recorded = {(a, _grant_key(g)) for a, gs in (previous_grants or {}).items() for g in gs}
+    conflicts, retired = [], []
+    for agent, settings in sorted(agents.items()):
+        allowlist = settings.get("allowlist") if isinstance(settings, dict) else None
+        if allowlist is None:
+            continue
+        if not isinstance(allowlist, list):
+            conflicts.append("approvals agent %s: allowlist is not an array" % agent)
+            continue
+        kept = []
+        for entry in allowlist:
+            key = _grant_key(entry)
+            ident = entry.get("id") if isinstance(entry, dict) else None
+            if not (isinstance(ident, str) and ident.startswith(GRANT_ID_PREFIX)):
+                kept.append(entry)
+            elif (agent, key) in wanted:
+                kept.append(entry)
+            elif (agent, key) in recorded:
+                retired.append({f: entry.get(f) for f in GRANT_FIELDS})
+            else:
+                conflicts.append(
+                    "approvals agent %s: allowlist entry %s uses a Compliance Claw"
+                    " grant id but is not a grant this deployment recorded or"
+                    " generates. Remove or rename it with `openclaw approvals`"
+                    " before apply." % (agent, ident))
+                kept.append(entry)
+        settings["allowlist"] = kept
+    if conflicts:
+        raise PatchError("the live exec approvals have %d problem(s) this apply will"
+                         " not silently fix:\n%s"
+                         % (len(conflicts), "\n".join("  - " + c for c in conflicts)))
+    for agent, generated in sorted(grants.items()):
+        settings = agents.setdefault(agent, {})
+        if not isinstance(settings, dict):
+            raise PatchError("approvals agent %s is not an object" % agent)
+        allowlist = settings.setdefault("allowlist", [])
+        present = {_grant_key(e) for e in allowlist}
+        allowlist.extend(copy.deepcopy(g) for g in generated if _grant_key(g) not in present)
+    for agent in list(agents):
+        if agents[agent] == {"allowlist": []}:
+            del agents[agent]
+    return doc, grants, retired
+
+
+def approvals_document(path):
+    """The document inside an `openclaw approvals get --json` reply, or None."""
+    blob = _load_json_or_none(path)
+    if blob is None:
+        return None
+    doc = blob.get("file", blob) if isinstance(blob, dict) else None
+    if not isinstance(doc, dict):
+        raise PatchError("%s is not an exec approvals reply" % path)
+    return doc
+
+
+def _without_usage(doc, drop=()):
+    """The document without OpenClaw's own fields and the given grant keys.
+
+    OpenClaw writes `socket` (its approval socket) and the usage fields of an
+    entry (lastUsedAt, lastResolvedPath, ...) itself; neither is owned here.
+    """
+    out = copy.deepcopy(doc or {"version": 1, "defaults": {}, "agents": {}})
+    out.pop("socket", None)
+    for agent, settings in list((out.get("agents") or {}).items()):
+        if not isinstance(settings, dict) or not isinstance(settings.get("allowlist"), list):
+            continue
+        settings["allowlist"] = [
+            {k: v for k, v in e.items() if k in GRANT_FIELDS or not k.startswith("last")}
+            if isinstance(e, dict) else e
+            for e in settings["allowlist"] if _grant_key(e) not in drop]
+        if settings == {"allowlist": []}:
+            del out["agents"][agent]
+    out.setdefault("defaults", {})
+    out.setdefault("agents", {})
+    return out
+
+
+def verify_approvals(live_reply, snapshot_doc, manifest):
+    """Owned grants landed, retired grants left, everything else unchanged."""
+    blob = _load_json_or_none(live_reply)
+    if not isinstance(blob, dict) or not isinstance(blob.get("file"), dict):
+        return ["the exec approvals could not be read from the gateway (%s)" % live_reply]
+    live = blob["file"]
+    problems = []
+    grants = manifest.get("approvalGrants", {})
+    owned = {_grant_key(g) for gs in grants.values() for g in gs}
+    retired = {_grant_key(g) for g in manifest.get("retiredGrants", [])}
+    for agent, generated in sorted(grants.items()):
+        present = {_grant_key(e) for e in
+                   (get_path(live, "agents.%s.allowlist" % agent) or [])}
+        missing = [g["id"] for g in generated if _grant_key(g) not in present]
+        if missing:
+            problems.append("exec approvals for agent %s are missing %r" % (agent, missing))
+    for agent, settings in (live.get("agents") or {}).items():
+        for entry in (settings or {}).get("allowlist") or []:
+            if _grant_key(entry) in retired:
+                problems.append("exec approvals for agent %s still hold retired grant %s"
+                                % (agent, entry.get("id")))
+    if snapshot_doc is not None:
+        before = _without_usage(snapshot_doc, owned | retired)
+        after = _without_usage(live, owned | retired)
+        if before != after:
+            problems.append("exec approvals this deployment does not own changed:\n"
+                            "      before: %s\n      after:  %s"
+                            % (json.dumps(before, sort_keys=True)[:600],
+                               json.dumps(after, sort_keys=True)[:600]))
+    # OpenClaw's own merged answer: config intersected with the host document.
+    effective = {}
+    for scope in get_path(blob, "effectivePolicy.scopes") or []:
+        if isinstance(scope, dict) and scope.get("agentId"):
+            effective[scope["agentId"]] = get_path(scope, "security.effective")
+    for agent in grants:
+        if effective.get(agent) not in EXEC_MODES_KEPT:
+            problems.append("the effective exec security of agent %s is %r, expected"
+                            " allowlist or deny" % (agent, effective.get(agent)))
+    return problems
 
 
 # --- binding classification ------------------------------------------------
@@ -585,6 +867,14 @@ def build_patch(efforts, config, dm_bindings, last_applied=None):
                          for name in previous.get("efforts", {})}
     previous_prefixes.update(previous.get("toolPrefixes", {}))
     existing = agent_entries(config)
+    conflicts = [c for e in efforts
+                 for c in access_conflicts(pe.agent_id(e["name"]),
+                                           existing.get(pe.agent_id(e["name"]), {}))]
+    if conflicts:
+        raise PatchError(
+            "the live OpenClaw configuration weakens %d owned access field(s); this"
+            " apply will not overwrite an administrator setting silently:\n%s"
+            % (len(conflicts), "\n".join("  - " + c for c in conflicts)))
 
     for index, effort in enumerate(efforts):
         name = effort["name"]
@@ -604,6 +894,7 @@ def build_patch(efforts, config, dm_bindings, last_applied=None):
         if deny:
             tools = entry.setdefault("tools", {})
             tools["deny"] = tools.get("deny", []) + deny
+        apply_access(entry, owned_access(existing.get(agent, {})))
         agents.append(entry)
 
         if "slack_channel_id" in effort:
@@ -705,6 +996,13 @@ def build_patch(efforts, config, dm_bindings, last_applied=None):
         "fleetFingerprint": fleet_fingerprint(efforts),
         "preservedPaths": list(PRESERVED_PATHS),
         "replacePaths": resolve_replace_paths(patch),
+        # Native access. The values each agent must carry after apply, and the
+        # exec approvals grants generated for its own targets.
+        "access": {a["id"]: {"workspaceOnly": a["tools"]["fs"]["workspaceOnly"],
+                             "execMode": a["tools"]["exec"]["mode"]} for a in agents},
+        "accessDenies": list(ACCESS_DENIES),
+        "approvalGrants": {pe.agent_id(e["name"]): target_grants(
+            pe.agent_id(e["name"]), [t["name"] for t in e["targets"]]) for e in efforts},
     }
     return patch, manifest
 
@@ -804,7 +1102,24 @@ def cmd_generate(args):
 
     patch, manifest = build_patch(efforts, config, preserved, state)
 
+    # The approvals half. With the live document (apply), the complete
+    # replacement document; without it (offline plan), the recorded grants that
+    # no longer generate, so plan can still show what would retire.
+    previous_grants = state.get("approvalGrants") or {}
+    approvals = None
+    if args.approvals:
+        live = approvals_document(args.approvals)
+        approvals, _, retired = build_approvals(efforts, live, previous_grants)
+    else:
+        wanted = {_grant_key(g) for gs in manifest["approvalGrants"].values() for g in gs}
+        retired = [g for gs in previous_grants.values() for g in gs
+                   if _grant_key(g) not in wanted]
+    manifest["retiredGrants"] = retired
+
     os.makedirs(args.out_dir, exist_ok=True)
+    if approvals is not None:
+        _write_atomic(os.path.join(args.out_dir, "approvals.json"),
+                      json.dumps(approvals, indent=2, sort_keys=True) + "\n")
     patch_path = os.path.join(args.out_dir, "patch.json")
     manifest_path = os.path.join(args.out_dir, "manifest.json")
     replace_path = os.path.join(args.out_dir, "replace-paths.txt")
@@ -884,6 +1199,21 @@ def cmd_verify(args):
                                  if before.get(k) != after.get(k))
                 problems.append("agent %s native settings changed: %s"
                                 % (agent, ", ".join(changed)))
+
+    # NATIVE ACCESS. The owned fields are on each agent, as generated.
+    for agent, want in sorted((manifest.get("access") or {}).items()):
+        entry = entries.get(agent, {})
+        if get_path(entry, "tools.fs.workspaceOnly") is not want["workspaceOnly"]:
+            problems.append("agent %s: tools.fs.workspaceOnly is %r, expected %r"
+                            % (agent, get_path(entry, "tools.fs.workspaceOnly"),
+                               want["workspaceOnly"]))
+        if get_path(entry, "tools.exec.mode") != want["execMode"]:
+            problems.append("agent %s: tools.exec.mode is %r, expected %r"
+                            % (agent, get_path(entry, "tools.exec.mode"), want["execMode"]))
+        missing = [d for d in manifest.get("accessDenies", [])
+                   if d not in (get_path(entry, "tools.deny") or [])]
+        if missing:
+            problems.append("agent %s is missing access denies %r" % (agent, missing))
 
     # MCP SERVERS, CHECKED THREE WAYS — and deliberately NOT as an equality on the
     # whole key set. This deployment owns the `pretorin-<effort>` entries and
@@ -974,6 +1304,10 @@ def cmd_verify(args):
         problems.extend(_verify_live_agents(args.agents_json, manifest))
     if args.mcp_json:
         problems.extend(_verify_live_mcp(args.mcp_json, manifest))
+    if args.approvals_json:
+        before_doc = (approvals_document(args.approvals_snapshot)
+                      if args.approvals_snapshot else None)
+        problems.extend(verify_approvals(args.approvals_json, before_doc, manifest))
 
     if problems:
         sys.stderr.write("openclaw-patch: verification FAILED\n")
@@ -1018,6 +1352,20 @@ def cmd_verify_rollback(args):
                              % (key,
                                 json.dumps(b, sort_keys=True)[:400],
                                 json.dumps(a, sort_keys=True)[:400]))
+    return 1
+
+
+def cmd_verify_approvals_rollback(args):
+    """Is the approvals document back? Usage fields are OpenClaw's own."""
+    after = _without_usage(approvals_document(args.approvals_json))
+    before = _without_usage(approvals_document(args.approvals_snapshot))
+    if after == before:
+        sys.stderr.write("openclaw-patch: approvals rollback verified\n")
+        return 0
+    sys.stderr.write("openclaw-patch: APPROVALS ROLLBACK VERIFICATION FAILED\n"
+                     "      before: %s\n      after:  %s\n"
+                     % (json.dumps(before, sort_keys=True)[:600],
+                        json.dumps(after, sort_keys=True)[:600]))
     return 1
 
 
@@ -1257,9 +1605,9 @@ def self_test():
 
     # THE ISOLATION ASSERTION: each agent denies the OTHER effort's tools by
     # prefix, and never its own.
-    check(agents[0]["tools"]["deny"] == ["pretorin-crm-hipaa__*"],
+    check(agents[0]["tools"]["deny"] == ["pretorin-crm-hipaa__*"] + list(ACCESS_DENIES),
           "agent A denies exactly agent B's MCP tool prefix")
-    check(agents[1]["tools"]["deny"] == ["pretorin-crm-soc2__*"],
+    check(agents[1]["tools"]["deny"] == ["pretorin-crm-soc2__*"] + list(ACCESS_DENIES),
           "agent B denies exactly agent A's MCP tool prefix")
 
     # Saved native settings belong to the matching declared agent, not its
@@ -1291,7 +1639,8 @@ def self_test():
           "saved model, name, identity and other native settings survive generation")
     check(retained.get("tools", {}).get("allow") == ["read"] and
           retained.get("tools", {}).get("fs") == {"workspaceOnly": True} and
-          set(retained.get("tools", {}).get("deny", [])) == set(saved_entry["tools"]["deny"]),
+          set(retained.get("tools", {}).get("deny", [])) ==
+          set(saved_entry["tools"]["deny"]) | set(ACCESS_DENIES),
           "native tools and administrator denies survive with the required deny")
     check(retained["workspace"] == workspace_dir("crm-soc2") and
           retained["agentDir"] == agent_dir("crm-soc2") and
@@ -1552,7 +1901,8 @@ def self_test():
     remaining = shrunk_saved["agents"]["list"][0]
     check(remaining.get("name") == "Saved fixture" and
           remaining.get("tools", {}).get("deny") ==
-          ["browser", "pretorin-unrecorded__*", "pretorin-crm-hipaa__get_control"],
+          ["browser", "pretorin-unrecorded__*", "pretorin-crm-hipaa__get_control"]
+          + list(ACCESS_DENIES),
           "effort removal retires only the recorded generated deny")
     no_record = json.loads(json.dumps(removed_saved))
     no_record["bindings"] = [patch["bindings"][0]]
@@ -1584,7 +1934,8 @@ def self_test():
             json.dump(snap, open(sf, "w"))
         args = argparse.Namespace(manifest=mf, config=cf,
                                   snapshot=sf if snap is not None else "",
-                                  agents_json="", mcp_json="")
+                                  agents_json="", mcp_json="",
+                                  approvals_json="", approvals_snapshot="")
         import io, contextlib
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -1773,6 +2124,95 @@ def self_test():
     check("credential_ref" not in json.dumps(patch),
           "the patch itself never mentions a credential at all")
 
+    # --- native access fields ------------------------------------------------
+    for a in patch["agents"]["list"]:
+        check(a["tools"]["fs"] == {"workspaceOnly": True}
+              and a["tools"]["exec"] == {"mode": "allowlist"}
+              and set(ACCESS_DENIES) <= set(a["tools"]["deny"]),
+              "agent %s carries workspaceOnly, exec allowlist and the access denies" % a["id"])
+    strict = {"agents": {"list": [{"id": "crm-soc2", "tools": {
+        "exec": {"mode": "deny", "timeoutSeconds": 60}, "fs": {"workspaceOnly": True},
+        "deny": ["browser"]}}]}}
+    kept = _gen(TWO_EFFORTS, strict)[0]["agents"]["list"][0]["tools"]
+    check(kept["exec"] == {"mode": "deny", "timeoutSeconds": 60}
+          and kept["deny"][0] == "browser",
+          "a stricter exec mode and other native exec settings survive")
+    for field, value, expected in (("fs", {"workspaceOnly": False}, "tools.fs.workspaceOnly is false"),
+                                   ("exec", {"mode": "full"}, 'tools.exec.mode is "full"'),
+                                   ("exec", {"security": "full", "ask": "off"}, "tools.exec.security is set")):
+        weak = {"agents": {"list": [{"id": "crm-hipaa", "tools": {field: value}}]}}
+        refuses("a weaker %s setting is an exact owned-field conflict" % field,
+                lambda weak=weak: _gen(TWO_EFFORTS, weak), expected)
+
+    # --- exec approvals grants -----------------------------------------------
+    efforts = _efforts_from(TWO_EFFORTS)
+    admin = {"pattern": "/usr/bin/rg", "lastUsedAt": 5}
+    live = {"version": 1, "socket": {"path": "/x.sock"}, "defaults": {"security": "allowlist"},
+            "agents": {"crm-soc2": {"ask": "on-miss", "allowlist": [admin]},
+                       "other": {"allowlist": [{"pattern": "/bin/date"}], "mcpTools": [{"server": "s"}]}}}
+    doc, grants, retired = build_approvals(efforts, live, {})
+    soc2 = doc["agents"]["crm-soc2"]
+    check(soc2["allowlist"][0] == admin and soc2["ask"] == "on-miss"
+          and doc["agents"]["other"] == live["agents"]["other"]
+          and doc["socket"] == live["socket"] and doc["defaults"] == live["defaults"],
+          "approvals: administrator defaults, agents, entries and MCP grants are copied as is")
+    check(len(grants["crm-soc2"]) == 4 and len(grants["crm-hipaa"]) == 8 and not retired,
+          "approvals: four fixed git grants per declared target, per agent")
+    check(build_approvals(efforts, doc, grants)[0] == doc,
+          "approvals: an unchanged second generation is identical (idempotent)")
+    gone = target_grants("crm-soc2", ["gone"])[0]
+    doc["agents"]["crm-soc2"]["allowlist"].append(dict(gone, lastUsedAt=9))
+    recorded = dict(grants, **{"crm-soc2": grants["crm-soc2"] + [gone]})
+    after, _, retired = build_approvals(efforts, doc, recorded)
+    check(gone["id"] not in json.dumps(after) and retired == [gone]
+          and admin in after["agents"]["crm-soc2"]["allowlist"],
+          "approvals: a removed target loses only its exact recorded grant")
+    changed = json.loads(json.dumps(doc))
+    changed["agents"]["crm-soc2"]["allowlist"][-1]["argPattern"] = "^.*$"
+    refuses("approvals: an altered Claw grant is refused, not retired or kept silently",
+            lambda: build_approvals(efforts, changed, recorded), gone["id"])
+    moved = json.loads(json.dumps(after))
+    moved["agents"]["other"]["allowlist"].append(grants["crm-soc2"][0])
+    refuses("approvals: a Claw grant under another agent is refused",
+            lambda: build_approvals(efforts, moved, grants), grants["crm-soc2"][0]["id"])
+    js = re.compile
+    blob = [js(g["argPattern"]) for g in grants["crm-hipaa"]]
+    sha = "0" * 40
+    good = ["-C /workspace/targets/shared rev-parse HEAD",
+            "-C /workspace/targets/extra show %s:docs/a.md" % sha]
+    bad = ["-C /workspace/targets/shared show HEAD:a", "-C /workspace/targets/shared show %s:../a" % sha,
+           "-C /workspace/targets/shared rev-parse HEAD --git-dir=/x",
+           "-C /var/lib/compliance-claw/targets/shared rev-parse HEAD"]
+    check(all(any(r.search(a) for r in blob) for a in good)
+          and not any(r.search(a) for r in blob for a in bad),
+          "approvals: grants match only fixed shapes in the agent's own targets")
+
+    # --- approvals verification ----------------------------------------------
+    import tempfile
+    d = tempfile.mkdtemp()
+    manifest = {"approvalGrants": grants, "retiredGrants": [gone]}
+    def reply(document, security="allowlist"):
+        path = os.path.join(d, "r.json")
+        json.dump({"file": document, "effectivePolicy": {"scopes": [
+            {"agentId": a, "security": {"effective": security}} for a in grants]}}, open(path, "w"))
+        return path
+    landed = json.loads(json.dumps(after))
+    landed["socket"] = {"path": "/other.sock"}
+    landed["agents"]["crm-soc2"]["allowlist"][0]["lastUsedAt"] = 77
+    check(verify_approvals(reply(landed), live, manifest) == [],
+          "approvals verify: passes despite OpenClaw socket and usage-field changes")
+    lost = json.loads(json.dumps(landed))
+    lost["agents"]["other"]["allowlist"] = []
+    check(any("does not own changed" in p for p in verify_approvals(reply(lost), live, manifest)),
+          "approvals verify: a lost administrator entry fails verification")
+    missing = json.loads(json.dumps(landed))
+    missing["agents"]["crm-hipaa"]["allowlist"].pop()
+    check(any("missing" in p for p in verify_approvals(reply(missing), live, manifest)),
+          "approvals verify: a missing owned grant fails verification")
+    check(any("effective exec security" in p
+              for p in verify_approvals(reply(landed, "full"), live, manifest)),
+          "approvals verify: effective full exec security fails verification")
+
     print("")
     print("openclaw-patch self-test: %d case(s) failed" % failures if failures
           else "openclaw-patch self-test: all cases pass")
@@ -1793,6 +2233,8 @@ def main(argv):
     gen.add_argument("--out-dir", required=True)
     gen.add_argument("--dm-add", default="")
     gen.add_argument("--dm-remove", default="")
+    gen.add_argument("--approvals", default="",
+                     help="live `openclaw approvals get --json` reply")
 
     fp = sub.add_parser("fingerprint")
     fp.add_argument("--efforts", required=True)
@@ -1807,6 +2249,14 @@ def main(argv):
     ver.add_argument("--snapshot", default="")
     ver.add_argument("--agents-json", default="")
     ver.add_argument("--mcp-json", default="")
+    ver.add_argument("--approvals-json", default="",
+                     help="`openclaw approvals get --json` reply after apply")
+    ver.add_argument("--approvals-snapshot", default="",
+                     help="the approvals reply captured before apply")
+
+    rba = sub.add_parser("verify-approvals-rollback")
+    rba.add_argument("--approvals-json", required=True)
+    rba.add_argument("--approvals-snapshot", required=True)
 
     args = parser.parse_args(argv[1:])
     if args.self_test:
@@ -1822,6 +2272,8 @@ def main(argv):
             return 0
         if args.mode == "verify-rollback":
             return cmd_verify_rollback(args)
+        if args.mode == "verify-approvals-rollback":
+            return cmd_verify_approvals_rollback(args)
         return cmd_verify(args)
     except PatchError as exc:
         sys.stderr.write("openclaw-patch: ERROR — %s\n" % exc)

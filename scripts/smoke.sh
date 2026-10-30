@@ -706,8 +706,11 @@ has "  it requires target selection" "state which target" "$AG"
 has "  it requires evidence provenance" "commit SHA" "$AG"
 has "  it pins the effort identity" "@EFFORT@" "$AG"
 has "  it refuses conversational context switching" "cannot" "$AG"
-has "  it redirects to the right channel via the mounted efforts.yaml" \
-    "/etc/compliance-claw/efforts.yaml" "$AG"
+# The agent cannot read efforts.yaml (its file tools stay in its workspace), so
+# clawctl renders the other efforts and their channels into the file.
+has "  it redirects to the right channel via the rendered effort list" \
+    "@OTHER_EFFORTS@" "$AG"
+has "  it states the native file and command limits" "What your tools can reach" "$AG"
 # THE HONESTY CLAUSE. An agent that described its own routing as a security
 # guarantee would be wrong, and the instructions say so explicitly.
 has "  it never claims prompt routing is a security boundary" \

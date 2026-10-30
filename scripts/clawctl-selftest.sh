@@ -145,6 +145,46 @@ json.dump(cfg, open(os.environ["CC_CFG"], "w"), indent=2, sort_keys=True)
     exit 0 ;;
 esac
 
+# THE EXEC APPROVALS DOCUMENT, standing in for OpenClaw's SQLite row. \`set\`
+# replaces the whole document from stdin, so it is handled before the drain.
+# \`get\` returns the document plus the effective agent policy OpenClaw derives
+# from tools.exec.mode, which is what verify reads.
+#   STUB_OC_FAIL=approvals        the forward set fails (restore still works)
+#   STUB_OC_FAIL=approvalsverify  the grants do not appear after apply
+STUB_OC_APPROVALS="\${STUB_OC_CONFIG:+\${STUB_OC_CONFIG}.approvals}"
+case " \$* " in
+  *" openclaw approvals set --stdin "*)
+    _doc="\$(cat)"
+    case "\$_doc" in
+      *compliance-claw:*) [ "\${STUB_OC_FAIL:-}" = approvals ] && exit 1 ;;
+    esac
+    [ -n "\$STUB_OC_APPROVALS" ] && printf '%s' "\$_doc" > "\$STUB_OC_APPROVALS"
+    exit 0 ;;
+  *" openclaw approvals get --json "*)
+    CC_APPR="\$STUB_OC_APPROVALS" CC_CFG="\${STUB_OC_CONFIG:-}" python3 -c '
+import json, os
+doc = {"version": 1, "defaults": {}, "agents": {}}
+path = os.environ["CC_APPR"]
+if path and os.path.exists(path):
+    doc = json.load(open(path))
+if os.environ.get("STUB_OC_FAIL") == "approvalsverify":
+    for agent in doc.get("agents", {}).values():
+        agent["allowlist"] = [e for e in agent.get("allowlist", [])
+                              if not str(e.get("id", "")).startswith("compliance-claw:")]
+scopes = []
+try:
+    cfg = json.load(open(os.environ["CC_CFG"]))
+except Exception:
+    cfg = {}
+roster = cfg.get("agents", {})
+entries = roster.get("list", [{"id": k, **v} for k, v in roster.get("entries", {}).items()])
+for entry in entries:
+    mode = entry.get("tools", {}).get("exec", {}).get("mode", "full")
+    scopes.append({"agentId": entry["id"], "security": {"effective": mode}})
+print(json.dumps({"file": doc, "hash": "stub", "effectivePolicy": {"scopes": scopes}}))'
+    exit 0 ;;
+esac
+
 
 # Only \`compose run\` attaches stdin, and only when stdin is not a terminal —
 # draining unconditionally hangs forever against a tty. \`logs\`, \`inspect\` and
@@ -1110,8 +1150,8 @@ $1" 2>/dev/null; }
 
   # THE ISOLATION ASSERTION. Each agent denies the other's MCP tool prefix and
   # never its own — a deny naming its own prefix would silence the agent.
-  if [ "$(q "print(cfg['agents']['list'][0]['tools']['deny'])")" = "['pretorin-crm-hipaa__*']" ] \
-     && [ "$(q "print(cfg['agents']['list'][1]['tools']['deny'])")" = "['pretorin-crm-soc2__*']" ]; then
+  if [ "$(q "print(cfg['agents']['list'][0]['tools']['deny'])")" = "['pretorin-crm-hipaa__*', 'gateway', 'openclaw']" ] \
+     && [ "$(q "print(cfg['agents']['list'][1]['tools']['deny'])")" = "['pretorin-crm-soc2__*', 'gateway', 'openclaw']" ]; then
     st_ok "each agent denies the OTHER effort's MCP tool prefix, and only that"
   else
     st_bad "per-agent tool policy" "$(q "print([a.get('tools') for a in cfg['agents']['list']])")"
@@ -1206,9 +1246,10 @@ print(ch == bd == ['C0HIPAABB','C0SOC2AAA'])")" = "True" ]; then
   else
     st_bad "a managed workspace per effort" "no AGENTS.md under ${tmp}/ocstate"
   fi
-  if grep -q "crm-soc2" "${WSA}/AGENTS.md" 2>/dev/null \
-     && ! grep -q "crm-hipaa" "${WSA}/AGENTS.md" 2>/dev/null; then
-    st_ok "  and each names ONLY its own effort"
+  # The other effort appears only in the routing list, never as this agent's own.
+  if grep -q 'agent for the \*\*crm-soc2\*\* effort' "${WSA}/AGENTS.md" 2>/dev/null \
+     && [ "$(grep "crm-hipaa" "${WSA}/AGENTS.md" 2>/dev/null)" = '- `crm-hipaa` — channel `C0HIPAABB`' ]; then
+    st_ok "  and each names ONLY its own effort, listing the other for routing"
   else
     st_bad "  and each names only its own effort" "$(head -20 "${WSA}/AGENTS.md" 2>/dev/null)"
   fi
@@ -1230,7 +1271,7 @@ print(ch == bd == ['C0HIPAABB','C0SOC2AAA'])")" = "True" ]; then
   else
     st_bad "  and each points at the one shared clone" "$(readlink "${WSA}/targets/simple-crm")"
   fi
-  if grep -q "NOT A SANDBOX" "${WSA}/targets/README.md" 2>/dev/null; then
+  if grep -q "This is not a sandbox" "${WSA}/targets/README.md" 2>/dev/null; then
     st_ok "  and the view says plainly that it is not a boundary"
   else
     st_bad "  and the view says plainly that it is not a boundary"
@@ -1343,6 +1384,162 @@ print(state.get("agentOwnership") == "explicit" and len(state.get("ambientBindin
     st_bad "candidate rollback restores the migrated configuration"
   fi
   cp "${tmp}/oc-legacy.json" "$OC"
+
+  # ------------------------------------------- 7b. native access and grants
+  st_head "7b. native access fields and exec approvals grants"
+  local AP="${OC}.approvals" ST="${tmp}/state/last-applied.json"
+  st_fleet_apply || true
+  if [ "$(q "
+ok = all(a['tools']['fs']['workspaceOnly'] is True and a['tools']['exec']['mode'] == 'allowlist'
+         and {'gateway', 'openclaw'} <= set(a['tools']['deny']) for a in cfg['agents']['list'])
+print(ok)")" = "True" ]; then
+    st_ok "each agent carries workspaceOnly, exec allowlist mode and the access denies"
+  else
+    st_bad "each agent carries the native access fields" "$(q "print([a.get('tools') for a in cfg['agents']['list']])")"
+  fi
+  # Each argPattern is compiled here with Python's engine as a stand-in for the
+  # ECMAScript one. The runtime check proves the real matcher.
+  if python3 - "$AP" "$ST" <<'PYGRANTS'
+import json, re, sys
+doc, state = [json.load(open(p)) for p in sys.argv[1:]]
+sha = "0123456789abcdef0123456789abcdef01234567"
+for agent in ("crm-soc2", "crm-hipaa"):
+    grants = [e for e in doc["agents"][agent]["allowlist"] if e["id"].startswith("compliance-claw:")]
+    assert len(grants) == 8 and all(e["pattern"] == "/usr/bin/git" for e in grants), grants
+    assert state["approvalGrants"][agent] == grants
+    rx = [re.compile(e["argPattern"]) for e in grants]
+    allowed = lambda args: any(r.search(args) for r in rx)
+    root = "-C /workspace/targets/simple-crm "
+    for args in ("remote get-url origin", "rev-parse HEAD", "ls-tree -r --name-only " + sha,
+                 "ls-tree --name-only %s:src/app" % sha, "show %s:.github/ci.yml" % sha):
+        assert allowed(root + args), args
+    for args in ("show HEAD:README.md", "show %s:../x" % sha, "show %s:a/../../x" % sha,
+                 "show %s:README.md --output=/tmp/x" % sha, "-c core.pager=id rev-parse HEAD",
+                 "show %s:/etc/passwd" % sha, "rev-parse HEAD; id", "show %s:a b" % sha):
+        assert not allowed(root + args), args
+    assert not allowed("-C /workspace/targets/simple-crmx rev-parse HEAD")
+    assert not allowed("-C /var/lib/compliance-claw/targets/simple-crm rev-parse HEAD")
+PYGRANTS
+  then st_ok "fixed git grants: own targets, full SHA, no option, escape or composition"
+  else st_bad "fixed git grants are exact and recorded"; fi
+
+  # Administrator grants and settings survive; only exact recorded grants retire.
+  python3 - "$AP" "$ST" <<'PYSEED'
+import json, sys
+ap, st = sys.argv[1:]
+doc, state = json.load(open(ap)), json.load(open(st))
+gone = {"id": "compliance-claw:crm-soc2:gone:url", "pattern": "/usr/bin/git",
+        "argPattern": "^-C /workspace/targets/gone remote get-url origin$"}
+agent = doc["agents"]["crm-soc2"]
+agent["security"] = "allowlist"
+agent["allowlist"] += [{"id": "admin-rg", "pattern": "/usr/bin/rg"}, dict(gone, lastUsedAt=1)]
+doc["agents"]["admin-agent"] = {"allowlist": [{"pattern": "/usr/bin/uptime"}]}
+state["approvalGrants"]["crm-soc2"].append(gone)
+json.dump(doc, open(ap, "w")); json.dump(state, open(st, "w"))
+PYSEED
+  if st_fleet_apply && python3 - "$AP" <<'PYKEPT'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+ids = [e.get("id") for e in doc["agents"]["crm-soc2"]["allowlist"]]
+assert "admin-rg" in ids and "compliance-claw:crm-soc2:gone:url" not in ids, ids
+assert doc["agents"]["crm-soc2"]["security"] == "allowlist"
+assert doc["agents"]["admin-agent"] == {"allowlist": [{"pattern": "/usr/bin/uptime"}]}
+PYKEPT
+  then st_ok "administrator grants survive; a removed target loses only its exact owned grant"
+  else st_bad "administrator grants survive and owned grants retire" "$(tail -8 "$fleetlog")"; fi
+
+  # A changed owned grant, or a weaker owned field, is refused before mutation.
+  local appr_before
+  sig_before="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  python3 - "$AP" <<'PYCHANGED'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+doc["agents"]["crm-soc2"]["allowlist"].append({"id": "compliance-claw:crm-soc2:simple-crm:shell",
+    "pattern": "/bin/sh"})
+json.dump(doc, open(sys.argv[1], "w"))
+PYCHANGED
+  appr_before="$(cat "$AP")"
+  if st_fleet_apply; then
+    st_bad "a changed Compliance Claw grant is refused" "apply exited zero"
+  elif grep -q 'compliance-claw:crm-soc2:simple-crm:shell' "$fleetlog" \
+       && [ "$appr_before" = "$(cat "$AP")" ] \
+       && [ "$sig_before" = "$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")" ]; then
+    st_ok "an unrecorded entry with a Claw grant id is refused by name before mutation"
+  else
+    st_bad "an unrecorded Claw grant id is refused before mutation" "$(tail -8 "$fleetlog")"
+  fi
+  python3 - "$AP" <<'PYUNCHANGED'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+doc["agents"]["crm-soc2"]["allowlist"].pop()
+json.dump(doc, open(sys.argv[1], "w"))
+PYUNCHANGED
+  CC_OC="$OC" python3 -c '
+import json, os
+cfg = json.load(open(os.environ["CC_OC"]))
+cfg["agents"]["list"][0]["tools"]["exec"]["mode"] = "full"
+json.dump(cfg, open(os.environ["CC_OC"], "w"))'
+  sig_before="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+  appr_before="$(cat "$AP")"
+  if st_fleet_apply; then
+    st_bad "a weaker administrator exec mode is refused" "apply exited zero"
+  elif grep -q 'tools.exec.mode is "full"' "$fleetlog" \
+       && [ "$appr_before" = "$(cat "$AP")" ] \
+       && [ "$sig_before" = "$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")" ]; then
+    st_ok "a weaker administrator exec mode is an exact owned-field conflict before mutation"
+  else
+    st_bad "a weaker exec mode is refused before mutation" "$(tail -8 "$fleetlog")"
+  fi
+  CC_OC="$OC" python3 -c '
+import json, os
+cfg = json.load(open(os.environ["CC_OC"]))
+cfg["agents"]["list"][0]["tools"]["exec"]["mode"] = "deny"
+json.dump(cfg, open(os.environ["CC_OC"], "w"))'
+  if st_fleet_apply && [ "$(q "print(cfg['agents']['list'][0]['tools']['exec']['mode'])")" = deny ]; then
+    st_ok "a stricter administrator exec mode survives apply"
+  else
+    st_bad "a stricter administrator exec mode survives apply" "$(tail -8 "$fleetlog")"
+  fi
+
+  # Injected failures restore configuration and approvals together.
+  local failure
+  for failure in approvals approvalsverify; do
+    sig_before="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+    appr_before="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True))' "$AP")"
+    python3 - "$ST" <<'PYNEW'
+import json, sys
+state = json.load(open(sys.argv[1]))
+state["approvalGrants"] = {}
+json.dump(state, open(sys.argv[1], "w"))
+PYNEW
+    CC_OC="$OC" python3 -c '
+import json, os
+cfg = json.load(open(os.environ["CC_OC"]))
+cfg["agents"]["list"][0]["tools"]["exec"]["mode"] = "allowlist"
+json.dump(cfg, open(os.environ["CC_OC"], "w"))'
+    python3 - "$AP" <<'PYEMPTY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for agent in doc["agents"].values():
+    agent["allowlist"] = [e for e in agent.get("allowlist", [])
+                          if not str(e.get("id", "")).startswith("compliance-claw:")]
+json.dump(doc, open(sys.argv[1], "w"))
+PYEMPTY
+    sig_before="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+    appr_before="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True))' "$AP")"
+    if st_fleet_apply "$failure"; then
+      st_bad "$failure failure fails apply" "apply exited zero"
+    elif [ "$sig_before" = "$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")" ] \
+         && [ "$appr_before" = "$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True))' "$AP")" ] \
+         && ! grep -q 'could NOT be restored' "$fleetlog"; then
+      st_ok "$failure failure restores configuration and approvals together"
+    else
+      st_bad "$failure failure restores configuration and approvals together" "$(tail -10 "$fleetlog")"
+    fi
+  done
+  st_fleet_apply || st_bad "apply recovers after the injected approvals failures" "$(tail -8 "$fleetlog")"
+  cp "${tmp}/oc-legacy.json" "$OC"
+  st_fleet_apply || true
 
   # ------------------------------------------------- 8. DMs, and refusals
   st_head "8. Slack DMs"
