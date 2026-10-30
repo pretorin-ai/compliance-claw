@@ -463,7 +463,8 @@ def apply_access(entry, access):
 # --- exec approvals: the fixed git grants ----------------------------------
 #
 # The only commands an effort agent can run. Each grant is one exact argument
-# shape for /usr/bin/git in ONE of the effort's own read-only targets:
+# shape for /usr/bin/git in ONE of the effort's own read-only targets, written
+# `git -c safe.directory=<target> -C <target> <operation>`:
 #
 #   remote get-url origin                       repository URL
 #   rev-parse HEAD                              full commit SHA
@@ -476,6 +477,11 @@ def apply_access(entry, access):
 # a grant, and the host blocks GIT_* / loader environment overrides. Paths are
 # relative, use a conservative character set and contain no `.` or `..`
 # segment, so no option, other repository or maintenance path can be named.
+#
+# safe.directory names that one target. The clone is owned by the host user,
+# which on a Linux VM is often not the container uid, and git then refuses it as
+# "dubious ownership". scripts/sync-targets.sh passes the same one-shot setting
+# for its own path. The grant allows no other -c value.
 GIT_BIN = "/usr/bin/git"
 TARGET_ROOT = "/workspace/targets"
 GRANT_ID_PREFIX = "compliance-claw:"
@@ -501,7 +507,8 @@ def target_grants(agent, targets):
         for op, args in GIT_OPERATIONS:
             out.append({"id": "%s%s:%s:%s" % (GRANT_ID_PREFIX, agent, target, op),
                         "pattern": GIT_BIN,
-                        "argPattern": "^-C %s %s$" % (root, args)})
+                        "argPattern": "^-c safe\\.directory=%s -C %s %s$"
+                                      % (root, root, args)})
     return out
 
 
@@ -2178,11 +2185,16 @@ def self_test():
     js = re.compile
     blob = [js(g["argPattern"]) for g in grants["crm-hipaa"]]
     sha = "0" * 40
-    good = ["-C /workspace/targets/shared rev-parse HEAD",
-            "-C /workspace/targets/extra show %s:docs/a.md" % sha]
-    bad = ["-C /workspace/targets/shared show HEAD:a", "-C /workspace/targets/shared show %s:../a" % sha,
-           "-C /workspace/targets/shared rev-parse HEAD --git-dir=/x",
-           "-C /var/lib/compliance-claw/targets/shared rev-parse HEAD"]
+    own = lambda t: "-c safe.directory=/workspace/targets/%s -C /workspace/targets/%s " % (t, t)
+    good = [own("shared") + "rev-parse HEAD", own("extra") + "show %s:docs/a.md" % sha]
+    bad = [own("shared") + "show HEAD:a", own("shared") + "show %s:../a" % sha,
+           own("shared") + "rev-parse HEAD --git-dir=/x",
+           "-C /workspace/targets/shared rev-parse HEAD",
+           "-c safe.directory=* -C /workspace/targets/shared rev-parse HEAD",
+           "-c safe.directory=/workspace/targets/extra -C /workspace/targets/shared rev-parse HEAD",
+           "-c core.pager=id -C /workspace/targets/shared rev-parse HEAD",
+           "-c safe.directory=/var/lib/compliance-claw/targets/shared"
+           " -C /var/lib/compliance-claw/targets/shared rev-parse HEAD"]
     check(all(any(r.search(a) for r in blob) for a in good)
           and not any(r.search(a) for r in blob for a in bad),
           "approvals: grants match only fixed shapes in the agent's own targets")

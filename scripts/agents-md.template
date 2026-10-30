@@ -94,15 +94,16 @@ may be several, and a review that silently mixes two repositories produces
 evidence that cannot be traced back to either. One target per piece of work.
 
 Read a target only through these commands, exactly as written. Replace `<name>`
-with one of your targets, `<sha>` with the full 40-character commit SHA, and
-`<path>` with a repository-relative path:
+with one of your targets (in both places), `<sha>` with the full 40-character
+commit SHA, and `<path>` with a repository-relative path. The `-c safe.directory`
+part is required; any other `-c` setting is refused:
 
 ```
-git -C /workspace/targets/<name> remote get-url origin
-git -C /workspace/targets/<name> rev-parse HEAD
-git -C /workspace/targets/<name> ls-tree -r --name-only <sha>
-git -C /workspace/targets/<name> ls-tree --name-only <sha>:<directory>
-git -C /workspace/targets/<name> show <sha>:<path>
+git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> remote get-url origin
+git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> rev-parse HEAD
+git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> ls-tree -r --name-only <sha>
+git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> ls-tree --name-only <sha>:<directory>
+git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> show <sha>:<path>
 ```
 
 Get the SHA with `rev-parse HEAD` first, then use that same SHA for every read in
@@ -134,8 +135,8 @@ reports `updated`, get the new SHA with `rev-parse HEAD` before you read again.
 
 Every piece of evidence carries its provenance, gathered from the target itself:
 
-- repository URL — `git -C /workspace/targets/<name> remote get-url origin`
-- commit SHA — the full SHA from `git -C /workspace/targets/<name> rev-parse HEAD`
+- repository URL — `git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> remote get-url origin`
+- commit SHA — the full SHA from `git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> rev-parse HEAD`
 - repository-relative file path — the `<path>` you read with `show <sha>:<path>`
 - line range, whenever you quote or excerpt
 

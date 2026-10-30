@@ -318,7 +318,7 @@ against the real handlers with fake keys.
 | --- | --- |
 | `tools.fs.workspaceOnly: true` | `read`, `write`, `edit`, `ls`, `apply_patch` and local media sends stay in the agent's own workspace. Credential files, `openclaw.json`, `/proc`, `..` escapes, other workspaces, the maintenance mount and the `targets/` links are refused. |
 | `tools.exec.mode: "allowlist"` | `exec` runs only grants in OpenClaw's exec approvals store, without a prompt. Anything else is refused: other commands, shell operators, command substitution, redirection. OpenClaw also refuses `GIT_*` and loader environment overrides. |
-| Four git grants per own target | `remote get-url origin`, `rev-parse HEAD`, `ls-tree [-r] --name-only <full-sha>[:<dir>]`, `show <full-sha>:<path>` in `/workspace/targets/<own target>`. No option, short ref, other repository or maintenance path matches. |
+| Four git grants per own target | `git -c safe.directory=<target> -C <target>` with `remote get-url origin`, `rev-parse HEAD`, `ls-tree [-r] --name-only <full-sha>[:<dir>]` or `show <full-sha>:<path>`, where `<target>` is `/workspace/targets/<own target>`. `safe.directory` names only that target, because the clone is owned by the host user. No other `-c` value, option, short ref, other repository or maintenance path matches. |
 | `tools.deny`: `gateway`, `openclaw` | No configuration reads and no delegated configuration changes from an agent turn. |
 
 `clawctl` owns these fields. A stricter `tools.exec.mode: "deny"` that an

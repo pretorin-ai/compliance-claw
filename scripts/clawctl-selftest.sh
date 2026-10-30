@@ -1409,7 +1409,7 @@ for agent in ("crm-soc2", "crm-hipaa"):
     assert state["approvalGrants"][agent] == grants
     rx = [re.compile(e["argPattern"]) for e in grants]
     allowed = lambda args: any(r.search(args) for r in rx)
-    root = "-C /workspace/targets/simple-crm "
+    root = "-c safe.directory=/workspace/targets/simple-crm -C /workspace/targets/simple-crm "
     for args in ("remote get-url origin", "rev-parse HEAD", "ls-tree -r --name-only " + sha,
                  "ls-tree --name-only %s:src/app" % sha, "show %s:.github/ci.yml" % sha):
         assert allowed(root + args), args
@@ -1417,8 +1417,10 @@ for agent in ("crm-soc2", "crm-hipaa"):
                  "show %s:README.md --output=/tmp/x" % sha, "-c core.pager=id rev-parse HEAD",
                  "show %s:/etc/passwd" % sha, "rev-parse HEAD; id", "show %s:a b" % sha):
         assert not allowed(root + args), args
-    assert not allowed("-C /workspace/targets/simple-crmx rev-parse HEAD")
-    assert not allowed("-C /var/lib/compliance-claw/targets/simple-crm rev-parse HEAD")
+    assert not allowed("-c safe.directory=/workspace/targets/simple-crmx -C /workspace/targets/simple-crmx rev-parse HEAD")
+    assert not allowed("-c safe.directory=* -C /workspace/targets/simple-crm rev-parse HEAD")
+    assert not allowed("-C /workspace/targets/simple-crm rev-parse HEAD")
+    assert not allowed("-c safe.directory=/var/lib/compliance-claw/targets/simple-crm -C /var/lib/compliance-claw/targets/simple-crm rev-parse HEAD")
 PYGRANTS
   then st_ok "fixed git grants: own targets, full SHA, no option, escape or composition"
   else st_bad "fixed git grants are exact and recorded"; fi
