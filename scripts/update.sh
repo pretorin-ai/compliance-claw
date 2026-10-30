@@ -313,7 +313,7 @@ required() { REQUIRED+=("$*"); }
 # tracked file, selection, secret, container or volume.
 resolve_release() {
   local tag="$1" local_tag r_json mapping cur_version cur_line rc selection_err \
-        openclaw_cur openclaw_new slack_cur slack_new missing f secret_abs
+        openclaw_cur openclaw_new slack_cur slack_new missing f secret_abs builtin
 
   [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
     || die "'${tag}' is not a release tag. Use the form vX.Y.Z, for example v0.6.0."
@@ -330,7 +330,7 @@ resolve_release() {
 
   # Objects and FETCH_HEAD only: no branch, tag or checkout changes.
   log "fetching ${tag} from ${RELEASE_REMOTE}"
-  git fetch --quiet --no-tags "$RELEASE_REMOTE" "refs/tags/${tag}" \
+  git fetch --quiet --no-tags --refmap= "$RELEASE_REMOTE" "refs/tags/${tag}" \
     || die "could not fetch tag ${tag} from ${RELEASE_REMOTE}. Check the tag name and network access."
   R_COMMIT="$(git rev-parse --verify --quiet 'FETCH_HEAD^{commit}')" \
     || die "tag ${tag} does not name a commit."
@@ -340,12 +340,12 @@ resolve_release() {
     blocker "the local tag ${tag} names ${local_tag}, but ${RELEASE_REMOTE} names ${R_COMMIT}. Inspect both; do not delete either without review."
   fi
 
-  # The helper downloads a FINAL release set only and checks every asset. The
-  # read accepts an unsigned set so that preview can show it; the gate below
-  # decides whether apply may use it.
+  # The helper downloads a FINAL release set only and checks every asset. Fetch
+  # checks integrity only; the signature gate below decides whether apply may
+  # use the set.
   log "downloading and verifying the release set"
   rc=0
-  r_json="$(release_helper fetch --version "$R_VERSION" --dir "${RELEASE_CACHE}/assets" --allow-unsigned --json)" || rc=$?
+  r_json="$(release_helper fetch --version "$R_VERSION" --dir "${RELEASE_CACHE}/assets" --json)" || rc=$?
   case "$rc" in
     0) ;;
     5) die "could not download the release set for ${tag} (see the reason above). Check network access. Nothing was changed." ;;
@@ -378,17 +378,27 @@ resolve_release() {
   # SOURCE. No local commit is dropped, no tracked change is overwritten, and
   # no untracked or ignored file is replaced by a file the tag adds.
   R_HEAD="$(git rev-parse HEAD)"
+  R_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
   if ! git merge-base --is-ancestor "$R_HEAD" "$R_COMMIT"; then
     blocker "the checkout (${R_HEAD}) has commits that ${tag} does not. That is a downgrade or a custom source. Use a newer release, or the branch route for custom source."
   fi
   if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     blocker "tracked files have local changes. Review them with 'git status' and commit or remove them yourself."
   fi
+  # Git replaces ignored files without a warning, also a file at a parent path.
+  local parent
   while IFS= read -r -d '' f; do
     if [ -e "$f" ] || [ -L "$f" ]; then
       blocker "${tag} adds ${f}, and a local file already exists at that path. Move it, then try again."
     fi
-  done < <(git diff --name-only --diff-filter=A -z "$R_HEAD" "$R_COMMIT")
+    parent="$(dirname -- "$f")"
+    while [ "$parent" != . ]; do
+      if { [ -e "$parent" ] || [ -L "$parent" ]; } && { [ ! -d "$parent" ] || [ -L "$parent" ]; }; then
+        blocker "${tag} adds ${f}, and a local file exists at its parent path ${parent}. Move it, then try again."
+      fi
+      parent="$(dirname -- "$parent")"
+    done
+  done < <(git diff --no-renames --name-only --diff-filter=A -z "$R_HEAD" "$R_COMMIT")
 
   # SELECTION. Repository files map to the tag's copies, the release overlay
   # goes directly after compose.yaml, and customer files keep their order.
@@ -463,7 +473,12 @@ for problem in problems:
     || die "could not render ${tag} with the saved overlays. Check that they still apply to it."
   [ "$(json_field "$R_CANDIDATE" project)" = "$(json_field "$R_CURRENT" project)" ] \
     || blocker "the Compose project name would change. Keep the project that owns the state volumes."
-  [ "$(json_field "$R_CANDIDATE" mounts)" = "$(json_field "$R_CURRENT" mounts)" ] \
+  python3 -c '
+import json, sys
+current, candidate = (json.loads(a)["mounts"] for a in sys.argv[1:])
+sys.exit(any(candidate.get(s, {}).get(t) != v
+             for s, mounts in current.items() for t, v in mounts.items()))
+' "$R_CURRENT" "$R_CANDIDATE" \
     || blocker "the state-volume selection would change. A restored or recovered volume selection must stay; review the overlays and ${tag} before you continue."
   rc=0
   selection_err="$(json_field "$R_CANDIDATE" selection \
@@ -478,7 +493,7 @@ for problem in problems:
   R_INSTALLED="$(installed_release_version || true)"
   cur_version="$R_INSTALLED"
   if [ -z "$cur_version" ]; then
-    cur_version="$(git show "${R_HEAD}:versions.env" 2>/dev/null | sed -n 's/^IMAGE_VERSION=//p')"
+    cur_version="$(git show "${R_HEAD}:versions.env" 2>/dev/null | sed -n 's/^IMAGE_VERSION=//p' || true)"
   fi
   R_CURRENT_VERSION="${cur_version:-unknown}"
   if [ -n "$cur_version" ]; then
@@ -488,13 +503,13 @@ for problem in problems:
   fi
 
   # REQUIRED STEPS AND DOWNLOADS.
-  openclaw_cur="$(git show "${R_HEAD}:versions.env" 2>/dev/null | sed -n 's/^OPENCLAW_VERSION=//p')"
-  openclaw_new="$(sed -n 's/^OPENCLAW_VERSION=//p' "${RELEASE_CACHE}/src/versions.env")"
+  openclaw_cur="$(git show "${R_HEAD}:versions.env" 2>/dev/null | sed -n 's/^OPENCLAW_VERSION=//p' || true)"
+  openclaw_new="$(sed -n 's/^OPENCLAW_VERSION=//p' "${RELEASE_CACHE}/src/versions.env" 2>/dev/null || true)"
   if [ "$openclaw_cur" != "$openclaw_new" ]; then
     required "OpenClaw changes ${openclaw_cur:-unknown} -> ${openclaw_new:-unknown}. Startup can migrate state. Stop the gateway and verify a backup of both state volumes first: docs/upgrade.md#openclaw-image-upgrade-and-state-backup"
   fi
-  slack_cur="$(git show "${R_HEAD}:versions.env" 2>/dev/null | sed -n 's/^SLACK_PLUGIN_VERSION=//p')"
-  slack_new="$(sed -n 's/^SLACK_PLUGIN_VERSION=//p' "${RELEASE_CACHE}/src/versions.env")"
+  slack_cur="$(git show "${R_HEAD}:versions.env" 2>/dev/null | sed -n 's/^SLACK_PLUGIN_VERSION=//p' || true)"
+  slack_new="$(sed -n 's/^SLACK_PLUGIN_VERSION=//p' "${RELEASE_CACHE}/src/versions.env" 2>/dev/null || true)"
   if [ "$slack_cur" != "$slack_new" ]; then
     required "the managed Slack package changes ${slack_cur:-unknown} -> ${slack_new:-unknown}. Gateway startup with Slack configured needs npm registry access."
   fi
@@ -510,6 +525,9 @@ for problem in problems:
   # SECRET SOURCES. Apply creates missing built-in files empty; it never
   # creates a file that a customer overlay names.
   R_NEW_SECRETS=""
+  # The release's init-file-secrets.sh holds the one built-in inventory.
+  builtin="$(sed -n 's/^[A-Z_][A-Z0-9_]*|\([a-z0-9-][a-z0-9-]*\)$/\1/p' \
+    "${RELEASE_CACHE}/src/scripts/init-file-secrets.sh" 2>/dev/null || true)"
   secret_abs="$(cd -- "${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}" 2>/dev/null && pwd -P || true)"
   missing="$(json_field "$R_CANDIDATE" secrets | python3 -c '
 import json, os, sys
@@ -520,7 +538,8 @@ for path in json.load(sys.stdin) or []:
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     if compose_has_file compose.secrets.yaml && [ -n "$secret_abs" ] \
-       && [ "$(cd -- "$(dirname -- "$f")" 2>/dev/null && pwd -P)" = "$secret_abs" ]; then
+       && [ "$(cd -- "$(dirname -- "$f")" 2>/dev/null && pwd -P)" = "$secret_abs" ] \
+       && printf '%s\n' "$builtin" | grep -qxF -- "$(basename -- "$f")"; then
       R_NEW_SECRETS="${R_NEW_SECRETS} $(basename -- "$f")"
     else
       blocker "the secret source ${f} does not exist. Create it with the documented mode; this script does not create custom secret files."
@@ -539,7 +558,7 @@ for path in json.load(sys.stdin) or []:
 
 print_recovery_set() {
   printf '  recovery set (keep these until the new release is verified):\n'
-  printf '    checkout:      %s\n' "$R_HEAD"
+  printf '    checkout:      %s%s\n' "$R_HEAD" "${R_BRANCH:+ (branch ${R_BRANCH})}"
   printf '    images:        openclaw %s; cli %s\n' \
     "$(json_field "$R_CURRENT" images openclaw)" "$(json_field "$R_CURRENT" images cli)"
   printf '    running image: %s\n' "$R_RUNNING"
@@ -562,7 +581,7 @@ print_release_report() {
   if [ "$R_SIGNATURE" = unsigned ]; then
     printf '                 UNVERIFIED: not signed; publisher authenticity not checked\n'
   fi
-  if R_BRANCH="$(git symbolic-ref --quiet --short HEAD)"; then
+  if [ -n "$R_BRANCH" ]; then
     printf '  checkout:      branch %s -> detached tag %s (release mode; the branch route then refuses)\n' \
       "$R_BRANCH" "$R_TAG"
   fi
@@ -623,7 +642,7 @@ if [ -n "$RELEASE_TAG" ]; then
   # The helper checks the source through the tag, so record the fetched tag.
   # An existing local tag already names this commit (otherwise a blocker).
   if [ -z "$R_LOCAL_TAG" ]; then
-    git fetch --quiet --no-tags "$RELEASE_REMOTE" "refs/tags/${R_TAG}:refs/tags/${R_TAG}" \
+    git fetch --quiet --no-tags --refmap= "$RELEASE_REMOTE" "refs/tags/${R_TAG}:refs/tags/${R_TAG}" \
       || die "could not record tag ${R_TAG} locally. Nothing was changed."
   fi
 
@@ -634,9 +653,14 @@ if [ -n "$RELEASE_TAG" ]; then
   else
     PREVIOUS_SET="remove ${RELEASE_RECORD} and ${RELEASE_OVERLAY} (no release set was installed before)"
   fi
+  if [ -n "$R_BRANCH" ]; then
+    R_RETURN="git checkout ${R_BRANCH}     # the branch at ${R_HEAD}"
+  else
+    R_RETURN="git checkout --detach ${R_HEAD}"
+  fi
   RECOVERY_NOTE="update: RECOVERY — no automatic recovery was attempted except the COMPOSE_FILE line
   before the gateway was replaced. To return the files:
-    git checkout --detach ${R_HEAD}
+    ${R_RETURN}
     ${PREVIOUS_SET}
     previous saved selection: COMPOSE_FILE=${COMPOSE_FILE:-compose.yaml}
   If the gateway was replaced, select the previous images and restore the verified

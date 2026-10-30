@@ -58,16 +58,19 @@ conditions stops apply before it changes a file or stops the gateway:
   signing and its verifier exist. Preview still shows the release, marked
   `UNVERIFIED`. There is no option that bypasses this. See
   [what the checks prove](image-verification.md#what-this-does-and-does-not-prove);
-- tracked files have local changes, or the release adds a file at a path where a
-  local file (also an ignored file) already exists;
+- tracked files have local changes, or the release adds or renames a file to a
+  path where a local file (also an ignored file) already exists, or at a path
+  under a local file;
 - the checkout has commits that the release does not have, or the release is
   older than the current release (no downgrade over migrated state). A checkout
   that follows `master` past a release tag can only move to a later release;
 - a later overlay changes the release image (a custom selection), or the release
-  changes the project or a state-volume source, for example a restored volume.
+  changes the project or the source of a current volume mount, for example a
+  restored volume. A release can add a volume mount.
   For a [restore overlay](#select-and-save-the-restored-volumes), take a new
   backup, then remove only its two image lines and keep its volume lines;
-- a secret file that a customer overlay names does not exist;
+- a secret file that a customer overlay names does not exist. Apply creates only
+  the release's built-in secret files, also in the secret directory;
 - the effort-record transfer is necessary and not confirmed;
 - the saved `COMPOSE_FILE` does not select the release overlay, and the change
   is not confirmed with `--save-selection` (see below).
@@ -109,7 +112,7 @@ Before apply, stop the gateway and verify a backup of both state volumes:
 [OpenClaw image upgrade and state backup](#openclaw-image-upgrade-and-state-backup).
 
 If a step fails after the checkout, the script names the recovery inputs: the
-previous commit, the previous release set (the `.previous` files), the previous
+previous branch or commit, the previous release set (the `.previous` files), the previous
 `COMPOSE_FILE` line, the previous images, and the verified backup. Apart from
 the `COMPOSE_FILE` line before the gateway is replaced, it does not recover
 automatically. The release route does not

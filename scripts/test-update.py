@@ -348,47 +348,41 @@ DOWNLOAD_LINE = 'RELEASE_DOWNLOAD = "https://github.com/%s/releases/download" % 
 
 
 SIGNATURE_SHIM = r"""#!/usr/bin/env python3
-# TEST SHIM, not the release helper. It runs the real helper next to it and adds
-# only the signature gate of the agreed interface: fetch/check exit 6 for an
-# unsigned set unless --allow-unsigned is given. Every release set is unsigned
-# today; CC_TEST_RELEASE_SIGNED=1 stands in for a later verified signature so
-# that the apply path can be tested. When the real helper has the gate, the
-# shim leaves the gate to it.
+# TEST SHIM, only in a test's temporary repository. The real helper refuses
+# every release set today (unsigned, exit 6). With CC_TEST_RELEASE_SIGNED=1
+# this shim stands in for a later verified signature so that the apply path
+# can be tested: it admits the unsigned set and reports it as verified.
+# Without the variable it passes everything to the real helper unchanged.
 import json, os, subprocess, sys
 real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-assets-real.py")
-native = "--allow-unsigned" in open(real).read()
-signed = os.environ.get("CC_TEST_RELEASE_SIGNED") == "1"
 args = sys.argv[1:]
-gated = args[:1] in (["fetch"], ["check"]) and "--self-test" not in args
-allow = "--allow-unsigned" in args
-if not native:
-    args = [a for a in args if a != "--allow-unsigned"]
-elif signed and gated and not allow:
+signed = os.environ.get("CC_TEST_RELEASE_SIGNED") == "1"
+if signed and args[:1] == ["check"] and "--allow-unsigned" not in args:
     args.append("--allow-unsigned")
 p = subprocess.run([sys.executable, real] + args, capture_output=True, text=True)
 out = p.stdout
-if p.returncode == 0 and gated and signed:
+if signed and p.returncode == 0 and args[:1] in (["fetch"], ["check"]) and "--json" in args:
     out = "".join(json.dumps({**json.loads(line), "signature_status": "fixture-verified"},
                              sort_keys=True) + "\n" for line in out.splitlines() if line.strip())
-elif p.returncode == 0 and gated and not allow and not native:
-    sys.stderr.write(p.stderr + "release-assets: ERROR — the release set is unsigned\n")
-    sys.exit(6)
 sys.stdout.write(out)
 sys.stderr.write(p.stderr)
 sys.exit(p.returncode)
 """
 
 
-def install_release_helper(repo, releases):
-    """Install the real release helper behind the signature shim.
+def install_release_helper(repo, releases, shim=True):
+    """Install the real release helper, behind the test shim unless shim=False.
 
     Only the helper's download base changes, to local files.
     """
     text = HELPER.read_text()
     assert text.count(DOWNLOAD_LINE) == 1, "the helper download base changed"
-    (repo / "scripts/release-assets-real.py").write_text(
-        text.replace(DOWNLOAD_LINE, "RELEASE_DOWNLOAD = %r" % releases.resolve().as_uri()))
-    (repo / "scripts/release-assets.py").write_text(SIGNATURE_SHIM)
+    text = text.replace(DOWNLOAD_LINE, "RELEASE_DOWNLOAD = %r" % releases.resolve().as_uri())
+    if shim:
+        (repo / "scripts/release-assets-real.py").write_text(text)
+        (repo / "scripts/release-assets.py").write_text(SIGNATURE_SHIM)
+    else:
+        (repo / "scripts/release-assets.py").write_text(text)
 
 
 def make_release_set(out, version, commit, digest=NEW_DIGEST, final=True,
@@ -517,7 +511,8 @@ class ReleaseTest(unittest.TestCase):
             "EFFORT_RECORD_TRANSITION=refs/tags/fixture-transition"))
         for name in ("compose-selection.sh", "init-file-secrets.sh"):
             shutil.copyfile(ROOT / "scripts" / name, self.repo / "scripts" / name)
-        install_release_helper(self.repo, self.fixture / "releases")
+        install_release_helper(self.repo, self.fixture / "releases",
+                               shim=not self._testMethodName.endswith("_real_helper"))
         (self.repo / ".gitignore").write_text(".env\nsecrets/\ncompose.release.yaml*\n")
         (self.repo / "versions.env").write_text(
             "OPENCLAW_VERSION=2026.10.5\nSLACK_PLUGIN_VERSION=2026.10.5\n"
@@ -529,6 +524,7 @@ class ReleaseTest(unittest.TestCase):
             "pretorin-api-key", "openclaw-gateway-token", "slack-app-token", "slack-bot-token",
             "openai-api-key", "anthropic-api-key", "github-readonly-pat"))
         (self.repo / "compose.secrets.yaml").write_text(secrets)
+        (self.repo / "old-notes.txt").write_text("notes\n")
         self.git("init", "-q", "-b", "master")
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "0.5.2")
@@ -601,17 +597,20 @@ class ReleaseTest(unittest.TestCase):
                 if c["args"][:2] in (["compose", "pull"], ["compose", "run"])
                 or c["args"][:3] == ["compose", "up", "-d"]]
 
-    def test_preview_reports_changes_without_any_change(self):
+    def test_preview_reports_changes_without_any_change_real_helper(self):
         before = self.snapshot()
-        self.assertEqual(self.run_update("--release", "v0.6.0", "--preview"), 0, self.output)
+        self.assertEqual(self.run_update("--release", "v0.6.0", "--preview"), 2, self.output)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.changed(), [])
-        for text in ("0.5.2 -> 0.6.0", NEW_IMAGE, OLD_IMAGE, self.old, self.new, "fixture-verified",
+        blockers = self.output.split("BLOCKERS")[1].split("update: preview")[0]
+        self.assertEqual(blockers.count("\n    - "), 1, blockers)
+        self.assertIn("UNVERIFIED: publisher authenticity not checked", blockers)
+        for text in ("0.5.2 -> 0.6.0", NEW_IMAGE, OLD_IMAGE, self.old, self.new, "unsigned",
                      "checked:       tag commit, asset checksums, image digest, effective image",
                      "branch master -> detached tag v0.6.0 (release mode",
                      "recovery set", "openclaw-gateway-password", "OpenClaw changes 2026.10.5 -> 2026.11.1",
                      "compose.yaml:compose.release.yaml:compose.secrets.yaml:deployment/customer.yaml",
-                     "Pretorin CLI:  not changed", "--release v0.6.0", "no blockers"):
+                     "Pretorin CLI:  not changed", "UNVERIFIED: not signed"):
             self.assertIn(text, self.output)
         self.assertFalse((self.repo / "secrets/runtime/openclaw-gateway-password").exists())
 
@@ -674,11 +673,18 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.changed(), [])
         self.assertEqual(self.snapshot(), before)
 
-    def test_unsigned_release_is_shown_but_apply_refuses(self):
+    def test_unsigned_release_is_shown_but_apply_refuses_real_helper(self):
         self.signed = "0"
         self.assert_blocked("UNVERIFIED: publisher authenticity not checked")
         self.assertIn("apply will refuse this release until signing/verification exists", self.output)
         self.assertIn("signature unsigned", self.output)
+
+    def test_test_signature_variable_cannot_pass_the_real_helper_real_helper(self):
+        # The variable exists only in the test shim; update.sh and the real
+        # helper never read it, so apply still refuses (exit 6 path).
+        self.signed = "1"
+        self.assert_blocked("UNVERIFIED: publisher authenticity not checked")
+        self.assertNotIn("fixture-verified", self.output)
 
     def test_matching_local_tag_is_kept(self):
         # A local annotated tag that names the release commit is a different tag
@@ -697,6 +703,37 @@ class ReleaseTest(unittest.TestCase):
         (self.repo / "docs/new.txt").write_text("customer file\n")
         self.assert_blocked("adds docs/new.txt")
 
+    def test_file_added_under_a_local_file_parent_blocks(self):
+        (self.repo / "docs").write_text("customer file named like the release directory\n")
+        self.assert_blocked("local file exists at its parent path docs")
+
+    def test_file_renamed_onto_a_local_file_blocks(self):
+        # Rename detection would show this as R, not A, and git checkout would
+        # replace the ignored local file without a warning.
+        self.publish_v070((self.repo / "compose.yaml").read_text(),
+                          change=lambda clone: (clone / "old-notes.txt").rename(clone / "secrets-notes.txt"))
+        (self.repo / ".git/info/exclude").write_text("secrets-notes.txt\n")
+        (self.repo / "secrets-notes.txt").write_text("customer notes\n")
+        before = self.snapshot()
+        self.assertNotEqual(self.run_update("--release", "v0.7.0"), 0, self.output)
+        self.assertIn("adds secrets-notes.txt", self.output)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_custom_secret_in_the_secret_directory_blocks(self):
+        (self.repo / "deployment/customer.yaml").write_text("secret: secrets/runtime/customer-extra\n")
+        self.assert_blocked("secrets/runtime/customer-extra does not exist")
+        self.assertNotIn("apply creates these empty: openclaw-gateway-password customer-extra", self.output)
+
+    def test_preview_changes_no_local_tag_with_a_tag_refspec(self):
+        self.git("config", "remote.origin.fetch", "+refs/tags/*:refs/tags/*")
+        self.git("tag", "v0.6.0", self.old)
+        self.assert_blocked("the local tag v0.6.0 names " + self.old)
+
+    def test_release_may_add_a_volume_mount(self):
+        self.publish_v070((self.repo / "compose.yaml").read_text() + "volume: /var/cache/release=release-cache\n")
+        self.assertEqual(self.run_update("--release", "v0.7.0", "--preview"), 0, self.output)
+        self.assertNotIn("state-volume selection would change", self.output)
+
     def test_local_commit_not_in_release_blocks(self):
         (self.repo / "local.txt").write_text("customer commit\n")
         self.git("add", "local.txt")
@@ -711,13 +748,16 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual((self.repo / "deployment/customer.yaml").read_text(),
                          "image: registry.example/custom:1\nvolume: /home/node/.openclaw=restored-openclaw\n")
 
-    def publish_v070(self, compose_text):
+    def publish_v070(self, compose_text, change=None):
         """Push a v0.7.0 tag on top of v0.6.0 to the origin, with its release set."""
         clone = self.fixture / "publisher"
         self.git("clone", "-q", str(self.fixture / "origin.git"), str(clone), cwd=self.fixture)
         self.git("checkout", "-q", "v0.6.0", cwd=clone)
         (clone / "compose.yaml").write_text(compose_text)
-        self.git("commit", "-q", "-am", "0.7.0", cwd=clone)
+        if change:
+            change(clone)
+        self.git("add", "-A", cwd=clone)
+        self.git("commit", "-q", "--allow-empty", "-m", "0.7.0", cwd=clone)
         self.git("tag", "v0.7.0", cwd=clone)
         self.git("push", "-q", "origin", "v0.7.0", cwd=clone)
         self.write_release("v0.7.0", self.git("rev-parse", "HEAD", cwd=clone))
@@ -847,7 +887,7 @@ class ReleaseTest(unittest.TestCase):
 
     def test_failures_after_checkout_name_recovery_without_recovering(self):
         self.assertNotEqual(self.run_update("--release", "v0.6.0", up_rc=17), 0, self.output)
-        for text in ("RECOVERY", "no automatic recovery", f"git checkout --detach {self.old}",
+        for text in ("RECOVERY", "no automatic recovery", "git checkout master     # the branch at " + self.old,
                      "no release set was installed before", "openclaw-image-upgrade-and-state-backup"):
             self.assertIn(text, self.output)
         self.assertNotIn("update: done.", self.output)
@@ -862,7 +902,7 @@ class ReleaseTest(unittest.TestCase):
         self.assertNotEqual(self.run_update("--release", "v0.6.0"), 0, self.output)
         self.assertIn("could not prepare the secret files", self.output)
         self.assertIn("NOTHING WAS STOPPED", self.output)
-        self.assertIn(f"git checkout --detach {self.old}", self.output)
+        self.assertIn("git checkout master     # the branch at " + self.old, self.output)
         self.assertFalse(any(c["args"][:3] == ["compose", "up", "-d"] for c in self.calls))
         self.assertEqual((self.fixture / "running-image").read_text(), OLD_IMAGE)
 
