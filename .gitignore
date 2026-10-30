@@ -39,3 +39,11 @@ efforts.yaml
 # the publisher attaches them to the GitHub Release. Host-local, not source.
 compliance-claw-release.json
 compose.release.yaml
+# scripts/update.sh keeps the previous release set beside it, as one recovery input.
+compliance-claw-release.json.previous
+compose.release.yaml.previous
+
+# Generated Python bytecode. parse-efforts.py imports parse-targets.py, so a
+# normal clawctl or bootstrap run on Linux writes scripts/__pycache__/, and the
+# updater's clean-tree check would then refuse.
+__pycache__/
