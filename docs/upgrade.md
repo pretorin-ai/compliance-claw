@@ -496,22 +496,27 @@ that state.
 
    ```sh
    test -f "$BACKUP_DIR/host-inputs.txt" &&
+   SOURCE_REVISION="$(record SOURCE_REVISION)" && git cat-file -e "$SOURCE_REVISION^{commit}" &&
    SEPARATOR="$(record COMPOSE_PATH_SEPARATOR)" && SAVED_FILES="$(record COMPOSE_FILE)" &&
    { awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" &&
      (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
-       test "$f" = "$RESTORE_OVERLAY" || git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 ||
-         printf '%s\n' "$f"; done); } |
-     while IFS= read -r f; do s="$(saved_input "$f")" && cmp -s -- "$f" "$s" ||
-       { printf 'STOP: %s differs from its saved copy. To copy it back: cp -p -- "%s" "%s"\n' "$f" "$s" "$f"; exit 1; }; done &&
+       test "$f" = "$RESTORE_OVERLAY" || printf '%s\n' "$f"; done); } |
+     while IFS= read -r f; do
+       test -n "$(git ls-tree --name-only "$SOURCE_REVISION" -- "$f" 2>/dev/null)" && continue
+       s="$(saved_input "$f")" && cmp -s -- "$f" "$s" ||
+         { printf 'STOP: %s differs from its saved copy. To copy it back: cp -p -- %q %q\n' "$f" "$s" "$f"; exit 1; }
+     done &&
    echo "OK: the host inputs match set $SET_ID"
    ```
 
-   A `STOP:` line names the first file that differs and prints the command that
-   copies the saved file back. Copy it back and run the block again. Keep a
-   changed file only after you check that the restored state supports it; then
-   copy the current file over its saved copy, so that this block and step 3 of
+   The block skips files that Git tracks at the recorded revision. Step 3 of
    [Select and save the restored volumes](#select-and-save-the-restored-volumes)
-   compare with it.
+   compares them after the checkout returns to that revision. A `STOP:` line
+   names the first file that differs and prints the command that copies the
+   saved file back. Copy it back and run the block again. Keep a changed file
+   only after you check that the restored state supports it; then copy the
+   current file over its saved copy, so that this block and step 3 compare with
+   it.
 
 3. Stop the candidate and keep its state. The candidate logs and container
    record go to a new private directory:
