@@ -1,36 +1,56 @@
-# Publish a scanned, SBOM-bearing linux/amd64 image to GHCR, by immutable digest.
+# Prepare and publish a Compliance Claw release set: a scanned, SBOM-bearing
+# linux/amd64 image by immutable digest, plus the deployment assets that select it.
 #
-# Cut a release:
-#   gh release create vX.Y.Z --target master --generate-notes
+# THREE OPERATIONS, ALL MANUAL (workflow_dispatch). Maintainer procedure:
+# docs/releasing.md.
 #
-# That is the whole trigger. NO VERSION-BUMP PR IS REQUIRED BEFOREHAND. Afterwards,
-# ONE post-release PR pins what this run published — IMAGE_VERSION in versions.env
-# and the matching version tag plus immutable digest in compose.yaml — because the
-# digest cannot be known until the image has been built.
+#   git tag -a vX.Y.Z -m vX.Y.Z <reviewed master commit> && git push origin vX.Y.Z
+#   gh workflow run release.yml --ref vX.Y.Z -f operation=prepare
+#   ... qualify the exact candidate ...
+#   gh workflow run release.yml --ref vX.Y.Z -f operation=publish
 #
-# THE RELEASE IS THE SOURCE OF TRUTH FOR THE VERSION. Modelled on
-# pretorin-ai/pretorin-cli's release-binaries.yml, which triggers on
-# `release: published`, derives the version from the release tag, and validates the
-# build against it. The earlier design here inverted that — versions.env held the
-# version and the tag had to match it — which forced a version-bump commit BEFORE
-# every release and a digest-pin commit AFTER it. Two PRs to ship one image.
-# Deriving from the tag removes the first one entirely.
+#   dry-run  (default, any ref) build, smoke, contracts, scan, SBOM and the
+#            release-set self-test. No login, no push, no release write.
+#   prepare  (tag ref only) everything in dry-run, then push BY DIGEST, verify the
+#            round trip, tag `candidate-X.Y.Z` on the verified manifest, generate
+#            the release set (scripts/release-assets.py prepare) and attach it to
+#            a DRAFT GitHub release. Drafts are not visible to customers and send
+#            no release notification. The stable version tag is NOT applied.
+#   publish  (tag ref only) NO BUILD. Takes the draft's assets, checks them
+#            against the tag, marks the record final, applies the version tag to
+#            the SAME digest, uploads the final record and un-drafts the release.
+#            The image and asset bytes are the ones `prepare` qualified.
 #
-# So `IMAGE_VERSION` in versions.env no longer means "the version we are about to
-# release". It means "the version this checkout deploys", and it moves together with
-# compose.yaml's digest pin in the single post-release commit. scripts/smoke.sh still
-# asserts the two agree, which is now a statement about the deployment rather than
-# about the release.
+# THE RELEASE SET (scripts/release-assets.py; interface in docs/releasing.md):
+#   compliance-claw-release.json   source commit, version, image digest, asset
+#                                  checksums, stage candidate|final, signature status
+#   compose.release.yaml           selects the digest for `openclaw` and `cli`
+#   sbom-X.Y.Z.spdx.json           SPDX SBOM of the image
 #
-# PUBLISH ORDER, also from pretorin-cli: push BY DIGEST first, verify the digest
-# round-trips, and only THEN apply the human-readable version tag. A floating tag
-# must never point at bytes that have not been checked.
+# WHAT CANNOT HAPPEN. A failed build, smoke, contract test, blocking scan, SBOM
+# check, round trip or asset check stops `prepare` before the draft exists, so
+# `publish` has nothing to finalize. `publish` refuses an asset set that does not
+# match its tag, and a version tag never moves: a retry cannot replace a
+# completed version with different bytes. `prepare` refuses a version whose
+# release or version tag is already published.
 #
-# THE IMAGE IS NOT SIGNED. Integrity comes from the immutable digest, the
-# release-time vulnerability scan, and the SBOM. pretorin-cli signs with an Azure
-# Key Vault HSM key over OIDC on a private ARC runner (no Fulcio, no Rekor); this
-# repository has no ARC runner and asserts CI holds zero credentials, so signing is
-# tracked as planned work in SECURITY.md ledger item 5 rather than half-done here.
+# THE TAG IS THE SOURCE OF TRUTH FOR THE VERSION. NO VERSION-BUMP PR IS REQUIRED
+# BEFOREHAND. `IMAGE_VERSION` in versions.env means "the version this checkout
+# deploys"; it moves together with compose.yaml's digest pin in ONE post-release
+# PR, because the digest cannot be known until the image has been built. The
+# release overlay is what lets the tagged source select its own image before that
+# PR exists. scripts/smoke.sh asserts the default pair agrees.
+#
+# PUBLISH ORDER, from pretorin-cli: push BY DIGEST first, verify the digest
+# round-trips, and only THEN apply a human-readable tag. A tag must never point at
+# bytes that have not been checked. scripts/release-tag.sh applies both the
+# candidate tag and the version tag by re-PUTting the exact manifest bytes.
+#
+# THE IMAGE AND THE RELEASE RECORD ARE NOT SIGNED. Integrity comes from the
+# immutable digest, the release-time vulnerability scan, the SBOM and the asset
+# checksums. The record reserves `compliance-claw-release.json.sig` and says
+# `signature.status: unsigned`; signing (SECURITY.md hardening ledger, image
+# signing) is later work and will sign this record rather than a second format.
 #
 # NO CREDENTIALS LIVE HERE beyond the automatic GITHUB_TOKEN. The first step asserts
 # that rather than trusting this comment.
@@ -40,27 +60,24 @@
 name: release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "Build, scan and SBOM only — do not push or tag"
-        type: boolean
-        default: true
+      operation:
+        description: "dry-run: build, scan and SBOM only. prepare: candidate image and DRAFT release (tag ref). publish: final release from the prepared draft, no build (tag ref)."
+        type: choice
+        options: [dry-run, prepare, publish]
+        default: dry-run
 
-# Workflow default, inherited by `publish`. `attach-sbom` overrides it — a job-level
-# permissions block REPLACES this one, so that job gets contents:write and no
-# packages access at all. No job holds both.
+# Read-only by default. Each job that writes names exactly one write permission:
+# packages (GHCR) or contents (GitHub Release). No job holds both.
 permissions:
   contents: read
-  packages: write     # push to GHCR — the only write `publish` performs
 
-# ONE release at a time, repo-wide — deliberately not per-ref. Two runs on
-# different tags would otherwise overlap on the shared `:build` staging ref
-# below. That race is not corrupting (the digest is read from the local image
-# right after push, never by resolving the tag), but a publish pipeline that can
-# interleave with itself is a bad thing to have to reason about.
+# ONE release operation at a time, repo-wide — deliberately not per-ref. Two runs
+# would otherwise overlap on the shared `:build` staging ref below. That race is
+# not corrupting (the digest is read from the local image right after push, never
+# by resolving the tag), but a publish pipeline that can interleave with itself is
+# a bad thing to have to reason about.
 #
 # cancel-in-progress stays false: a half-cancelled release is worse than a slow
 # one, and a run that has pushed but not yet tagged must be allowed to finish.
@@ -69,11 +86,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # dry-run and prepare. The only job that builds, and one of two that write to
+  # GHCR. It never writes a GitHub Release.
+  candidate:
+    if: ${{ inputs.operation != 'publish' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write     # push to GHCR (prepare only) — the only write here
     outputs:
       version: ${{ steps.pins.outputs.version }}
+      tag: ${{ steps.pins.outputs.tag }}
       digest: ${{ steps.push.outputs.digest }}
 
     steps:
@@ -90,11 +114,13 @@ jobs:
           fi
           echo "No credentials configured beyond the automatic GITHUB_TOKEN."
 
-      # THE VERSION COMES FROM THE RELEASE TAG. On workflow_dispatch there is no
-      # tag, so a dry run labels itself from versions.env — enough to rehearse the
-      # pipeline without inventing a release.
+      # THE VERSION COMES FROM THE TAG the run was started on (`--ref vX.Y.Z`).
+      # prepare refuses any other ref. A dry run on a branch labels itself from
+      # versions.env — enough to rehearse the pipeline without inventing a release.
       - name: Resolve version and pins
         id: pins
+        env:
+          OPERATION: ${{ inputs.operation }}
         run: |
           set -euo pipefail
           . ./versions.env
@@ -104,25 +130,26 @@ jobs:
             echo "$v=$val" >> "$GITHUB_OUTPUT"
           done
 
-          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+          TAG=""
+          if [[ "$GITHUB_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
-            case "$TAG" in
-              v[0-9]*.[0-9]*.[0-9]*) ;;
-              *) echo "::error::release tag '${TAG}' is not vMAJOR.MINOR.PATCH"; exit 1 ;;
-            esac
             VERSION="${TAG#v}"
-            echo "release ${TAG} -> version ${VERSION}"
+            echo "tag ${TAG} at ${GITHUB_SHA} -> version ${VERSION}"
             # versions.env is ALLOWED to lag here: it describes what the checkout
-            # DEPLOYS, and the pin commit that updates it lands after this run.
+            # DEPLOYS, and the pin commit that updates it lands after the release.
             if [ "${VERSION}" != "${IMAGE_VERSION:-}" ]; then
               echo "::notice::versions.env still says IMAGE_VERSION=${IMAGE_VERSION:-unset}; the post-release pin commit moves it to ${VERSION}."
             fi
-          else
+          elif [ "$OPERATION" = dry-run ]; then
             VERSION="${IMAGE_VERSION:?IMAGE_VERSION unset and no release tag}"
-            echo "dry run, labelling from versions.env -> ${VERSION}"
+            echo "dry run on ${GITHUB_REF}, labelling from versions.env -> ${VERSION}"
+          else
+            echo "::error::${OPERATION} must run on a release tag: gh workflow run release.yml --ref vX.Y.Z -f operation=${OPERATION} (got ${GITHUB_REF})"
+            exit 1
           fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "image_ref=${IMAGE_REPO}:${VERSION}" >> "$GITHUB_OUTPUT"
           # A CONSTANT staging ref, not build-${GITHUB_SHA}.
           #
@@ -137,6 +164,28 @@ jobs:
           # pointing at the most recent successful build. Nothing accumulates,
           # and nothing has to be deleted on the success path.
           echo "build_ref=${IMAGE_REPO}:build" >> "$GITHUB_OUTPUT"
+
+      # Before an hour of build: the tag must name the commit being built, and a
+      # version whose release is already published is complete — prepare must not
+      # produce a second set of bytes for it. (A draft is not visible to this
+      # read-only token; the draft job re-checks with write access.)
+      - name: Bind the tag to this commit and refuse a completed version
+        if: ${{ inputs.operation == 'prepare' }}
+        env:
+          TAG: ${{ steps.pins.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          TAGGED="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+          [ "$TAGGED" = "$GITHUB_SHA" ] \
+            || { echo "::error::tag ${TAG} is ${TAGGED}, but this run builds ${GITHUB_SHA}"; exit 1; }
+          if DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" \
+             && [ "$DRAFT" = false ]; then
+            echo "::error::release ${TAG} is already published; a completed version is never prepared again. Use a new version."
+            exit 1
+          fi
+          echo "tag ${TAG} -> ${TAGGED}; no published release for it"
 
       # trivy and syft from pinned versions, compared against pinned digests. CI
       # installs no unverified binary, for the same reason the build does not.
@@ -346,20 +395,38 @@ jobs:
           path: sbom-${{ steps.pins.outputs.version }}.spdx.json
           if-no-files-found: error
 
+      # The release-set rules, offline, on every operation: a dry run proves the
+      # helper that prepare and publish depend on before either is attempted.
+      - name: Release-set rules (offline)
+        run: python3 scripts/release-assets.py --self-test
+
       - name: Log in to GHCR
-        if: ${{ !inputs.dry_run }}
+        if: ${{ inputs.operation == 'prepare' }}
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      # A version tag that already exists is a completed version (for example,
+      # one published before release sets existed). Never prepare new bytes for it.
+      - name: Refuse a version whose image tag is already published
+        if: ${{ inputs.operation == 'prepare' }}
+        env:
+          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE_REF" >/dev/null 2>&1; then
+            echo "::error::${IMAGE_REF} already exists; a completed version is never prepared again. Use a new version."
+            exit 1
+          fi
+          echo "${IMAGE_REF} does not exist yet"
+
       # STEP 1 OF 2: publish BY DIGEST under the constant staging ref resolved
-      # above (`:build`), never a per-release name. The version tag is deliberately
-      # NOT applied yet — see the verify step below. This is pretorin-cli's
-      # ordering: bytes are published and checked before any human-readable tag
-      # points at them.
+      # above (`:build`), never a per-release name. No other tag is applied yet —
+      # see the verify step below. This is pretorin-cli's ordering: bytes are
+      # published and checked before any human-readable tag points at them.
       - name: Push by digest
         id: push
-        if: ${{ !inputs.dry_run }}
+        if: ${{ inputs.operation == 'prepare' }}
         env:
           BUILD_REF: ${{ steps.pins.outputs.build_ref }}
         run: |
@@ -373,11 +440,11 @@ jobs:
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "pushed by digest: ${DIGEST}"
 
-      # Prove the registry returns what we sent, BEFORE the version tag exists. The
+      # Prove the registry returns what we sent, BEFORE any other tag exists. The
       # local image is removed first so the pull cannot be served from cache, and the
       # SBOM is regenerated from the pulled bytes and compared.
       - name: Verify the published digest round-trips
-        if: ${{ !inputs.dry_run }}
+        if: ${{ inputs.operation == 'prepare' }}
         env:
           IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
           BUILD_REF: ${{ steps.pins.outputs.build_ref }}
@@ -402,87 +469,38 @@ jobs:
           PULLED="$(python3 -c 'import json;print(len(json.load(open("sbom.pulled.json")).get("packages",[])))')"
           echo "SBOM packages: built=${BUILT} pulled=${PULLED}"
           [ "$BUILT" = "$PULLED" ] || { echo "::error::pulled image inventory differs from the built image"; exit 1; }
+          rm -f sbom.pulled.json
           echo "digest round-trip verified"
 
-      # STEP 2 OF 2: only now does the version tag point at the digest, and only at a
-      # digest that has been pulled back and re-inventoried.
-      #
-      # A tag is added by re-PUTting THE SAME MANIFEST BYTES under the tag name. A
-      # digest IS the hash of those bytes, so this preserves it by construction --
-      # there is no operation to get wrong.
-      #
-      # `docker buildx imagetools create --tag X repo@digest` is NOT that operation
-      # and must not be used here. It does not move a tag; it BUILDS A NEW MANIFEST
-      # LIST wrapping the source, which by definition hashes differently. v0.2.0's
-      # first release attempt proved it: the step published
-      # `sha256:351ecb37...` (a manifest.list) for a verified
-      # `sha256:34619259...` (a manifest.v2), and the assertion below correctly
-      # refused to let a tag point at bytes nothing had verified.
-      #
-      # `docker tag` + `docker push` would probably preserve the digest for a
-      # single manifest, but only as a side effect of the client regenerating an
-      # identical manifest. "Probably" is not a supply-chain control.
-      - name: Apply the version tag to the verified digest
-        if: ${{ !inputs.dry_run }}
+      # STEP 2 OF 2 for a candidate: `candidate-X.Y.Z` names the verified digest,
+      # by the exact-manifest operation in scripts/release-tag.sh. It keeps the
+      # candidate from looking abandoned once `:build` moves on, and it is how
+      # `publish` proves the digest it tags is the one this run qualified. It may
+      # move on a re-prepare; the version tag never does. NOT the stable tag.
+      - name: Tag the verified digest as the candidate
+        if: ${{ inputs.operation == 'prepare' }}
         env:
           IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
-          VERSION: ${{ steps.pins.outputs.version }}
           DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ steps.pins.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          REPO_PATH="${IMAGE_REPO#ghcr.io/}"
-          ACCEPT='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
-
-          # A registry bearer token for this repository only, exchanged from the
-          # automatic GITHUB_TOKEN. Same credential `docker login` already used.
-          TOKEN="$(curl -fsSL -u "${GITHUB_ACTOR}:${GH_TOKEN}" \
-            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_PATH}:pull,push" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
-          [ -n "$TOKEN" ] || { echo "::error::could not obtain a ghcr.io token"; exit 1; }
-
-          # Content-Type must be echoed back exactly: it is part of what the digest
-          # covers, so guessing it would change the bytes and hence the digest.
-          CT="$(curl -fsSL -o manifest.json -w '%{content_type}' \
-            -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${ACCEPT}" \
-            "https://ghcr.io/v2/${REPO_PATH}/manifests/${DIGEST}")"
-
-          # Gate 1: the bytes we are about to re-PUT really are the verified image.
-          LOCAL="sha256:$(sha256sum manifest.json | cut -d' ' -f1)"
-          [ "$LOCAL" = "$DIGEST" ] \
-            || { echo "::error::fetched manifest hashes to ${LOCAL}, expected ${DIGEST}"; exit 1; }
-
-          # Gate 2: the registry's own accounting of what it just stored.
-          STORED="$(curl -fsSL -X PUT -o /dev/null -w '%header{docker-content-digest}' \
-            -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: ${CT}" \
-            --data-binary @manifest.json \
-            "https://ghcr.io/v2/${REPO_PATH}/manifests/${VERSION}")"
-          [ "$STORED" = "$DIGEST" ] \
-            || { echo "::error::registry stored the tag as ${STORED}, expected ${DIGEST}"; exit 1; }
-
-          # Gate 3: resolve the tag through the docker client, so the check does not
-          # depend on the same API call that wrote it.
-          RESOLVED="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          [ "$RESOLVED" = "$DIGEST" ] \
-            || { echo "::error::tag ${IMAGE_REF} resolves to ${RESOLVED}, expected ${DIGEST}"; exit 1; }
-          echo "tag ${IMAGE_REF} -> ${DIGEST}"
+        run: bash scripts/release-tag.sh "$IMAGE_REPO" "$DIGEST" "candidate-${VERSION}" --allow-move
 
       # Reclaim a digest that was pushed but never tagged -- a run that died
-      # between "Push by digest" and the tagging step. Such a version carries the
+      # between "Push by digest" and the candidate tag. Such a version carries the
       # staging tag and nothing else, which is precisely the condition tested
       # below, and it is the ONLY case where deleting is safe.
       #
       # THE TAG SET IS THE SAFETY INTERLOCK, not a nicety. GHCR deletes VERSIONS
-      # (digests), never individual tags. Once the version tag has been applied,
-      # the staging tag and the release tag name the same version, so deleting
-      # "the leftover staging tag" would delete the release. The guard makes that
-      # impossible: a tagged release always has more than one tag by then.
+      # (digests), never individual tags. Once the candidate tag has been applied,
+      # the staging tag and the candidate tag name the same version, so deleting
+      # "the leftover staging tag" would delete the candidate. The guard makes that
+      # impossible: a tagged candidate always has more than one tag by then.
       #
       # Best-effort throughout. GITHUB_TOKEN may not carry package-delete rights
       # depending on org policy, and a release must never fail over housekeeping.
       - name: Reclaim the digest if it was never tagged
-        if: ${{ always() && !inputs.dry_run }}
+        if: ${{ always() && inputs.operation == 'prepare' }}
         env:
           IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -506,7 +524,7 @@ jobs:
           [ -n "${ID:-}" ] || { echo "digest ${DIGEST} not found in the package listing; nothing to do"; exit 0; }
 
           if [ "${TAGS:-}" != "build" ]; then
-            echo "digest ${DIGEST} carries tags [${TAGS:-<none>}] -- it is tagged for release, keeping it"
+            echo "digest ${DIGEST} carries tags [${TAGS:-<none>}] -- it is tagged, keeping it"
             exit 0
           fi
 
@@ -515,22 +533,282 @@ jobs:
             && echo "deleted abandoned version ${ID}" \
             || echo "::notice::could not delete version ${ID} (permissions); delete it by hand if it matters"
 
-      - name: Summary
-        if: ${{ !inputs.dry_run }}
+      # The release set, from the qualified values only. prepare refuses a
+      # mismatched SBOM name, a malformed digest or commit, or a tag that does not
+      # name this commit; check then re-reads what was written.
+      - name: Generate the release set
+        if: ${{ inputs.operation == 'prepare' }}
         env:
           IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
-          IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ steps.pins.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-assets.py prepare --version "$VERSION" \
+            --commit "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY" \
+            --image-repository "$IMAGE_REPO" --digest "$DIGEST" \
+            --sbom "sbom-${VERSION}.spdx.json" --out release-set --source .
+          python3 scripts/release-assets.py check --dir release-set --stage candidate \
+            --all-assets --version "$VERSION" --source .
+          ls -l release-set
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ inputs.operation == 'prepare' }}
+        with:
+          name: release-set-${{ steps.pins.outputs.version }}
+          path: release-set/
+          if-no-files-found: error
+
+      - name: Summary
+        if: ${{ inputs.operation == 'prepare' }}
+        env:
+          IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
           VERSION: ${{ steps.pins.outputs.version }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
           {
+            echo "### Candidate prepared (not a customer release)"
+            echo ""
+            echo '```'
+            echo "${IMAGE_REPO}@${DIGEST}"
+            echo "${IMAGE_REPO}:candidate-${VERSION}   (tag applied only after the digest was verified)"
+            echo '```'
+            echo ""
+            echo "The draft release v${VERSION} carries the candidate release set. The"
+            echo "version tag \`${VERSION}\` is NOT applied, and customers are not notified."
+            echo "Qualify this exact candidate, then publish it without a rebuild:"
+            echo ""
+            echo '```sh'
+            echo "gh workflow run release.yml --ref v${VERSION} -f operation=publish"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # prepare, after every candidate gate passed. SEPARATE JOB, contents:write only:
+  # it writes the DRAFT release and has no packages access. `needs: candidate`
+  # means a failed build, scan, round trip or asset check creates no draft.
+  draft:
+    needs: candidate
+    if: ${{ inputs.operation == 'prepare' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # create or update the DRAFT release — the ONLY write here
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-set-${{ needs.candidate.outputs.version }}
+          path: release-set
+
+      - name: Attach the candidate set to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.candidate.outputs.tag }}
+          VERSION: ${{ needs.candidate.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-assets.py check --dir release-set --stage candidate \
+            --all-assets --version "$VERSION"
+          STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+          case "$STATE" in
+            none)
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+                --title "$TAG" --generate-notes release-set/*
+              echo "created draft release ${TAG}" ;;
+            true)
+              # A draft is not complete: a re-prepare replaces its candidate set.
+              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber release-set/*
+              echo "replaced the candidate set on draft release ${TAG}" ;;
+            *)
+              echo "::error::release ${TAG} is already published; its assets are never replaced"
+              exit 1 ;;
+          esac
+
+  # ---------------------------------------------------------------------------
+  # publish: NO BUILD. Three jobs so that no job holds both write permissions:
+  #   final-assets   contents:write  read the draft set, check it, mark it final
+  #   final-image    packages:write  tag the SAME digest with the version
+  #   final-release  contents:write  upload the final record, un-draft
+  # Every step is safe to retry: finalize is idempotent, the version tag only
+  # accepts the recorded digest, and assets are written only while still a draft.
+  # ---------------------------------------------------------------------------
+  final-assets:
+    if: ${{ inputs.operation == 'publish' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # drafts are visible only with write access; nothing is written here
+    outputs:
+      version: ${{ steps.set.outputs.version }}
+      tag: ${{ steps.set.outputs.tag }}
+      digest: ${{ steps.set.outputs.digest }}
+      completed: ${{ steps.set.outputs.completed }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Check the prepared set against its tag and mark it final
+        id: set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || { echo "::error::publish must run on a release tag: gh workflow run release.yml --ref vX.Y.Z -f operation=publish"; exit 1; }
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          . ./versions.env
+          git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+
+          STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+          [ "$STATE" != none ] \
+            || { echo "::error::no release ${TAG}: run operation=prepare on this tag first"; exit 1; }
+          mkdir release-set
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-set \
+            --pattern compliance-claw-release.json --pattern compose.release.yaml \
+            --pattern "sbom-${VERSION}.spdx.json"
+
+          if [ "$STATE" = false ]; then
+            # Already published: confirm, change nothing. Downstream jobs only verify.
+            python3 scripts/release-assets.py check --dir release-set --stage final \
+              --all-assets --version "$VERSION" --source .
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          else
+            # A candidate, or a final record from an earlier attempt that stopped
+            # before the release was un-drafted.
+            python3 scripts/release-assets.py check --dir release-set --stage any \
+              --all-assets --version "$VERSION" --source .
+            python3 scripts/release-assets.py finalize --dir release-set
+            echo "completed=false" >> "$GITHUB_OUTPUT"
+          fi
+          SUMMARY="$(python3 scripts/release-assets.py check --dir release-set \
+            --all-assets --version "$VERSION" --source . --json)"
+          REC_REPO="$(printf '%s' "$SUMMARY" | jq -r .image_reference | sed 's/:[^:/]*@.*$//')"
+          [ "$REC_REPO" = "$IMAGE_REPO" ] \
+            || { echo "::error::the record names ${REC_REPO}; versions.env says ${IMAGE_REPO}"; exit 1; }
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "digest=$(printf '%s' "$SUMMARY" | jq -r .digest)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: final-set-${{ steps.set.outputs.version }}
+          path: release-set/
+          if-no-files-found: error
+
+  final-image:
+    needs: final-assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write   # apply the version tag — the ONLY write here
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # The digest must be the one prepare qualified: candidate-X.Y.Z names it
+      # (applied only after the round trip). A completed release may have moved
+      # past its candidate tag, so there the version tag is the evidence instead.
+      - name: Confirm the recorded digest is the qualified candidate
+        env:
+          VERSION: ${{ needs.final-assets.outputs.version }}
+          DIGEST: ${{ needs.final-assets.outputs.digest }}
+          COMPLETED: ${{ needs.final-assets.outputs.completed }}
+        run: |
+          set -euo pipefail
+          . ./versions.env
+          WHICH="candidate-${VERSION}"
+          [ "$COMPLETED" = false ] || WHICH="${VERSION}"
+          RESOLVED="$(docker buildx imagetools inspect "${IMAGE_REPO}:${WHICH}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [ "$RESOLVED" = "$DIGEST" ] \
+            || { echo "::error::${IMAGE_REPO}:${WHICH} is ${RESOLVED}; the release record names ${DIGEST}"; exit 1; }
+          docker pull --platform linux/amd64 "${IMAGE_REPO}@${DIGEST}"
+          PLATFORM="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${IMAGE_REPO}@${DIGEST}")"
+          [ "$PLATFORM" = linux/amd64 ] || { echo "::error::image platform is ${PLATFORM}"; exit 1; }
+          echo "${IMAGE_REPO}:${WHICH} -> ${DIGEST} (${PLATFORM})"
+
+      # The stable tag, on the same bytes. release-tag.sh refuses to move an
+      # existing version tag, and is a no-op when it already names this digest.
+      - name: Apply the version tag to the qualified digest
+        env:
+          VERSION: ${{ needs.final-assets.outputs.version }}
+          DIGEST: ${{ needs.final-assets.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          . ./versions.env
+          bash scripts/release-tag.sh "$IMAGE_REPO" "$DIGEST" "$VERSION"
+
+  final-release:
+    needs: [final-assets, final-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # upload the final record and un-draft — the ONLY write here
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: final-set-${{ needs.final-assets.outputs.version }}
+          path: release-set
+
+      - name: Publish the final release set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.final-assets.outputs.tag }}
+          VERSION: ${{ needs.final-assets.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-assets.py check --dir release-set --all-assets --version "$VERSION"
+          STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$STATE" = true ]; then
+            # Only the record changes (stage: final); the overlay and SBOM on the
+            # draft are the qualified bytes and are checked, not re-uploaded.
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              release-set/compliance-claw-release.json
+          fi
+          mkdir published
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir published \
+            --pattern compliance-claw-release.json --pattern compose.release.yaml \
+            --pattern "sbom-${VERSION}.spdx.json"
+          for f in release-set/*; do
+            cmp "$f" "published/$(basename "$f")" \
+              || { echo "::error::release asset $(basename "$f") differs from the checked set"; exit 1; }
+          done
+          python3 scripts/release-assets.py check --dir published --all-assets --version "$VERSION"
+          if [ "$STATE" = true ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+            echo "published release ${TAG}"
+          else
+            echo "release ${TAG} was already published with these exact assets"
+          fi
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.final-assets.outputs.version }}
+          DIGEST: ${{ needs.final-assets.outputs.digest }}
+        run: |
+          set -euo pipefail
+          . ./versions.env
+          {
             echo "### Published"
             echo ""
             echo '```'
             echo "${IMAGE_REPO}@${DIGEST}"
-            echo "${IMAGE_REF}   (tag applied only after the digest was verified)"
+            echo "${IMAGE_REPO}:${VERSION}   (the digest prepare qualified; no rebuild)"
             echo '```'
+            echo ""
+            echo "The release v${VERSION} carries the final release set."
+            echo "Customers select it with compose.release.yaml (docs/image-verification.md)."
             echo ""
             echo "**One commit closes the release.** Pin the digest and move"
             echo "\`IMAGE_VERSION\` together — both describe what this checkout deploys:"
@@ -544,46 +822,7 @@ jobs:
             echo "IMAGE_VERSION=${VERSION}"
             echo '```'
             echo ""
-            echo "Pull it:"
-            echo ""
-            echo '```sh'
-            echo "docker login ghcr.io          # the package is not public"
-            echo "docker pull ${IMAGE_REPO}@${DIGEST}"
-            echo '```'
-            echo ""
-            echo "**Not signed.** A digest guarantees INTEGRITY — these exact bytes —"
-            echo "but not AUTHENTICITY. Azure Key Vault signing, as pretorin-cli does"
-            echo "it, is SECURITY.md ledger item 5."
+            echo "**Not signed.** A digest and the asset checksums guarantee INTEGRITY —"
+            echo "these exact bytes — but not AUTHENTICITY. Image and record signing is"
+            echo "planned work in the SECURITY.md hardening ledger."
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # SEPARATE JOB, and the only one with `contents: write`.
-  #
-  # Attaching the SBOM to the release makes it outlive workflow-artifact retention,
-  # which matters for a compliance artifact — but `gh release upload` needs
-  # contents:write, and the publish job above must not have it. pretorin-cli keeps
-  # its `attach` job as the sole contents:write job for the same reason. Splitting
-  # costs one artifact round-trip and keeps the build/push job read-only on contents.
-  #
-  # `needs: publish` means a failed or blocked release attaches nothing.
-  attach-sbom:
-    needs: publish
-    if: ${{ github.event_name == 'release' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write   # upload a release asset — the ONLY write here
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: sbom-${{ needs.publish.outputs.version }}
-
-      - name: Attach the SBOM to the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.publish.outputs.version }}
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          test -f "sbom-${VERSION}.spdx.json"
-          gh release upload "$TAG" "sbom-${VERSION}.spdx.json" --clobber --repo "$GITHUB_REPOSITORY"
-          echo "attached sbom-${VERSION}.spdx.json to ${TAG}"
