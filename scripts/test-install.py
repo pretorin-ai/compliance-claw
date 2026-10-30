@@ -431,6 +431,9 @@ class InstallTest(unittest.TestCase):
         overlay = tampered / "compose.release.yaml"
         overlay.write_text(overlay.read_text().replace("c" * 64, "d" * 64))
         self.assert_refused_without_change(self.rel(tampered) + self.full_args()[4:], "sha256")
+        colon = self.base / "rel:x"
+        shutil.copytree(self.release, colon)
+        self.assert_refused_without_change(self.rel(colon) + self.full_args()[4:], "Compose path separator")
         self.assert_refused_without_change(self.full_args(), "would not run the release image",
                                            image="ghcr.io/example/other:1@sha256:" + "e" * 64)
 

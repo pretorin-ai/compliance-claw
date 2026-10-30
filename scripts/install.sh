@@ -105,12 +105,15 @@ fi
 INTERACTIVE=0
 if [ -t 0 ] && [ -t 1 ]; then INTERACTIVE=1; fi
 
-WORK_DIR=""
+WORK_DIR="" TTY_STATE=""
 cleanup() {
   [ -z "$WORK_DIR" ] || rm -rf "$WORK_DIR"
+  [ -z "$TTY_STATE" ] || stty "$TTY_STATE" 2>/dev/null || true
   return 0
 }
-trap cleanup EXIT INT TERM
+# An interrupt stops the run; the EXIT trap then cleans up.
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cc-install.XXXXXX")"
 
 # ---------------------------------------------------------------------------
@@ -133,9 +136,6 @@ MISSING=""
 for tool in git python3 openssl docker; do
   command -v "$tool" >/dev/null 2>&1 || MISSING="${MISSING} ${tool}"
 done
-if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
-  MISSING="${MISSING} sha256sum"
-fi
 [ -z "$MISSING" ] || die "required host tools are missing:${MISSING}
   Install them with the VM's package manager, then re-run. Nothing was changed."
 
@@ -243,6 +243,10 @@ compose_resolve_selection || die "the deployment selection did not resolve. A se
   compose.release.yaml before it is placed cannot resolve: unset COMPOSE_FILE in this
   shell and let the installer select it. Nothing was changed."
 SEP="${COMPOSE_PATH_SEPARATOR:-:}"
+case "$RELEASE_SRC" in
+  *"$SEP"*) die "${RELEASE_SRC} contains '${SEP}', the Compose path separator. Move the release
+  files to another directory. Nothing was changed." ;;
+esac
 if [ -z "${COMPOSE_FILE:-}" ]; then
   COMPOSE_FILE="compose.yaml${SEP}compose.release.yaml${SEP}compose.secrets.yaml${SEP}compose.efforts.yaml"
   TO_SAVE+=("COMPOSE_FILE=${COMPOSE_FILE}")
@@ -485,8 +489,13 @@ for entry in "${SECRET_INPUTS[@]}"; do fill_secret "${entry%%|*}" "${entry#*|}";
 ask_hidden() {  # NAME PROMPT — hidden input into an empty file; Enter skips
   local dest="${SECRET_DIR}/$1" value=""
   [ "$INTERACTIVE" = 1 ] && [ ! -s "$dest" ] || return 0
+  # Echo goes off BEFORE the prompt, so keys typed early are not shown either.
+  TTY_STATE="$(stty -g)"
+  stty -echo
   printf 'install: %s (hidden; press Enter to skip): ' "$2"
-  IFS= read -rs value || value=""
+  IFS= read -r value || value=""
+  stty "$TTY_STATE"
+  TTY_STATE=""
   printf '\n'
   if [ -n "$value" ]; then
     printf '%s' "$value" > "$dest"
