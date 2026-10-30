@@ -41,6 +41,11 @@
 # native Control UI; see docs/administration.md.
 set -euo pipefail
 
+# No bytecode from this run or any child: parse-efforts.py imports a sibling
+# script, which writes scripts/__pycache__/ on Linux, and a refusal must leave
+# the checkout exactly as it was.
+export PYTHONDONTWRITEBYTECODE=1
+
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 

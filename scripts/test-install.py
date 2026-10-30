@@ -166,7 +166,11 @@ class InstallTest(unittest.TestCase):
             path.chmod(0o600)
         self.env = {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
                     "HOME": str(self.base), "FIXTURE": str(self.base),
-                    "TMPDIR": str(self.base), "CC_INSTALL_HEALTH_TIMEOUT": "0"}
+                    "TMPDIR": str(self.base), "CC_INSTALL_HEALTH_TIMEOUT": "0",
+                    # Bytecode is a write too. Without this, a host default
+                    # (macOS keeps it in a user cache) hides a write into the
+                    # checkout that a Linux VM makes: scripts/__pycache__/.
+                    "PYTHONPYCACHEPREFIX": str(self.root / ".pycache-probe")}
         self.release = self.make_release(self.base / "release")
 
     def git(self, *args):
@@ -343,6 +347,17 @@ class InstallTest(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertNotEqual(self.run_install(self.full_args(), **{key: 1}), 0, self.output)
                 self.assertNotIn("clawctl:apply", self.order())
+
+    def test_secret_file_script_failure_stops_at_the_secrets_stage(self):
+        # init-file-secrets.sh cannot create its directory over a plain file.
+        (self.root / "secrets").mkdir()
+        (self.root / "secrets/runtime").write_text("")
+        self.assertNotEqual(self.run_install(self.full_args()), 0, self.output)
+        self.assertIn("init-file-secrets.sh failed", self.output)
+        self.assertIn("stopped at stage 6/10 secrets", self.output)
+        self.assertIn("#if-a-setup-stage-fails", self.output)
+        self.assertFalse(any(c["tool"] == "bootstrap" for c in self.calls))
+        self.assertNotIn("clawctl:apply", self.order())
 
     def test_plan_without_yes_is_shown_but_not_applied(self):
         args = [a for a in self.full_args() if a != "--yes"]
