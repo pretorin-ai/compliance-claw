@@ -141,12 +141,13 @@ on_exit() {
 }
 
 # The saved COMPOSE_FILE line in .env: check that it can be changed, replace or
-# add it, or put the old line back. Changes no other byte, keeps the mode and
-# owner, and replaces the file atomically. `write` prints the old line as
+# add it, or put the old line back. Changes no other byte, keeps the mode,
+# owner, and group (or stops without a change), and replaces the file
+# atomically. `write` prints the old line as
 # "line:<text>" or "absent". The selection holds no credential, but the rest of
 # .env can: nothing else from the file is printed.
 ENV_SELECTION_PY="$(cat <<'PY'
-import os, re, sys, tempfile
+import os, re, stat, sys, tempfile
 mode, path, value = sys.argv[1], sys.argv[2], sys.argv[3]
 def fail(message):
     sys.exit("update: .env: " + message)
@@ -155,6 +156,14 @@ if os.path.islink(path) or not os.path.isfile(path):
 st = os.stat(path)
 if os.geteuid() not in (0, st.st_uid):
     fail("is owned by another user; this user cannot keep its owner")
+# A new file in the directory gets the directory group (BSD/macOS, or a
+# set-group-ID directory) or the process group. Another group can be set only
+# when this user is in it.
+parent = os.stat(os.path.dirname(path))
+new_gid = parent.st_gid if sys.platform == "darwin" or "bsd" in sys.platform or \
+    parent.st_mode & stat.S_ISGID else os.getegid()
+if os.geteuid() != 0 and st.st_gid != new_gid and st.st_gid not in os.getgroups():
+    fail("has group %d, which this user is not in, so a replacement cannot keep it" % st.st_gid)
 with open(path, "rb") as f:
     data = f.read()
 lines = data.split(b"\n")
@@ -186,9 +195,20 @@ fd, tmp = tempfile.mkstemp(prefix=".env.update.", dir=os.path.dirname(path))
 try:
     with os.fdopen(fd, "wb") as f:
         f.write(b"\n".join(lines))
-    os.chmod(tmp, st.st_mode & 0o7777)
-    if os.geteuid() == 0:
-        os.chown(tmp, st.st_uid, st.st_gid)
+    # A new file takes this user and, on some systems, the directory's group.
+    # Keep the owner, group, and mode of .env, or stop and keep .env as it is.
+    new_st = os.stat(tmp)
+    try:
+        if (new_st.st_uid, new_st.st_gid) != (st.st_uid, st.st_gid):
+            os.chown(tmp, st.st_uid if os.geteuid() == 0 else -1, st.st_gid)
+        os.chmod(tmp, st.st_mode & 0o7777)
+    except PermissionError:
+        pass
+    new_st = os.stat(tmp)
+    if (new_st.st_uid, new_st.st_gid, new_st.st_mode & 0o7777) != (st.st_uid, st.st_gid, st.st_mode & 0o7777):
+        os.unlink(tmp)
+        fail("this user cannot keep its owner %d, group %d, and mode %04o; .env was not changed"
+             % (st.st_uid, st.st_gid, st.st_mode & 0o7777))
     os.replace(tmp, path)
 except BaseException:
     if os.path.exists(tmp):

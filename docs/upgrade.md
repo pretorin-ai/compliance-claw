@@ -96,9 +96,10 @@ scripts/update.sh --release vX.Y.Z --save-selection
 ```
 
 Apply changes only the `COMPOSE_FILE` line, after all checks above, and keeps
-every other line, the file mode, and the owner. It prints the previous line. If
-a later step fails before the gateway is replaced, it puts the previous line
-back. A `COMPOSE_FILE` exported in the shell overrides `.env`, so apply refuses
+every other line, the file mode, the owner, and the group. If this user cannot
+keep the group of `.env`, it stops and does not change the file. It prints the
+previous line. If a later step fails before the gateway is replaced, it puts
+the previous line back. A `COMPOSE_FILE` exported in the shell overrides `.env`, so apply refuses
 and names the value to use. You can also save the line by hand, as described in
 [Save deployment settings](../README.md#save-deployment-settings).
 

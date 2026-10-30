@@ -33,8 +33,7 @@ commit, the version, the immutable image digest, and the deployment files.
 [`scripts/release-assets.py`](../scripts/release-assets.py) is the only
 program that writes or reads this set. Its header gives the fields, commands,
 and exit codes. Guided setup and the updater must use its `fetch` and `check`
-commands; they must not parse the record themselves. They are not connected to
-it in this version.
+commands; they must not parse the record themselves.
 
 The record says `signature.status: unsigned`. The name
 `compliance-claw-release.json.sig` is reserved for a later record signature.

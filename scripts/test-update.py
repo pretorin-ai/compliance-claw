@@ -565,6 +565,7 @@ class ReleaseTest(unittest.TestCase):
         (self.fixture / "bin/docker").chmod(0o700)
         (self.fixture / "running-image").write_text(OLD_IMAGE)
         self.signed = "1"
+        self.extra_env = {}
         self.selection = {
             "COMPOSE_PROJECT_NAME": "cc-release-test",
             "COMPOSE_FILE": "compose.yaml:compose.release.yaml:compose.secrets.yaml:deployment/customer.yaml",
@@ -579,7 +580,7 @@ class ReleaseTest(unittest.TestCase):
         env = {**self.git_env, "PATH": str(self.fixture / "bin") + os.pathsep + os.environ["PATH"],
                "HOME": str(self.fixture), "FIXTURE": str(self.fixture), "REPO": str(self.repo),
                "TMPDIR": str(self.fixture), "CC_TEST_RELEASE_SIGNED": self.signed,
-               **self.selection}
+               **self.selection, **self.extra_env}
         p = subprocess.run(["bash", str(self.repo / "scripts/update.sh"), *args], env=env,
                            cwd=self.repo, text=True, capture_output=True)
         self.output = p.stdout + p.stderr
@@ -850,13 +851,30 @@ class ReleaseTest(unittest.TestCase):
         env.write_text("# deployment settings\nCOMPOSE_PROJECT_NAME=cc-release-test\n"
                        f"COMPOSE_FILE={compose_file}\nLEGACY_SECRET=CANARY-ENV-SECRET\n")
         env.chmod(0o640)
+        # A new file takes the process group (Linux) or the directory group
+        # (macOS). Give .env another group of this user, so that a replacement
+        # that does not keep the group fails the test.
+        groups = sorted(set(os.getgroups()) - {os.getegid(), self.repo.stat().st_gid})
+        self.env_other_group = bool(groups)
+        if groups:
+            os.chown(env, -1, groups[0])
+            print("\n%s: .env group %d (process group %d, directory group %d)"
+                  % (self._testMethodName, groups[0], os.getegid(), self.repo.stat().st_gid))
+        else:
+            print("\n%s: SKIPPED the other-group case: this user has no supplementary group"
+                  % self._testMethodName)
         self.selection = {}
         return env
+
+    def assert_env_attributes(self, env, before):
+        after = env.stat()
+        self.assertEqual((after.st_uid, after.st_gid, after.st_mode & 0o7777),
+                         (before.st_uid, before.st_gid, before.st_mode & 0o7777))
 
     def test_first_adoption_saves_only_the_compose_file_line(self):
         (self.repo / "compose.release.yaml").unlink()
         env = self.save_selection_in_env("compose.yaml:compose.secrets.yaml:deployment/customer.yaml")
-        before = env.read_bytes()
+        before, attributes = env.read_bytes(), env.stat()
         new = "compose.yaml:compose.release.yaml:compose.secrets.yaml:deployment/customer.yaml"
         self.assert_blocked("--save-selection")
         self.assertIn("->   " + new, self.output)
@@ -871,7 +889,7 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(env.read_text(), before.decode().replace(
             "COMPOSE_FILE=compose.yaml:compose.secrets.yaml:deployment/customer.yaml",
             "COMPOSE_FILE=" + new))
-        self.assertEqual(env.stat().st_mode & 0o777, 0o640)
+        self.assert_env_attributes(env, attributes)
         self.assertNotIn("CANARY-ENV-SECRET", self.output)
         up = [c for c in self.calls if c["args"][:3] == ["compose", "up", "-d"]]
         self.assertEqual(len(up), 1)
@@ -886,14 +904,56 @@ class ReleaseTest(unittest.TestCase):
     def test_failure_before_downtime_restores_the_compose_file_line(self):
         (self.repo / "compose.release.yaml").unlink()
         env = self.save_selection_in_env("compose.yaml:compose.secrets.yaml:deployment/customer.yaml")
-        before = env.read_bytes()
+        before, attributes = env.read_bytes(), env.stat()
         runtime = self.repo / "secrets/runtime"
         runtime.chmod(0o500)
         self.addCleanup(runtime.chmod, 0o700)
         self.assertNotEqual(self.run_update("--release", "v0.6.0", "--save-selection"), 0, self.output)
         self.assertIn("restored the previous COMPOSE_FILE line", self.output)
         self.assertEqual(env.read_bytes(), before)
-        self.assertEqual(env.stat().st_mode & 0o777, 0o640)
+        self.assert_env_attributes(env, attributes)
+        self.assertFalse(any(c["args"][:3] == ["compose", "up", "-d"] for c in self.calls))
+
+    def other_group_or_skip(self):
+        if not self.env_other_group:
+            self.skipTest("this user has no supplementary group")
+
+    def python_hook(self, code):
+        """Run every Python process of the update with this code loaded first."""
+        hook = self.fixture / "python-hook"
+        hook.mkdir()
+        (hook / "sitecustomize.py").write_text("import os\n" + code)
+        self.extra_env["PYTHONPATH"] = str(hook)
+
+    def test_env_group_that_cannot_be_set_blocks_before_any_change(self):
+        (self.repo / "compose.release.yaml").unlink()
+        env = self.save_selection_in_env("compose.yaml:compose.secrets.yaml:deployment/customer.yaml")
+        self.other_group_or_skip()
+        # This user is no longer in the group of .env.
+        self.python_hook("os.getgroups = lambda: [os.getegid()]\n")
+        before, attributes = self.snapshot(), env.stat()
+        self.assertEqual(self.run_update("--release", "v0.6.0", "--preview", "--save-selection"), 2, self.output)
+        self.assertIn("which this user is not in, so a replacement cannot keep it", self.output)
+        self.assertNotEqual(self.run_update("--release", "v0.6.0", "--save-selection"), 0, self.output)
+        self.assertIn("which this user is not in, so a replacement cannot keep it", self.output)
+        self.assertEqual(self.snapshot(), before)
+        self.assert_env_attributes(env, attributes)
+        self.assertEqual(self.changed(), [])
+
+    def test_env_that_does_not_keep_its_group_is_not_replaced(self):
+        (self.repo / "compose.release.yaml").unlink()
+        env = self.save_selection_in_env("compose.yaml:compose.secrets.yaml:deployment/customer.yaml")
+        self.other_group_or_skip()
+        # The check expects that the group can be set, but chown fails.
+        self.python_hook("def chown(*args, **kwargs):\n    raise PermissionError('test: chown refused')\n"
+                         "os.chown = chown\n")
+        before, attributes = env.read_bytes(), env.stat()
+        self.assertNotEqual(self.run_update("--release", "v0.6.0", "--save-selection"), 0, self.output)
+        self.assertIn("cannot keep its owner %d, group %d, and mode 0640; .env was not changed"
+                      % (attributes.st_uid, attributes.st_gid), self.output)
+        self.assertEqual(env.read_bytes(), before)
+        self.assert_env_attributes(env, attributes)
+        self.assertEqual(sorted(p.name for p in self.repo.glob(".env*")), [".env"])
         self.assertFalse(any(c["args"][:3] == ["compose", "up", "-d"] for c in self.calls))
 
     def test_pull_failure_changes_nothing(self):
