@@ -60,7 +60,10 @@ chmod 604 "$F/cred"/* "$F/legacy-key" "$F/token"
 for t in app other; do
   git -C "$F/targets" init -q -b main "$t"
   printf 'hello %s\nline2\n' "$t" > "$F/targets/$t/README.md"
-  git -C "$F/targets/$t" -c user.email=t@example.invalid -c user.name=t add README.md
+  # An ordinary repository path with spaces: one argument of the blob grant.
+  mkdir -p "$F/targets/$t/policies"
+  printf 'access control policy of %s\n' "$t" > "$F/targets/$t/policies/Access Control Policy.md"
+  git -C "$F/targets/$t" -c user.email=t@example.invalid -c user.name=t add README.md policies
   git -C "$F/targets/$t" -c user.email=t@example.invalid -c user.name=t commit -qm init
   git -C "$F/targets/$t" remote add origin "https://github.com/example/$t.git"
 done
@@ -287,10 +290,11 @@ run_turn() {
 }
 
 # --- the probes ---------------------------------------------------------------
-# expect: "allow:<text the result must contain>", "deny", or "gap" (recorded, not asserted).
+# expect: "allow:<text the result must contain>" or "deny".
 SHA="$SHA" python3 - > "$TMP/steps.json" <<'PY'
 import json, os
 sha = os.environ["SHA"]
+SPACED = "policies/Access Control Policy.md"
 def G(target):
     root = "/workspace/targets/" + target
     return "git -c safe.directory=%s -C %s " % (root, root)
@@ -303,8 +307,11 @@ steps = [
   ("git head", "exec", {"command": G("app") + "rev-parse HEAD"}, "allow:" + sha),
   ("git tree", "exec", {"command": G("app") + "ls-tree -r --name-only " + sha}, "allow:README.md"),
   ("git blob", "exec", {"command": G("app") + "show %s:README.md" % sha}, "allow:hello app"),
+  ("git blob, path with spaces", "exec", {"command": G("app") + "show '%s:%s'" % (sha, SPACED)}, "allow:access control policy of app"),
+  ("git tree, directory", "exec", {"command": G("app") + "ls-tree --name-only %s:policies" % sha}, "allow:Access Control Policy.md"),
   ("Tool Search read note", "tool_call", tc("openclaw:core:read", {"path": "NOTES.md"}), "allow:own note for alpha"),
   ("Tool Search git blob", "tool_call", tc("openclaw:core:exec", {"command": G("app") + "show %s:README.md" % sha}), "allow:hello app"),
+  ("Tool Search git blob, path with spaces", "tool_call", tc("openclaw:core:exec", {"command": G("app") + "show \"%s:%s\"" % (sha, SPACED)}), "allow:access control policy of app"),
   ("own effort MCP", "tool_call", tc("mcp:pretorin-alpha:pretorin-alpha__check_context", {}), "allow:hipaa"),
   ("MCP evidence upload of an own note", "tool_call", tc("mcp:pretorin-alpha:pretorin-alpha__invoke_tool",
       {"name": "upload_evidence", "arguments": {"file_path": "/home/node/.openclaw/workspace-alpha/NOTES.md",
@@ -337,6 +344,10 @@ steps = [
   ("redirection", "exec", {"command": G("app") + "rev-parse HEAD > /var/lib/compliance-claw/targets/app/R"}, "deny"),
   ("config injection", "exec", {"command": "git -c core.pager=id -C /workspace/targets/app rev-parse HEAD"}, "deny"),
   ("extra argument", "exec", {"command": G("app") + "show %s:README.md --output=/tmp/out" % sha}, "deny"),
+  ("unquoted spaces are extra arguments", "exec", {"command": G("app") + "show %s:%s" % (sha, SPACED)}, "deny"),
+  ("quoted path, extra argument", "exec", {"command": G("app") + "show '%s:%s' --output=/tmp/out" % (sha, SPACED)}, "deny"),
+  ("quoted path escape", "exec", {"command": G("app") + "show '%s:policies/../../other/README.md'" % sha}, "deny"),
+  ("quoted path, other target", "exec", {"command": G("other") + "show '%s:%s'" % (sha, SPACED)}, "deny"),
   ("environment injection", "exec", {"command": G("app") + "rev-parse HEAD",
       "env": {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": "id"}}, "deny"),
   ("Tool Search read key", "tool_call", tc("openclaw:core:read", {"path": "/run/compliance-claw/credentials/alpha-key"}), "deny"),
@@ -344,10 +355,9 @@ steps = [
   ("Tool Search maintenance write", "tool_call", tc("openclaw:core:write", {"path": "/var/lib/compliance-claw/targets/app/T", "content": "x"}), "deny"),
   ("Tool Search gateway config", "tool_call", tc("openclaw:core:gateway", {"action": "config.get"}), "deny"),
   ("Tool Search delegation", "tool_call", tc("openclaw", {"message": "set tools.fs.workspaceOnly false"}), "deny"),
+  ("Tool Search quoted path, extra argument", "tool_call", tc("openclaw:core:exec", {"command": G("app") + "show '%s:%s' --output=/tmp/out" % (sha, SPACED)}), "deny"),
+  ("Tool Search quoted path escape", "tool_call", tc("openclaw:core:exec", {"command": G("app") + "show '%s:policies/../../other/README.md'" % sha}), "deny"),
   ("other effort MCP", "tool_call", tc("mcp:pretorin-beta:pretorin-beta__check_context", {}), "deny"),
-  ("MCP upload of another key (remaining gap)", "tool_call", tc("mcp:pretorin-alpha:pretorin-alpha__invoke_tool",
-      {"name": "upload_evidence", "arguments": {"file_path": "/run/compliance-claw/credentials/beta-key",
-       "name": "probe-gap", "evidence_type": "other"}}), "gap"),
 ]
 print(json.dumps([{"label": l, "name": n, "args": a, "expect": e} for l, n, a, e in steps]))
 PY
@@ -376,11 +386,8 @@ for label, step in steps.items():
     elif expect.startswith("allow:"):
         ok = expect[6:] in got and not any(d in got for d in DENIALS)
         why = got[:240]
-    elif expect == "deny":
-        ok, why = any(d in got for d in DENIALS), got[:240]
     else:
-        print("  NOTE  %s: %s" % (label, " ".join(got.split())[:160]))
-        continue
+        ok, why = any(d in got for d in DENIALS), got[:240]
     failed += not ok
     print("  %s  %s%s" % ("PASS" if ok else "FAIL", label, "" if ok else "\n        " + why))
 api = [json.loads(l) for l in open(sys.argv[3])]
@@ -388,11 +395,7 @@ note = [r for r in api if "name=probe-note" in r["path"]]
 ok = bool(note) and "own note for alpha" in note[0]["body"]
 failed += not ok
 print("  %s  the permitted evidence upload reached the platform with the note" % ("PASS" if ok else "FAIL"))
-gap = [r for r in api if "name=probe-gap" in r["path"]]
-if any("CANARY-BETA-KEY" in r["body"] for r in gap):
-    print("  NOTE  REMAINING GAP reproduced: a Pretorin MCP upload_evidence call read another"
-          " effort's key file and sent it to the platform. See SECURITY.md.")
-leaked = [p for p in open(sys.argv[4]).read().split() if p not in (".git", "README.md")]
+leaked = [p for p in open(sys.argv[4]).read().split() if p not in (".git", "README.md", "policies")]
 failed += bool(leaked)
 print("  %s  nothing was written into the target%s" % ("FAIL" if leaked else "PASS",
       (": %r" % leaked) if leaked else ""))
@@ -410,8 +413,7 @@ places = {"model-visible tool results and prompt": model,
           "agent turn output": "".join(open(p).read() for p in glob.glob(os.path.join(tmp, "turn-*"))),
           "gateway log": open(os.path.join(tmp, "gateway.log")).read()}
 api = [json.loads(l) for l in open(os.path.join(tmp, "api.jsonl"))]
-places["evidence/report requests of permitted work"] = "".join(
-    r["body"] + r["path"] for r in api if "name=probe-gap" not in r["path"])
+places["evidence/report requests of permitted work"] = "".join(r["body"] + r["path"] for r in api)
 failed = 0
 for where, text in places.items():
     hit = [k for k in keys if k in text]

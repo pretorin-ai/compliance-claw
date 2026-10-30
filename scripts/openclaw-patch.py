@@ -379,8 +379,8 @@ def generated_denies(agent, prefixes):
 #                           persistent configuration changes. Neither is needed
 #                           for compliance work.
 #
-# This is not a sandbox. Pretorin MCP and plugin tools run in the gateway
-# process with its file access; SECURITY.md records that remaining path.
+# This is not a sandbox. These controls restrict native OpenClaw agent tools
+# only; SECURITY.md states what they do not cover.
 ACCESS_DENIES = ("gateway", "openclaw")
 EXEC_MODES_KEPT = ("allowlist", "deny")
 # Legacy exec policy fields. OpenClaw refuses a config patch that mixes them
@@ -471,12 +471,15 @@ def apply_access(entry, access):
 #   ls-tree [-r] --name-only <sha>[:<dir>]      tree listing at a full SHA
 #   show <sha>:<path>                           one blob at a full SHA
 #
-# OpenClaw matches argPattern (ECMAScript) against the parsed argv after argv[0],
-# joined with single spaces, and runs a match without a prompt. Allowlist mode
-# rejects command substitution, redirection and any segment that is not itself
-# a grant, and the host blocks GIT_* / loader environment overrides. Paths are
-# relative, use a conservative character set and contain no `.` or `..`
-# segment, so no option, other repository or maintenance path can be named.
+# OpenClaw matches argPattern (ECMAScript) against the parsed argv after argv[0]
+# and runs a match without a prompt. A pattern that holds a NUL character uses
+# the native NUL form: each argument is followed by one NUL, so one argument can
+# hold a space (`show <sha>:policies/Access Control Policy.md`) and a second
+# argument cannot hide in it. Allowlist mode rejects command substitution,
+# redirection and any segment that is not itself a grant, and the host blocks
+# GIT_* / loader environment overrides. Paths are relative, use letters, digits,
+# space and `. _ @ + - , ( )`, and contain no `.` or `..` segment, so no option,
+# other repository or maintenance path can be named.
 #
 # safe.directory names that one target. The clone is owned by the host user,
 # which on a Linux VM is often not the container uid, and git then refuses it as
@@ -485,14 +488,15 @@ def apply_access(entry, access):
 GIT_BIN = "/usr/bin/git"
 TARGET_ROOT = "/workspace/targets"
 GRANT_ID_PREFIX = "compliance-claw:"
+NUL = "\x00"
 _SHA = r"[0-9a-f]{40}"
-_PATH = (r"(?:(?!\.{1,2}(?:/|$))[A-Za-z0-9._@+-]+/)*"
-         r"(?!\.{1,2}$)[A-Za-z0-9._@+-]+")
+_SEGMENT = r"[A-Za-z0-9 ._@+,()-]+"
+_PATH = (r"(?:(?!\.{1,2}/)%s/)*(?!\.{1,2}%s)%s" % (_SEGMENT, NUL, _SEGMENT))
 GIT_OPERATIONS = (
-    ("url", r"remote get-url origin"),
-    ("head", r"rev-parse HEAD"),
-    ("tree", r"ls-tree (?:-r )?--name-only %s(?::%s)?" % (_SHA, _PATH)),
-    ("blob", r"show %s:%s" % (_SHA, _PATH)),
+    ("url", ("remote", "get-url", "origin")),
+    ("head", ("rev-parse", "HEAD")),
+    ("tree", ("ls-tree", "(?:-r%s)?--name-only" % NUL, "%s(?::%s)?" % (_SHA, _PATH))),
+    ("blob", ("show", "%s:%s" % (_SHA, _PATH))),
 )
 # Fields this deployment writes on a grant. OpenClaw adds usage fields such as
 # lastUsedAt and lastResolvedPath; those are never compared.
@@ -505,10 +509,10 @@ def target_grants(agent, targets):
         # Target names are [A-Za-z0-9._-]; only `.` is special in a pattern.
         root = "%s/%s" % (TARGET_ROOT, target.replace(".", r"\."))
         for op, args in GIT_OPERATIONS:
+            argv = ("-c", r"safe\.directory=" + root, "-C", root) + args
             out.append({"id": "%s%s:%s:%s" % (GRANT_ID_PREFIX, agent, target, op),
                         "pattern": GIT_BIN,
-                        "argPattern": "^-c safe\\.directory=%s -C %s %s$"
-                                      % (root, root, args)})
+                        "argPattern": "^" + "".join(a + NUL for a in argv) + "$"})
     return out
 
 
@@ -533,7 +537,7 @@ def build_approvals(efforts, live, previous_grants):
     recorded. An entry with a Claw grant id that matches neither that record nor
     the new generation was changed by someone else; it is refused by name.
     """
-    doc = copy.deepcopy(live) if live else {"version": 1, "defaults": {}, "agents": {}}
+    doc = copy.deepcopy(live)
     agents = _approval_agents(doc)
     grants = {pe.agent_id(e["name"]): target_grants(pe.agent_id(e["name"]),
                                                     [t["name"] for t in e["targets"]])
@@ -584,15 +588,33 @@ def build_approvals(efforts, live, previous_grants):
     return doc, grants, retired
 
 
+def approvals_reply(path):
+    """A checked `openclaw approvals get --json` reply. Raise PatchError if not.
+
+    A missing, empty or malformed reply is a failed read, never "no approvals".
+    OpenClaw reports an empty store as a complete reply: exists=false and the
+    document {"version": 1, "defaults": {}, "agents": {}}.
+    """
+    try:
+        with open(path) as handle:
+            blob = json.loads(handle.read())
+    except OSError as exc:
+        raise PatchError("the exec approvals reply %s could not be read (%s)"
+                         % (path, exc.strerror))
+    except ValueError:
+        raise PatchError("the exec approvals reply %s is empty or is not JSON" % path)
+    doc = blob.get("file") if isinstance(blob, dict) else None
+    if not (isinstance(doc, dict) and type(doc.get("version")) is int
+            and isinstance(doc.get("defaults"), dict)
+            and isinstance(doc.get("agents"), dict)):
+        raise PatchError("the exec approvals reply %s holds no exec approvals document"
+                         % path)
+    return blob
+
+
 def approvals_document(path):
-    """The document inside an `openclaw approvals get --json` reply, or None."""
-    blob = _load_json_or_none(path)
-    if blob is None:
-        return None
-    doc = blob.get("file", blob) if isinstance(blob, dict) else None
-    if not isinstance(doc, dict):
-        raise PatchError("%s is not an exec approvals reply" % path)
-    return doc
+    """The document inside a checked `openclaw approvals get --json` reply."""
+    return approvals_reply(path)["file"]
 
 
 def _without_usage(doc, drop=()):
@@ -601,7 +623,7 @@ def _without_usage(doc, drop=()):
     OpenClaw writes `socket` (its approval socket) and the usage fields of an
     entry (lastUsedAt, lastResolvedPath, ...) itself; neither is owned here.
     """
-    out = copy.deepcopy(doc or {"version": 1, "defaults": {}, "agents": {}})
+    out = copy.deepcopy(doc)
     out.pop("socket", None)
     for agent, settings in list((out.get("agents") or {}).items()):
         if not isinstance(settings, dict) or not isinstance(settings.get("allowlist"), list):
@@ -619,9 +641,10 @@ def _without_usage(doc, drop=()):
 
 def verify_approvals(live_reply, snapshot_doc, manifest):
     """Owned grants landed, retired grants left, everything else unchanged."""
-    blob = _load_json_or_none(live_reply)
-    if not isinstance(blob, dict) or not isinstance(blob.get("file"), dict):
-        return ["the exec approvals could not be read from the gateway (%s)" % live_reply]
+    try:
+        blob = approvals_reply(live_reply)
+    except PatchError as exc:
+        return ["%s; the exec approvals could not be read from the gateway" % exc]
     live = blob["file"]
     problems = []
     grants = manifest.get("approvalGrants", {})
@@ -1312,9 +1335,13 @@ def cmd_verify(args):
     if args.mcp_json:
         problems.extend(_verify_live_mcp(args.mcp_json, manifest))
     if args.approvals_json:
-        before_doc = (approvals_document(args.approvals_snapshot)
-                      if args.approvals_snapshot else None)
-        problems.extend(verify_approvals(args.approvals_json, before_doc, manifest))
+        try:
+            before_doc = (approvals_document(args.approvals_snapshot)
+                          if args.approvals_snapshot else None)
+        except PatchError as exc:
+            problems.append(str(exc))
+        else:
+            problems.extend(verify_approvals(args.approvals_json, before_doc, manifest))
 
     if problems:
         sys.stderr.write("openclaw-patch: verification FAILED\n")
@@ -1364,8 +1391,13 @@ def cmd_verify_rollback(args):
 
 def cmd_verify_approvals_rollback(args):
     """Is the approvals document back? Usage fields are OpenClaw's own."""
-    after = _without_usage(approvals_document(args.approvals_json))
-    before = _without_usage(approvals_document(args.approvals_snapshot))
+    try:
+        after = _without_usage(approvals_document(args.approvals_json))
+        before = _without_usage(approvals_document(args.approvals_snapshot))
+    except PatchError as exc:
+        sys.stderr.write("openclaw-patch: APPROVALS ROLLBACK VERIFICATION FAILED\n"
+                         "      %s\n" % exc)
+        return 1
     if after == before:
         sys.stderr.write("openclaw-patch: approvals rollback verified\n")
         return 0
@@ -2182,26 +2214,84 @@ def self_test():
     moved["agents"]["other"]["allowlist"].append(grants["crm-soc2"][0])
     refuses("approvals: a Claw grant under another agent is refused",
             lambda: build_approvals(efforts, moved, grants), grants["crm-soc2"][0]["id"])
-    js = re.compile
-    blob = [js(g["argPattern"]) for g in grants["crm-hipaa"]]
+    blob = [re.compile(g["argPattern"]) for g in grants["crm-hipaa"]]
     sha = "0" * 40
-    own = lambda t: "-c safe.directory=/workspace/targets/%s -C /workspace/targets/%s " % (t, t)
-    good = [own("shared") + "rev-parse HEAD", own("extra") + "show %s:docs/a.md" % sha]
-    bad = [own("shared") + "show HEAD:a", own("shared") + "show %s:../a" % sha,
-           own("shared") + "rev-parse HEAD --git-dir=/x",
-           "-C /workspace/targets/shared rev-parse HEAD",
-           "-c safe.directory=* -C /workspace/targets/shared rev-parse HEAD",
-           "-c safe.directory=/workspace/targets/extra -C /workspace/targets/shared rev-parse HEAD",
-           "-c core.pager=id -C /workspace/targets/shared rev-parse HEAD",
-           "-c safe.directory=/var/lib/compliance-claw/targets/shared"
-           " -C /var/lib/compliance-claw/targets/shared rev-parse HEAD"]
-    check(all(any(r.search(a) for r in blob) for a in good)
-          and not any(r.search(a) for r in blob for a in bad),
-          "approvals: grants match only fixed shapes in the agent's own targets")
+    # The native NUL form: each argv element after argv[0], each followed by NUL.
+    argv = lambda *args: "".join(x + NUL for x in args)
+    own = lambda t: ("-c", "safe.directory=/workspace/targets/" + t, "-C", "/workspace/targets/" + t)
+    good = [own("shared") + ("rev-parse", "HEAD"), own("extra") + ("show", sha + ":docs/a.md"),
+            own("shared") + ("show", sha + ":policies/Access Control Policy.md"),
+            own("shared") + ("ls-tree", "--name-only", sha + ":Policy Docs (2026)")]
+    bad = [own("shared") + ("show", "HEAD:a"), own("shared") + ("show", sha + ":../a"),
+           own("shared") + ("show", sha + ":a/../../b c"), own("shared") + ("show", sha + ":/etc/x"),
+           own("shared") + ("show", sha + ":a", "b"), own("shared") + ("show", sha + ":a", "--output=/x"),
+           own("shared") + ("show", sha + ":a\nb"), own("shared") + ("show", sha + ":a*"),
+           own("shared") + ("rev-parse", "HEAD", "--git-dir=/x"),
+           own("shared") + ("rev-parse HEAD",), ("-C", "/workspace/targets/shared", "rev-parse", "HEAD"),
+           ("-c", "safe.directory=*", "-C", "/workspace/targets/shared", "rev-parse", "HEAD"),
+           own("extra")[:2] + own("shared")[2:] + ("rev-parse", "HEAD"),
+           ("-c", "core.pager=id", "-C", "/workspace/targets/shared", "rev-parse", "HEAD"),
+           ("-c", "safe.directory=/var/lib/compliance-claw/targets/shared",
+            "-C", "/var/lib/compliance-claw/targets/shared", "rev-parse", "HEAD")]
+    check(all(any(r.search(argv(*a)) for r in blob) for a in good)
+          and not any(r.search(argv(*a)) for r in blob for a in bad),
+          "approvals: grants match only fixed argv shapes in the agent's own targets,"
+          " one path argument with spaces included")
+    check(all(NUL in g["argPattern"] for gs in grants.values() for g in gs),
+          "approvals: every grant uses the native NUL argument form")
+    spaced = [{"id": g["id"], "pattern": g["pattern"],
+               "argPattern": g["argPattern"].replace(NUL, " ")} for g in grants["crm-soc2"]]
+    olddoc = json.loads(json.dumps(live))
+    olddoc["agents"]["crm-soc2"]["allowlist"] = [admin] + spaced
+    moved_doc, _, retired = build_approvals(efforts, olddoc, {"crm-soc2": spaced})
+    check(retired == spaced and moved_doc["agents"]["crm-soc2"]["allowlist"]
+          == [admin] + grants["crm-soc2"],
+          "approvals: recorded grants of the earlier space form retire on the next apply")
+
+    # --- approvals replies -----------------------------------------------------
+    import contextlib, io, tempfile
+    d = tempfile.mkdtemp()
+    def raw(name, text):
+        path = os.path.join(d, name)
+        if text is not None:
+            open(path, "w").write(text)
+        return path
+    native_empty = json.dumps({"path": "x", "exists": False, "hash": "missing:x",
+                               "file": {"version": 1, "defaults": {}, "agents": {}},
+                               "effectivePolicy": {"scopes": []}})
+    check(approvals_document(raw("empty-state.json", native_empty))
+          == {"version": 1, "defaults": {}, "agents": {}},
+          "approvals reply: a valid native empty-state reply is an empty document")
+    broken = (("missing", None), ("empty", ""), ("malformed", '{"file": {"version": 1, "agents"'),
+              ("no document", '{"hash": "x", "effectivePolicy": {"scopes": []}}'),
+              ("bare document", '{"version": 1, "defaults": {}, "agents": {}}'),
+              ("wrong document", '{"file": {"version": "1", "defaults": {}, "agents": []}}'))
+    for label, text in broken:
+        bad_reply = raw("bad-%s.json" % label.replace(" ", "-"), text)
+        refuses("approvals reply: a %s reply as no approvals" % label,
+                lambda bad_reply=bad_reply: approvals_document(bad_reply), "exec approvals reply")
+        args = argparse.Namespace(approvals_json=bad_reply,
+                                  approvals_snapshot=raw("snap.json", native_empty))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = cmd_verify_approvals_rollback(args)
+        check(code != 0 and "verified" not in err.getvalue(),
+              "approvals rollback verify: a %s live reply fails, with no success claim" % label)
+        args = argparse.Namespace(approvals_json=raw("snap.json", native_empty),
+                                  approvals_snapshot=bad_reply)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cmd_verify_approvals_rollback(args)
+        check(code != 0 and "verified" not in err.getvalue(),
+              "approvals rollback verify: a %s snapshot fails, with no success claim" % label)
+        out = tempfile.mkdtemp()
+        refuses("generate: a %s supplied approvals reply as no approvals" % label,
+                lambda bad_reply=bad_reply, out=out: cmd_generate(argparse.Namespace(
+                    efforts=raw("efforts.yaml", TWO_EFFORTS), config="", last_applied_state="",
+                    out_dir=out, dm_add="", dm_remove="", approvals=bad_reply)),
+                "exec approvals reply")
+        check(os.listdir(out) == [], "generate: a %s approvals reply writes nothing" % label)
 
     # --- approvals verification ----------------------------------------------
-    import tempfile
-    d = tempfile.mkdtemp()
     manifest = {"approvalGrants": grants, "retiredGrants": [gone]}
     def reply(document, security="allowlist"):
         path = os.path.join(d, "r.json")
@@ -2224,6 +2314,11 @@ def self_test():
     check(any("effective exec security" in p
               for p in verify_approvals(reply(landed, "full"), live, manifest)),
           "approvals verify: effective full exec security fails verification")
+    for label, text in broken:
+        problems = verify_approvals(raw("after-%s.json" % label.replace(" ", "-"), text),
+                                    live, manifest)
+        check(len(problems) == 1 and "exec approvals reply" in problems[0],
+              "approvals verify: a %s live reply fails verification" % label)
 
     print("")
     print("openclaw-patch self-test: %d case(s) failed" % failures if failures

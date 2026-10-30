@@ -151,6 +151,8 @@ esac
 # from tools.exec.mode, which is what verify reads.
 #   STUB_OC_FAIL=approvals        the forward set fails (restore still works)
 #   STUB_OC_FAIL=approvalsverify  the grants do not appear after apply
+#   STUB_OC_APPR_GET=fail|empty|malformed|nodoc  \`get\` gives no valid reply,
+#     from call number STUB_OC_APPR_GET_FROM (default 1) on
 STUB_OC_APPROVALS="\${STUB_OC_CONFIG:+\${STUB_OC_CONFIG}.approvals}"
 case " \$* " in
   *" openclaw approvals set --stdin "*)
@@ -161,6 +163,18 @@ case " \$* " in
     [ -n "\$STUB_OC_APPROVALS" ] && printf '%s' "\$_doc" > "\$STUB_OC_APPROVALS"
     exit 0 ;;
   *" openclaw approvals get --json "*)
+    if [ -n "\${STUB_OC_APPR_GET:-}" ] && [ -n "\$STUB_OC_APPROVALS" ]; then
+      _n=\$(( \$(cat "\${STUB_OC_APPROVALS}.gets" 2>/dev/null || echo 0) + 1 ))
+      echo "\$_n" > "\${STUB_OC_APPROVALS}.gets"
+      if [ "\$_n" -ge "\${STUB_OC_APPR_GET_FROM:-1}" ]; then
+        case "\$STUB_OC_APPR_GET" in
+          fail) echo "gateway closed the connection" >&2; exit 1 ;;
+          empty) exit 0 ;;
+          malformed) printf '{"file": {"version": 1, "agents"'; exit 0 ;;
+          nodoc) printf '{"hash": "stub", "effectivePolicy": {"scopes": []}}'; exit 0 ;;
+        esac
+      fi
+    fi
     CC_APPR="\$STUB_OC_APPROVALS" CC_CFG="\${STUB_OC_CONFIG:-}" python3 -c '
 import json, os
 doc = {"version": 1, "defaults": {}, "agents": {}}
@@ -1016,6 +1030,8 @@ BASE
         STUB_OC_CONFIG="$OC" STUB_OC_FAIL="${1:-}" STUB_WS_ROOT="${tmp}/ocstate" \
         STUB_TARGETS="simple-crm other" STUB_ONBOARD="${2:-ok}" \
         STUB_WS_FAIL="${STUB_WS_FAIL:-}" \
+        STUB_OC_APPR_GET="${STUB_OC_APPR_GET:-}" \
+        STUB_OC_APPR_GET_FROM="${STUB_OC_APPR_GET_FROM:-1}" \
         STUB_GATEWAY_RUNNING="${STUB_GATEWAY_RUNNING:-0}" \
         STUB_NATIVE_PREPARE="${STUB_NATIVE_PREPARE:-0}" \
         bash "${root}/scripts/clawctl" apply ) >"$fleetlog" 2>&1
@@ -1408,21 +1424,24 @@ for agent in ("crm-soc2", "crm-hipaa"):
     assert len(grants) == 8 and all(e["pattern"] == "/usr/bin/git" for e in grants), grants
     assert state["approvalGrants"][agent] == grants
     rx = [re.compile(e["argPattern"]) for e in grants]
-    allowed = lambda args: any(r.search(args) for r in rx)
-    root = "-c safe.directory=/workspace/targets/simple-crm -C /workspace/targets/simple-crm "
-    for args in ("remote get-url origin", "rev-parse HEAD", "ls-tree -r --name-only " + sha,
-                 "ls-tree --name-only %s:src/app" % sha, "show %s:.github/ci.yml" % sha):
-        assert allowed(root + args), args
-    for args in ("show HEAD:README.md", "show %s:../x" % sha, "show %s:a/../../x" % sha,
-                 "show %s:README.md --output=/tmp/x" % sha, "-c core.pager=id rev-parse HEAD",
-                 "show %s:/etc/passwd" % sha, "rev-parse HEAD; id", "show %s:a b" % sha):
-        assert not allowed(root + args), args
-    assert not allowed("-c safe.directory=/workspace/targets/simple-crmx -C /workspace/targets/simple-crmx rev-parse HEAD")
-    assert not allowed("-c safe.directory=* -C /workspace/targets/simple-crm rev-parse HEAD")
-    assert not allowed("-C /workspace/targets/simple-crm rev-parse HEAD")
-    assert not allowed("-c safe.directory=/var/lib/compliance-claw/targets/simple-crm -C /var/lib/compliance-claw/targets/simple-crm rev-parse HEAD")
+    # The native NUL form: each argv element after argv[0], each followed by NUL.
+    allowed = lambda *argv: any(r.search("".join(x + "\0" for x in argv)) for r in rx)
+    root = ("-c", "safe.directory=/workspace/targets/simple-crm", "-C", "/workspace/targets/simple-crm")
+    for args in (("remote", "get-url", "origin"), ("rev-parse", "HEAD"),
+                 ("ls-tree", "-r", "--name-only", sha), ("ls-tree", "--name-only", sha + ":src/app"),
+                 ("show", sha + ":.github/ci.yml"), ("show", sha + ":policies/Access Control Policy.md")):
+        assert allowed(*root + args), args
+    for args in (("show", "HEAD:README.md"), ("show", sha + ":../x"), ("show", sha + ":a/../../x"),
+                 ("show", sha + ":README.md", "--output=/tmp/x"), ("show", sha + ":/etc/passwd"),
+                 ("show", sha + ":a", "b"), ("rev-parse", "HEAD;", "id"), ("rev-parse HEAD",)):
+        assert not allowed(*root + args), args
+    assert not allowed("-c", "core.pager=id", "-C", "/workspace/targets/simple-crm", "rev-parse", "HEAD")
+    assert not allowed("-c", "safe.directory=/workspace/targets/simple-crmx", "-C", "/workspace/targets/simple-crmx", "rev-parse", "HEAD")
+    assert not allowed("-c", "safe.directory=*", "-C", "/workspace/targets/simple-crm", "rev-parse", "HEAD")
+    assert not allowed("-C", "/workspace/targets/simple-crm", "rev-parse", "HEAD")
+    assert not allowed("-c", "safe.directory=/var/lib/compliance-claw/targets/simple-crm", "-C", "/var/lib/compliance-claw/targets/simple-crm", "rev-parse", "HEAD")
 PYGRANTS
-  then st_ok "fixed git grants: own targets, full SHA, no option, escape or composition"
+  then st_ok "fixed git grants: own targets, full SHA, one path argument, no option, escape or composition"
   else st_bad "fixed git grants are exact and recorded"; fi
 
   # Administrator grants and settings survive; only exact recorded grants retire.
@@ -1538,6 +1557,45 @@ PYEMPTY
     else
       st_bad "$failure failure restores configuration and approvals together" "$(tail -10 "$fleetlog")"
     fi
+  done
+
+  # A failed, empty or malformed approvals read is never "no approvals". Before
+  # apply: refused before any change. After apply, from a genuinely empty store:
+  # verification fails, and the rollback that follows cannot be verified either,
+  # because an unreadable reply must not compare equal to the empty snapshot.
+  local mode from
+  for from in 1 2; do
+    for mode in fail empty malformed nodoc; do
+      [ "$from" = 2 ] && [ "$mode" = fail ] && continue
+      python3 - "$AP" "$from" <<'PYSTRIP'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for agent in doc["agents"].values():
+    agent["allowlist"] = [e for e in agent.get("allowlist", [])
+                          if not str(e.get("id", "")).startswith("compliance-claw:")]
+if sys.argv[2] == "2":
+    doc = {"version": 1, "defaults": {}, "agents": {}}
+json.dump(doc, open(sys.argv[1], "w"))
+PYSTRIP
+      rm -f "${AP}.gets"
+      sig_before="$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")"
+      appr_before="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True))' "$AP")"
+      if STUB_OC_APPR_GET="$mode" STUB_OC_APPR_GET_FROM="$from" st_fleet_apply; then
+        st_bad "a $mode approvals read (call $from) fails apply" "apply exited zero"
+      elif [ "$sig_before" = "$(q "print(json.dumps({k:v for k,v in cfg.items() if k!='meta'}, sort_keys=True))")" ] \
+           && [ "$appr_before" = "$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True))' "$AP")" ] \
+           && ! grep -qE 'rollback verified|are back, and the' "$fleetlog" \
+           && { [ "$from" = 1 ] || grep -q 'the restore did not put things back' "$fleetlog"; } \
+           && grep -qE 'could not read the exec approvals|exec approvals reply' "$fleetlog"; then
+        if [ "$from" = 1 ]; then
+          st_ok "a $mode approvals read before apply stops it before any change"
+        else
+          st_ok "a $mode approvals read after apply fails verification and claims no rollback"
+        fi
+      else
+        st_bad "a $mode approvals read (call $from) is a failure, not an empty state" "$(tail -12 "$fleetlog")"
+      fi
+    done
   done
   st_fleet_apply || st_bad "apply recovers after the injected approvals failures" "$(tail -8 "$fleetlog")"
   cp "${tmp}/oc-legacy.json" "$OC"

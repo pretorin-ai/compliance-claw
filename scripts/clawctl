@@ -867,8 +867,8 @@ oc_config_restore() {
 #
 # IT IS A LIST, NOT A READ PATH. The agent's file tools are limited to this
 # workspace and refuse the links; its exec grants name its own targets by
-# absolute path (openclaw-patch.py: target_grants). Pretorin and plugin tools
-# run in the gateway process and are not limited by either.
+# absolute path (openclaw-patch.py: target_grants). These limits apply to native
+# agent tools only; SECURITY.md states what they do not cover.
 #
 # MANAGED MEANS TRACKED. Every path created is listed in .compliance-claw-managed
 # and only paths from the PREVIOUS list absent from the new one are removed;
@@ -954,8 +954,8 @@ printf '%s' "$CC_AGENTS_MD" > "${NEW}/AGENTS.md"
   printf 'this effort declares, and they are mounted read-only.\n\n'
   printf 'These links are a list, not a read path. File tools stay in this\n'
   printf 'workspace and refuse them. Read a target with the git commands in\n'
-  printf 'AGENTS.md, at a full commit SHA. This is not a sandbox: Pretorin and\n'
-  printf 'plugin tools run in the gateway process with its file access.\n\n'
+  printf 'AGENTS.md, at a full commit SHA. This is not a sandbox: these limits\n'
+  printf 'apply to native agent tools only.\n\n'
   for t in "$@"; do
     printf -- '- %s -> /workspace/targets/%s\n' "$t" "$t"
   done
@@ -1935,10 +1935,12 @@ for agent, access in sorted((manifest.get("access") or {}).items()):
     p("  access %s: tools.fs.workspaceOnly=%s tools.exec.mode=%s deny=%s"
       % (agent, json.dumps(access["workspaceOnly"]), access["execMode"],
          ",".join(manifest.get("accessDenies", []))))
-recorded = {g["id"] for gs in (state.get("approvalGrants") or {}).values() for g in gs}
+# By the whole grant, not the id: a grant whose pattern changed is new.
+key = lambda g: (g.get("id"), g.get("pattern"), g.get("argPattern"))
+recorded = {key(g) for gs in (state.get("approvalGrants") or {}).values() for g in gs}
 for agent, grants in sorted((manifest.get("approvalGrants") or {}).items()):
     for g in grants:
-        p("%s exec grant %s" % ("  " if g["id"] in recorded else "+", g["id"]))
+        p("%s exec grant %s" % ("  " if key(g) in recorded else "+", g["id"]))
 for g in manifest.get("retiredGrants") or []:
     p("- exec grant %s (retired only if it is unchanged)" % g["id"])
 p("  config paths replaced wholesale: %s" % ", ".join(manifest["replacePaths"]))

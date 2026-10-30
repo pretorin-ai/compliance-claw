@@ -77,7 +77,7 @@ OpenClaw enforces these limits; they are not only instructions.
   links, are refused.
 - `exec` runs only the git commands in the next section, in this effort's own
   targets. Any other command, a shell operator (`;`, `&&`, `|`, `$(...)`, `>`),
-  an extra option or a short ref such as `HEAD:` is refused.
+  an extra argument or option, or a short ref such as `HEAD:` is refused.
 - Do not ask for, read, copy or repeat API keys, tokens or configuration files.
   The Pretorin tools authenticate for you; you never need the key value.
 
@@ -95,20 +95,22 @@ evidence that cannot be traced back to either. One target per piece of work.
 
 Read a target only through these commands, exactly as written. Replace `<name>`
 with one of your targets (in both places), `<sha>` with the full 40-character
-commit SHA, and `<path>` with a repository-relative path. The `-c safe.directory`
-part is required; any other `-c` setting is refused:
+commit SHA, and `<path>` with a repository-relative path. Keep the single quotes
+around `<sha>:<path>`: they keep a path with spaces as one argument. The
+`-c safe.directory` part is required; any other `-c` setting is refused:
 
 ```
 git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> remote get-url origin
 git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> rev-parse HEAD
 git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> ls-tree -r --name-only <sha>
-git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> ls-tree --name-only <sha>:<directory>
-git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> show <sha>:<path>
+git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> ls-tree --name-only '<sha>:<directory>'
+git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> show '<sha>:<path>'
 ```
 
 Get the SHA with `rev-parse HEAD` first, then use that same SHA for every read in
-the piece of work, so each cited line comes from one known commit. A path with a
-space or other unusual character cannot be read this way; report it by name.
+the piece of work, so each cited line comes from one known commit. A path may
+hold letters, digits, spaces and `. _ @ + - , ( )`. A path with any other
+character cannot be read this way; report it by name.
 
 ## Bringing a target up to date
 
@@ -137,7 +139,7 @@ Every piece of evidence carries its provenance, gathered from the target itself:
 
 - repository URL — `git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> remote get-url origin`
 - commit SHA — the full SHA from `git -c safe.directory=/workspace/targets/<name> -C /workspace/targets/<name> rev-parse HEAD`
-- repository-relative file path — the `<path>` you read with `show <sha>:<path>`
+- repository-relative file path — the `<path>` you read with `show '<sha>:<path>'`
 - line range, whenever you quote or excerpt
 
 Pretorin's evidence tools take these directly as `code_repository`,
@@ -145,5 +147,4 @@ Pretorin's evidence tools take these directly as `code_repository`,
 them is not reviewable by anyone who did not run this container.
 
 To upload a file as evidence, write it in this workspace first and upload it by
-its absolute path in this workspace. Never name a key, secret or configuration
-file as an upload path.
+its absolute path in this workspace.
