@@ -422,16 +422,22 @@ Contributor test commands, prerequisites, and disposable container setup are in
 
 ## Updating an existing deployment
 
+Select a published release. Preview it, then apply the same release:
+
 ```sh
-scripts/update.sh
+scripts/update.sh --release vX.Y.Z --preview   # changes nothing
+scripts/update.sh --release vX.Y.Z
 ```
 
-One command: fast-forward the checkout, pull the pinned image, restart the
-selected gateway, verify, and report. What survives an update, the health wait,
-refusals and the template warnings are in
+Preview shows the source, image, and volume selection, the required steps,
+the recovery set, and the blockers. Apply checks everything again, pulls the
+image before it stops anything, then restarts the selected gateway, verifies,
+and reports. `scripts/update.sh` with no options follows a Git branch instead.
+The first use, blockers, what survives an update, the health wait, and the
+template warnings are in
 [Routine deployment update](docs/upgrade.md#routine-deployment-update). For an
 OpenClaw version change, back up both state volumes first:
-[Update, upgrade and recovery](docs/upgrade.md).
+[OpenClaw image upgrade and state backup](docs/upgrade.md#openclaw-image-upgrade-and-state-backup).
 
 ## Resetting
 

@@ -7,17 +7,118 @@ Run every command from the repository root with the deployment's saved
 
 ## Routine deployment update
 
+`scripts/update.sh` has two routes. Use the release route for a published
+release. The branch route follows a Git branch; it is the custom route.
+
+### Release route
+
+Preview the release first. Preview does not change the checkout, the Compose
+selection, secret files, containers, or volumes:
+
+```sh
+scripts/update.sh --release vX.Y.Z --preview
+```
+
+Preview fetches the tag (Git objects and `FETCH_HEAD` only) and downloads the
+release assets to a temporary directory. The release verifier checks the release
+record, asset checksums, source commit, and signature status. Preview then
+renders the release with your saved Compose files, in order. It shows:
+
+- the source commit, version, and image changes, and the signature status;
+- the `COMPOSE_FILE` value, project, and both state volumes after the update;
+- the secret files that apply creates empty;
+- the required steps: a backup before an OpenClaw version change, npm access
+  for a managed Slack package change, and the
+  [effort-record transfer](#transfer-existing-effort-records) when it applies;
+- the recovery set: the current checkout, images, running image, Compose
+  selection, project, and state volumes;
+- the blockers.
+
+Exit 0 means that apply with the same options would continue. Exit 2 means
+that apply would stop on a blocker. A verification, download, or access failure
+exits 1. Then apply the same release:
+
+```sh
+scripts/update.sh --release vX.Y.Z
+```
+
+Apply does all the checks again; it does not use preview results. Each of these
+conditions stops apply before it changes a file or stops the gateway:
+
+- the release record, checksums, source commit, or a claimed signature does not
+  verify; or the release is a candidate, not a final release;
+- tracked files have local changes, or the release adds a file at a path where a
+  local file (also an ignored file) already exists;
+- the checkout has commits that the release does not have, or the release is
+  older than the current release (no downgrade over migrated state). A checkout
+  that follows `master` past a release tag can only move to a later release;
+- a later overlay changes the release image (a custom selection), or the release
+  changes the project or a state-volume source, for example a restored volume;
+- a secret file that a customer overlay names does not exist;
+- the effort-record transfer is necessary and not confirmed.
+
+After these checks, apply pulls the release image. Then it checks out the
+release tag (detached `HEAD`), installs the release overlay at
+`compose.release.yaml`, and keeps the old one as `compose.release.yaml.previous`.
+It renders the saved selection again and stops if the result differs from the
+verified result. Then it continues with the [shared steps](#shared-update-steps).
+Apply of the release that is already installed changes no file, and Compose
+does not replace the running gateway.
+
+The saved `COMPOSE_FILE` must select `compose.release.yaml` directly after
+`compose.yaml`. If it does not, apply writes a neutral `compose.release.yaml`
+that changes nothing, prints the `COMPOSE_FILE` line to save, and exits 3.
+Nothing is stopped or pulled. Save that line in `.env`, as described in
+[Save deployment settings](../README.md#save-deployment-settings), and run the
+same command again.
+
+A release that adds per-effort Plan and preflight roots requires the
+[effort-record transfer](#transfer-existing-effort-records). Do the transfer
+first. Then apply with `--effort-records-ready`. The script does not move,
+adopt, or check the records.
+
+A release that changes the OpenClaw version can migrate state at startup.
+Before apply, stop the gateway and verify a backup of both state volumes:
+[OpenClaw image upgrade and state backup](#openclaw-image-upgrade-and-state-backup).
+
+If a step fails after the checkout, the script names the recovery inputs: the
+previous commit, `compose.release.yaml.previous`, the previous images, and the
+verified backup. It does not recover automatically. The release route does not
+change the active Pretorin CLI.
+
+### Branch route
+
 ```sh
 scripts/update.sh
 ```
 
-One command: fast-forward the checkout, pull the image this checkout pins, restart
-the selected gateway, then report anything you have to act on. Compose waits up
+The branch route fast-forwards the checkout's upstream branch and pulls the
+image that the branch pins. Then it continues with the
+[shared steps](#shared-update-steps). It is not a verified release. It refuses
+when the saved selection includes a release overlay, because branch source with
+a release image is a mixed state.
+
+`update.sh` refuses rather than guessing, and names the exact command each time:
+a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
+diverged from its upstream, or a deployment selection that includes the local build
+overlay (that is a rebuild, not an update).
+
+### Shared update steps
+
+On the [file-secret path](file-secrets.md), the script runs
+`scripts/init-file-secrets.sh` before it stops anything. That command creates
+missing built-in secret files and does not change existing files. Then the
+script checks that every secret file in the Compose selection exists. A failure
+stops the update with the gateway still running. The `.env` path does not create
+secret files.
+
+Then the script pulls the selected image, restarts the selected gateway, and
+reports anything you have to act on. Compose waits up
 to 720 seconds for the gateway to report healthy (15-second probe interval,
 720-second startup grace). Your own Compose overlays still take precedence over
 these values. The wait covers gateway startup only: the Git fetch, the image
 pull and the 330-second stop grace add their own time. The script then checks
-that the running container is healthy and runs the pinned image, with your
+that the running container is healthy and runs the selected image, with your
 overlays applied, and checks the gateway again after diagnostics. A second run
 changes nothing.
 
@@ -33,17 +134,6 @@ without a completion report. A failed diagnostic reports configuration status as
 unknown. Inspect the reported error and `docker compose ps -a` with the same
 deployment selection. No automatic recovery is attempted. Gateway health does
 not prove that Slack or Pretorin MCP calls succeed.
-
-On `master` the digest pin and `IMAGE_VERSION` are already set to the current
-release, so updating means pulling `master` rather than editing anything. To move
-to a *specific* release instead, point `compose.yaml` at that digest and set the
-matching `IMAGE_VERSION` in `versions.env` before running it — `smoke.sh` asserts
-the two agree.
-
-`update.sh` refuses rather than guessing, and names the exact command each time:
-a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
-diverged from its upstream, or a deployment selection that includes the local build
-overlay (that is a rebuild, not an update).
 
 ### What survives an update, and what does not
 

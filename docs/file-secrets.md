@@ -156,9 +156,19 @@ never created — not a warning. So after pulling a release that adds one:
 scripts/init-file-secrets.sh      # write-if-absent; never overwrites a value
 ```
 
-`scripts/bootstrap.sh` already does this, and `scripts/update.sh` does it after
-the fast-forward and **before it stops anything**, so an upgrade cannot turn into
-an outage over a credential the deployment does not even use.
+`scripts/bootstrap.sh` already does this. On the file-secret path,
+`scripts/update.sh` runs it after the source changes and **before it stops
+anything**, so an upgrade cannot turn into an outage over a credential the
+deployment does not even use. If it fails, the update stops and the gateway
+continues to run.
+
+The command creates only missing files. A missing gateway token gets a new
+random value; the other new files are empty. An existing file keeps its bytes,
+owner, and mode, also when it is empty: an intentionally empty token stays
+empty. Modes are set only on the files and the directory that the command
+creates. The `.env` path does not create secret files. `scripts/update.sh` also
+stops before downtime when a secret file that a customer overlay names does not
+exist; create that file yourself with the documented mode.
 
 | Excluded from `cli` | Why |
 | --- | --- |

@@ -6,6 +6,8 @@
 #   scripts/init-file-secrets.sh --from-env  # copy existing secret values from .env
 #
 # Existing destination files are never overwritten. Values are never printed.
+# Modes are set only on the directory and files this script creates: an existing
+# file keeps its bytes, owner and mode (for example 0400 owned by 1000:1000).
 #
 # RUN IT AGAIN AFTER AN UPGRADE THAT ADDS A SECRET. compose.secrets.yaml resolves
 # every secret source at `up` time, so a file this script has not created yet
@@ -37,8 +39,11 @@ die() { printf 'file-secrets: ERROR — %s\n' "$*" >&2; exit 1; }
 compose_resolve_selection
 SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
 
-mkdir -p "$SECRET_DIR"
-chmod 700 "$SECRET_DIR"
+if [ ! -e "$SECRET_DIR" ] && [ ! -L "$SECRET_DIR" ]; then
+  mkdir -p "$SECRET_DIR"
+  chmod 700 "$SECRET_DIR"
+fi
+[ -d "$SECRET_DIR" ] || die "${SECRET_DIR} is not a directory"
 
 # Read a literal NAME=value line without sourcing operator-controlled .env.
 env_value() {
@@ -56,14 +61,17 @@ env_value() {
   printf '%s' "$raw"
 }
 
+# Return 1 when the file already exists (or is a link), so the caller leaves it
+# unchanged. noclobber refuses a file that appears between the test and the write.
 write_new() {
   local path="$1" value="$2"
-  if [ -e "$path" ]; then
+  if [ -e "$path" ] || [ -L "$path" ]; then
     log "keeping ${path}"
-    return 0
+    return 1
   fi
-  ( umask 077 && printf '%s' "$value" > "$path" )
-  chmod 600 "$path"
+  # `set -e` does not apply inside a function called as an `if` condition.
+  ( set -C && umask 077 && printf '%s' "$value" > "$path" ) \
+    || die "could not create ${path}"
   log "created ${path}"
 }
 
@@ -84,12 +92,15 @@ while IFS='|' read -r name filename; do
   if [ "$FROM_ENV" = 1 ]; then
     value="$(env_value "$name")"
   fi
-  if [ "$name" = OPENCLAW_GATEWAY_TOKEN ] && [ ! -e "${SECRET_DIR}/${filename}" ] && [ -z "$value" ]; then
+  if [ "$name" = OPENCLAW_GATEWAY_TOKEN ] && [ ! -e "${SECRET_DIR}/${filename}" ] \
+     && [ ! -L "${SECRET_DIR}/${filename}" ] && [ -z "$value" ]; then
     command -v openssl >/dev/null 2>&1 || die "openssl is required to generate the gateway token"
     value="$(openssl rand -hex 32)"
+    [[ "$value" =~ ^[0-9a-f]{64}$ ]] || die "could not generate the gateway token"
   fi
-  write_new "${SECRET_DIR}/${filename}" "$value"
-  container_readable_mode "${SECRET_DIR}/${filename}"
+  if write_new "${SECRET_DIR}/${filename}" "$value"; then
+    container_readable_mode "${SECRET_DIR}/${filename}"
+  fi
   unset value
 done <<'EOF'
 PRETORIN_API_KEY|pretorin-api-key
