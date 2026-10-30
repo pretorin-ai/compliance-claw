@@ -235,13 +235,14 @@ names the person who must keep it:
 | `pretorin-state` | Named volume | Archive and file list | Holds the active CLI, Pretorin context, effort records, resolvers, recipes, audit file. |
 | Previous image | Docker image cache | Reference and ID in the record | Keep it cached. Do not prune it while you can need the set. |
 | Compose selection | `.env` and shell | Values in the record | Keep the project name and the ordered files. |
-| Declarations and private overlays | Host files | Copies in `host-inputs/` | Keep the originals. A changed declaration needs your review. |
+| Declarations and private overlays | Host files | Copies in `host-inputs/`, at their full host path | Keep the originals. A changed declaration needs your review. |
 | Credentials | Secret directory, or `.env` on the legacy path | Not copied | Keep current files. Get a replacement from the issuer if necessary. |
 | Target clones and other customer bind mounts | Host directories | Paths only | Back them up yourself, or clone the targets again. |
 
 Prepare the shell first, and again in each new shell. This block resolves the
 saved [Compose selection](../README.md#save-deployment-settings). It defines the
-state list, the selection check and two copy functions:
+state list, the selection check, the path of each saved host file and two copy
+functions:
 
 ```sh
 umask 077
@@ -267,6 +268,12 @@ for secret in config.get("secrets", {}).values():
 for kind, path in sorted(inputs):
     print("%s\t%s" % (kind, path))
 '
+saved_input() {
+  case "$1" in
+    /*) printf '%s\n' "$BACKUP_DIR/host-inputs$1" ;;
+    *) printf '%s\n' "$BACKUP_DIR/host-inputs$PWD/$1" ;;
+  esac
+}
 state_sh() {
   docker run --rm -i --network none --platform linux/amd64 --user 0:0 \
     --entrypoint sh --mount "type=volume,src=$1,dst=/state${3:+,$3}" \
@@ -347,10 +354,11 @@ repository, the target directory or a shared directory.
    state_sh "$PRETORIN_VOLUME" "$STATE_LIST" readonly > "$BACKUP_DIR/pretorin-state.list" &&
    state_sh "$PRETORIN_VOLUME" 'tar --numeric-owner -cpf - .' readonly > "$BACKUP_DIR/pretorin-state.tar" &&
    awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" |
-     while IFS= read -r f; do cp -p -- "$f" "$BACKUP_DIR/host-inputs/" || exit 1; done &&
+     while IFS= read -r f; do s="$(saved_input "$f")" &&
+       mkdir -p -- "${s%/*}" && cp -p -- "$f" "$s" || exit 1; done &&
    (IFS="${COMPOSE_PATH_SEPARATOR:-:}"; for f in ${COMPOSE_FILE:-compose.yaml}; do
-     git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 ||
-       cp -p -- "$f" "$BACKUP_DIR/host-inputs/" || exit 1; done) &&
+     git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || { s="$(saved_input "$f")" &&
+       mkdir -p -- "${s%/*}" && cp -p -- "$f" "$s"; } || exit 1; done) &&
    SOURCE_REVISION="$(git rev-parse HEAD)" &&
    printf '%s=%s\n' \
      SET_ID "$SET_ID" \
@@ -581,7 +589,10 @@ that state.
      > "$RESTORE_DIR/host-inputs.txt" &&
    cmp "$BACKUP_DIR/host-inputs.txt" "$RESTORE_DIR/host-inputs.txt" &&
    awk -F '\t' '$1 == "file" { print $2 }' "$RESTORE_DIR/host-inputs.txt" |
-     while IFS= read -r f; do cmp -- "$f" "$BACKUP_DIR/host-inputs/$(basename -- "$f")" || exit 1; done &&
+     while IFS= read -r f; do cmp -- "$f" "$(saved_input "$f")" || exit 1; done &&
+   (IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
+     git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 ||
+       cmp -- "$f" "$(saved_input "$f")" || exit 1; done) &&
    echo "OK: the saved selection uses $IMAGE_REF with the restored volumes"
    ```
 
@@ -589,8 +600,10 @@ that state.
    discard it to force the switch. `umask 022` keeps the usual mode on the files
    that Git writes; the gateway reads tracked files such as `targets.yaml`.
    A new login shell must give the same result. A difference in a declaration
-   stops the step. Copy the saved declaration from `host-inputs/` back, or keep
-   the current one only after you check that the restored state supports it.
+   or a private overlay stops the step. Each saved copy is under `host-inputs/`
+   at the full host path of its original; `saved_input FILE` prints that path.
+   Copy the saved file back, or keep the current one only after you check that
+   the restored state supports it.
    This output can contain private configuration; keep it local.
 
 4. Reconcile credentials and access before the gateway starts. The gateway
@@ -676,7 +689,7 @@ its branch with `git switch` before the update.
   with the current approval.
 - **Host inputs.** Secret files, target clones and customer bind mounts are not
   in the archives. `host-inputs/` holds copies of declarations and private
-  overlays for comparison only.
+  overlays, each at the full host path of its original, for comparison only.
 - **Doctor captures.** At startup, OpenClaw Doctor can write a pre-repair copy
   of config and databases under `/home/node/.openclaw.update-captures/`. That
   path is in the container layer, not in a state volume. The volume backup does
