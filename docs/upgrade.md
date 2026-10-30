@@ -326,11 +326,17 @@ repository, the target directory or a shared directory.
    echo "OK: no running container uses the state volumes"
    ```
 
-   An exit code other than 0 means an unclean stop. Do not archive that state.
-   Read `docker compose logs openclaw`, start the gateway again with the same
-   image, wait until it is healthy, and repeat this step. Wait for a running
-   one-off command to end; do not stop it while it writes. Do not start a
-   container until the archives are complete.
+   An exit code other than 0 means an unclean stop. That state is not a valid
+   backup point: do not archive it, and do not start an upgrade. Keep the state
+   volumes and the gateway logs unchanged. Save the logs with
+   `docker compose logs --no-color openclaw` to a private file, and do not
+   repair, edit or delete state. Then use an earlier verified set as described
+   in [Restore a compatible recovery set](#restore-a-compatible-recovery-set),
+   or ask for support diagnosis with the saved logs (see
+   [Troubleshooting](../README.md#troubleshooting)).
+
+   Wait for a running one-off command to end; do not stop it while it writes.
+   Do not start a container until the archives are complete.
 
 3. Archive both volumes, their file lists and the host files. Then write the
    private record and the checksums:
