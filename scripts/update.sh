@@ -97,12 +97,13 @@ if [ -z "$RELEASE_TAG" ] && { [ "$PREVIEW" = 1 ] || [ "$RECORDS_READY" = 1 ]; };
   die "--preview and --effort-records-ready apply only to a release. Add --release vX.Y.Z."
 fi
 
-# THE RELEASE INTERFACE (from the release-asset work). The overlay is a
-# deployment file at a stable path; it sets only the openclaw and cli images.
-# The helper is the one verifier of the release record; this script reads only
-# the helper's result, never the record.
+# THE RELEASE SET. scripts/release-assets.py is the one verifier: it downloads
+# the record and overlay, checks them, and checks the effective image selection.
+# This script reads only the helper's result, never the record. Both files live
+# in the repository root; the overlay sets only the openclaw and cli images.
 RELEASE_REMOTE=origin
 RELEASE_OVERLAY="compose.release.yaml"
+RELEASE_RECORD="compliance-claw-release.json"
 RELEASE_HELPER="${REPO_ROOT}/scripts/release-assets.py"
 # Per-effort Plan/preflight roots. A release that adds this commit to a
 # deployment without it needs the effort-record transfer before it starts.
@@ -165,6 +166,11 @@ try:
             m["target"]: [volumes.get(m["source"], {}).get("name", m["source"]),
                           bool(volumes.get(m["source"], {}).get("external", False))]
             for m in spec.get("volumes", []) if m.get("type") == "volume"}
+    # Only the fields the release helper checks: never pass on the whole model.
+    summary["selection"] = {"services": {
+        name: {k: config["services"][name][k] for k in ("image", "platform")
+               if k in config["services"][name]}
+        for name in summary["images"]}}
     summary["secrets"] = sorted({v["file"] for v in (config.get("secrets") or {}).values()
                                  if isinstance(v, dict) and v.get("file")})
     if not isinstance(summary["project"], str) or "openclaw" not in summary["images"]:
@@ -196,16 +202,22 @@ print("" if value is None else (json.dumps(value, sort_keys=True) if isinstance(
 ' "$@"
 }
 
-# The release helper: download, verify, and read an installed overlay.
-release_fetch()           { python3 "$RELEASE_HELPER" fetch "$1" "$2"; }
-release_check()           { python3 "$RELEASE_HELPER" check "$1" --source-commit "$2"; }
-release_overlay_version() { python3 "$RELEASE_HELPER" overlay-version "$1" 2>/dev/null; }
+# Helper exit codes: 1 release data, 3 source checkout, 4 image selection,
+# 5 a tool (download, git, Compose) could not run.
+release_helper() { python3 "$RELEASE_HELPER" "$@"; }
 
-# A real release overlay selected at the stable path, as opposed to the neutral
-# placeholder that only reserves its place in COMPOSE_FILE.
+# The version of the release set installed in the repository root, if valid.
+installed_release_version() {
+  local summary
+  [ -f "$RELEASE_HELPER" ] || return 1
+  summary="$(release_helper check --dir "$REPO_ROOT" --stage any --json 2>/dev/null)" || return 1
+  json_field "$summary" version
+}
+
+# A verified release set selected at the stable path, as opposed to the neutral
+# placeholder overlay that only reserves its place in COMPOSE_FILE.
 release_overlay_active() {
-  [ -f "$RELEASE_HELPER" ] && compose_has_file "$RELEASE_OVERLAY" \
-    && release_overlay_version "${REPO_ROOT}/${RELEASE_OVERLAY}" >/dev/null
+  compose_has_file "$RELEASE_OVERLAY" && installed_release_version >/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -220,7 +232,7 @@ required() { REQUIRED+=("$*"); }
 # blocker for every condition that must stop apply before downtime. Changes no
 # tracked file, selection, secret, container or volume.
 resolve_release() {
-  local tag="$1" version_line local_tag r_json mapping cur_version cur_line \
+  local tag="$1" local_tag r_json mapping cur_version cur_line rc selection_err \
         openclaw_cur openclaw_new slack_cur slack_new missing f secret_abs
 
   [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
@@ -234,7 +246,7 @@ resolve_release() {
   Fetch the full history first:  git fetch --unshallow ${RELEASE_REMOTE}"
 
   RELEASE_CACHE="$(mktemp -d "${TMPDIR:-/tmp}/cc-release.XXXXXX")"
-  mkdir "${RELEASE_CACHE}/assets" "${RELEASE_CACHE}/src"
+  mkdir "${RELEASE_CACHE}/src"
 
   # Objects and FETCH_HEAD only: no branch, tag or checkout changes.
   log "fetching ${tag} from ${RELEASE_REMOTE}"
@@ -247,21 +259,22 @@ resolve_release() {
     blocker "the local tag ${tag} names ${local_tag}, but ${RELEASE_REMOTE} names ${R_COMMIT}. Inspect both; do not delete either without review."
   fi
 
-  log "downloading and verifying the release assets"
-  release_fetch "$tag" "${RELEASE_CACHE}/assets" \
-    || die "could not download the release assets for ${tag}. A release before verified selection has none; use the branch route."
-  r_json="$(release_check "${RELEASE_CACHE}/assets" "$R_COMMIT")" \
-    || die "release ${tag} failed verification (see the reason above). Nothing was changed."
+  # The helper downloads a FINAL release set only and checks every asset.
+  log "downloading and verifying the release set"
+  rc=0
+  r_json="$(release_helper fetch --version "$R_VERSION" --dir "${RELEASE_CACHE}/assets" --json)" || rc=$?
+  case "$rc" in
+    0) ;;
+    5) die "could not download the release set for ${tag} (see the reason above). Check network access. Nothing was changed." ;;
+    *) die "${tag} has no valid final release set (see the reason above). A release before release sets has none; use the branch route. Nothing was changed." ;;
+  esac
+  [ "$(json_field "$r_json" commit)" = "$R_COMMIT" ] && [ "$(json_field "$r_json" tag)" = "$tag" ] \
+    || die "the release record names another source than tag ${tag} on ${RELEASE_REMOTE} (${R_COMMIT}). Nothing was changed."
   R_IMAGE="$(json_field "$r_json" image_reference)"
   R_SIGNATURE="$(json_field "$r_json" signature_status)"
-  [ "$(json_field "$r_json" version)" = "$R_VERSION" ] \
-    || die "the release record names version $(json_field "$r_json" version), not ${R_VERSION}."
-  [ "$(json_field "$r_json" source_commit)" = "$R_COMMIT" ] \
-    || die "the release record names another source commit than tag ${tag}."
   [ -n "$R_IMAGE" ] || die "the release verifier returned no image reference."
-  [ "$(json_field "$r_json" final)" = True ] \
-    || blocker "${tag} is a release candidate. Preview it only; apply needs a final release."
-  R_OVERLAY="${RELEASE_CACHE}/assets/compose.release.yaml"
+  R_OVERLAY="${RELEASE_CACHE}/assets/${RELEASE_OVERLAY}"
+  R_RECORD="${RELEASE_CACHE}/assets/${RELEASE_RECORD}"
 
   git archive --format=tar "$R_COMMIT" | tar -x -C "${RELEASE_CACHE}/src" \
     || die "could not read the source of ${tag}."
@@ -339,16 +352,19 @@ for problem in problems:
     || blocker "the Compose project name would change. Keep the project that owns the state volumes."
   [ "$(json_field "$R_CANDIDATE" mounts)" = "$(json_field "$R_CURRENT" mounts)" ] \
     || blocker "the state-volume selection would change. A restored or recovered volume selection must stay; review the overlays and ${tag} before you continue."
-  for f in openclaw cli; do
-    [ "$(json_field "$R_CANDIDATE" images "$f")" = "$R_IMAGE" ] \
-      || blocker "the effective ${f} image is not the release image. A later overlay overrides it; that is a custom selection, which the release route does not apply."
-  done
+  rc=0
+  selection_err="$(json_field "$R_CANDIDATE" selection \
+    | release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" --rendered - 2>&1 >/dev/null)" || rc=$?
+  case "$rc" in
+    0) ;;
+    4) blocker "the effective openclaw or cli image is not the release image. A later overlay overrides it; that is a custom selection, which the release route does not apply." ;;
+    *) printf '%s\n' "$selection_err" >&2; die "could not check the release image selection. Nothing was changed." ;;
+  esac
 
   # VERSION. Never downgrade over state that a newer release can have migrated.
-  cur_version=""
-  if release_overlay_active; then
-    cur_version="$(release_overlay_version "${REPO_ROOT}/${RELEASE_OVERLAY}")"
-  else
+  R_INSTALLED="$(installed_release_version || true)"
+  cur_version="$R_INSTALLED"
+  if [ -z "$cur_version" ]; then
     cur_version="$(git show "${R_HEAD}:versions.env" 2>/dev/null | sed -n 's/^IMAGE_VERSION=//p')"
   fi
   R_CURRENT_VERSION="${cur_version:-unknown}"
@@ -497,12 +513,21 @@ if [ -n "$RELEASE_TAG" ]; then
   docker image inspect --format '{{.Id}}' "$R_IMAGE" >/dev/null \
     || die "${R_IMAGE} is not available locally after the pull. Nothing was changed."
 
+  if [ -n "$R_INSTALLED" ]; then
+    PREVIOUS_SET="restore release set ${R_INSTALLED}: scripts/release-assets.py fetch --version ${R_INSTALLED} --dir <new empty directory>,
+    then copy ${RELEASE_RECORD} and ${RELEASE_OVERLAY} from it into the repository root"
+  else
+    PREVIOUS_SET="replace ${RELEASE_OVERLAY} with the neutral overlay (one line: services: {}) and remove ${RELEASE_RECORD}"
+  fi
   RECOVERY_NOTE="update: RECOVERY — no automatic recovery was attempted. To return the files:
     git checkout --detach ${R_HEAD}
-    restore the previous ${RELEASE_OVERLAY} from ${RELEASE_OVERLAY}.previous (if it exists)
+    ${PREVIOUS_SET}
   If the gateway was replaced, select the previous images and restore the verified
   backup of both state volumes: docs/upgrade.md#openclaw-image-upgrade-and-state-backup"
 
+  # The helper checks the source through the tag, so record the fetched tag.
+  git fetch --quiet --no-tags "$RELEASE_REMOTE" "refs/tags/${R_TAG}:refs/tags/${R_TAG}" \
+    || die "could not record tag ${R_TAG} locally. The gateway was not stopped."
   if [ "$R_HEAD" != "$R_COMMIT" ]; then
     log "checking out ${R_TAG} (${R_COMMIT})"
     git checkout --quiet --detach "$R_COMMIT" \
@@ -510,18 +535,22 @@ if [ -n "$RELEASE_TAG" ]; then
   else
     log "the checkout is already at ${R_TAG}"
   fi
-  if cmp -s "$R_OVERLAY" "${REPO_ROOT}/${RELEASE_OVERLAY}"; then
-    log "${RELEASE_OVERLAY} already selects ${R_TAG}"
+  if cmp -s "$R_OVERLAY" "${REPO_ROOT}/${RELEASE_OVERLAY}" && cmp -s "$R_RECORD" "${REPO_ROOT}/${RELEASE_RECORD}"; then
+    log "the ${R_TAG} release set is already installed"
   else
-    cp -p "${REPO_ROOT}/${RELEASE_OVERLAY}" "${REPO_ROOT}/${RELEASE_OVERLAY}.previous"
-    cp "$R_OVERLAY" "${REPO_ROOT}/${RELEASE_OVERLAY}.new"
-    chmod 644 "${REPO_ROOT}/${RELEASE_OVERLAY}.new"
-    mv -f "${REPO_ROOT}/${RELEASE_OVERLAY}.new" "${REPO_ROOT}/${RELEASE_OVERLAY}"
-    log "installed the ${R_TAG} release overlay"
+    # The record first, then the overlay that Compose reads; each replaced atomically.
+    for f in "$RELEASE_RECORD" "$RELEASE_OVERLAY"; do
+      cp "${RELEASE_CACHE}/assets/${f}" "${REPO_ROOT}/${f}.new"
+      chmod 644 "${REPO_ROOT}/${f}.new"
+      mv -f "${REPO_ROOT}/${f}.new" "${REPO_ROOT}/${f}"
+    done
+    log "installed the ${R_TAG} release set"
   fi
 
-  # Apply rechecks: the saved selection must now render the verified model.
+  # Apply rechecks: the installed set, the tag and HEAD, and the saved selection.
   compose_resolve_selection
+  release_helper check --dir "$REPO_ROOT" --version "$R_VERSION" --source "$REPO_ROOT" --compose \
+    || die "the installed release set, source or selection did not verify after checkout. The gateway was not stopped."
   APPLIED="$(model_summary)" || die "could not read the Compose selection after checkout. The gateway was not stopped."
   for key in project mounts images; do
     [ "$(json_field "$APPLIED" "$key")" = "$(json_field "$R_CANDIDATE" "$key")" ] \

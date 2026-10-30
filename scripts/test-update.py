@@ -322,43 +322,44 @@ class UpdateTest(unittest.TestCase):
 # a small line format instead of YAML, so these tests prove the updater's order,
 # refusals and file effects, not Compose merging (see test-update-compose.py).
 # ---------------------------------------------------------------------------
-OLD_IMAGE = "ghcr.io/example/cc:0.5.2@sha256:" + "1" * 64
-NEW_IMAGE = "ghcr.io/example/cc:0.6.0@sha256:" + "2" * 64
+IMAGE_REPOSITORY = "ghcr.io/pretorin-ai/compliance-claw"
+OLD_IMAGE = IMAGE_REPOSITORY + ":0.5.2@sha256:" + "1" * 64
+NEW_DIGEST = "sha256:" + "2" * 64
+NEW_IMAGE = IMAGE_REPOSITORY + ":0.6.0@" + NEW_DIGEST
 IMAGE_IDS = {OLD_IMAGE: "sha256:" + "3" * 64, NEW_IMAGE: "sha256:" + "4" * 64,
+             IMAGE_REPOSITORY + ":0.7.0@" + NEW_DIGEST: "sha256:" + "6" * 64,
              "registry.example/custom:1": "sha256:" + "5" * 64}
-PLACEHOLDER = "# placeholder\nservices: {}\n"
+PLACEHOLDER = "services: {}\n"
+HELPER = ROOT / "scripts/release-assets.py"
+DOWNLOAD_LINE = 'RELEASE_DOWNLOAD = "https://github.com/%s/releases/download" % RELEASE_REPOSITORY'
 
-HELPER = r"""#!/usr/bin/env python3
-# Fixture of the release-asset helper interface. Test only.
-import hashlib, json, os, re, shutil, sys
-from pathlib import Path
-cmd = sys.argv[1]
-if cmd == "fetch":
-    src = Path(os.environ["CC_FIXTURE_RELEASES"]) / sys.argv[2]
-    if not src.is_dir():
-        sys.exit("release-assets: no release assets for " + sys.argv[2])
-    for f in src.iterdir():
-        shutil.copyfile(f, Path(sys.argv[3]) / f.name)
-elif cmd == "check":
-    d = Path(sys.argv[2])
-    record = json.loads((d / "compliance-claw-release.json").read_text())
-    if record["source_commit"] != sys.argv[4]:
-        sys.exit("release-assets: the record source commit does not match the tag")
-    if hashlib.sha256((d / "compose.release.yaml").read_bytes()).hexdigest() != record["overlay_sha256"]:
-        sys.exit("release-assets: overlay checksum mismatch")
-    if record["signature"] == "bad":
-        sys.exit("release-assets: signature verification failed")
-    print(json.dumps({"version": record["version"], "source_commit": record["source_commit"],
-                      "image_reference": record["image"], "signature_status": record["signature"],
-                      "final": record["final"]}))
-elif cmd == "overlay-version":
-    m = re.search(r"x-compliance-claw-release: [{]version: ([0-9.]+)[}]", Path(sys.argv[2]).read_text())
-    if not m:
-        sys.exit(1)
-    print(m.group(1))
-else:
-    sys.exit("release-assets: unknown command")
-"""
+
+def install_release_helper(repo, releases):
+    """Copy the real release helper; only its download base is local files."""
+    text = HELPER.read_text()
+    assert text.count(DOWNLOAD_LINE) == 1, "the helper download base changed"
+    (repo / "scripts/release-assets.py").write_text(
+        text.replace(DOWNLOAD_LINE, "RELEASE_DOWNLOAD = %r" % releases.resolve().as_uri()))
+
+
+def make_release_set(out, version, commit, digest=NEW_DIGEST, final=True,
+                     image_repository=IMAGE_REPOSITORY):
+    """Prepare (and finalize) a release set with the real publisher commands."""
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    sbom = out.parent / ("sbom-input-" + version) / ("sbom-" + version + ".spdx.json")
+    sbom.parent.mkdir(exist_ok=True)
+    sbom.write_text(json.dumps({"spdxVersion": "SPDX-2.3", "packages": [{"name": "fixture"}]}))
+    subprocess.run(["python3", str(HELPER), "prepare", "--version", version, "--commit", commit,
+                    "--repository", "pretorin-ai/compliance-claw", "--image-repository",
+                    image_repository, "--digest", digest, "--sbom", str(sbom), "--out", str(out)],
+                   check=True, capture_output=True)
+    if final:
+        subprocess.run(["python3", str(HELPER), "finalize", "--dir", str(out)],
+                       check=True, capture_output=True)
+    return image_repository + ":" + version + "@" + digest
+
 
 RELEASE_STUB = r"""#!/usr/bin/env python3
 import json, os, pathlib, subprocess, sys
@@ -374,7 +375,7 @@ project_dir = repo
 if a[1:2] == ["--project-directory"]:
     project_dir = a[2]
     a = a[:1] + a[3:]
-if a[1:3] == ["--profile", "*"]:
+if a[1:2] == ["--profile"] and a[2] in ("*", "cli"):
     a = a[:1] + a[3:]
 # Log the normalized command, so a pull with --project-directory still counts.
 head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -390,6 +391,7 @@ def render():
             sys.exit("fixture compose: missing file " + str(path))
         for line in path.read_text().splitlines():
             key, _, value = line.partition(": ")
+            key, value = key.strip(), value.strip().strip('"')
             if key == "image": image = value
             elif key == "volume": target, name = value.split("="); mounts[target] = name
             elif key == "secret": secrets[pathlib.Path(value).name] = {"file": str(pathlib.Path(project_dir, value))}
@@ -454,7 +456,7 @@ class ReleaseTest(unittest.TestCase):
             "EFFORT_RECORD_TRANSITION=refs/tags/fixture-transition"))
         for name in ("compose-selection.sh", "init-file-secrets.sh"):
             shutil.copyfile(ROOT / "scripts" / name, self.repo / "scripts" / name)
-        (self.repo / "scripts/release-assets.py").write_text(HELPER)
+        install_release_helper(self.repo, self.fixture / "releases")
         (self.repo / ".gitignore").write_text(".env\nsecrets/\ncompose.release.yaml*\n")
         (self.repo / "versions.env").write_text(
             "OPENCLAW_VERSION=2026.10.5\nSLACK_PLUGIN_VERSION=2026.10.5\n"
@@ -485,7 +487,7 @@ class ReleaseTest(unittest.TestCase):
         self.git("remote", "add", "origin", str(self.fixture / "origin.git"))
         self.git("tag", "-d", "v0.6.0")
         self.git("reset", "-q", "--hard", self.old)
-        self.write_release("v0.6.0")
+        self.write_release("v0.6.0", self.new)
 
         # Deployment state: placeholder overlay selected, a customer overlay, the
         # v0.5.2 secret files with canary values.
@@ -506,24 +508,15 @@ class ReleaseTest(unittest.TestCase):
             "COMPOSE_FILE": "compose.yaml:compose.release.yaml:compose.secrets.yaml:deployment/customer.yaml",
         }
 
-    def write_release(self, tag, overlay_extra="", **record):
-        assets = self.fixture / "releases" / tag
-        assets.mkdir(parents=True, exist_ok=True)
-        version = tag[1:]
-        overlay = f"x-compliance-claw-release: {{version: {version}}}\nimage: {NEW_IMAGE}\n{overlay_extra}"
-        (assets / "compose.release.yaml").write_text(overlay)
-        import hashlib
-        data = {"version": version, "source_commit": self.new, "image": NEW_IMAGE,
-                "overlay_sha256": hashlib.sha256(overlay.encode()).hexdigest(),
-                "signature": "unsigned", "final": True, **record}
-        (assets / "compliance-claw-release.json").write_text(json.dumps(data))
+    def write_release(self, tag, commit, **kwargs):
+        return make_release_set(self.fixture / "releases" / tag, tag[1:], commit, **kwargs)
 
     def run_update(self, *args, **settings):
         (self.fixture / "settings.json").write_text(json.dumps({"ids": IMAGE_IDS, **settings}))
         (self.fixture / "calls.jsonl").write_text("")
         env = {**self.git_env, "PATH": str(self.fixture / "bin") + os.pathsep + os.environ["PATH"],
                "HOME": str(self.fixture), "FIXTURE": str(self.fixture), "REPO": str(self.repo),
-               "CC_FIXTURE_RELEASES": str(self.fixture / "releases"), "TMPDIR": str(self.fixture),
+               "TMPDIR": str(self.fixture),
                **self.selection}
         p = subprocess.run(["bash", str(self.repo / "scripts/update.sh"), *args], env=env,
                            cwd=self.repo, text=True, capture_output=True)
@@ -562,9 +555,12 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.run_update("--release", "v0.6.0"), 0, self.output)
         self.assertIn("update: done.", self.output)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.new)
-        self.assertEqual((self.repo / "compose.release.yaml").read_text(),
-                         (self.fixture / "releases/v0.6.0/compose.release.yaml").read_text())
-        self.assertEqual((self.repo / "compose.release.yaml.previous").read_text(), PLACEHOLDER)
+        for name in ("compose.release.yaml", "compliance-claw-release.json"):
+            self.assertEqual((self.repo / name).read_bytes(),
+                             (self.fixture / "releases/v0.6.0" / name).read_bytes())
+        self.assertEqual(self.git("rev-parse", "refs/tags/v0.6.0^{commit}"), self.new)
+        self.assertEqual(sorted(p.name for p in self.repo.glob("compose.release.yaml*")),
+                         ["compose.release.yaml"])
         pulls = [c for c in self.calls if c["args"][:2] == ["compose", "pull"]]
         self.assertEqual(pulls[0]["head"], self.old, "the image must be pulled before checkout")
         self.assertIn("/assets/compose.release.yaml", pulls[0]["compose_file"])
@@ -579,12 +575,15 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual((self.repo / "deployment/customer.yaml").read_text(), "# customer settings\n")
         self.assertFalse(self.git("status", "--porcelain", "--untracked-files=no"))
 
-        # The same release again: no checkout, no overlay replacement.
-        previous = (self.repo / "compose.release.yaml.previous").stat().st_mtime_ns
+        # The same release again: no checkout, no release-set replacement.
+        installed = (self.repo / "compose.release.yaml").stat().st_mtime_ns
         self.assertEqual(self.run_update("--release", "v0.6.0"), 0, self.output)
         self.assertIn("already at v0.6.0", self.output)
-        self.assertIn("already selects v0.6.0", self.output)
-        self.assertEqual((self.repo / "compose.release.yaml.previous").stat().st_mtime_ns, previous)
+        self.assertIn("release set is already installed", self.output)
+        self.assertEqual((self.repo / "compose.release.yaml").stat().st_mtime_ns, installed)
+        # The installed release set is now the current version.
+        self.assertEqual(self.run_update("--release", "v0.6.0", "--preview"), 0, self.output)
+        self.assertIn("0.6.0 -> 0.6.0", self.output)
 
         # A release checkout must not take the branch route.
         self.assertNotEqual(self.run_update(), 0, self.output)
@@ -621,9 +620,27 @@ class ReleaseTest(unittest.TestCase):
         (self.repo / "deployment/customer.yaml").write_text("image: registry.example/custom:1\n")
         self.assert_blocked("custom selection")
 
+    def publish_v070(self, compose_text):
+        """Push a v0.7.0 tag on top of v0.6.0 to the origin, with its release set."""
+        clone = self.fixture / "publisher"
+        self.git("clone", "-q", str(self.fixture / "origin.git"), str(clone), cwd=self.fixture)
+        self.git("checkout", "-q", "v0.6.0", cwd=clone)
+        (clone / "compose.yaml").write_text(compose_text)
+        self.git("commit", "-q", "-am", "0.7.0", cwd=clone)
+        self.git("tag", "v0.7.0", cwd=clone)
+        self.git("push", "-q", "origin", "v0.7.0", cwd=clone)
+        self.write_release("v0.7.0", self.git("rev-parse", "HEAD", cwd=clone))
+
     def test_release_that_changes_state_volumes_blocks(self):
-        self.write_release("v0.6.0", overlay_extra="volume: /home/node/.openclaw=other-volume\n")
-        self.assert_blocked("state-volume selection would change")
+        self.publish_v070((self.repo / "compose.yaml").read_text().replace(
+            "cc-release-test_openclaw-state", "other-volume"))
+        before = self.snapshot()
+        self.assertEqual(self.run_update("--release", "v0.7.0", "--preview"), 2, self.output)
+        self.assertIn("state-volume selection would change", self.output)
+        self.assertNotEqual(self.run_update("--release", "v0.7.0"), 0, self.output)
+        self.assertIn("state-volume selection would change", self.output)
+        self.assertEqual(self.changed(), [])
+        self.assertEqual(self.snapshot(), before)
 
     def test_recovered_volume_selection_is_kept(self):
         (self.repo / "deployment/customer.yaml").write_text(
@@ -631,13 +648,16 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.run_update("--release", "v0.6.0"), 0, self.output)
         self.assertIn("restored-openclaw", self.output)
 
-    def test_candidate_release_is_preview_only(self):
-        self.write_release("v0.6.0", final=False)
-        self.assert_blocked("release candidate")
+    def test_candidate_release_set_stops(self):
+        # A candidate lives on a draft release; the helper fetches final sets only.
+        self.write_release("v0.6.0", self.new, final=False)
+        self.assert_blocked("no valid final release set", preview_rc=1)
 
     def test_downgrade_blocks(self):
-        (self.repo / "compose.release.yaml").write_text(
-            f"x-compliance-claw-release: {{version: 0.7.0}}\nimage: {NEW_IMAGE}\n")
+        installed = self.fixture / "installed"
+        make_release_set(installed, "0.7.0", self.new)
+        for name in ("compose.release.yaml", "compliance-claw-release.json"):
+            shutil.copyfile(installed / name, self.repo / name)
         self.assert_blocked("older than the current release 0.7.0")
 
     def test_effort_record_transition_needs_confirmation(self):
@@ -647,20 +667,24 @@ class ReleaseTest(unittest.TestCase):
         self.assertIn("confirmed complete", self.output)
 
     def test_verification_failures_stop_before_any_change(self):
-        cases = {"source commit": {"source_commit": self.old},
-                 "signature verification failed": {"signature": "bad"}}
-        for text, record in cases.items():
-            with self.subTest(text=text):
-                self.write_release("v0.6.0", **record)
+        with self.subTest(text="another source commit"):
+            self.write_release("v0.6.0", self.old)
+            self.assert_blocked("names another source than tag v0.6.0", preview_rc=1)
+        assets = self.fixture / "releases/v0.6.0"
+        for name, text in (("compose.release.yaml", "does not match its recorded sha256"),
+                           ("compliance-claw-release.json", "not in canonical form"),
+                           ("sbom-0.6.0.spdx.json", "does not match its recorded sha256")):
+            with self.subTest(name=name):
+                self.write_release("v0.6.0", self.new)
+                if name == "compliance-claw-release.json":
+                    record = json.loads((assets / name).read_text())
+                    (assets / name).write_text(json.dumps(record))
+                else:
+                    (assets / name).write_bytes((assets / name).read_bytes() + b"\n")
                 self.assert_blocked(text, preview_rc=1)
-        with self.subTest(text="overlay checksum"):
-            self.write_release("v0.6.0")
-            path = self.fixture / "releases/v0.6.0/compose.release.yaml"
-            path.write_text(path.read_text() + "# changed\n")
-            self.assert_blocked("overlay checksum mismatch", preview_rc=1)
         with self.subTest(text="no assets"):
             shutil.rmtree(self.fixture / "releases/v0.6.0")
-            self.assert_blocked("could not download the release assets", preview_rc=1)
+            self.assert_blocked("could not download the release set", preview_rc=1)
 
     def test_unknown_tag_and_bad_arguments_stop(self):
         before = self.snapshot()
@@ -695,7 +719,7 @@ class ReleaseTest(unittest.TestCase):
     def test_failures_after_checkout_name_recovery_without_recovering(self):
         self.assertNotEqual(self.run_update("--release", "v0.6.0", up_rc=17), 0, self.output)
         for text in ("RECOVERY", "no automatic recovery", f"git checkout --detach {self.old}",
-                     "compose.release.yaml.previous", "openclaw-image-upgrade-and-state-backup"):
+                     "neutral overlay", "openclaw-image-upgrade-and-state-backup"):
             self.assertIn(text, self.output)
         self.assertNotIn("update: done.", self.output)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.new)

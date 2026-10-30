@@ -19,10 +19,12 @@ selection, secret files, containers, or volumes:
 scripts/update.sh --release vX.Y.Z --preview
 ```
 
-Preview fetches the tag (Git objects and `FETCH_HEAD` only) and downloads the
-release assets to a temporary directory. The release verifier checks the release
-record, asset checksums, source commit, and signature status. Preview then
-renders the release with your saved Compose files, in order. It shows:
+Preview fetches the tag (Git objects and `FETCH_HEAD` only). Then
+`scripts/release-assets.py` downloads the final
+[release set](image-verification.md#checking-a-release-set) to a temporary
+directory and checks the record and asset checksums. The updater compares the
+record with the tag commit. Preview then renders the release with your saved
+Compose files, in order. It shows:
 
 - the source commit, version, and image changes, and the signature status;
 - the `COMPOSE_FILE` value, project, and both state volumes after the update;
@@ -45,8 +47,10 @@ scripts/update.sh --release vX.Y.Z
 Apply does all the checks again; it does not use preview results. Each of these
 conditions stops apply before it changes a file or stops the gateway:
 
-- the release record, checksums, source commit, or a claimed signature does not
-  verify; or the release is a candidate, not a final release;
+- the release has no valid final release set (a candidate on a draft release,
+  or a release before release sets), or its record, asset checksums, or source
+  commit does not verify. The record is unsigned; see
+  [what the checks prove](image-verification.md#what-this-does-and-does-not-prove);
 - tracked files have local changes, or the release adds a file at a path where a
   local file (also an ignored file) already exists;
 - the checkout has commits that the release does not have, or the release is
@@ -57,11 +61,12 @@ conditions stops apply before it changes a file or stops the gateway:
 - a secret file that a customer overlay names does not exist;
 - the effort-record transfer is necessary and not confirmed.
 
-After these checks, apply pulls the release image. Then it checks out the
-release tag (detached `HEAD`), installs the release overlay at
-`compose.release.yaml`, and keeps the old one as `compose.release.yaml.previous`.
-It renders the saved selection again and stops if the result differs from the
-verified result. Then it continues with the [shared steps](#shared-update-steps).
+After these checks, apply pulls the release image. Then it records the tag,
+checks out the tag (detached `HEAD`), and installs the release set
+(`compliance-claw-release.json` and `compose.release.yaml`) in the repository
+root. It checks the installed set, the source, and the saved selection again
+with the release helper, and stops if the result differs from the verified
+result. Then it continues with the [shared steps](#shared-update-steps).
 Apply of the release that is already installed changes no file, and Compose
 does not replace the running gateway.
 
@@ -82,8 +87,9 @@ Before apply, stop the gateway and verify a backup of both state volumes:
 [OpenClaw image upgrade and state backup](#openclaw-image-upgrade-and-state-backup).
 
 If a step fails after the checkout, the script names the recovery inputs: the
-previous commit, `compose.release.yaml.previous`, the previous images, and the
-verified backup. It does not recover automatically. The release route does not
+previous commit, the previous release set (download it again with
+`scripts/release-assets.py fetch`), the previous images, and the verified
+backup. It does not recover automatically. The release route does not
 change the active Pretorin CLI.
 
 ### Branch route

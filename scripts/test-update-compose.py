@@ -6,7 +6,6 @@ Usage: python3 scripts/test-update-compose.py LOCAL_IMAGE OTHER_LOCAL_IMAGE
 Uses no registry, credentials, ports, or OpenClaw runtime. Git and image pulls
 are stubbed; Compose selection, startup, wait, and inspection are real.
 """
-import hashlib
 import importlib.util
 import json
 import os
@@ -115,12 +114,14 @@ def selection_regression(root, docker, docker_env):
         print("PASS: saved/explicit native selection, recovered volumes, secret initialization, caller refusals and schema-only independence")
 
 
-def release_repo(base, root, docker_env, image, populate):
+def release_repo(base, root, docker_env, digest, populate,
+                 repository="ghcr.io/pretorin-ai/compliance-claw"):
     """Build a Git checkout with a v0.6.0 tag on a local bare origin.
 
-    The checkout stays one commit behind the tag. The release helper is the
-    fixture from test-update.py: it stands in for the release-asset interface
-    and does not prove the published release assets.
+    The checkout stays one commit behind the tag. The release set is made with
+    the real release helper; only its download base points at local files.
+    Returns the checkout, a Git runner, both commits, the environment and the
+    release image reference.
     """
     spec = importlib.util.spec_from_file_location("test_update", root / "scripts/test-update.py")
     fixture_module = importlib.util.module_from_spec(spec)
@@ -129,7 +130,7 @@ def release_repo(base, root, docker_env, image, populate):
     repo.mkdir()
     populate(repo)
     (repo / ".gitignore").write_text(".env\nsecrets/\nefforts.yaml\ncompose.release.yaml*\ndeployment/\n")
-    (repo / "scripts/release-assets.py").write_text(fixture_module.HELPER)
+    fixture_module.install_release_helper(repo, base / "releases")
     git_env = {**docker_env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
@@ -153,24 +154,15 @@ def release_repo(base, root, docker_env, image, populate):
     git("tag", "-d", "v0.6.0")
     git("reset", "-q", "--hard", old)
 
-    assets = base / "releases/v0.6.0"
-    assets.mkdir(parents=True)
-    overlay = ("x-compliance-claw-release: {version: 0.6.0}\n"
-               f"services:\n  openclaw:\n    image: {image}\n  cli:\n    image: {image}\n")
-    (assets / "compose.release.yaml").write_text(overlay)
-    (assets / "compliance-claw-release.json").write_text(json.dumps({
-        "version": "0.6.0", "source_commit": new, "image": image,
-        "overlay_sha256": hashlib.sha256(overlay.encode()).hexdigest(),
-        "signature": "unsigned", "final": True}))
-    # Release-route files are deployment files; the release reserves their place.
+    image = fixture_module.make_release_set(base / "releases/v0.6.0", "0.6.0", new, digest,
+                                            image_repository=repository)
+    # The neutral overlay reserves the release overlay's place in COMPOSE_FILE.
     (repo / "compose.release.yaml").write_text("services: {}\n")
-    env = {**git_env, "CC_FIXTURE_RELEASES": str(assets.parent), "TMPDIR": str(base)}
-    return repo, git, old, new, env
+    return repo, git, old, new, {**git_env, "TMPDIR": str(base)}, image
 
 
 def release_regression(root, docker, docker_env):
     """Real Compose renders the release route; real Git; unreachable daemon."""
-    new_image = "ghcr.io/pretorin-ai/compliance-claw:0.6.0@sha256:" + "2" * 64
 
     def populate(repo):
         shutil.copytree(root / "scripts", repo / "scripts")
@@ -180,7 +172,8 @@ def release_regression(root, docker, docker_env):
 
     with tempfile.TemporaryDirectory(prefix="cc-release-") as tmp:
         base = Path(tmp).resolve()
-        repo, git, old, new, git_env = release_repo(base, root, docker_env, new_image, populate)
+        repo, git, old, new, git_env, new_image = release_repo(
+            base, root, docker_env, "sha256:" + "2" * 64, populate)
 
         # Saved selection: placeholder release overlay, separator ';', a secret
         # directory with spaces, and recovered external volumes last.
@@ -240,8 +233,18 @@ def release_apply_regression(root, docker, docker_env, images, image_ids):
     """Apply a release with real Compose, real Git and synthetic containers.
 
     The gateway uses restored external volumes, a customer overlay setting and a
-    customer secret path. Pulls are stubbed; both images are already local.
+    customer secret path. Pulls are stubbed; both images are already local. The
+    release reference uses the registry digest of the first image.
     """
+    digests = json.loads(subprocess.run(
+        [docker, "image", "inspect", "--format", "{{json .RepoDigests}}", images[0]],
+        env=docker_env, capture_output=True, text=True, check=True).stdout) or []
+    qualified = [d for d in digests if "/" in d.split("@")[0]]
+    if not qualified:
+        print("SKIP: release apply needs a first image with a registry digest, for example "
+              "a pulled ghcr.io/pretorin-ai/compliance-claw release")
+        return
+    repository, digest = qualified[0].split("@")
     def populate(repo):
         (repo / "scripts").mkdir()
         for name in ("update.sh", "compose-selection.sh", "init-file-secrets.sh"):
@@ -258,7 +261,8 @@ def release_apply_regression(root, docker, docker_env, images, image_ids):
 
     with tempfile.TemporaryDirectory(prefix="cc-release-apply-") as tmp:
         base = Path(tmp).resolve()
-        repo, git, old, new, env = release_repo(base, root, docker_env, images[0], populate)
+        repo, git, old, new, env, release_image = release_repo(
+            base, root, docker_env, digest, populate, repository)
         project = "cc-release-" + base.name[len("cc-release-apply-"):].lower()
         restored = {k: project + "-restored-" + k for k in ("openclaw-state", "pretorin-state")}
         (repo / "deployment").mkdir()
