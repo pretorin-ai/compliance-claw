@@ -591,7 +591,7 @@ that state.
    awk -F '\t' '$1 == "file" { print $2 }' "$RESTORE_DIR/host-inputs.txt" |
      while IFS= read -r f; do cmp -- "$f" "$(saved_input "$f")" || exit 1; done &&
    (IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
-     git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 ||
+     test "$f" = "$RESTORE_OVERLAY" || git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 ||
        cmp -- "$f" "$(saved_input "$f")" || exit 1; done) &&
    echo "OK: the saved selection uses $IMAGE_REF with the restored volumes"
    ```
@@ -603,7 +603,8 @@ that state.
    or a private overlay stops the step. Each saved copy is under `host-inputs/`
    at the full host path of its original; `saved_input FILE` prints that path.
    Copy the saved file back, or keep the current one only after you check that
-   the restored state supports it.
+   the restored state supports it. The comparison skips the restore overlay,
+   because step 1 wrote it again for this restore.
    This output can contain private configuration; keep it local.
 
 4. Reconcile credentials and access before the gateway starts. The gateway
