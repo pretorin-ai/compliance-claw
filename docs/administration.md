@@ -52,10 +52,19 @@ gateway is healthy.
 
 An SSH tunnel that uses the same local port keeps the seeded origin, for
 example `ssh -N -L 18789:127.0.0.1:18789 <operator>@<vm-host>`. A different
-local port, host name or HTTPS proxy is a different origin. Add it with native
-configuration, then reconnect and check that the Control UI loads and
-authenticates. Keep the existing origins that people still use. A tunnel or
-proxy changes the network path only. It does not add a user identity.
+local port, host name or HTTPS proxy is a different origin. Set the complete
+list with native configuration; the pinned OpenClaw refuses `--merge` for this
+list. Keep the existing origins that people still use:
+
+```sh
+docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint \
+  openclaw config set gateway.controlUi.allowedOrigins \
+  '["http://127.0.0.1:18789","http://localhost:18789","https://<claw-host>"]' \
+  --strict-json --replace
+```
+
+Then reconnect and check that the Control UI loads and authenticates. A tunnel
+or proxy changes the network path only. It does not add a user identity.
 
 ### If a setup stage fails
 
