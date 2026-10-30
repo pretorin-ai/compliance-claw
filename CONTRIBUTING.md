@@ -126,6 +126,7 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | Host image update | `python3 scripts/test-update.py` | Host tools; runs the real updater with isolated Git and Docker stubs. Does not prove live readiness or Compose merging. |
 | Saved deployment selection | `python3 scripts/test-update-compose.py --selection-only` | Real Compose CLI, no daemon, no credentials; covers saved/explicit settings, restored volumes, secret initialization and refusals. |
 | Host image update with Compose | `python3 scripts/test-update-compose.py LOCAL_IMAGE OTHER_LOCAL_IMAGE` | Two cached images with `sh`, `sleep`, and `test`; synthetic containers, two disposable projects, no registry or service credentials. Does not run OpenClaw or prove channel/MCP operation. |
+| Release set and selection | `python3 scripts/release-assets.py --self-test`; `python3 scripts/test-release-render.py` | Python 3, Git, and the real Compose CLI; no daemon, pull, or credential. Inert digests and the v0.5.2 tag fixtures. Does not run the release workflow, publish, or prove a pull. |
 | Target sync | `bash scripts/sync-targets.sh --self-test` | Bash, Git, Python 3; creates temporary local repositories. |
 | Shell diagnostic text | `python3 scripts/lint-heredocs.py scripts/*.sh` | Local static check; not a separate build CI step. |
 | CLI updater input | `bash scripts/pretorin-update.sh --self-test` | Docker and the candidate build overlay; the wrapper runs the in-image script. |
