@@ -489,7 +489,12 @@ class InstallTest(unittest.TestCase):
 
     def test_real_helper_refuses_every_unsigned_release_before_any_write(self):
         shutil.copyfile(ROOT / "scripts/release-assets.py", self.root / "scripts/release-assets.py")
-        self.assert_refused_without_change(self.full_args(), "is refused: it is not signed")
+        # The real helper is part of the release commit, not a local change.
+        self.git("commit", "-qam", "real helper")
+        self.git("tag", "-f", "v" + VERSION)
+        release = self.make_release(self.base / "release-real")
+        self.assert_refused_without_change(self.rel(release) + self.full_args()[4:],
+                                           "is refused: it is not signed")
         self.assertIn("manual installation", self.output)
         self.assertNotIn("UNVERIFIED", self.output)
 
@@ -508,6 +513,17 @@ class InstallTest(unittest.TestCase):
         self.git("commit", "-q", "-m", "later")
         self.assert_refused_without_change(self.full_args(), "not the source of the release")
         self.assertIn("Check out the release tag", self.output)
+
+    def test_changed_tracked_file_at_the_release_commit_is_refused(self):
+        # HEAD is still the tag, so the helper's source check passes. The
+        # installer must not run the changed script, and must keep the change.
+        script = self.root / "scripts/bootstrap.sh"
+        script.write_text(BOOTSTRAP + "# local change\n")
+        self.assert_refused_without_change(self.full_args(), "  scripts/bootstrap.sh")
+        self.assertIn("tracked files differ from the release commit", self.output)
+        self.assertIn("stopped at stage 2/10 inspection", self.output)
+        self.assertEqual(script.read_text(), BOOTSTRAP + "# local change\n")
+        self.assertFalse(any(c["tool"] == "clawctl" for c in self.calls))
 
     def test_placed_set_from_another_release_is_not_replaced(self):
         self.assertEqual(self.run_install(self.full_args()), 0, self.output)

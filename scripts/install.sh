@@ -191,6 +191,19 @@ stage "2/10 inspection"
 CONFLICTS=()
 conflict() { CONFLICTS+=("$1"); }
 
+# The helper checks that HEAD is the release commit, not the tracked file
+# bytes. A changed tracked file is local code, so stop before any of it runs,
+# the helper included. No installer step writes a tracked file, so one check is
+# enough. Index bits (assume-unchanged, skip-worktree) hide a change from this.
+CHANGED="$(GIT_OPTIONAL_LOCKS=0 git -c core.quotePath=true status --porcelain --untracked-files=no)" \
+  || die "could not read the state of this checkout with 'git status'. Nothing was changed."
+[ -z "$CHANGED" ] || die "tracked files differ from the release commit:
+$(printf '%s\n' "$CHANGED" | cut -c4- | sed 's/^/    /')
+  The installer runs scripts from this checkout, so it stops here. Review the
+  changes with 'git status' and 'git diff', then keep them out of this checkout
+  yourself. Check out the release tag, repeat the trust check, then re-run.
+  Nothing was changed."
+
 # The release set first: nothing else from this checkout runs before the
 # helper agrees that the checkout is the recorded source commit.
 release_check() {  # DIR [ARGS] -> the helper's exit code; its messages in CHECK_OUT

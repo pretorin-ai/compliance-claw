@@ -138,17 +138,19 @@ curl -fLO https://github.com/pretorin-ai/compliance-claw/releases/download/vX.Y.
 
 grep -E '"(commit|stage|tag|version)"' compliance-claw-release.json
 git -C ~/compliance-claw rev-parse 'vX.Y.Z^{commit}' 'HEAD^{commit}'
+git -C ~/compliance-claw status --porcelain --untracked-files=no
 grep -A2 '"name": "compose.release.yaml"' compliance-claw-release.json
 sha256sum compose.release.yaml        # macOS: shasum -a 256 compose.release.yaml
 ```
 
 Continue only when `stage` is `final`, the tag and version are the release you
-chose, both `rev-parse` lines equal `commit`, and the two SHA-256 values are
-equal. These checks show that the clone, the record and the overlay agree. The
-record is **not signed** and all of these files come from GitHub, so the checks
-do not prove who published the release. A downloaded checker cannot prove its
-own origin; signing is planned work. The installer repeats these checks with the
-helper and adds the signature check, but the helper comes from the same clone.
+chose, both `rev-parse` lines equal `commit`, `git status` shows no line, and
+the two SHA-256 values are equal. These checks show that the clone, the record
+and the overlay agree. The record is **not signed** and all of these files come
+from GitHub, so the checks do not prove who published the release. A
+downloaded checker cannot prove its own origin; signing is planned work. The
+installer repeats these checks with the helper and adds the signature check,
+but the helper comes from the same clone.
 
 **2. Run the installer.** Put each credential in a file that only you can read
 (`chmod 600`). The installer copies a value into an empty secret file only. It
@@ -171,7 +173,8 @@ scripts/install.sh --check --release X.Y.Z --release-dir ~/cc-release \
 ```
 
 The installer stops before any write when the release set fails a check (an
-unsigned set included), the checkout is not the release commit, or a later
+unsigned set included), the checkout is not the release commit, a tracked file
+in the checkout has a local change, or a later
 Compose overlay selects another image. It places `compose.release.yaml` and `compliance-claw-release.json` in
 the checkout and saves this selection in `.env`:
 `COMPOSE_FILE=compose.yaml:compose.release.yaml:compose.secrets.yaml:compose.efforts.yaml`.
