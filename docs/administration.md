@@ -170,11 +170,18 @@ placeholders, no credential and no private name.
 2. Put the CA file at a private host path. Put the credential in the secret
    directory as `internal-ai-api-key`. Both files must belong to UID 1000 and
    have an owner-only mode, `0400` or `0600`. OpenClaw file references refuse a
-   file that the group or other users can read. For example:
+   file that the group or other users can read. For example, on a Linux host,
+   create a root-owned directory that others cannot write, install the file,
+   and check the owner and mode:
 
    ```sh
+   sudo install -d -m 0755 /opt/compliance-claw-trust
    sudo install -o 1000 -g 1000 -m 0400 ca.pem /opt/compliance-claw-trust/internal-ai-ca.pem
+   sudo stat -c '%u:%g %a %n' /opt/compliance-claw-trust /opt/compliance-claw-trust/internal-ai-ca.pem
    ```
+
+   The check must show `0:0 755` for the directory and `1000:1000 400` for
+   the file.
 
    Deliver the credential with an approved secret-input method, as in the
    [secret guide](file-secrets.md#internal-ai-endpoint-credential).
