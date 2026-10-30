@@ -1,0 +1,50 @@
+# compose.internal-ai-ca.yaml — example private overlay for an internal
+# OpenAI-compatible AI endpoint whose TLS certificate comes from a private
+# certificate authority (CA).
+#
+# Copy this file to a private path outside the checkout, then add that path LAST
+# in the saved COMPOSE_FILE. Keep the deployment's other files and their order:
+#
+#   COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml:/private/path/compose.internal-ai-ca.yaml
+#   INTERNAL_AI_CA_FILE=/private/path/internal-ai-ca.pem
+#
+# This overlay only ADDS two read-only inputs. Compose merges volume and secret
+# lists across files by their container path, so the state volumes, target
+# mounts, effort mounts, secret files and loopback port from the earlier files
+# stay unchanged. Check that with `docker compose config` before startup.
+#
+# It contains no certificate, key, endpoint name or credential. The values are
+# host files that the VM operator supplies:
+#
+#   INTERNAL_AI_CA_FILE  the approved CA certificate (PEM), owner UID 1000,
+#                        mode 0400 or 0600. Public data, but the trust decision
+#                        is the operator's. Compose stops with the message
+#                        below if this setting is missing.
+#   internal-ai-api-key  the endpoint credential, in the deployment's secret
+#                        directory, owner UID 1000, mode 0400 or 0600 (OpenClaw
+#                        refuses a file that others can read). Gateway only,
+#                        like the model API keys.
+#
+# OpenClaw reads both files through native file SecretRef providers. See
+# internal-ai.patch.json5 and docs/administration.md
+# ("Internal AI endpoint with a private CA"). TLS verification stays on.
+
+x-internal-ai-ca-mount: &internal-ai-ca-mount
+  "${INTERNAL_AI_CA_FILE:?Set INTERNAL_AI_CA_FILE to the approved internal AI CA certificate file}:/etc/compliance-claw/internal-ai/ca.pem:ro"
+
+services:
+  openclaw:
+    volumes:
+      - *internal-ai-ca-mount
+    secrets:
+      - internal_ai_api_key
+
+  cli:
+    # The CA also on cli, so one-off configuration commands load the same
+    # provider settings as the gateway. The credential stays gateway-only.
+    volumes:
+      - *internal-ai-ca-mount
+
+secrets:
+  internal_ai_api_key:
+    file: "${COMPLIANCE_CLAW_SECRET_DIR:-./secrets/runtime}/internal-ai-api-key"

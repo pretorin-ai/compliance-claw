@@ -106,6 +106,9 @@ release, or now with `scripts/bootstrap.sh --build`.
 - A model-provider key (OpenAI or Anthropic), or an OpenAI device-code login.
 - Optional: a Slack workspace where you can install an app, and a read-only
   GitHub App if you want to review private repositories.
+- Approved outbound connections for the features you use. No inbound
+  connection is required. See [network connections](docs/administration.md#network-connections)
+  and the [operator handoff checklist](docs/administration.md#operator-handoff-checklist).
 
 ## Quickstart
 
@@ -468,6 +471,8 @@ before using it.
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
 | Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`, then check the next MCP call. `--status` reports the installed binary only |
+| Model turn fails with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | The AI endpoint certificate does not chain to a trusted CA | Configure the approved CA for that provider; keep verification on. See [internal AI endpoint](docs/administration.md#internal-ai-endpoint-with-a-private-ca). |
+| A setup stage fails and the cause is not in this table | Different causes per stage | Follow [if a setup stage fails](docs/administration.md#if-a-setup-stage-fails); collect [support diagnostics](docs/administration.md#support-diagnostics). |
 | `/compliance-claw /pretorin-update` does nothing in Slack | Existing slash-command configuration or missing owner authority | Check startup warnings, the registered command name, and `commands.ownerAllowFrom`. Preserve state before configuration repair; see [CLI updates](docs/upgrade.md#updating-the-pretorin-cli). |
 
 Logs and state:
