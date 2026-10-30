@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Run the guided installer with isolated command stubs.
 
-The real installer, init-file-secrets.sh, compose-selection.sh, parsers and
-`clawctl migrate` run against a temporary checkout. Docker, bootstrap.sh and the
-other clawctl commands are stubs that record their calls. These tests prove
+The real installer, init-file-secrets.sh, compose-selection.sh, parsers,
+release-assets.py and `clawctl migrate` run against a temporary Git checkout
+with a fixture release set made by the real helper. Docker, bootstrap.sh and
+the other clawctl commands are stubs that record their calls. These tests prove
 input handling, ordering, refusals and rerun preservation only. They do not
 prove an image pull, a clone, Compose merging, gateway startup, a provider or
-Pretorin call, or a customer task.
+Pretorin call, a customer task, or release authenticity (fixture sets are
+unsigned, as every set is today). CC_TEST_INSTALL_SCRIPT can select another
+script to show that a test rejects a removed check.
 """
 import json
 import os
@@ -16,15 +19,21 @@ import re
 import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 
 
 ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = Path(os.environ.get("CC_TEST_INSTALL_SCRIPT", ROOT / "scripts/install.sh"))
 SYSTEM = "7b74d8f3-d77c-49e4-8792-c372dd154d38"
-IMAGE = "ghcr.io/pretorin-ai/compliance-claw:0.5.2@sha256:" + "b" * 64
-DEFAULT_SELECTION = "compose.yaml:compose.secrets.yaml:compose.efforts.yaml"
+VERSION = "9.9.9"
+IMAGE = "ghcr.io/pretorin-ai/compliance-claw:%s@sha256:%s" % (VERSION, "c" * 64)
+DEFAULT_SELECTION = "compose.yaml:compose.release.yaml:compose.secrets.yaml:compose.efforts.yaml"
+RELEASE_FILES = ("compliance-claw-release.json", "compose.release.yaml")
+GIT = ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+       "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
 CANARIES = {
     "pretorin": "CANARY-PRETORIN-DO-NOT-PRINT",
     "openai": "CANARY-OPENAI-DO-NOT-PRINT",
@@ -44,7 +53,8 @@ fixture = pathlib.Path(os.environ["FIXTURE"])
 settings = json.loads((fixture / "settings.json").read_text())
 with (fixture / "calls.jsonl").open("a") as f:
     f.write(json.dumps({"tool": tool, "args": a,
-        "COMPOSE_FILE": os.environ.get("COMPOSE_FILE")}) + "\n")
+        "COMPOSE_FILE": os.environ.get("COMPOSE_FILE"),
+        "placed": os.path.exists("compose.release.yaml")}) + "\n")
 def fail(key):
     if settings.get(key) is not None:
         print("fixture: " + key, file=sys.stderr)
@@ -79,9 +89,11 @@ elif tool == "docker":
     elif a == ["compose", "version", "--short"]: print(settings.get("compose", "2.27.2"))
     elif a == ["compose", "config", "--environment"]:
         for k, v in selection().items(): print(k + "=" + v)
-    elif a == ["compose", "config", "--format", "json"]:
-        print(json.dumps({"services": {"openclaw": {"image": settings.get("image", %r)},
-            "cli": {"environment": {"SECRET": "CANARY-CONFIG-DO-NOT-PRINT"}}}}))
+    elif a in (["compose", "config", "--format", "json"],
+               ["compose", "--profile", "cli", "config", "--format", "json"]):
+        image = settings.get("image", %r)
+        print(json.dumps({"services": {"openclaw": {"image": image},
+            "cli": {"image": image, "environment": {"SECRET": "CANARY-CONFIG-DO-NOT-PRINT"}}}}))
     elif a[:2] == ["image", "inspect"]: fail("image_rc")
     elif a[:2] == ["manifest", "inspect"]: fail("manifest_rc")
     elif a == ["compose", "ps", "--quiet", "openclaw"]: print(settings.get("cid", "c" * 12))
@@ -110,8 +122,9 @@ class InstallTest(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.root = self.base / "checkout"
         (self.root / "scripts").mkdir(parents=True)
-        for name in ("install.sh", "compose-selection.sh", "init-file-secrets.sh",
-                     "parse-efforts.py", "parse-targets.py", "onboard-lib.sh"):
+        shutil.copyfile(SCRIPT, self.root / "scripts/install.sh")
+        for name in ("compose-selection.sh", "init-file-secrets.sh",
+                     "parse-efforts.py", "parse-targets.py", "onboard-lib.sh", "release-assets.py"):
             shutil.copyfile(ROOT / "scripts" / name, self.root / "scripts" / name)
         shutil.copyfile(ROOT / "scripts/clawctl", self.root / "scripts/clawctl.real")
         (self.root / "scripts/clawctl").write_text(CLAWCTL)
@@ -134,6 +147,33 @@ class InstallTest(unittest.TestCase):
         self.env = {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
                     "HOME": str(self.base), "FIXTURE": str(self.base),
                     "TMPDIR": str(self.base), "CC_INSTALL_HEALTH_TIMEOUT": "0"}
+        self.release = self.make_release(self.base / "release")
+
+    def git(self, *args):
+        return subprocess.run([*GIT, "-C", str(self.root), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def make_release(self, out, final=True, version=VERSION, digest="c" * 64):
+        """A release set from the real helper, for the checkout's tagged commit."""
+        if not (self.root / ".git").exists():
+            self.git("init", "-q")
+            self.git("add", "-A")
+            self.git("commit", "-q", "-m", "fixture")
+            self.git("tag", "v" + VERSION)
+        sbom = self.base / f"sbom-{version}.spdx.json"
+        sbom.write_text(json.dumps({"spdxVersion": "SPDX-2.3", "packages": [{"name": "x"}]}))
+        helper = [sys.executable, str(self.root / "scripts/release-assets.py")]
+        subprocess.run([*helper, "prepare", "--version", version, "--commit", self.git("rev-parse", "HEAD"),
+                        "--repository", "pretorin-ai/compliance-claw",
+                        "--image-repository", "ghcr.io/pretorin-ai/compliance-claw",
+                        "--digest", "sha256:" + digest, "--sbom", str(sbom), "--out", str(out)],
+                       check=True, capture_output=True)
+        if final:
+            subprocess.run([*helper, "finalize", "--dir", str(out)], check=True, capture_output=True)
+        return out
+
+    def rel(self, directory=None, version=VERSION):
+        return ["--release", version, "--release-dir", str(directory or self.release)]
 
     # -- helpers -----------------------------------------------------------
     def declaration(self, channel=None, system=SYSTEM):
@@ -147,7 +187,7 @@ class InstallTest(unittest.TestCase):
         return [x for n in names for x in (option[n], str(self.keys / n))]
 
     def full_args(self, *extra):
-        return [*self.declaration(), *self.keyfiles("pretorin", "openai"), "--yes", *extra]
+        return [*self.rel(), *self.declaration(), *self.keyfiles("pretorin", "openai"), "--yes", *extra]
 
     def run_install(self, args, env=None, **settings):
         (self.base / "settings.json").write_text(json.dumps(settings))
@@ -174,7 +214,7 @@ class InstallTest(unittest.TestCase):
 
     def snapshot(self):
         return {str(p.relative_to(self.root)): (p.read_bytes() if p.is_file() else None, p.stat().st_mode)
-                for p in sorted(self.root.rglob("*"))}
+                for p in sorted(self.root.rglob("*")) if ".git" not in p.relative_to(self.root).parts}
 
     def secret(self, name):
         return (self.root / "secrets/runtime" / name).read_text()
@@ -196,6 +236,10 @@ class InstallTest(unittest.TestCase):
         for call in self.calls:
             if call["tool"] in ("bootstrap", "clawctl") and call["args"][:1] != ["migrate"]:
                 self.assertEqual(call["COMPOSE_FILE"], DEFAULT_SELECTION)
+                self.assertTrue(call["placed"], call)
+        for name in RELEASE_FILES:
+            self.assertEqual((self.root / name).read_bytes(), (self.release / name).read_bytes())
+        self.assertIn("release record          unsigned", self.output)
         efforts = (self.root / "efforts.yaml").read_text()
         self.assertIn("name: crm-soc2", efforts)
         self.assertIn(f"system_id: {SYSTEM}", efforts)
@@ -221,6 +265,12 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(re.findall(r"(?m)^COMPOSE_FILE=", (self.root / ".env").read_text()), ["COMPOSE_FILE="])
         # A rerun with no declaration and no key files reuses everything too.
         self.assertEqual(self.run_install(["--yes"]), 0, self.output)
+        self.assertEqual(self.snapshot(), before)
+        # Without --release-dir, an incomplete placed set is refused, not guessed.
+        (self.root / "compliance-claw-release.json").unlink()
+        self.assertNotEqual(self.run_install(["--yes"]), 0, self.output)
+        self.assertIn("failed its check", self.output)
+        self.assertEqual(self.run_install(self.full_args()), 0, self.output)
         self.assertEqual(self.snapshot(), before)
 
     def test_saved_custom_overlay_order_is_kept_and_not_saved_again(self):
@@ -276,7 +326,7 @@ class InstallTest(unittest.TestCase):
 
     # -- Slack follows the declaration -------------------------------------
     def test_declared_slack_channel_needs_both_tokens_before_first_start(self):
-        args = [*self.declaration("C0123ABCDEF"), *self.keyfiles("pretorin", "openai"), "--yes"]
+        args = [*self.rel(), *self.declaration("C0123ABCDEF"), *self.keyfiles("pretorin", "openai"), "--yes"]
         self.assertNotEqual(self.run_install(args), 0, self.output)
         self.assertIn("routes Slack channels", self.output)
         self.assertFalse(any(c["tool"] == "bootstrap" for c in self.calls))
@@ -317,24 +367,26 @@ class InstallTest(unittest.TestCase):
 
     def test_declaration_and_file_conflicts_stop_before_any_write(self):
         self.assert_refused_without_change(
-            [*self.declaration(system="crm-system"), "--yes"], "not a UUID")
-        self.assert_refused_without_change(["--yes"], "no declaration was given")
+            [*self.rel(), *self.declaration(system="crm-system"), "--yes"], "not a UUID")
+        self.assert_refused_without_change([*self.rel(), "--yes"], "no declaration was given")
         self.assert_refused_without_change(
-            [*self.declaration("D0123ABCDEF"), "--yes"], "not valid")
+            [*self.rel(), *self.declaration("D0123ABCDEF"), "--yes"], "not valid")
         (self.root / "efforts.yaml").write_text(
             "efforts:\n  - name: crm-soc2\n    system_id: %s\n    framework_id: hipaa\n"
             "    credential_ref: default\n    targets:\n      - name: simple-crm\n"
             "        url: https://github.com/pretorin-ai/simple-crm.git\n        ref: main\n" % SYSTEM)
         self.assert_refused_without_change(self.full_args(), "with other values")
         (self.root / "efforts.yaml").write_text("efforts: [broken\n")
-        self.assert_refused_without_change(["--yes"], "is not valid")
+        self.assert_refused_without_change([*self.rel(), "--yes"], "is not valid")
 
     def test_selection_conflicts_stop_before_any_write(self):
         cases = (
-            ({"COMPOSE_FILE": "compose.yaml:compose.efforts.yaml"}, "does not select compose.secrets.yaml"),
-            ({"COMPOSE_FILE": "compose.yaml:compose.secrets.yaml"}, "does not select compose.efforts.yaml"),
+            ({"COMPOSE_FILE": "compose.yaml:compose.release.yaml:compose.efforts.yaml"}, "does not select compose.secrets.yaml"),
+            ({"COMPOSE_FILE": "compose.yaml:compose.release.yaml:compose.secrets.yaml"}, "does not select compose.efforts.yaml"),
             ({"COMPOSE_FILE": DEFAULT_SELECTION + ":compose.build.yaml"}, "local build overlay"),
             ({"COMPOSE_FILE": "compose.secrets.yaml:compose.yaml:compose.efforts.yaml"}, "does not start with compose.yaml"),
+            ({"COMPOSE_FILE": "compose.yaml:compose.secrets.yaml:compose.efforts.yaml"}, "directly\n    after compose.yaml"),
+            ({"COMPOSE_FILE": "compose.yaml:compose.secrets.yaml:compose.release.yaml:compose.efforts.yaml"}, "directly\n    after compose.yaml"),
         )
         for env, text in cases:
             with self.subTest(env=env):
@@ -358,7 +410,7 @@ class InstallTest(unittest.TestCase):
         empty.write_text("")
         empty.chmod(0o600)
         self.assert_refused_without_change(
-            [*self.declaration(), "--pretorin-key-file", str(empty)], "not a readable, nonempty file")
+            [*self.rel(), *self.declaration(), "--pretorin-key-file", str(empty)], "not a readable, nonempty file")
 
     def test_secret_values_are_not_accepted_or_echoed_as_arguments(self):
         for arg in ("--pretorin-key=" + CANARIES["pretorin"], CANARIES["pretorin"]):
@@ -367,6 +419,38 @@ class InstallTest(unittest.TestCase):
                 self.assertIn("never arguments", self.output)
                 self.assertFalse(self.calls)
         self.assertNotEqual(self.run_install(["--openai-key-file", "a", "--anthropic-key-file", "b"]), 0)
+
+    # -- release set: refusals before any write or delegated script ---------
+    def test_release_set_refusals_stop_before_any_write(self):
+        self.assert_refused_without_change(self.full_args()[4:], "no release set was given")
+        self.assert_refused_without_change(self.rel(version="9.9.8") + self.full_args()[4:], "expected 9.9.8")
+        candidate = self.make_release(self.base / "candidate", final=False)
+        self.assert_refused_without_change(self.rel(candidate) + self.full_args()[4:], "is a candidate")
+        tampered = self.base / "tampered"
+        shutil.copytree(self.release, tampered)
+        overlay = tampered / "compose.release.yaml"
+        overlay.write_text(overlay.read_text().replace("c" * 64, "d" * 64))
+        self.assert_refused_without_change(self.rel(tampered) + self.full_args()[4:], "sha256")
+        self.assert_refused_without_change(self.full_args(), "would not run the release image",
+                                           image="ghcr.io/example/other:1@sha256:" + "e" * 64)
+
+    def test_checkout_not_at_the_release_commit_is_refused(self):
+        (self.root / "NOTE").write_text("later\n")
+        self.git("add", "NOTE")
+        self.git("commit", "-q", "-m", "later")
+        self.assert_refused_without_change(self.full_args(), "not the source of the release")
+        self.assertIn("Check out the release tag", self.output)
+
+    def test_placed_set_from_another_release_is_not_replaced(self):
+        self.assertEqual(self.run_install(self.full_args()), 0, self.output)
+        # A valid set for the same tag that selects another digest.
+        other = self.make_release(self.base / "other", digest="f" * 64)
+        before = self.snapshot()
+        self.assertNotEqual(self.run_install(self.rel(other) + self.full_args()[4:],
+                                             image=IMAGE.replace("c" * 64, "f" * 64)), 0, self.output)
+        self.assertIn("from another release", self.output)
+        self.assertIn("Nothing was changed", self.output)
+        self.assertEqual(self.snapshot(), before)
 
     # -- readiness ---------------------------------------------------------
     def test_readiness_failures_are_reported_and_not_called_success(self):
@@ -393,7 +477,7 @@ class InstallTest(unittest.TestCase):
         (self.base / "settings.json").write_text("{}")
         (self.base / "calls.jsonl").write_text("")
         master, slave = pty.openpty()
-        proc = subprocess.Popen(["bash", str(self.root / "scripts/install.sh"), *self.declaration()],
+        proc = subprocess.Popen(["bash", str(self.root / "scripts/install.sh"), *self.rel(), *self.declaration()],
                                 env=self.env, cwd=self.base, stdin=slave, stdout=slave,
                                 stderr=slave, close_fds=True)
         os.close(slave)

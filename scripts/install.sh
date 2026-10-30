@@ -9,6 +9,16 @@
 #   scripts/install.sh --check [OPTIONS]   # preflight and inspection; no writes
 #   scripts/install.sh [OPTIONS]           # install, then report readiness
 #
+# The release set, required on the first run:
+#   --release X.Y.Z --release-dir DIR   (DIR holds compliance-claw-release.json and
+#                                        compose.release.yaml for that release)
+# scripts/release-assets.py checks the record, the overlay checksum and that this
+# checkout is the recorded tag commit before any write and before any other
+# script from this checkout runs. This script and the helper come from the same
+# checkout, so the manual git/sha256sum check in README.md comes first. The
+# record is unsigned: the checks bind the files together; they do not prove
+# who made them.
+#
 # Declaration, only for a new efforts.yaml. A rerun with the same values reuses it:
 #   --effort NAME --system-id UUID --framework-id ID
 #   --target NAME=https://HOST/REPO.git[#BRANCH]   (repeat; --private-target too)
@@ -34,6 +44,8 @@ cd "$REPO_ROOT"
 
 EFFORTS_FILE="${CC_EFFORTS_FILE:-efforts.yaml}"
 PARSE_EFFORTS="scripts/parse-efforts.py"
+RELEASE_HELPER="scripts/release-assets.py"
+RELEASE_FILES="compliance-claw-release.json compose.release.yaml"
 HEALTH_TIMEOUT="${CC_INSTALL_HEALTH_TIMEOUT:-720}"
 ENTRYPOINT="/usr/local/bin/compliance-claw-entrypoint"
 GUIDE_ADMIN="docs/administration.md"
@@ -44,9 +56,9 @@ warn()  { printf 'install: WARNING — %s\n' "$*" >&2; }
 die()   { printf 'install: ERROR — %s\n' "$*" >&2; exit 1; }
 stage() { printf '\ninstall: == %s ==\n' "$*"; }
 
-usage() { sed -n '2,29p' "$0"; }
+usage() { sed -n '2,39p' "$0"; }
 
-CHECK_ONLY=0 ASSUME_YES=0
+CHECK_ONLY=0 ASSUME_YES=0 RELEASE="" RELEASE_DIR=""
 EFFORT="" SYSTEM_ID="" FRAMEWORK_ID="" CHANNEL=""
 TARGETS=()
 PRETORIN_KEY_FILE="" OPENAI_KEY_FILE="" ANTHROPIC_KEY_FILE=""
@@ -57,6 +69,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK_ONLY=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
+    --release) need_value "$@"; RELEASE="$2"; shift 2 ;;
+    --release-dir) need_value "$@"; RELEASE_DIR="$2"; shift 2 ;;
     --effort) need_value "$@"; EFFORT="$2"; shift 2 ;;
     --system-id) need_value "$@"; SYSTEM_ID="$2"; shift 2 ;;
     --framework-id) need_value "$@"; FRAMEWORK_ID="$2"; shift 2 ;;
@@ -76,6 +90,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+[ -z "$RELEASE_DIR" ] || [ -n "$RELEASE" ] \
+  || die "--release-dir needs --release X.Y.Z, the version you chose."
 [ -z "$OPENAI_KEY_FILE" ] || [ -z "$ANTHROPIC_KEY_FILE" ] \
   || die "give one model key file, not both. The other provider stays unconfigured."
 
@@ -98,7 +114,7 @@ trap cleanup EXIT INT TERM
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cc-install.XXXXXX")"
 
 # ---------------------------------------------------------------------------
-stage "1/9 preflight: host, tools and Docker"
+stage "1/10 preflight: host, tools and Docker"
 # ---------------------------------------------------------------------------
 # The reference route is a connected Linux amd64 VM. Other hosts use the manual
 # Quickstart, where bootstrap.sh checks amd64 emulation. No VM size is checked:
@@ -153,12 +169,55 @@ FS_TYPE="$(findmnt -n -o FSTYPE --target "$REPO_ROOT" 2>/dev/null || true)"
 log "checkout ${REPO_ROOT} is writable (${FS_TYPE:-file system type unknown})"
 
 # ---------------------------------------------------------------------------
-stage "2/9 inspection: existing files and the deployment selection"
+stage "2/10 inspection: existing files and the deployment selection"
 # ---------------------------------------------------------------------------
 # Each conflict is reported before the first write. Existing customer files are
 # reused or refused, never replaced.
 CONFLICTS=()
 conflict() { CONFLICTS+=("$1"); }
+
+# The release set first: nothing else from this checkout runs before the
+# helper agrees that the checkout is the recorded source commit.
+release_check() {  # DIR [ARGS] -> the helper's exit code; its messages in CHECK_OUT
+  local rc=0
+  CHECK_OUT="$(python3 "$RELEASE_HELPER" check --dir "$1" --stage final \
+    ${RELEASE:+--version "$RELEASE"} "${@:2}" 2>&1)" || rc=$?
+  return "$rc"
+}
+if [ -n "$RELEASE_DIR" ]; then
+  [ -d "$RELEASE_DIR" ] || die "${RELEASE_DIR} is not a directory. Nothing was changed."
+  RELEASE_SRC="$(cd -- "$RELEASE_DIR" && pwd)"
+else
+  RELEASE_SRC=""
+  for f in $RELEASE_FILES; do [ ! -e "$f" ] || RELEASE_SRC="$REPO_ROOT"; done
+  [ -n "$RELEASE_SRC" ] || die "no release set was given. Download the release you chose and give:
+    --release X.Y.Z --release-dir DIR
+  See README.md#guided-installation-on-a-linux-amd64-vm. Nothing was changed."
+fi
+rc=0; release_check "$RELEASE_SRC" --source . || rc=$?
+case "$rc" in
+  0) log "release set in ${RELEASE_SRC}: final record, overlay checksum and source commit match (unsigned)" ;;
+  3) die "this checkout is not the source of the release:
+$(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
+  Check out the release tag, repeat the trust check, then re-run. Nothing was changed." ;;
+  *) die "the release set in ${RELEASE_SRC} failed its check (exit ${rc}):
+$(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
+  Do not edit release files. Download the set again, or use the files that were
+  placed by an earlier run with --release-dir. Nothing was changed." ;;
+esac
+RELEASE_TO_PLACE=""
+if [ "$RELEASE_SRC" != "$REPO_ROOT" ]; then
+  for f in $RELEASE_FILES; do
+    if [ ! -e "$f" ]; then
+      RELEASE_TO_PLACE="${RELEASE_TO_PLACE} ${f}"
+    elif cmp -s "${RELEASE_SRC}/${f}" "$f"; then
+      log "keeping ${f} (same release)"
+    else
+      conflict "${f} in this checkout is from another release or was changed. It is
+    not replaced. To move a deployment to another release, use docs/upgrade.md."
+    fi
+  done
+fi
 
 # The shell value wins over .env, as in native Compose. A value present in both
 # places with different text is ambiguous for later shells, so it is refused.
@@ -180,10 +239,12 @@ for key in $SELECTION_KEYS; do
 done
 
 . "${REPO_ROOT}/scripts/compose-selection.sh"
-compose_resolve_selection
+compose_resolve_selection || die "the deployment selection did not resolve. A selection that names
+  compose.release.yaml before it is placed cannot resolve: unset COMPOSE_FILE in this
+  shell and let the installer select it. Nothing was changed."
 SEP="${COMPOSE_PATH_SEPARATOR:-:}"
 if [ -z "${COMPOSE_FILE:-}" ]; then
-  COMPOSE_FILE="compose.yaml${SEP}compose.secrets.yaml${SEP}compose.efforts.yaml"
+  COMPOSE_FILE="compose.yaml${SEP}compose.release.yaml${SEP}compose.secrets.yaml${SEP}compose.efforts.yaml"
   TO_SAVE+=("COMPOSE_FILE=${COMPOSE_FILE}")
 fi
 export COMPOSE_FILE
@@ -192,6 +253,17 @@ SECRET_DIR="${COMPLIANCE_CLAW_SECRET_DIR:-secrets/runtime}"
 FIRST_FILE="${COMPOSE_FILE%%"$SEP"*}"
 [ "$FIRST_FILE" -ef compose.yaml ] || conflict "COMPOSE_FILE=${COMPOSE_FILE} does not start with compose.yaml.
     The base file comes first; keep custom overlays after it, in their order."
+# By name: the overlay can be selected before it is placed.
+AFTER_FIRST="${COMPOSE_FILE#*"$SEP"}"
+SECOND_FILE="${AFTER_FIRST%%"$SEP"*}"
+case "$SECOND_FILE" in
+  compose.release.yaml|./compose.release.yaml|"${REPO_ROOT}/compose.release.yaml") ;;
+  *) [ "$AFTER_FIRST" != "$COMPOSE_FILE" ] && [ "$SECOND_FILE" -ef compose.release.yaml ] \
+       || conflict "COMPOSE_FILE=${COMPOSE_FILE} does not select compose.release.yaml directly
+    after compose.yaml. Put it second; keep the other overlays in their order." ;;
+esac
+# The same selection with the checked overlay, for a render before placement.
+CHECKED_FILE="${FIRST_FILE}${SEP}${RELEASE_SRC}/compose.release.yaml${AFTER_FIRST#"$SECOND_FILE"}"
 compose_has_file compose.secrets.yaml || conflict "COMPOSE_FILE=${COMPOSE_FILE} does not select compose.secrets.yaml.
     The guided installation uses file-backed credentials. Add it after compose.yaml."
 compose_has_file compose.efforts.yaml || conflict "COMPOSE_FILE=${COMPOSE_FILE} does not select compose.efforts.yaml.
@@ -309,11 +381,18 @@ if [ "${#CONFLICTS[@]}" -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-stage "3/9 image access"
+stage "3/10 image access"
 # ---------------------------------------------------------------------------
-# Before any write: the image the selection names must be present or reachable.
-# The merged model is never printed, because it can contain credentials.
-IMAGE="$(docker compose config --format json 2>/dev/null | python3 -c '
+# Before any write. Compose must select the release image for both services
+# (a later overlay that sets image is refused), and that image must be present
+# or reachable. The merged model is never printed: it can contain credentials.
+rc=0
+release_check "$RELEASE_SRC" --rendered /dev/stdin \
+  < <(COMPOSE_FILE="$CHECKED_FILE" docker compose --profile cli config --format json 2>/dev/null) || rc=$?
+[ "$rc" = 0 ] || die "Compose would not run the release image with this selection (exit ${rc}):
+$(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
+  Remove a later overlay that sets image, or fix the selection. Nothing was changed."
+IMAGE="$(COMPOSE_FILE="$CHECKED_FILE" docker compose config --format json 2>/dev/null | python3 -c '
 import json, sys
 try:
     image = json.load(sys.stdin)["services"]["openclaw"]["image"]
@@ -342,7 +421,22 @@ if [ "$CHECK_ONLY" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-stage "4/9 declaration"
+stage "4/10 release set"
+# ---------------------------------------------------------------------------
+for f in $RELEASE_TO_PLACE; do
+  [ ! -e "$f" ] || die "${f} appeared during this run. Nothing more was changed. Re-run."
+  cp -- "${RELEASE_SRC}/${f}" "$f"
+  chmod 644 "$f"
+  log "placed ${f}"
+done
+rc=0; release_check . --source . --compose || rc=$?
+[ "$rc" = 0 ] || die "the placed release set failed its check (exit ${rc}):
+$(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
+  Nothing was started. Keep the files for diagnosis."
+log "release ${RELEASE:-set} is placed and selected for openclaw and cli"
+
+# ---------------------------------------------------------------------------
+stage "5/10 declaration"
 # ---------------------------------------------------------------------------
 if [ -n "$NEW_EFFORTS" ]; then
   [ ! -e "$EFFORTS_FILE" ] || die "${EFFORTS_FILE} appeared during this run. Nothing more was changed. Re-run."
@@ -357,7 +451,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-stage "5/9 secret files"
+stage "6/10 secret files"
 # ---------------------------------------------------------------------------
 save_selection() {
   [ -f .env ] || return 0
@@ -424,7 +518,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-stage "6/9 bootstrap: targets and image"
+stage "7/10 bootstrap: targets and image"
 # ---------------------------------------------------------------------------
 bash scripts/bootstrap.sh || die "bootstrap.sh stopped; see its message above.
   Fix the cause, then re-run this command. Existing files and clones were kept."
@@ -432,13 +526,13 @@ save_selection
 log "Ignore the bootstrap 'Next:' list; this command does those steps now."
 
 # ---------------------------------------------------------------------------
-stage "7/9 validate: credentials and Pretorin scope"
+stage "8/10 validate: credentials and Pretorin scope"
 # ---------------------------------------------------------------------------
 bash scripts/clawctl validate || die "validation failed; see the rows above. Nothing was applied.
   Fix each row, then re-run this command."
 
 # ---------------------------------------------------------------------------
-stage "8/9 plan and apply"
+stage "9/10 plan and apply"
 # ---------------------------------------------------------------------------
 bash scripts/clawctl plan || die "plan failed; see the message above. Nothing was applied."
 if [ "$ASSUME_YES" != 1 ]; then
@@ -454,7 +548,7 @@ bash scripts/clawctl apply || die "apply failed; see its recovery message above.
   Recovery: ${GUIDE_RECOVERY}"
 
 # ---------------------------------------------------------------------------
-stage "9/9 readiness"
+stage "10/10 readiness"
 # ---------------------------------------------------------------------------
 # Distinct results. A local check that passes is not a provider, platform or
 # customer task result, and this report does not say otherwise.
@@ -488,6 +582,7 @@ printf '\n'
 log "gateway health          ${GATEWAY}  (container running and healthy)"
 log "model configuration     ${MODEL}  (local check; the provider was not contacted)"
 log "Pretorin scope/transport ok  (scoped read probe passed in validate; writes not tested)"
+log "release record          unsigned (checksums and source commit match; not signed)"
 log "first useful task       NOT VERIFIED — still required"
 printf '\n'
 [ "$GATEWAY" = ok ] || log "  gateway: docker compose ps -a; docker compose logs openclaw. Keep the volumes; ${GUIDE_RECOVERY}"
