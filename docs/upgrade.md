@@ -671,6 +671,11 @@ its branch with `git switch` before the update.
 - **Host inputs.** Secret files, target clones and customer bind mounts are not
   in the archives. `host-inputs/` holds copies of declarations and private
   overlays for comparison only.
+- **Doctor captures.** At startup, OpenClaw Doctor can write a pre-repair copy
+  of config and databases under `/home/node/.openclaw.update-captures/`. That
+  path is in the container layer, not in a state volume. The volume backup does
+  not include it, and a container recreation removes it. Do not use it for
+  recovery; use the paired volume backup.
 - **Image-only rollback.** The previous image with the candidate volumes is not
   a rollback. An old image cannot reverse a migration of the config or SQLite
   schema. A copy of `openclaw.json` alone is not a full state backup. Recover
