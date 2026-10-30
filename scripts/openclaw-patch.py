@@ -58,7 +58,7 @@ do not name what you do not own. `plugins` appears nowhere below.
       matching agents' settings, except effort-owned fields/generated denies
 
     THE EXEC APPROVALS DOCUMENT IS NOT openclaw.json. OpenClaw keeps it in its
-    SQLite state. `approvals` below reads the live document and returns a
+    SQLite state. build_approvals below reads the live document and returns a
     complete replacement in which only exact Claw-owned git grants change. Every
     other default, agent setting, allowlist entry and MCP grant is copied as is.
 

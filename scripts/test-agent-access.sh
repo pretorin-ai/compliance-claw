@@ -79,11 +79,12 @@ efforts:
     system_id: 22222222-2222-4222-8222-222222222222
     framework_id: soc2
     credential_ref: beta-key
-    slack_channel_id: C0BETA0001
     targets:
       - name: other
         url: https://github.com/example/other.git
 Y
+# No slack_channel_id: a Slack configuration makes the entrypoint install the
+# Slack package, which needs the network this test does not have.
 
 # The scripted model. "SCRIPT:<base64 JSON steps>" in the user message makes each
 # reply one tool call; each tool result is logged as the model received it.
