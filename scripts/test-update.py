@@ -498,7 +498,10 @@ class ReleaseTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.fixture = Path(self.temp.name).resolve()
         self.repo = self.fixture / "repo"
-        self.git_env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+        # Never inherit a deployment selection (CI exports COMPOSE_FILE).
+        inherited = {k: v for k, v in os.environ.items()
+                     if not k.startswith(("COMPOSE_", "COMPLIANCE_CLAW_", "CC_"))}
+        self.git_env = {**inherited, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
                         "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
         (self.repo / "scripts").mkdir(parents=True)
