@@ -285,10 +285,12 @@ gateway so a deployment that has not migrated yet still has a working
 
 **What separates one effort from another, and what does not.** Each agent's tool
 policy denies every other effort's Pretorin tools, and its instructions state a
-fixed scope and refuse to switch. That is a tool-visibility and prompt boundary,
-not a process or filesystem one — tool execution is unsandboxed and `mcp.servers`
-is gateway-wide. The enforced boundary is the Pretorin key's own server-side
-scopes and the platform's cross-scope write guard.
+fixed scope and refuse to switch. Its native file tools stay in its own
+workspace and `exec` runs only fixed git reads of its own targets. That is a tool
+policy, not a process boundary: Pretorin MCP children and plugins run in one
+gateway process as one user, and `mcp.servers` is gateway-wide. The enforced
+boundary is the Pretorin key's own server-side scopes and the platform's
+cross-scope write guard.
 
 Full guide, including how to add a second effort, what you choose when you mint
 each token, and the one-key-or-many trade-off:

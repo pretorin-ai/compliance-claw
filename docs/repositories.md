@@ -194,8 +194,9 @@ recommended mechanism for any customer or production deployment. A PAT carries a
 person's identity, expires on a human's schedule, is harder to scope, and —
 unlike the App — is a git credential that lives inside the container. It is never
 an environment variable, never in a URL, `.git/config`, a log, an audit line or a
-Slack message; but tool execution in that container is unsandboxed, so a
-prompt-injected agent can read the file. Read
+Slack message. An agent's native tools cannot read the file, but the container
+has no sandbox, and gateway-side MCP file operations are outside that policy and
+remain unresolved. Read
 [SECURITY.md](../SECURITY.md#the-pat-is-a-deliberately-relaxed-invariant-not-an-oversight)
 before enabling it.
 
@@ -280,10 +281,12 @@ synchronizer writes through a second mount of the same host directory,
 `/var/lib/compliance-claw/targets`, on the **gateway service only**.
 
 That is process-level separation inside one container, **not a security
-boundary**: the wrapper and the agent's unsandboxed tool execution run as the
-same uid, so an agent can reach the writable path directly. What it buys is that
-the assessment path — the one every evidence citation comes from — stays
-read-only, so an accidental write fails instead of silently succeeding. See
+boundary**: the wrapper, plugins and Pretorin MCP children run as the same uid.
+An agent's native file and command tools refuse the writable path. Gateway-side
+MCP file operations are outside that policy and remain unresolved. What the split
+buys is that the assessment
+path — the one every evidence citation comes from — stays read-only, so an
+accidental write fails instead of silently succeeding. See
 [SECURITY.md](../SECURITY.md#the-sandbox-boundary--say-it-plainly).
 
 ### The sync audit record
