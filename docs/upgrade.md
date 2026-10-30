@@ -211,30 +211,242 @@ Build pins can change before an image is published. Use the published image
 digest in `compose.yaml` for deployment. The release workflow must pass before
 the post-release PR changes that digest and `IMAGE_VERSION` together.
 
-Before an OpenClaw upgrade, record the running image digest, the checkout
-revision, the Compose files, and the names of both state volumes. Keep the
-previous image available. The image and both state volumes are one recovery
-set.
+The previous image and both state volumes are one recovery set. The set is
+compatible only with the image that last ran that state. Make and verify a set
+before each OpenClaw upgrade, before an
+[effort-record transfer](#transfer-existing-effort-records), and before
+intentional state deletion. Use the steps below as one procedure. Run them on
+the deployment host, from the repository root, in one Bash shell. They need
+Docker, Compose 2.27.2 or newer, Git and Python 3. State copies use the recorded
+image as root, with no network.
 
-Stop the gateway before you archive its state:
+Each command block ends with an `OK:` line. If a block does not print its `OK:`
+line, stop. Read the error and correct the cause before you continue. Do not
+skip a check and do not run a later block.
+
+### Recovery set and host inputs
+
+A recovery set has these parts. The procedure records or copies each one, or
+names the person who must keep it:
+
+| Item | Where it is | In the recovery set | Contents or your responsibility |
+| --- | --- | --- | --- |
+| `openclaw-state` | Named volume | Archive and file list | Holds config, sessions, agent workspaces, model login, managed Slack package. |
+| `pretorin-state` | Named volume | Archive and file list | Holds the active CLI, Pretorin context, effort records, resolvers, recipes, audit file. |
+| Previous image | Docker image cache | Reference and ID in the record | Keep it cached. Do not prune it while you can need the set. |
+| Compose selection | `.env` and shell | Values in the record | Keep the project name and the ordered files. |
+| Declarations and private overlays | Host files | Copies in `host-inputs/`, at their full host path | Keep the originals. A changed declaration needs your review. |
+| Credentials | Secret directory, or `.env` on the legacy path | Not copied | Keep current files. Get a replacement from the issuer if necessary. |
+| Target clones and other customer bind mounts | Host directories | Paths only | Back them up yourself, or clone the targets again. |
+
+Prepare the shell first, and again in each new shell. This block resolves the
+saved [Compose selection](../README.md#save-deployment-settings). It defines the
+state list, the selection check, the path of each saved host file, the rule for
+files that Git tracks at a commit, a reader for the set record, and two copy
+functions:
 
 ```sh
-docker compose stop --timeout 330 openclaw
-docker compose ps -a openclaw
+umask 077
+BACKUP_ROOT=/var/backups/compliance-claw
+STATE_LIST='find . -printf "%y %m %U:%G %p -> %l\n" | LC_ALL=C sort && find . -type f -exec sha256sum {} + | LC_ALL=C sort -k 2'
+SELECTION_CHECK='
+import json, os, sys
+config = json.load(sys.stdin)
+image = sys.argv[1]
+want = {"/home/node/.openclaw": sys.argv[2], "/home/node/.pretorin": sys.argv[3]}
+inputs = set()
+for name in ("openclaw", "cli"):
+    service = config["services"][name]
+    mounts = service.get("volumes", [])
+    state = {m["target"]: config["volumes"][m["source"]]["name"] for m in mounts if m["type"] == "volume"}
+    if service["image"] != image or state != want:
+        sys.exit("STOP: %s selects %s with %s" % (name, service["image"], state))
+    for m in mounts:
+        if m["type"] == "bind":
+            inputs.add(("file" if os.path.isfile(m["source"]) else "directory", m["source"]))
+for secret in config.get("secrets", {}).values():
+    inputs.add(("secret", secret["file"]))
+for kind, path in sorted(inputs):
+    print("%s\t%s" % (kind, path))
+'
+saved_input() {
+  python3 -c 'import os, sys; print(sys.argv[3] + os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))' \
+    "$PWD" "$1" "$BACKUP_DIR/host-inputs"
+}
+tracked_at() {
+  test -n "$(git ls-tree --name-only "$1" -- "$2" 2>/dev/null)"
+}
+record() { sed -n "s/^$1=//p" "$BACKUP_DIR/recovery-set.env"; }
+state_sh() {
+  docker run --rm -i --network none --platform linux/amd64 --user 0:0 \
+    --entrypoint sh --mount "type=volume,src=$1,dst=/state${3:+,$3}" \
+    "$IMAGE_ID" -euc "cd /state && $2"
+}
+backup_sh() {
+  docker run --rm --network none --platform linux/amd64 --user 0:0 \
+    --entrypoint sh --mount "type=bind,src=$BACKUP_DIR,dst=/backup,readonly" \
+    -w /backup "$IMAGE_ID" -euc "$1"
+}
+. scripts/compose-selection.sh && compose_resolve_selection &&
+echo "OK: shell prepared for project ${COMPOSE_PROJECT_NAME:-from compose.yaml}"
 ```
 
-Check that the container stopped with exit code 0. If shutdown was interrupted,
-check its logs before you continue. Archive both `openclaw-state` and
-`pretorin-state`. Store the archives in a private directory. These archives can
-contain credentials, sessions, and customer data. Verify each archive by
-restoring it into a new test volume. Check the restored files against the
-archive. Test the previous image with the restored state and no network access.
+Change `BACKUP_ROOT` to a private host directory with enough space. Archives
+can contain credentials, sessions and customer data. Do not put them in the
+repository, the target directory or a shared directory.
 
-Only then start the new image with the original state volumes. Check gateway
-health, agent and channel settings, the managed Slack package, and the active
-Pretorin CLI. Send a test request through the approved test channel. Replace
-the container once more and repeat the checks. The replacement must use the
-same state volumes.
+### Back up the recovery set
+
+1. Identify the gateway that last used the state. Record its project, image and
+   state volumes. The selection check compares them with the saved selection for
+   both services and lists the host inputs:
+
+   ```sh
+   SET_ID="$(date -u +%Y%m%dT%H%M%SZ)" &&
+   BACKUP_DIR="$BACKUP_ROOT/$SET_ID" &&
+   GATEWAY="$(docker compose ps -a -q openclaw)" && test -n "$GATEWAY" &&
+   PROJECT="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$GATEWAY")" &&
+   IMAGE_REF="$(docker inspect --format '{{.Config.Image}}' "$GATEWAY")" &&
+   IMAGE_ID="$(docker inspect --format '{{.Image}}' "$GATEWAY")" &&
+   OPENCLAW_VOLUME="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.openclaw"}}{{.Name}}{{end}}{{end}}' "$GATEWAY")" &&
+   PRETORIN_VOLUME="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.pretorin"}}{{.Name}}{{end}}{{end}}' "$GATEWAY")" &&
+   test "$(docker image inspect --format '{{.Id}}' "$IMAGE_REF")" = "$IMAGE_ID" &&
+   SOURCE_REVISION="$(git rev-parse HEAD)" &&
+   (set -f; IFS="${COMPOSE_PATH_SEPARATOR:-:}"; for f in ${COMPOSE_FILE:-compose.yaml}; do
+     ! tracked_at "$SOURCE_REVISION" "$f" || { git diff --quiet "$SOURCE_REVISION" -- "$f" &&
+       git diff --cached --quiet "$SOURCE_REVISION" -- "$f"; } ||
+       { printf 'STOP: %s is tracked by Git and differs from commit %s\n' "$f" "$SOURCE_REVISION"; exit 1; }
+   done) &&
+   mkdir -p "$BACKUP_ROOT" && mkdir "$BACKUP_DIR" "$BACKUP_DIR/host-inputs" &&
+   docker compose --profile '*' config --format json |
+     python3 -c "$SELECTION_CHECK" "$IMAGE_REF" "$OPENCLAW_VOLUME" "$PRETORIN_VOLUME" \
+     > "$BACKUP_DIR/host-inputs.txt" &&
+   echo "OK: $PROJECT uses $IMAGE_REF, $OPENCLAW_VOLUME and $PRETORIN_VOLUME"
+   ```
+
+   A `STOP:` message means that the saved selection is not the selection of
+   that gateway. If the image reference now points to a different image ID,
+   the tag changed. Give the recorded image ID a new private tag, select that tag,
+   and start again. Read `host-inputs.txt`. It names each declaration, secret
+   file and customer bind mount of this deployment.
+
+   A `STOP:` message that names a Compose file means that a selected Compose
+   file that Git tracks has staged or unsaved changes. The backup does not copy
+   tracked Compose files, and the recorded commit cannot recreate the changed
+   bytes. Do not discard the changes. Move your settings into a private overlay
+   outside Git, or save the changed file separately and return it to its
+   committed version. Then run this block again.
+
+2. Stop all writers. The gateway runs the Pretorin MCP servers, so this stops
+   them too. The checks stop on any running container that uses either volume,
+   for example a one-off `cli` command:
+
+   ```sh
+   docker compose stop --timeout 330 openclaw &&
+   test "$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$GATEWAY")" = "exited 0" &&
+   test -z "$(docker ps -q --filter "volume=$OPENCLAW_VOLUME")" &&
+   test -z "$(docker ps -q --filter "volume=$PRETORIN_VOLUME")" &&
+   echo "OK: no running container uses the state volumes"
+   ```
+
+   An exit code other than 0 means an unclean stop. That state is not a valid
+   backup point: do not archive it, and do not start an upgrade. Keep the state
+   volumes and the gateway logs unchanged. Save the logs with
+   `docker compose logs --no-color openclaw` to a private file, and do not
+   repair, edit or delete state. Then use an earlier verified set as described
+   in [Restore a compatible recovery set](#restore-a-compatible-recovery-set),
+   or ask for support diagnosis with the saved logs (see
+   [Troubleshooting](../README.md#troubleshooting)).
+
+   Wait for a running one-off command to end; do not stop it while it writes.
+   Do not start a container until the archives are complete.
+
+3. Archive both volumes, their file lists and the host files. Then write the
+   private record and the checksums:
+
+   ```sh
+   test "$(git rev-parse HEAD)" = "$SOURCE_REVISION" &&
+   state_sh "$OPENCLAW_VOLUME" "$STATE_LIST" readonly > "$BACKUP_DIR/openclaw-state.list" &&
+   state_sh "$OPENCLAW_VOLUME" 'tar --numeric-owner -cpf - .' readonly > "$BACKUP_DIR/openclaw-state.tar" &&
+   state_sh "$PRETORIN_VOLUME" "$STATE_LIST" readonly > "$BACKUP_DIR/pretorin-state.list" &&
+   state_sh "$PRETORIN_VOLUME" 'tar --numeric-owner -cpf - .' readonly > "$BACKUP_DIR/pretorin-state.tar" &&
+   awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" |
+     while IFS= read -r f; do s="$(saved_input "$f")" &&
+       mkdir -p -- "${s%/*}" && cp -p -- "$f" "$s" || exit 1; done &&
+   (set -f; IFS="${COMPOSE_PATH_SEPARATOR:-:}"; for f in ${COMPOSE_FILE:-compose.yaml}; do
+     tracked_at "$SOURCE_REVISION" "$f" || { s="$(saved_input "$f")" &&
+       mkdir -p -- "${s%/*}" && cp -p -- "$f" "$s"; } || exit 1; done) &&
+   printf '%s=%s\n' \
+     SET_ID "$SET_ID" \
+     SOURCE_REVISION "$SOURCE_REVISION" \
+     PROJECT "$PROJECT" \
+     COMPOSE_FILE "${COMPOSE_FILE:-}" \
+     COMPOSE_PATH_SEPARATOR "${COMPOSE_PATH_SEPARATOR:-}" \
+     COMPOSE_PROFILES "${COMPOSE_PROFILES:-}" \
+     COMPLIANCE_CLAW_SECRET_DIR "${COMPLIANCE_CLAW_SECRET_DIR:-}" \
+     IMAGE_REF "$IMAGE_REF" \
+     IMAGE_ID "$IMAGE_ID" \
+     IMAGE_DIGESTS "$(docker image inspect --format '{{join .RepoDigests " "}}' "$IMAGE_ID")" \
+     OPENCLAW_VOLUME "$OPENCLAW_VOLUME" \
+     PRETORIN_VOLUME "$PRETORIN_VOLUME" \
+     > "$BACKUP_DIR/recovery-set.env" &&
+   backup_sh 'sha256sum openclaw-state.tar openclaw-state.list pretorin-state.tar pretorin-state.list recovery-set.env host-inputs.txt &&
+     find host-inputs -type f -exec sha256sum {} +' > "$BACKUP_DIR/SHA256SUMS" &&
+   echo "OK: recovery set $SET_ID is in $BACKUP_DIR"
+   ```
+
+   The file lists record the type, mode, numeric owner, path and link target of
+   each entry, and a SHA-256 checksum of each regular file. The record holds
+   no secret value. Compose secret files and bind-mounted directories are not
+   copied. Each bind-mounted single file is copied, so a private overlay that
+   mounts a key file puts that key in the set. Read `host-inputs.txt` before
+   this step. An overlay is copied when Git does not track it at the current
+   commit, also when it is only staged. `SHA256SUMS` covers the archives, the
+   file lists, the record, `host-inputs.txt` and each saved host file.
+
+4. Verify the recovery set. The same block is the first step of a restore:
+
+   ```sh
+   grep -qx "SET_ID=$SET_ID" "$BACKUP_DIR/recovery-set.env" &&
+   grep -Eq '^SOURCE_REVISION=[0-9a-f]{40}$' "$BACKUP_DIR/recovery-set.env" &&
+   SOURCE_REVISION="$(record SOURCE_REVISION)" && test -s "$BACKUP_DIR/host-inputs.txt" &&
+   SEPARATOR="$(record COMPOSE_PATH_SEPARATOR)" && SAVED_FILES="$(record COMPOSE_FILE)" &&
+   { awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" &&
+     (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
+       tracked_at "$SOURCE_REVISION" "$f" || printf '%s\n' "$f"; done); } |
+     while IFS= read -r f; do s="$(saved_input "$f")" && test -f "$s" &&
+       N="${s#"$BACKUP_DIR"/}" awk 'substr($0, 67) == ENVIRON["N"] { found = 1 } END { exit !found }' "$BACKUP_DIR/SHA256SUMS" ||
+       { printf 'STOP: the set has no saved copy or no checksum for %s\n' "$f"; exit 1; }
+     done &&
+   backup_sh "test -s host-inputs.txt &&
+     grep -qx '[0-9a-f]\{64\}  host-inputs.txt' SHA256SUMS &&
+     sha256sum --strict -c SHA256SUMS &&
+     tar -tf openclaw-state.tar ./openclaw.json >/dev/null &&
+     tar -tf pretorin-state.tar ./bin/pretorin >/dev/null &&
+     mkdir /tmp/openclaw-state /tmp/pretorin-state &&
+     tar --numeric-owner -C /tmp/openclaw-state -xpf openclaw-state.tar &&
+     tar --numeric-owner -C /tmp/pretorin-state -xpf pretorin-state.tar &&
+     (cd /tmp/openclaw-state && $STATE_LIST) | cmp openclaw-state.list - &&
+     (cd /tmp/pretorin-state && $STATE_LIST) | cmp pretorin-state.list -" &&
+   echo "OK: recovery set $SET_ID is complete and matches its file lists"
+   ```
+
+   This stops on a missing or changed file, an empty or unchecked
+   `host-inputs.txt`, a missing or changed saved host file, a record from a
+   different set, and an archive of the wrong volume. It also stops when a host
+   file that the backup copies has no saved copy or no line in `SHA256SUMS`, for
+   example after an interrupted transfer. The checksums find damage; they do not
+   prove who wrote the set. Write down the `SET_ID` and `BACKUP_DIR`
+   values outside the shell. A complete and readable set does not prove that an
+   image is compatible with it. Only the recorded image is a compatible image.
+
+### Upgrade with the original volumes
+
+Start the new image only after the set is verified. Use the original state
+volumes. Check gateway health, agent and channel settings, the managed Slack
+package, and the active Pretorin CLI. Send a test request through the approved
+test channel. Replace the container once more and repeat the checks. The
+replacement must use the same state volumes.
 
 The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.10.5 allows
 325 seconds for shutdown and 5 more seconds for its supervisor. Compose uses
@@ -247,29 +459,6 @@ interrupted stop, the lease can remain valid for five minutes after the last
 heartbeat. Wait for natural expiry before you retry. A running owner renews
 the lease every 30 seconds. Do not delete or edit a lease to bypass its owner.
 Do not delete a state volume to clear this error.
-
-For rollback, stop the candidate with the same shutdown limit. Keep its state
-for diagnosis. Restore both verified archives into new volumes and select the
-previous image digest with the previous Compose files. Check restored files
-and gateway health before you return traffic. An image rollback alone cannot
-reverse changes to the config or SQLite schema. A copy of `openclaw.json`
-alone is not a full state backup.
-
-After a manual restore, keep the final native Compose overlay at a stable private
-path outside the temporary backup directory. Retain the exact external names of
-both restored volumes and the previous image references for both services. Save
-the ordered files and project in the existing `.env`, as described in
-[Save deployment settings](../README.md#save-deployment-settings). Include that
-overlay last, for example:
-
-```dotenv
-COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml:/private/path/restored.yaml
-```
-
-Run `docker compose --profile '*' config` and check the image and both state mounts
-by destination before startup. This output can contain private configuration;
-keep it local. A missing saved overlay must stop the command; do not remove it
-to fall back to the original volumes. No script renames or adopts volumes.
 
 `scripts/update.sh` retains the volumes. It does not create a backup or perform
 state recovery. The OpenClaw container adapter runs Doctor before the gateway
@@ -296,6 +485,293 @@ same PID namespace. The command uses the existing entrypoint to load file
 credentials inside the container. Before the gateway exists, it uses the CLI
 container. Do not remove state ownership locks to make a separate container read
 live state.
+
+If the upgraded gateway fails, do not select the previous image with the
+original volumes. The candidate can have migrated them. Restore the verified set
+into new volumes as described below.
+
+### Restore a compatible recovery set
+
+A restore puts the archived state into new, empty volumes. The candidate state
+stays in the original volumes for diagnosis. The previous image never opens
+that state.
+
+1. In a new shell, run the [preparation block](#recovery-set-and-host-inputs).
+   Then set the recovery set to restore and a stable private path for the
+   restore overlay. Use the `BACKUP_ROOT` of the backup. Keep the overlay
+   outside the backup directory, outside the repository and outside the target
+   directory. Then read the record:
+
+   ```sh
+   SET_ID=20261029T101500Z
+   BACKUP_DIR="$BACKUP_ROOT/$SET_ID"
+   RESTORE_OVERLAY=/srv/compliance-claw/restored.yaml
+   ```
+
+   ```sh
+   PROJECT="$(record PROJECT)" && IMAGE_REF="$(record IMAGE_REF)" && IMAGE_ID="$(record IMAGE_ID)" &&
+   OPENCLAW_VOLUME="$(record OPENCLAW_VOLUME)" && PRETORIN_VOLUME="$(record PRETORIN_VOLUME)" &&
+   test -n "$PROJECT" && test -n "$IMAGE_REF" && test -n "$IMAGE_ID" &&
+   test -n "$OPENCLAW_VOLUME" && test -n "$PRETORIN_VOLUME" &&
+   test "$(docker image inspect --format '{{.Id}}' "$IMAGE_REF")" = "$IMAGE_ID" &&
+   echo "OK: set $SET_ID needs $IMAGE_REF"
+   ```
+
+   If the previous image is not cached and `IMAGE_REF` has a digest, pull
+   `IMAGE_REF`. Otherwise pull a reference from `IMAGE_DIGESTS` and give it the
+   recorded name with `docker tag`. A local build has no digest reference; it
+   must still be in the image cache. Run the block again. Do not use a different
+   image.
+
+2. Run the [verification block](#back-up-the-recovery-set) from step 4 of the
+   backup. Continue only after its `OK:` line. Then compare the declarations and
+   private overlays of the set with their saved copies. Do not stop the
+   candidate before both blocks print their `OK:` lines:
+
+   ```sh
+   test -s "$BACKUP_DIR/host-inputs.txt" &&
+   SOURCE_REVISION="$(record SOURCE_REVISION)" && git cat-file -e "$SOURCE_REVISION^{commit}" &&
+   SEPARATOR="$(record COMPOSE_PATH_SEPARATOR)" && SAVED_FILES="$(record COMPOSE_FILE)" &&
+   { awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" &&
+     (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
+       test "$f" = "$RESTORE_OVERLAY" || printf '%s\n' "$f"; done); } |
+     while IFS= read -r f; do
+       tracked_at "$SOURCE_REVISION" "$f" && continue
+       s="$(saved_input "$f")" && cmp -s -- "$f" "$s" ||
+         { printf 'STOP: %s differs from its saved copy. To copy it back: cp -p -- %q %q\n' "$f" "$s" "$f"; exit 1; }
+     done &&
+   echo "OK: the host inputs match set $SET_ID"
+   ```
+
+   The block skips files that Git tracks at the recorded revision, because the
+   candidate revision can change them. For a tracked declaration such as
+   `targets.yaml`, the verification block checked its saved copy, and step 3 of
+   [Select and save the restored volumes](#select-and-save-the-restored-volumes)
+   compares it after the checkout returns to that revision. A tracked overlay
+   has no saved copy; that checkout restores it. A `STOP:` line
+   names the first file that differs and prints the command that copies the
+   saved file back. Copy it back and run the block again. Keep a changed file
+   only after you check that the restored state supports it; then copy the
+   current file over its saved copy, so that this block and step 3 compare with
+   it.
+
+3. Stop the candidate and keep its state. The candidate logs and container
+   record go to a new private directory:
+
+   ```sh
+   RESTORE_ID="$(date -u +%Y%m%dT%H%M%SZ)" &&
+   RESTORE_DIR="$BACKUP_DIR-restore-$RESTORE_ID" && mkdir "$RESTORE_DIR" &&
+   CANDIDATE="$(docker compose ps -a -q openclaw)" && test -n "$CANDIDATE" &&
+   test "$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$CANDIDATE")" = "$PROJECT" &&
+   docker compose stop --timeout 330 openclaw &&
+   docker compose logs --no-color openclaw > "$RESTORE_DIR/candidate-openclaw.log" &&
+   docker inspect "$CANDIDATE" > "$RESTORE_DIR/candidate-container.json" &&
+   test -z "$(docker ps -q --filter "volume=$OPENCLAW_VOLUME")" &&
+   test -z "$(docker ps -q --filter "volume=$PRETORIN_VOLUME")" &&
+   echo "OK: candidate stopped; its state stays in $OPENCLAW_VOLUME and $PRETORIN_VOLUME"
+   ```
+
+4. Restore into two new volumes and compare them with the file lists. A volume
+   name that exists already stops the step. The copy also stops if a
+   destination is not empty:
+
+   ```sh
+   VOLUME_ID="$(date -u +%Y%m%dT%H%M%SZ)" &&
+   NEW_OPENCLAW_VOLUME="${PROJECT}_openclaw-state-restore-$VOLUME_ID" &&
+   NEW_PRETORIN_VOLUME="${PROJECT}_pretorin-state-restore-$VOLUME_ID" &&
+   ! docker volume inspect "$NEW_OPENCLAW_VOLUME" >/dev/null 2>&1 &&
+   ! docker volume inspect "$NEW_PRETORIN_VOLUME" >/dev/null 2>&1 &&
+   docker volume create --label "compliance-claw.recovery-set=$SET_ID" "$NEW_OPENCLAW_VOLUME" &&
+   docker volume create --label "compliance-claw.recovery-set=$SET_ID" "$NEW_PRETORIN_VOLUME" &&
+   state_sh "$NEW_OPENCLAW_VOLUME" 'test -z "$(find . -mindepth 1 -print -quit)" && tar --numeric-owner -xpf -' \
+     < "$BACKUP_DIR/openclaw-state.tar" &&
+   state_sh "$NEW_PRETORIN_VOLUME" 'test -z "$(find . -mindepth 1 -print -quit)" && tar --numeric-owner -xpf -' \
+     < "$BACKUP_DIR/pretorin-state.tar" &&
+   state_sh "$NEW_OPENCLAW_VOLUME" "$STATE_LIST" readonly | cmp "$BACKUP_DIR/openclaw-state.list" - &&
+   state_sh "$NEW_PRETORIN_VOLUME" "$STATE_LIST" readonly | cmp "$BACKUP_DIR/pretorin-state.list" - &&
+   echo "OK: $NEW_OPENCLAW_VOLUME and $NEW_PRETORIN_VOLUME match set $SET_ID"
+   ```
+
+   The comparison covers content, type, mode, numeric owner and link target
+   before an image starts on the new volumes. If a step fails after a volume
+   was created, do not use that volume. Correct the cause and run this step
+   again; it uses new names.
+
+### Select and save the restored volumes
+
+1. Write the restore overlay. It selects the previous image for both services
+   and the restored volumes:
+
+   ```sh
+   printf '%s\n' \
+     'services:' \
+     '  openclaw:' \
+     "    image: \"$IMAGE_REF\"" \
+     '  cli:' \
+     "    image: \"$IMAGE_REF\"" \
+     'volumes:' \
+     '  openclaw-state:' \
+     '    external: true' \
+     "    name: \"$NEW_OPENCLAW_VOLUME\"" \
+     '  pretorin-state:' \
+     '    external: true' \
+     "    name: \"$NEW_PRETORIN_VOLUME\"" \
+     > "$RESTORE_DIR/restored.yaml" &&
+   mkdir -p "$(dirname "$RESTORE_OVERLAY")" &&
+   cp "$RESTORE_DIR/restored.yaml" "$RESTORE_OVERLAY" &&
+   SEPARATOR="$(record COMPOSE_PATH_SEPARATOR)" && SAVED_FILES="$(record COMPOSE_FILE)" &&
+   printf 'COMPOSE_FILE=%s%s%s\nCOMPOSE_PROJECT_NAME=%s\n' \
+     "${SAVED_FILES:-compose.yaml}" "${SEPARATOR:-:}" "$RESTORE_OVERLAY" "$PROJECT" &&
+   echo "OK: save the two lines above in .env"
+   ```
+
+2. Save the two printed lines in the repository-root `.env`, as described in
+   [Save deployment settings](../README.md#save-deployment-settings). Replace
+   the old `COMPOSE_FILE` and `COMPOSE_PROJECT_NAME` lines. Keep the other
+   lines. The restore overlay must be the last file. From now on, the saved
+   selection names the restored volumes, so no Compose command can start an
+   image on the candidate volumes. Keep the overlay at its stable path; a
+   missing saved overlay stops Compose and each host script. Do not remove it to
+   fall back to the original volumes.
+
+3. Return the checkout to the recorded revision, so that the previous image
+   uses the previous Compose files. Then check that a clean shell resolves the
+   saved selection to the restored set, and that the host inputs did not
+   change:
+
+   ```sh
+   SOURCE_REVISION="$(record SOURCE_REVISION)" && test -n "$SOURCE_REVISION" &&
+   { test "$(git rev-parse HEAD)" = "$SOURCE_REVISION" ||
+     (umask 022 && git switch --detach "$SOURCE_REVISION"); } &&
+   unset COMPOSE_FILE COMPOSE_PATH_SEPARATOR COMPOSE_PROJECT_NAME COMPOSE_PROFILES COMPLIANCE_CLAW_SECRET_DIR &&
+   docker compose --profile '*' config --format json |
+     python3 -c "$SELECTION_CHECK" "$IMAGE_REF" "$NEW_OPENCLAW_VOLUME" "$NEW_PRETORIN_VOLUME" \
+     > "$RESTORE_DIR/host-inputs.txt" &&
+   cmp "$BACKUP_DIR/host-inputs.txt" "$RESTORE_DIR/host-inputs.txt" &&
+   awk -F '\t' '$1 == "file" { print $2 }' "$RESTORE_DIR/host-inputs.txt" |
+     while IFS= read -r f; do cmp -- "$f" "$(saved_input "$f")" || exit 1; done &&
+   (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
+     test "$f" = "$RESTORE_OVERLAY" || tracked_at "$SOURCE_REVISION" "$f" ||
+       cmp -- "$f" "$(saved_input "$f")" || exit 1; done) &&
+   echo "OK: the saved selection uses $IMAGE_REF with the restored volumes"
+   ```
+
+   Git refuses the switch if local changes conflict. Keep local work; do not
+   discard it to force the switch. `umask 022` keeps the usual mode on the files
+   that Git writes; the gateway reads tracked files such as `targets.yaml`.
+   A new login shell must give the same result. A difference in a declaration
+   or a private overlay stops the step. Each saved copy is under `host-inputs/`
+   at the full host path of its original; `saved_input FILE` prints that path.
+   Copy the saved file back, or keep the current one only after you check that
+   the restored state supports it. If the switch removed a file that was
+   private at the backup, for example an overlay that the candidate revision
+   added to Git, the block stops: Compose reports `no such file or directory`
+   for a removed overlay, and the `host-inputs.txt` comparison reports a
+   difference for a removed bind-mounted file. Copy its verified saved copy
+   back with
+   `cp -p -- "$(saved_input FILE)" FILE` and run this block again. The
+   comparison skips the restore overlay, because step 1 wrote it again for this
+   restore.
+   This output can contain private configuration; keep it local.
+
+4. Reconcile credentials and access before the gateway starts. The gateway
+   connects its configured channels when it starts, and the restored
+   `openclaw-state` holds the grants from the backup time. A restore must not
+   restore removed authority:
+
+   - Keep the current secret files. Do not copy an old secret file back.
+     Credentials that an issuer revoked stay revoked; get a new credential from
+     the issuer if necessary.
+   - The restored `openclaw-state` can hold an old model login. Sign in again if
+     the provider rejects it.
+   - List each authority removal after the backup time in `SET_ID` (UTC):
+     `commands.ownerAllowFrom` entries, person links and roles. While the
+     gateway is stopped, read the owner list with the `cli` service and set the
+     list that is approved now:
+
+     ```sh
+     docker compose run --rm -T cli openclaw config get commands.ownerAllowFrom
+     ```
+
+     If the list is unset, the command says so and exits 1; the runtime default
+     then applies. Use `openclaw config set commands.ownerAllowFrom` in the same
+     way to change it. A person link or role changes only through an authenticated Gateway
+     connection. If one was removed after the backup, disable Slack before the
+     start:
+
+     ```sh
+     docker compose run --rm -T cli openclaw config set channels.slack.enabled false
+     ```
+
+     After step 5, remove the link or role as described in
+     [Updating the Pretorin CLI](#updating-the-pretorin-cli). Then set
+     `channels.slack.enabled` to `true` with `docker compose exec -T openclaw
+     openclaw config set` and run `docker compose restart openclaw`.
+
+5. Test the previous image with the restored state and no network. Then start
+   the gateway and check that no running container uses the candidate state:
+
+   ```sh
+   docker run --rm --network none --platform linux/amd64 \
+     --mount "type=volume,src=$NEW_OPENCLAW_VOLUME,dst=/home/node/.openclaw" \
+     --mount "type=volume,src=$NEW_PRETORIN_VOLUME,dst=/home/node/.pretorin" \
+     "$IMAGE_REF" pretorin version &&
+   docker compose up -d --wait --wait-timeout 720 openclaw &&
+   test "$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q openclaw)")" = healthy &&
+   docker compose exec -T openclaw pretorin version &&
+   test -z "$(docker ps -q --filter "volume=$OPENCLAW_VOLUME")" &&
+   test -z "$(docker ps -q --filter "volume=$PRETORIN_VOLUME")" &&
+   echo "OK: $IMAGE_REF runs with the restored volumes"
+   ```
+
+   Do not rely on the exit status of the wait alone; the block checks the
+   health status. If the status is still `starting`, read the gateway logs.
+   When the gateway is healthy, run the lines from the health check to the end
+   of the block.
+
+   The active CLI version must be the version from the backup time, not the
+   image seed. Check agent and channel settings, the managed Slack package and
+   the effort records. Send a test request through the approved test channel
+   before you return traffic. For effort records that moved to per-effort
+   roots, use [Transfer existing effort records](#transfer-existing-effort-records).
+
+The saved restore overlay selects the image. Do not run `scripts/update.sh`
+while the overlay sets the image. To try the upgrade again later, make and
+verify a new recovery set from the restored volumes. Then remove only the two
+`image:` lines from the overlay; keep the volume lines. Return the checkout to
+its branch with `git switch` before the update.
+
+### What a restore does not recover
+
+- **Changes after the backup.** The restored volumes have the state at backup
+  time. Sessions, settings, model login refreshes, CLI updates, effort records
+  and audit lines from a later time are not in them. They stay in the candidate
+  volumes. Do not copy candidate files into the restored volumes: the candidate
+  can have migrated their format.
+- **External writes.** A local restore does not undo Pretorin platform writes or
+  uploads. It does not delete remote copies, Slack messages or GitHub changes.
+  Check the platform state before you resume a Plan from the restored records.
+- **Credentials and access.** A restore does not reinstate revoked authority.
+  A grant made after the backup is not in the restored config. Grant it again
+  only if it is still approved. Reconcile each credential, person link and role
+  with the current approval.
+- **Host inputs.** Secret files, target clones and customer bind mounts are not
+  in the archives. `host-inputs/` holds copies of declarations and private
+  overlays, each at the full host path of its original, for comparison only.
+- **Doctor captures.** At startup, OpenClaw Doctor can write a pre-repair copy
+  of config and databases under `/home/node/.openclaw.update-captures/`. That
+  path is in the container layer, not in a state volume. The volume backup does
+  not include it, and a container recreation removes it. Do not use it for
+  recovery; use the paired volume backup.
+- **Image-only rollback.** The previous image with the candidate volumes is not
+  a rollback. An old image cannot reverse a migration of the config or SQLite
+  schema. A copy of `openclaw.json` alone is not a full state backup. Recover
+  the compatible pair: the recorded image with state restored from its set.
+
+Keep the candidate volumes and the restore directory until you finish the
+diagnosis. Remove a volume only by its exact name, after you check that no
+recovery set or running deployment needs it. No script renames, adopts,
+catalogues or removes volumes.
 
 ## Pretorin CLI activation and results
 
