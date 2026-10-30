@@ -85,7 +85,7 @@ Replace `X.Y.Z` with the intended release version.
    A second prepare run for the same version replaces the candidate set on the
    draft. The job summary shows the candidate digest.
 
-3. Qualify the exact candidate. Record its digest from the prepare job summary.
+3. Check the exact candidate. Record its digest from the prepare job summary.
    Use the digest and the assets on the draft. Do not rebuild. To check the draft
    set locally from a checkout of the tag:
 
@@ -95,20 +95,25 @@ Replace `X.Y.Z` with the intended release version.
      --stage candidate --all-assets --version X.Y.Z --source .
    ```
 
-4. Publish the qualified candidate:
+4. Publish the prepared candidate:
 
    ```sh
-   gh workflow run release.yml --ref vX.Y.Z -f operation=publish -f digest=sha256:<qualified digest>
+   gh workflow run release.yml --ref vX.Y.Z -f operation=publish -f digest=sha256:<prepared candidate digest>
    ```
 
    Publish does not build. It refuses when the `digest` input is missing or when
    the draft record names another digest, so a later prepare cannot cause
-   publication of bytes nobody qualified. It downloads the draft set, checks it
-   against the tag and `versions.env`, and changes the record `stage` to `final`. It confirms
-   that `candidate-X.Y.Z` still names the recorded digest, and then applies the
-   version tag `X.Y.Z` to that digest. It uploads only the final record (the
+   publication of bytes that you did not select. It downloads the draft set,
+   checks it against the tag and `versions.env`, and changes the record `stage`
+   to `final`. It confirms that `candidate-X.Y.Z` still names the recorded
+   digest, and then applies the version tag `X.Y.Z` to that digest. It uploads only the final record (the
    overlay and SBOM bytes do not change), compares every published asset with the
    checked set, and then publishes the release.
+
+   Publication does not qualify the release for customers. The set stays
+   unsigned, customer trust and qualification acceptance is pending, and guided
+   install and the updater refuse it. The job summary and the release notes say
+   so.
 
 5. Wait for the full workflow to succeed. Then open one post-release PR that
    changes both values from the job summary:
@@ -138,7 +143,7 @@ model, or Slack credentials.
   because the version tag exists.
 - If prepare fails after it moved `candidate-X.Y.Z` but before the draft job, the
   draft and the candidate tag name different digests. Publish then refuses. Run
-  prepare again until it succeeds, and qualify the new digest.
+  prepare again until it succeeds, and check the new digest.
 - A version tag never moves. A published release is never prepared again and its
   assets are never replaced. To correct a published release, publish a new
   version.
@@ -163,10 +168,12 @@ a branch, from `versions.env`.
 
 ## Release notes and discovery
 
-Prepare creates the draft with generated notes. Edit the notes on the draft
-before publish. Customers discover a release with native GitHub release
-subscriptions: **Watch → Custom → Releases** on the repository. Drafts do not
-notify subscribers. There is no other notification service.
+Prepare creates the draft with generated notes. The notes start with a
+statement that the release is unsigned and that customer trust and
+qualification acceptance is pending. Edit the notes on the draft before
+publish, but keep that statement. Customers discover a release with native
+GitHub release subscriptions: **Watch → Custom → Releases** on the repository.
+Drafts do not notify subscribers. There is no other notification service.
 
 ## Limits
 

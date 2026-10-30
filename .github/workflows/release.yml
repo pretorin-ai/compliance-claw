@@ -6,8 +6,8 @@
 #
 #   git tag -a vX.Y.Z -m vX.Y.Z <reviewed master commit> && git push origin vX.Y.Z
 #   gh workflow run release.yml --ref vX.Y.Z -f operation=prepare
-#   ... qualify the exact candidate; record its digest from the job summary ...
-#   gh workflow run release.yml --ref vX.Y.Z -f operation=publish -f digest=sha256:<qualified>
+#   ... check the exact candidate; record its digest from the job summary ...
+#   gh workflow run release.yml --ref vX.Y.Z -f operation=publish -f digest=sha256:<prepared candidate>
 #
 # `gh release create` is NOT the trigger any more: a release is published by
 # this workflow, after its checks, never before them.
@@ -19,12 +19,14 @@
 #            the release set (scripts/release-assets.py prepare) and attach it to
 #            a DRAFT GitHub release. Drafts are not visible to customers and send
 #            no release notification. The stable version tag is NOT applied.
-#   publish  (tag ref only) NO BUILD. Requires `digest`, the qualified
+#   publish  (tag ref only) NO BUILD. Requires `digest`, the prepared
 #            candidate digest; refuses when the draft record or candidate-X.Y.Z
-#            names other bytes, so a later re-prepare cannot publish unqualified
-#            bytes. Checks the draft's assets against the tag, marks the record
-#            final, applies the version tag to the SAME digest, uploads the final
-#            record and un-drafts the release.
+#            names other bytes, so a later re-prepare cannot publish bytes the
+#            maintainer did not select. Checks the draft's assets against the
+#            tag, marks the record final, applies the version tag to the SAME
+#            digest, uploads the final record and un-drafts the release. The
+#            release stays unsigned; customer trust and qualification acceptance
+#            is pending, and customer install and update refuse it.
 #
 # THE RELEASE SET (scripts/release-assets.py; interface in docs/releasing.md):
 #   compliance-claw-release.json   source commit, version, image digest, asset
@@ -75,7 +77,7 @@ on:
         options: [dry-run, prepare, publish]
         default: dry-run
       digest:
-        description: "publish only: the qualified candidate digest (sha256:...) from the prepare summary"
+        description: "publish only: the prepared candidate digest (sha256:...) from the prepare summary"
         type: string
         required: false
         default: ""
@@ -524,7 +526,7 @@ jobs:
       # STEP 2 OF 2 for a candidate: `candidate-X.Y.Z` names the verified digest,
       # by the exact-manifest operation in scripts/release-tag.sh. It keeps the
       # candidate from looking abandoned once `:build` moves on, and it is how
-      # `publish` proves the digest it tags is the one this run qualified. It may
+      # `publish` proves the digest it tags is the one this run prepared. It may
       # move on a re-prepare; the version tag never does. NOT the stable tag.
       - name: Tag the verified digest as the candidate
         if: ${{ inputs.operation == 'prepare' }}
@@ -607,7 +609,7 @@ jobs:
             echo ""
             echo "The draft release v${VERSION} carries the candidate release set. The"
             echo "version tag \`${VERSION}\` is NOT applied, and customers are not notified."
-            echo "Qualify this exact candidate digest, then publish it without a rebuild."
+            echo "Check this exact candidate digest, then publish it without a rebuild."
             echo "Publish refuses any other digest:"
             echo ""
             echo '```sh'
@@ -638,6 +640,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.candidate.outputs.tag }}
           VERSION: ${{ needs.candidate.outputs.version }}
+          # Prepended to the generated notes, so the published notes say it too.
+          UNSIGNED_NOTE: "**This release is unsigned, and customer trust and qualification acceptance is pending.** Guided install and the updater refuse it (`release-assets.py check` exit 6) until signing and verification exist."
         run: |
           set -euo pipefail
           # true (draft), false (published) or none. Only "release not found"
@@ -658,7 +662,7 @@ jobs:
           case "$STATE" in
             none)
               gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
-                --title "$TAG" --generate-notes release-set/*
+                --title "$TAG" --notes "$UNSIGNED_NOTE" --generate-notes release-set/*
               echo "created draft release ${TAG}" ;;
             true)
               # A draft is not complete: a re-prepare replaces its candidate set.
@@ -695,11 +699,11 @@ jobs:
         id: set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          QUALIFIED: ${{ inputs.digest }}
+          CANDIDATE: ${{ inputs.digest }}
         run: |
           set -euo pipefail
-          [[ "$QUALIFIED" =~ ^sha256:[0-9a-f]{64}$ ]] \
-            || { echo "::error::publish needs -f digest=sha256:<qualified candidate digest> (from the prepare summary)"; exit 1; }
+          [[ "$CANDIDATE" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::publish needs -f digest=sha256:<prepared candidate digest> (from the prepare summary)"; exit 1; }
           [[ "$GITHUB_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
             || { echo "::error::publish must run on a release tag: gh workflow run release.yml --ref vX.Y.Z -f operation=publish"; exit 1; }
           TAG="${GITHUB_REF#refs/tags/}"
@@ -743,8 +747,8 @@ jobs:
           SUMMARY="$(python3 scripts/release-assets.py check --allow-unsigned --dir release-set \
             --all-assets --version "$VERSION" --source . --json)"
           REC_DIGEST="$(printf '%s' "$SUMMARY" | jq -r .digest)"
-          [ "$REC_DIGEST" = "$QUALIFIED" ] \
-            || { echo "::error::the release record names ${REC_DIGEST}; the qualified digest is ${QUALIFIED}. Re-qualify, or prepare again."; exit 1; }
+          [ "$REC_DIGEST" = "$CANDIDATE" ] \
+            || { echo "::error::the release record names ${REC_DIGEST}; the digest input is ${CANDIDATE}. Check the current candidate, or prepare again."; exit 1; }
           REC_REPO="$(printf '%s' "$SUMMARY" | jq -r .image_reference | sed 's/:[^:/]*@.*$//')"
           [ "$REC_REPO" = "$IMAGE_REPO" ] \
             || { echo "::error::the record names ${REC_REPO}; versions.env says ${IMAGE_REPO}"; exit 1; }
@@ -775,10 +779,10 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # The digest must be the one prepare qualified: candidate-X.Y.Z names it
+      # The digest must be the one prepare verified: candidate-X.Y.Z names it
       # (applied only after the round trip). A completed release may have moved
       # past its candidate tag, so there the version tag is the evidence instead.
-      - name: Confirm the recorded digest is the qualified candidate
+      - name: Confirm the recorded digest is the prepared candidate
         env:
           VERSION: ${{ needs.final-assets.outputs.version }}
           DIGEST: ${{ needs.final-assets.outputs.digest }}
@@ -798,7 +802,7 @@ jobs:
 
       # The stable tag, on the same bytes. release-tag.sh refuses to move an
       # existing version tag, and is a no-op when it already names this digest.
-      - name: Apply the version tag to the qualified digest
+      - name: Apply the version tag to the prepared candidate digest
         env:
           VERSION: ${{ needs.final-assets.outputs.version }}
           DIGEST: ${{ needs.final-assets.outputs.digest }}
@@ -833,7 +837,7 @@ jobs:
           STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
           if [ "$STATE" = true ]; then
             # Only the record changes (stage: final); the overlay and SBOM on the
-            # draft are the qualified bytes and are checked, not re-uploaded.
+            # draft are the prepared bytes and are checked, not re-uploaded.
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
               release-set/compliance-claw-release.json
           fi
@@ -865,11 +869,15 @@ jobs:
             echo ""
             echo '```'
             echo "${IMAGE_REPO}@${DIGEST}"
-            echo "${IMAGE_REPO}:${VERSION}   (the digest prepare qualified; no rebuild)"
+            echo "${IMAGE_REPO}:${VERSION}   (the prepared candidate digest; no rebuild)"
             echo '```'
             echo ""
             echo "The release v${VERSION} carries the final release set."
             echo "Customers select it with compose.release.yaml (docs/image-verification.md)."
+            echo ""
+            echo "**This release is unsigned, and customer trust and qualification acceptance"
+            echo "is pending.** Guided install and the updater refuse it (release-assets.py"
+            echo "check exit 6) until signing and verification exist."
             echo ""
             echo "**One commit closes the release.** Pin the digest and move"
             echo "\`IMAGE_VERSION\` together — both describe what this checkout deploys:"

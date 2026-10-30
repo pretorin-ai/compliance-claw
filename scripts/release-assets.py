@@ -56,7 +56,7 @@ strict pattern has already validated.
 
 THE STAGE FIELD separates a prepared candidate (on a DRAFT GitHub release) from a
 final customer release. `finalize` changes only that field. The overlay and SBOM
-bytes do not change, so final publication reuses the qualified bytes. A customer
+bytes do not change, so final publication reuses the prepared bytes. A customer
 flow keeps the default `--stage final` and refuses a candidate.
 
 HOST PLACEMENT. A deployment keeps the verified record and overlay in the
