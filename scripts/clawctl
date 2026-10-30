@@ -1799,7 +1799,9 @@ run_efforts() {
     log "Do not edit configuration in the OpenClaw Control UI while 'apply' runs."
     log "  The UI writes through the gateway RPC, which carries a base-hash guard;"
     log "  this command writes the file directly and has none, and the lock it takes"
-    log "  does not cover the UI."
+    log "  does not cover the UI. The same applies to exec approvals: apply replaces"
+    log "  the whole approvals document it read, so an approval edited while apply"
+    log "  runs can be lost."
     return "$rc"
   fi
 

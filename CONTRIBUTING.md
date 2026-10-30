@@ -135,7 +135,7 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | File-secret delivery | `bash scripts/test-file-secrets.sh compliance-claw:local` | Candidate image; temporary canary secrets. |
 | Native proxy/local maintenance | `bash scripts/test-proxy-auth.sh compliance-claw:local` | Candidate image; no network or published ports; native requests with synthetic state and password. |
 | Effort credential delivery and local records | `bash scripts/test-effort-credentials.sh compliance-claw:local` | Candidate image; canary credentials, native Plan/preflight reads and resume, stopped-record copy/restore, restart and replacement. Synthetic API, no live platform proof. |
-| Agent file and command access | `bash scripts/test-agent-access.sh compliance-claw:local` | Candidate image; no network; real native and Tool Search handlers, exec grants and MCP launcher; scripted model, synthetic Pretorin API, fake keys. Not live model, Slack or platform proof. |
+| Agent file and command access | `bash scripts/test-agent-access.sh compliance-claw:local` | Candidate image and host Git; no network; real native and Tool Search handlers, exec grants and MCP launcher; scripted model, synthetic Pretorin API, fake keys. Not live model, Slack or platform proof. |
 | Fresh Slack seed | `bash scripts/test-fresh-slack-seed.sh` | Builds an isolated deployment; no live Slack exchange. |
 | Integrated runtime | `bash scripts/smoke.sh --no-creds` | Disposable project and fixtures above; writes test state. |
 | Documentation/templates | Links, anchors, front matter, and command/source checks | Run changed examples only where needed. No artificial tests or full image build solely for prose. |
