@@ -248,6 +248,8 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(self.run_install(args, env=env, **settings), 0, self.output)
         self.assertIn(text, self.output)
         self.assertIn("Nothing was changed", self.output)
+        if "== 1/10 preflight ==" in self.output:
+            self.assertIn("#if-a-setup-stage-fails", self.output)
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(any(c["tool"] in ("bootstrap",) or
                              (c["tool"] == "clawctl" and c["args"][0] != "migrate") for c in self.calls))
@@ -263,7 +265,7 @@ class InstallTest(unittest.TestCase):
                 self.assertTrue(call["placed"], call)
         for name in RELEASE_FILES:
             self.assertEqual((self.root / name).read_bytes(), (self.release / name).read_bytes())
-        self.assertIn("release set             ok", self.output)
+        self.assertIn("release set        ok", self.output)
         # The installer itself never relaxes the signature gate.
         self.assertTrue(self.helper_calls())
         self.assertFalse(any("--allow-unsigned" in c for c in self.helper_calls()))
@@ -277,9 +279,15 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.secret("openai-api-key"), CANARIES["openai"] + "\n")
         for name in ("anthropic-api-key", "slack-app-token", "slack-bot-token", "github-readonly-pat"):
             self.assertEqual(self.secret(name), "")
-        for text in ("gateway health          ok", "model configuration     ok",
+        # Filled in place: the mode init-file-secrets.sh set is kept.
+        runtime = self.root / "secrets/runtime"
+        untouched = (runtime / "slack-app-token").stat().st_mode
+        for name in ("pretorin-api-key", "openai-api-key"):
+            self.assertEqual((runtime / name).stat().st_mode, untouched, name)
+        self.assertEqual(sorted(p.name for p in runtime.iterdir() if p.name.startswith(".")), [])
+        for text in ("gateway            ok", "model              ok",
                      "provider was not contacted", "writes not tested",
-                     "first useful task       NOT VERIFIED", "effort agent: crm-soc2"):
+                     "first useful task  NOT VERIFIED", "effort agent: crm-soc2"):
             self.assertIn(text, self.output)
 
     def test_rerun_preserves_declaration_selection_and_credentials(self):
@@ -500,10 +508,10 @@ class InstallTest(unittest.TestCase):
     # -- readiness ---------------------------------------------------------
     def test_readiness_failures_are_reported_and_not_called_success(self):
         cases = (
-            ({"health": "running unhealthy"}, "gateway health          FAIL"),
-            ({"health": "running starting"}, "gateway health          FAIL"),
-            ({"cid": ""}, "gateway health          FAIL"),
-            ({"model_rc": 1}, "model configuration     NOT READY"),
+            ({"health": "running unhealthy"}, "gateway            FAIL"),
+            ({"health": "running starting"}, "gateway            FAIL"),
+            ({"cid": ""}, "gateway            FAIL"),
+            ({"model_rc": 1}, "model              NOT READY"),
         )
         for settings, text in cases:
             with self.subTest(settings=settings):
@@ -515,7 +523,7 @@ class InstallTest(unittest.TestCase):
 
     def test_expiring_model_auth_is_reported_but_not_a_failure(self):
         self.assertEqual(self.run_install(self.full_args(), model_rc=2), 0, self.output)
-        self.assertIn("model configuration     EXPIRING", self.output)
+        self.assertIn("model              EXPIRING", self.output)
 
     # -- hidden input --------------------------------------------------------
     def test_terminal_prompt_reads_keys_without_echo(self):

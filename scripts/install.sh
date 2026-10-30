@@ -55,8 +55,14 @@ GUIDE_RECOVERY="docs/upgrade.md"
 
 log()   { printf 'install: %s\n' "$*"; }
 warn()  { printf 'install: WARNING — %s\n' "$*" >&2; }
-die()   { printf 'install: ERROR — %s\n' "$*" >&2; exit 1; }
-stage() { printf '\ninstall: == %s ==\n' "$*"; }
+# A stopped stage names itself and the operator guide's stage-failure section.
+STAGE=""
+die()   {
+  printf 'install: ERROR — %s\n' "$*" >&2
+  [ -z "$STAGE" ] || printf 'install: stopped at stage %s. See %s#if-a-setup-stage-fails\n' "$STAGE" "$GUIDE_ADMIN" >&2
+  exit 1
+}
+stage() { STAGE="$*"; printf '\ninstall: == %s ==\n' "$*"; }
 
 usage() { sed -n '2,39p' "$0"; }
 
@@ -121,7 +127,7 @@ trap 'exit 130' INT TERM
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cc-install.XXXXXX")"
 
 # ---------------------------------------------------------------------------
-stage "1/10 preflight: host, tools and Docker"
+stage "1/10 preflight"
 # ---------------------------------------------------------------------------
 # The reference route is a connected Linux amd64 VM. Other hosts use the manual
 # Quickstart, where bootstrap.sh checks amd64 emulation. No VM size is checked:
@@ -173,7 +179,7 @@ FS_TYPE="$(findmnt -n -o FSTYPE --target "$REPO_ROOT" 2>/dev/null || true)"
 log "checkout ${REPO_ROOT} is writable (${FS_TYPE:-file system type unknown})"
 
 # ---------------------------------------------------------------------------
-stage "2/10 inspection: existing files and the deployment selection"
+stage "2/10 inspection"
 # ---------------------------------------------------------------------------
 # Each conflict is reported before the first write. Existing customer files are
 # reused or refused, never replaced.
@@ -434,7 +440,8 @@ else
   die "cannot reach ${IMAGE}.
   The package is not public. Log in, then re-run:
     docker login ghcr.io        (a classic token needs read:packages)
-  Also check this VM's network route to the registry. Nothing was changed."
+  Also check this VM's network route to the registry
+  (${GUIDE_ADMIN}#network-connections). Nothing was changed."
 fi
 
 if [ "$CHECK_ONLY" = 1 ]; then
@@ -475,7 +482,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-stage "6/10 secret files"
+stage "6/10 secrets"
 # ---------------------------------------------------------------------------
 save_selection() {
   [ -f .env ] || return 0
@@ -547,7 +554,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-stage "7/10 bootstrap: targets and image"
+stage "7/10 bootstrap"
 # ---------------------------------------------------------------------------
 bash scripts/bootstrap.sh || die "bootstrap.sh stopped; see its message above.
   Fix the cause, then re-run this command. Existing files and clones were kept."
@@ -555,13 +562,13 @@ save_selection
 log "Ignore the bootstrap 'Next:' list; this command does those steps now."
 
 # ---------------------------------------------------------------------------
-stage "8/10 validate: credentials and Pretorin scope"
+stage "8/10 validate"
 # ---------------------------------------------------------------------------
 bash scripts/clawctl validate || die "validation failed; see the rows above. Nothing was applied.
   Fix each row, then re-run this command."
 
 # ---------------------------------------------------------------------------
-stage "9/10 plan and apply"
+stage "9/10 plan/apply"
 # ---------------------------------------------------------------------------
 bash scripts/clawctl plan || die "plan failed; see the message above. Nothing was applied."
 if [ "$ASSUME_YES" != 1 ]; then
@@ -608,11 +615,11 @@ fi
 
 AGENTS="$(python3 "$PARSE_EFFORTS" agents "$EFFORTS_FILE" | awk -F'\t' '{ printf " %s", $2 }')"
 printf '\n'
-log "gateway health          ${GATEWAY}  (container running and healthy)"
-log "model configuration     ${MODEL}  (local check; the provider was not contacted)"
-log "Pretorin scope/transport ok  (scoped read probe passed in validate; writes not tested)"
-log "release set             ok  (record, checksums, signature and source commit)"
-log "first useful task       NOT VERIFIED — still required"
+log "gateway            ${GATEWAY}  (container running and healthy)"
+log "model              ${MODEL}  (local check; the provider was not contacted)"
+log "Pretorin           ok  (scoped read probe passed in validate; writes not tested)"
+log "release set        ok  (record, checksums, signature and source commit)"
+log "first useful task  NOT VERIFIED — still required"
 printf '\n'
 [ "$GATEWAY" = ok ] || log "  gateway: docker compose ps -a; docker compose logs openclaw. Keep the volumes; ${GUIDE_RECOVERY}"
 [ "$MODEL" != "NOT READY" ] || log "  model: supply ${SECRET_DIR}/openai-api-key or anthropic-api-key and re-run, or
@@ -624,7 +631,7 @@ install:      listens on 127.0.0.1:18789 on this VM only.
 install:   2. In /settings/model-providers, run Test connection for the model.
 install:   3. Select an effort agent:${AGENTS}
 install:      and run one approved read-only task against its repositories.
-install:   Duties and handoff: ${GUIDE_ADMIN}#duties-and-handoff
+install:   Operator handoff: ${GUIDE_ADMIN}#operator-handoff-checklist
 install:   Recovery: ${GUIDE_RECOVERY}
 EOF
 if [ "$READY_FAIL" = 1 ]; then

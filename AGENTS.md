@@ -27,7 +27,7 @@ Do not describe an intended UI flow as an available feature without evidence.
 | --- | --- |
 | `Dockerfile`, `versions.env`, `vendor/` | Build the runtime and verify dependency bytes and pins. |
 | `compose*.yaml` | Services, mounts, credentials, build selection, and test isolation. |
-| `scripts/bootstrap.sh`, `scripts/init-file-secrets.sh` | Host prerequisites, target clones, image selection, and initial secret files. |
+| `scripts/bootstrap.sh`, `scripts/init-file-secrets.sh`, `scripts/install.sh`, `scripts/test-install.py` | Host prerequisites, target clones, image selection, and initial secret files. The guided installer only calls these and `clawctl`. |
 | `scripts/entrypoint.sh`, config/Slack templates, `scripts/managed-slack.mjs` | Runtime secret loading, initial config, active CLI seed, and managed Slack installation. |
 | `scripts/clawctl`, `parse-targets.py`, `parse-efforts.py`, `openclaw-patch.py` in `scripts/` | Validate declarations, generate owned configuration, apply, verify, and roll back. |
 | `scripts/onboard-lib.sh`, `scripts/onboard-targets.sh`, `scripts/pretorin-mcp-launch.sh` | Bind source context and start MCP with the effort's scope and credential. |

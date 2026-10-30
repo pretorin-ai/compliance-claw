@@ -205,14 +205,18 @@ from `clawctl validate` (writes are not tested), the release set check, and the
 first useful task. The installer cannot do that task. A healthy
 container or a saved key does not show that the Claw works. The Claw
 administrator then follows the
-[duties and handoff](docs/administration.md#duties-and-handoff) section to test
-the model connection and run one approved task. Use
-[update, upgrade and recovery](docs/upgrade.md) for problems after installation.
+[operator handoff checklist](docs/administration.md#operator-handoff-checklist) to test
+the model connection and run one approved task. If a stage stops, the
+installer names it; see [if a setup stage fails](docs/administration.md#if-a-setup-stage-fails).
+Use [update, upgrade and recovery](docs/upgrade.md) for problems after installation.
 
 The installer does not set up the VM, Docker, the network, an identity provider
 or a model service. Providers, models, external MCP connections and agent
-settings stay in the native Control UI. A custom endpoint or another mounted
-credential stays an operator task. For other hosts, a custom selection, or
+settings stay in the native Control UI. A custom endpoint
+([internal AI endpoint](docs/administration.md#internal-ai-endpoint-with-a-private-ca))
+or another mounted credential stays an operator task. The VM needs the
+[network connections](docs/administration.md#network-connections) for the
+registry, GitHub and the services you use. For other hosts, a custom selection, or
 full control of each step, use the manual installation below.
 
 ### Manual installation
@@ -228,7 +232,9 @@ export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
 #    uses a Slack channel, if needed. efforts.yaml is what the deployment reads.
 cp efforts.example.yaml efforts.yaml
 vi efforts.yaml                  # system_id, framework_id, targets; optional slack_channel_id
-#    Already have a single-effort targets.yaml? Convert it instead:
+scripts/clawctl validate --schema-only
+#    Do not edit the committed targets.yaml for a new installation. Only an
+#    existing single-effort deployment converts its targets.yaml:
 #    scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 
 # 3. clone the targets, PULL the released image, create the secret files
