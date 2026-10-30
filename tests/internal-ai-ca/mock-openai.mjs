@@ -118,9 +118,6 @@ const server = https.createServer(
           .flatMap((m) => m.tool_calls.map((call) => call?.id)),
       );
       const toolResult = messages.find((m) => m?.role === "tool" && callIds.has(m.tool_call_id));
-      if (!toolResult) {
-        log({ debugRoles: messages.map((m) => m?.role), debugToolIds: [...callIds] });
-      }
       if (toolResult) {
         const content =
           typeof toolResult.content === "string" ? toolResult.content : JSON.stringify(toolResult.content);
@@ -129,6 +126,8 @@ const server = https.createServer(
           outcome: "final_after_tool_result",
           stream: Boolean(body.stream),
           toolResultBytes: content.length,
+          // An error result means the tool call did not run correctly.
+          toolResultError: /"isError"\s*:\s*true|"status"\s*:\s*"error"|^\s*error\b/i.test(content),
         });
         respond(res, body, { content: FINAL_TEXT }, "stop");
         return;

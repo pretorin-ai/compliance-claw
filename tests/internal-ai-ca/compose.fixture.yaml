@@ -5,10 +5,18 @@
 # so a pass cannot come from a real provider. Not for customer use.
 
 services:
+  # Both target mounts point at an empty temporary directory, so the agent's
+  # tool call cannot reach the checkout's workspace/targets. Compose merges
+  # these over the base mounts by container path.
   openclaw:
     image: "${INTERNAL_AI_TEST_IMAGE:?set INTERNAL_AI_TEST_IMAGE}"
+    volumes:
+      - "${INTERNAL_AI_TEST_DIR:?set INTERNAL_AI_TEST_DIR}/targets:/workspace/targets:ro"
+      - "${INTERNAL_AI_TEST_DIR:?set INTERNAL_AI_TEST_DIR}/targets:/var/lib/compliance-claw/targets:rw"
   cli:
     image: "${INTERNAL_AI_TEST_IMAGE:?set INTERNAL_AI_TEST_IMAGE}"
+    volumes:
+      - "${INTERNAL_AI_TEST_DIR:?set INTERNAL_AI_TEST_DIR}/targets:/workspace/targets:ro"
 
   mock-ai:
     image: "${INTERNAL_AI_TEST_IMAGE:?set INTERNAL_AI_TEST_IMAGE}"

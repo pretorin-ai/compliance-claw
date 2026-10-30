@@ -16,12 +16,14 @@
 # It contains no certificate, key, endpoint name or credential. The values are
 # host files that the VM operator supplies:
 #
-#   INTERNAL_AI_CA_FILE  the approved CA certificate (PEM). Public data, but
-#                        the trust decision is the operator's. Compose stops
-#                        with the message below if this setting is missing.
+#   INTERNAL_AI_CA_FILE  the approved CA certificate (PEM), owner UID 1000,
+#                        mode 0400 or 0600. Public data, but the trust decision
+#                        is the operator's. Compose stops with the message
+#                        below if this setting is missing.
 #   internal-ai-api-key  the endpoint credential, in the deployment's secret
-#                        directory with the same owner and mode as the other
-#                        secret files. Gateway only, like the model API keys.
+#                        directory, owner UID 1000, mode 0400 or 0600 (OpenClaw
+#                        refuses a file that others can read). Gateway only,
+#                        like the model API keys.
 #
 # OpenClaw reads both files through native file SecretRef providers. See
 # internal-ai.patch.json5 and docs/administration.md

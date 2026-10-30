@@ -17,7 +17,9 @@
 #   - the same configuration rejects an endpoint certificate from another CA.
 #
 # It does not prove a real AI provider, real network, proxy or model quality.
-# It writes only to its own Compose project and a temporary directory.
+# It writes only to its own Compose project and a temporary directory: the
+# fixture overlay replaces both target mounts with an empty temporary directory.
+# Run it from a disposable checkout, as for the other isolated tests.
 set -euo pipefail
 
 IMAGE="${1:?usage: run.sh IMAGE (for example compliance-claw:local)}"
@@ -27,6 +29,9 @@ cd "$ROOT"
 # Its own project and port, never inherited: CI and contributor shells can set
 # COMPOSE_PROJECT_NAME for another stack, and cleanup below deletes volumes.
 export COMPOSE_PROJECT_NAME="${INTERNAL_AI_TEST_PROJECT:-cc-internal-ai-ca}"
+case "$COMPOSE_PROJECT_NAME" in
+  compliance-claw|"") echo "internal-ai-ca: refusing project '${COMPOSE_PROJECT_NAME}': use a disposable name" >&2; exit 2 ;;
+esac
 export CC_TEST_PORT="${INTERNAL_AI_TEST_PORT:-18988}"
 export COMPOSE_PATH_SEPARATOR=:
 export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.test.yaml:examples/internal-ai-ca/compose.internal-ai-ca.yaml:tests/internal-ai-ca/compose.fixture.yaml
@@ -35,6 +40,8 @@ export INTERNAL_AI_TEST_CERT_SET=approved
 unset COMPOSE_PROFILES CC_EFFORTS_FILE CC_TARGETS_DIR
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/cc-internal-ai-ca.XXXXXX")"
+# The container user (UID 1000) must enter it on a host where the runner is not UID 1000.
+chmod 0755 "$TMP"
 export INTERNAL_AI_TEST_DIR="$TMP"
 export COMPLIANCE_CLAW_SECRET_DIR="$TMP/secrets"
 export INTERNAL_AI_CA_FILE="$TMP/internal-ai-ca.pem"
@@ -63,7 +70,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Test CAs and endpoint certificates ------------------------------------
-mkdir -p "$TMP/ca" "$TMP/certs/approved" "$TMP/certs/untrusted" "$TMP/secrets" workspace/targets
+mkdir -p "$TMP/ca" "$TMP/certs/approved" "$TMP/certs/untrusted" "$TMP/secrets" "$TMP/targets"
 printf 'subjectAltName=DNS:ai.internal.test\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' \
   > "$TMP/ca/server.ext"
 for set in approved untrusted; do
@@ -135,7 +142,8 @@ for problem in problems:
     print(f"  {problem}")
 sys.exit(1 if problems else 0)
 PY
-if (unset INTERNAL_AI_CA_FILE; docker compose --profile '*' config >/dev/null 2>"$TMP/no-ca.err"); then
+# --env-file /dev/null: a developer .env must not supply the missing setting.
+if (unset INTERNAL_AI_CA_FILE; docker compose --env-file /dev/null --profile '*' config >/dev/null 2>"$TMP/no-ca.err"); then
   fail "Compose accepted the overlay without INTERNAL_AI_CA_FILE"
 elif ! grep -q 'Set INTERNAL_AI_CA_FILE' "$TMP/no-ca.err"; then
   fail "missing CA setting did not name INTERNAL_AI_CA_FILE"
@@ -149,16 +157,18 @@ sed -e 's#https://ai.internal.example/v1#https://ai.internal.test:8443/v1#' \
 grep -q 'ai.internal.test:8443' "$TMP/internal-ai.patch.json5" || fail "patch endpoint placeholder changed"
 grep -q '"fixture-model"' "$TMP/internal-ai.patch.json5" || fail "patch model placeholder changed"
 
-log "starting the isolated gateway and mock endpoint (slow under amd64 emulation)"
-docker compose up -d --wait --wait-timeout 720 openclaw mock-ai
-
-log "the cli dry run must refuse: the credential is gateway-only"
+# The documented cli path: configuration work while the gateway is stopped.
+log "gateway stopped: the cli dry run must refuse, the credential is gateway-only"
 if docker compose run --rm -T cli openclaw config patch --stdin --dry-run \
   < "$TMP/internal-ai.patch.json5" > "$TMP/cli-dry-run.out" 2>&1; then
   fail "cli dry run resolved the gateway-only credential"
 elif ! grep -q 'internal_ai_api_key' "$TMP/cli-dry-run.out"; then
-  fail "cli dry run failed for another reason: $(tail -3 "$TMP/cli-dry-run.out")"
+  fail "cli dry run failed for another reason:"
+  sed 's/^/  /' "$TMP/cli-dry-run.out" | tail -15
 fi
+
+log "starting the isolated gateway and mock endpoint (slow under amd64 emulation)"
+docker compose up -d --wait --wait-timeout 720 openclaw mock-ai
 
 gateway() { docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint "$@"; }
 log "applying the native patch through the running gateway"
@@ -189,11 +199,18 @@ fi
 docker compose logs --no-log-prefix --since "$since" mock-ai > "$TMP/approved.mock" 2>&1
 grep -q '"outcome":"tool_call"' "$TMP/approved.mock" || fail "endpoint never sent a tool call"
 grep -q '"outcome":"final_after_tool_result"' "$TMP/approved.mock" || fail "endpoint never received the tool result"
+grep '"outcome":"final_after_tool_result"' "$TMP/approved.mock" | grep -q '"toolResultError":false' \
+  || fail "the tool result reported an error, so the tool did not run correctly"
 
 # --- Untrusted CA: the same configuration must refuse -----------------------
 log "untrusted CA: the same configuration must reject the endpoint"
+since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 INTERNAL_AI_TEST_CERT_SET=untrusted docker compose up -d --force-recreate mock-ai >/dev/null 2>&1
-sleep 3
+for _ in $(seq 1 60); do
+  docker compose logs --no-log-prefix --since "$since" mock-ai 2>/dev/null \
+    | grep -q '"outcome":"listening","certSet":"untrusted"' && break
+  sleep 2
+done
 since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if agent_turn untrusted; then
   fail "agent turn succeeded against a certificate from an untrusted CA"
@@ -204,7 +221,7 @@ grep -q '"path":' "$TMP/untrusted.mock" && fail "an HTTP request crossed an untr
 grep -q 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' "$TMP/untrusted.gateway" \
   || fail "gateway did not report the certificate verification failure"
 
-for file in "$TMP"/*.json "$TMP"/*.err "$TMP"/*.mock "$TMP"/*.gateway; do
+for file in "$TMP"/*.json "$TMP"/*.err "$TMP"/*.out "$TMP"/*.mock "$TMP"/*.gateway; do
   if grep -q 'canary-internal-ai-api-key-test-only' "$file"; then
     fail "credential value appeared in $(basename "$file")"
   fi

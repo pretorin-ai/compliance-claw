@@ -159,8 +159,8 @@ The native file reference has stricter checks than the other files here. The
 file must belong to UID 1000 and have an owner-only mode, `0400` or `0600`.
 A local fixture refused `0440` and `0604` as too open, so the `0604` mode that
 the local helper uses for other files on a host user other than UID 1000 does
-not work here. Prepare and replace the file with the same method as the other
-files, then recreate the gateway. The one-off `cli` service does not receive
+not work here. Use an approved secret-input method, set owner UID 1000 and
+mode `0400`, replace the file by rename, then recreate the gateway. The one-off `cli` service does not receive
 this credential.
 
 ### Upgrading a deployment that predates a secret
