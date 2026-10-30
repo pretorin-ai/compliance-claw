@@ -109,6 +109,68 @@ release, or now with `scripts/bootstrap.sh --build`.
 
 ## Quickstart
 
+### Guided installation on a Linux amd64 VM
+
+`scripts/install.sh` guides a VM operator through a first installation of the
+image that this checkout selects. It does not build source. It calls the
+existing host scripts in this order: checks, `clawctl migrate` for a new
+declaration, `init-file-secrets.sh`, `bootstrap.sh`, `clawctl validate`,
+`clawctl plan` and, after your approval, `clawctl apply`.
+
+Put each credential in a file that only you can read (`chmod 600`). The
+installer copies a value into an empty secret file only. It never accepts a
+value as an argument and never shows one. In a terminal, it asks for a missing
+Pretorin or OpenAI key with hidden input.
+
+```sh
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
+
+# Check the host, the existing files and image access. This writes nothing.
+scripts/install.sh --check \
+  --effort crm-soc2 --system-id <system-uuid> --framework-id soc2 \
+  --target simple-crm=https://github.com/pretorin-ai/simple-crm.git#main \
+  --pretorin-key-file ~/keys/pretorin --openai-key-file ~/keys/openai
+
+# Install: run the same command without --check. The installer shows the plan
+# and asks before apply; add --yes when no terminal is attached.
+```
+
+Options:
+
+- `--private-target NAME=URL[#BRANCH]` declares a private repository. Supply its
+  credential first; see [private repositories](docs/repositories.md#private-repositories).
+- `--slack-channel-id C...` routes the effort to a Slack channel. Then give
+  `--slack-app-token-file` and `--slack-bot-token-file` too: the installer stops
+  before the first start if a declared channel has no tokens. Omit the channel
+  for browser-only access.
+- `--anthropic-key-file` replaces `--openai-key-file`. Then select an Anthropic
+  model in the Control UI ([providers and models](docs/administration.md#providers-and-models)).
+- With an existing `efforts.yaml`, omit the declaration options. The installer
+  uses the file as it is.
+
+The installer reports an exact conflict and changes nothing when an existing
+file disagrees with an input. It keeps `efforts.yaml`, `.env`, the saved
+Compose selection with its overlay order, clones, and every secret file, empty
+or not. After an interruption, fix the reported cause and run the same command
+again. To rotate a credential, use the [rotation procedure](docs/file-secrets.md#rotation).
+
+The last stage reports four separate results: gateway health, a local model
+configuration check (the provider is not contacted), the Pretorin scope probe
+from `clawctl validate` (writes are not tested), and the first useful task. The
+installer cannot do that task. A healthy container or a saved key does not
+show that the Claw works. The Claw administrator then follows the
+[duties and handoff](docs/administration.md#duties-and-handoff) section to test
+the model connection and run one approved task. Use
+[update, upgrade and recovery](docs/upgrade.md) for problems after installation.
+
+The installer does not set up the VM, Docker, the network, an identity provider
+or a model service. Providers, models, external MCP connections and agent
+settings stay in the native Control UI. A custom endpoint or another mounted
+credential stays an operator task. For other hosts, a custom selection, or
+full control of each step, use the manual installation below.
+
+### Manual installation
+
 ```sh
 # 0. authenticate to the registry (the package is not public)
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
