@@ -149,6 +149,14 @@ def main():
             "    ports:\n      - \"127.0.0.1:18790:18790\"\n")
         (cur / "deployment" / "pin-image.yaml").write_text(
             "services:\n  openclaw:\n    image: compliance-claw:local\n")
+        # The shape of a restore overlay, selected LAST: previous digest for both
+        # services plus external state volumes.
+        previous = REPO + ":0.5.2@" + V052_DIGEST
+        (cur / "deployment" / "restore.yaml").write_text(
+            "services:\n  openclaw:\n    image: %s\n  cli:\n    image: %s\n"
+            "volumes:\n  openclaw-state:\n    external: true\n    name: cc-restore-openclaw\n"
+            "  pretorin-state:\n    external: true\n    name: cc-restore-pretorin\n"
+            % (previous, previous))
         rel = prepare(tmp / "rel-next", NEXT_VERSION, NEXT_COMMIT, NEXT_DIGEST)
         install(rel, cur)
         extra = {"COMPLIANCE_CLAW_SECRET_DIR": "./secrets/runtime"}
@@ -210,6 +218,24 @@ def main():
                 "compose.yaml:compose.release.yaml:" + customer + ":deployment/pin-image.yaml", extra)
         ok(p.returncode == 4 and "compliance-claw:local" in p.stderr and "openclaw" in p.stderr,
            "check --compose exits 4 and names a later image override", p.stderr)
+        p = run([sys.executable, str(HELPER), "check", "--compose"], cur,
+                "compose.yaml:compose.release.yaml:" + customer + ":deployment/restore.yaml", extra)
+        ok(p.returncode == 4 and "restore overlay" in p.stderr and previous in p.stderr
+           and want in p.stderr and "cc-restore" not in p.stderr,
+           "check --compose exits 4 on a later restore overlay and prints only image references",
+           p.stderr)
+        p = run(["bash", "-c", '"$1" compose --profile cli config --format json | "$2" "$3" check --rendered -',
+                 "_", docker, sys.executable, str(HELPER)],
+                cur, "compose.yaml:compose.release.yaml:" + customer, extra)
+        ok(p.returncode == 0 and CANARY not in p.stdout + p.stderr,
+           "check --rendered - accepts a piped Compose model", p.stderr)
+        # Legacy .env selection: the model itself holds the canary secret value.
+        legacy = model(cur, "compose.yaml:compose.release.yaml:deployment/pin-image.yaml")
+        ok(CANARY in json.dumps(legacy), "the legacy selection renders the .env value into the model")
+        p = run([sys.executable, str(HELPER), "check", "--compose"], cur,
+                "compose.yaml:compose.release.yaml:deployment/pin-image.yaml")
+        ok(p.returncode == 4 and CANARY not in p.stdout + p.stderr,
+           "check --compose never prints the rendered model's secret values", p.stderr)
         p = run([sys.executable, str(HELPER), "check", "--compose"], cur,
                 "compose.yaml:compose.release.yaml:missing.yaml", extra)
         ok(p.returncode == 5, "check --compose exits 5 when Compose cannot render the selection", p.stderr)

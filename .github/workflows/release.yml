@@ -6,8 +6,11 @@
 #
 #   git tag -a vX.Y.Z -m vX.Y.Z <reviewed master commit> && git push origin vX.Y.Z
 #   gh workflow run release.yml --ref vX.Y.Z -f operation=prepare
-#   ... qualify the exact candidate ...
-#   gh workflow run release.yml --ref vX.Y.Z -f operation=publish
+#   ... qualify the exact candidate; record its digest from the job summary ...
+#   gh workflow run release.yml --ref vX.Y.Z -f operation=publish -f digest=sha256:<qualified>
+#
+# `gh release create` is NOT the trigger any more: a release is published by
+# this workflow, after its checks, never before them.
 #
 #   dry-run  (default, any ref) build, smoke, contracts, scan, SBOM and the
 #            release-set self-test. No login, no push, no release write.
@@ -16,10 +19,12 @@
 #            the release set (scripts/release-assets.py prepare) and attach it to
 #            a DRAFT GitHub release. Drafts are not visible to customers and send
 #            no release notification. The stable version tag is NOT applied.
-#   publish  (tag ref only) NO BUILD. Takes the draft's assets, checks them
-#            against the tag, marks the record final, applies the version tag to
-#            the SAME digest, uploads the final record and un-drafts the release.
-#            The image and asset bytes are the ones `prepare` qualified.
+#   publish  (tag ref only) NO BUILD. Requires `digest`, the qualified
+#            candidate digest; refuses when the draft record or candidate-X.Y.Z
+#            names other bytes, so a later re-prepare cannot publish unqualified
+#            bytes. Checks the draft's assets against the tag, marks the record
+#            final, applies the version tag to the SAME digest, uploads the final
+#            record and un-drafts the release.
 #
 # THE RELEASE SET (scripts/release-assets.py; interface in docs/releasing.md):
 #   compliance-claw-release.json   source commit, version, image digest, asset
@@ -67,6 +72,11 @@ on:
         type: choice
         options: [dry-run, prepare, publish]
         default: dry-run
+      digest:
+        description: "publish only: the qualified candidate digest (sha256:...) from the prepare summary"
+        type: string
+        required: false
+        default: ""
 
 # Read-only by default. Each job that writes names exactly one write permission:
 # packages (GHCR) or contents (GitHub Release). No job holds both.
@@ -176,12 +186,24 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # true (draft), false (published) or none. Only "release not found"
+          # means none; any other error stops the run.
+          release_state() {
+            local out
+            if out="$(gh release view "$1" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1)"; then
+              STATE="$out"
+            elif printf '%s' "$out" | grep -qi 'release not found'; then
+              STATE=none
+            else
+              echo "::error::cannot read release $1: ${out}"; exit 1
+            fi
+          }
           git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
           TAGGED="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
           [ "$TAGGED" = "$GITHUB_SHA" ] \
             || { echo "::error::tag ${TAG} is ${TAGGED}, but this run builds ${GITHUB_SHA}"; exit 1; }
-          if DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" \
-             && [ "$DRAFT" = false ]; then
+          release_state "$TAG"
+          if [ "$STATE" = false ]; then
             echo "::error::release ${TAG} is already published; a completed version is never prepared again. Use a new version."
             exit 1
           fi
@@ -414,10 +436,14 @@ jobs:
           IMAGE_REF: ${{ steps.pins.outputs.image_ref }}
         run: |
           set -euo pipefail
-          if docker buildx imagetools inspect "$IMAGE_REF" >/dev/null 2>&1; then
+          if OUT="$(docker buildx imagetools inspect "$IMAGE_REF" 2>&1)"; then
             echo "::error::${IMAGE_REF} already exists; a completed version is never prepared again. Use a new version."
             exit 1
           fi
+          # Only "not found" means absent. An auth, network or rate-limit error
+          # stops here rather than an hour later at publish.
+          printf '%s' "$OUT" | grep -qiE 'not found|manifest unknown' \
+            || { echo "::error::cannot tell whether ${IMAGE_REF} exists: ${OUT}"; exit 1; }
           echo "${IMAGE_REF} does not exist yet"
 
       # STEP 1 OF 2: publish BY DIGEST under the constant staging ref resolved
@@ -471,6 +497,27 @@ jobs:
           [ "$BUILT" = "$PULLED" ] || { echo "::error::pulled image inventory differs from the built image"; exit 1; }
           rm -f sbom.pulled.json
           echo "digest round-trip verified"
+
+      # The release set, from the verified values only, BEFORE the candidate tag
+      # moves: a set that cannot be generated leaves an earlier draft and its
+      # candidate tag in step. prepare refuses a mismatched SBOM name, a malformed
+      # digest or commit, or a tag that does not name this commit; check then
+      # re-reads what was written.
+      - name: Generate the release set
+        if: ${{ inputs.operation == 'prepare' }}
+        env:
+          IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ steps.pins.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-assets.py prepare --version "$VERSION" \
+            --commit "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY" \
+            --image-repository "$IMAGE_REPO" --digest "$DIGEST" \
+            --sbom "sbom-${VERSION}.spdx.json" --out release-set --source .
+          python3 scripts/release-assets.py check --dir release-set --stage candidate \
+            --all-assets --version "$VERSION" --source .
+          ls -l release-set
 
       # STEP 2 OF 2 for a candidate: `candidate-X.Y.Z` names the verified digest,
       # by the exact-manifest operation in scripts/release-tag.sh. It keeps the
@@ -533,25 +580,6 @@ jobs:
             && echo "deleted abandoned version ${ID}" \
             || echo "::notice::could not delete version ${ID} (permissions); delete it by hand if it matters"
 
-      # The release set, from the qualified values only. prepare refuses a
-      # mismatched SBOM name, a malformed digest or commit, or a tag that does not
-      # name this commit; check then re-reads what was written.
-      - name: Generate the release set
-        if: ${{ inputs.operation == 'prepare' }}
-        env:
-          IMAGE_REPO: ${{ steps.pins.outputs.IMAGE_REPO }}
-          DIGEST: ${{ steps.push.outputs.digest }}
-          VERSION: ${{ steps.pins.outputs.version }}
-        run: |
-          set -euo pipefail
-          python3 scripts/release-assets.py prepare --version "$VERSION" \
-            --commit "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY" \
-            --image-repository "$IMAGE_REPO" --digest "$DIGEST" \
-            --sbom "sbom-${VERSION}.spdx.json" --out release-set --source .
-          python3 scripts/release-assets.py check --dir release-set --stage candidate \
-            --all-assets --version "$VERSION" --source .
-          ls -l release-set
-
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ inputs.operation == 'prepare' }}
         with:
@@ -577,10 +605,11 @@ jobs:
             echo ""
             echo "The draft release v${VERSION} carries the candidate release set. The"
             echo "version tag \`${VERSION}\` is NOT applied, and customers are not notified."
-            echo "Qualify this exact candidate, then publish it without a rebuild:"
+            echo "Qualify this exact candidate digest, then publish it without a rebuild."
+            echo "Publish refuses any other digest:"
             echo ""
             echo '```sh'
-            echo "gh workflow run release.yml --ref v${VERSION} -f operation=publish"
+            echo "gh workflow run release.yml --ref v${VERSION} -f operation=publish -f digest=${DIGEST}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -609,9 +638,21 @@ jobs:
           VERSION: ${{ needs.candidate.outputs.version }}
         run: |
           set -euo pipefail
+          # true (draft), false (published) or none. Only "release not found"
+          # means none; any other error stops the run.
+          release_state() {
+            local out
+            if out="$(gh release view "$1" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1)"; then
+              STATE="$out"
+            elif printf '%s' "$out" | grep -qi 'release not found'; then
+              STATE=none
+            else
+              echo "::error::cannot read release $1: ${out}"; exit 1
+            fi
+          }
           python3 scripts/release-assets.py check --dir release-set --stage candidate \
             --all-assets --version "$VERSION"
-          STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+          release_state "$TAG"
           case "$STATE" in
             none)
               gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
@@ -652,8 +693,11 @@ jobs:
         id: set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QUALIFIED: ${{ inputs.digest }}
         run: |
           set -euo pipefail
+          [[ "$QUALIFIED" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::publish needs -f digest=sha256:<qualified candidate digest> (from the prepare summary)"; exit 1; }
           [[ "$GITHUB_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
             || { echo "::error::publish must run on a release tag: gh workflow run release.yml --ref vX.Y.Z -f operation=publish"; exit 1; }
           TAG="${GITHUB_REF#refs/tags/}"
@@ -661,7 +705,19 @@ jobs:
           . ./versions.env
           git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
 
-          STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+          # true (draft), false (published) or none. Only "release not found"
+          # means none; any other error stops the run.
+          release_state() {
+            local out
+            if out="$(gh release view "$1" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1)"; then
+              STATE="$out"
+            elif printf '%s' "$out" | grep -qi 'release not found'; then
+              STATE=none
+            else
+              echo "::error::cannot read release $1: ${out}"; exit 1
+            fi
+          }
+          release_state "$TAG"
           [ "$STATE" != none ] \
             || { echo "::error::no release ${TAG}: run operation=prepare on this tag first"; exit 1; }
           mkdir release-set
@@ -684,6 +740,9 @@ jobs:
           fi
           SUMMARY="$(python3 scripts/release-assets.py check --dir release-set \
             --all-assets --version "$VERSION" --source . --json)"
+          REC_DIGEST="$(printf '%s' "$SUMMARY" | jq -r .digest)"
+          [ "$REC_DIGEST" = "$QUALIFIED" ] \
+            || { echo "::error::the release record names ${REC_DIGEST}; the qualified digest is ${QUALIFIED}. Re-qualify, or prepare again."; exit 1; }
           REC_REPO="$(printf '%s' "$SUMMARY" | jq -r .image_reference | sed 's/:[^:/]*@.*$//')"
           [ "$REC_REPO" = "$IMAGE_REPO" ] \
             || { echo "::error::the record names ${REC_REPO}; versions.env says ${IMAGE_REPO}"; exit 1; }

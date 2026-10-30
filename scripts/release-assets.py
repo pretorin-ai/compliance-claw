@@ -6,8 +6,10 @@
                                --sbom PATH --out DIR [--source DIR]
     release-assets.py finalize --dir DIR
     release-assets.py check    [--dir DIR] [--stage final|candidate|any]
-                               [--version X.Y.Z] [--all-assets] [--source DIR]
-                               [--compose | --rendered FILE] [--json]
+                               [--version X.Y.Z] [--all-assets]
+                               [--source DIR [--tag-only]]
+                               [--compose | --rendered FILE|-] [--json]
+    release-assets.py fetch    --version X.Y.Z --dir DIR [--json]
     release-assets.py --self-test
 
 HOST-ONLY, standard library only. Nothing in the image runs this.
@@ -24,8 +26,22 @@ select that digest. It is three GitHub Release assets:
     Nothing produces it yet, and `signature.status` says "unsigned".
 
 The publisher (.github/workflows/release.yml) calls `prepare` and `finalize`.
-Guided setup and the updater call `check`. They do not parse the record
-themselves: one resolver, one set of rules.
+Guided setup and the updater must use `fetch` and `check` (not yet wired in
+this version). They must not parse the record themselves: one resolver, one
+set of rules.
+
+`fetch` downloads the three assets of a PUBLISHED release of the fixed public
+repository (no credential, no draft), into an empty directory, and then runs
+the same checks as `check --stage final --all-assets`.
+
+THE RENDERED COMPOSE MODEL IS NEVER PRINTED OR WRITTEN. A legacy `.env`
+selection renders secret values into it. `check --compose` keeps it in memory;
+`--rendered -` reads it from stdin so a caller needs no temporary file. On a
+selection mismatch only the image references are printed.
+
+SIGNATURES. This version has no verifier, so `check` refuses every
+`signature.status` other than "unsigned". A claimed signature is never treated
+as verified.
 
 THE OVERLAY IS GENERATED FROM THE RECORD, BYTE FOR BYTE. `check` regenerates it
 and compares, so a key added by hand (a port, a volume, an environment value)
@@ -54,10 +70,11 @@ EXIT CODES (every subcommand):
        stage, version); every `prepare` refusal
     2  usage error
     3  source checkout does not match the record (tag missing or at another
-       commit, or HEAD is another commit)
+       commit, or HEAD is another commit; --tag-only skips the HEAD check)
     4  the effective Compose selection does not select the release image
        (overlay not selected, or a later overlay overrides it)
-    5  a required tool cannot run (git, docker compose)
+    5  a required tool or download cannot run (git, docker compose, the
+       release download)
 """
 import argparse
 import hashlib
@@ -68,6 +85,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 
 RECORD = "compliance-claw-release.json"
 OVERLAY = "compose.release.yaml"
@@ -79,6 +98,10 @@ STAGES = ("candidate", "final")
 # refused rather than guessed at.
 SIGNATURE_STATUSES = ("unsigned",)
 SERVICES = ("openclaw", "cli")
+# fetch reads only published releases of this repository.
+RELEASE_REPOSITORY = "pretorin-ai/compliance-claw"
+RELEASE_DOWNLOAD = "https://github.com/%s/releases/download" % RELEASE_REPOSITORY
+FETCH_LIMIT = 64 * 1024 * 1024
 
 VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -216,6 +239,8 @@ def validate_record(record):
     names = []
     for i, asset in enumerate(assets):
         require_keys(asset, ("name", "role", "sha256", "size"), "assets[%d]" % i)
+        require(isinstance(asset["name"], str) and isinstance(asset["role"], str),
+                "assets[%d] name and role must be strings" % i)
         require(asset["name"] in expected and expected[asset["name"]] == asset["role"],
                 "assets[%d] is %r with role %r; expected one of %s"
                 % (i, asset["name"], asset["role"], expected))
@@ -228,9 +253,9 @@ def validate_record(record):
 
     signature = record["signature"]
     require_keys(signature, ("status", "record_signature_asset"), "signature")
-    require(signature["status"] in SIGNATURE_STATUSES,
-            "signature.status is %r, expected one of %s"
-            % (signature["status"], SIGNATURE_STATUSES))
+    require(isinstance(signature["status"], str) and signature["status"] in SIGNATURE_STATUSES,
+            "signature.status is %r: signature present but no verifier in this version"
+            % (signature["status"],))
     require(signature["record_signature_asset"] == RECORD_SIGNATURE,
             "signature.record_signature_asset is %r, expected %r"
             % (signature["record_signature_asset"], RECORD_SIGNATURE))
@@ -261,12 +286,18 @@ def verify_assets(directory, record, all_assets):
             require(asset["name"] != OVERLAY and not all_assets,
                     "release asset %s is missing from %s" % (asset["name"], directory))
             continue
-        data = read_bytes(path)
+        try:
+            data = read_bytes(path)
+        except OSError as exc:
+            raise ReleaseError(DATA, "cannot read release asset %s: %s" % (path, exc.strerror))
         require(len(data) == asset["size"] and sha256_bytes(data) == asset["sha256"],
                 "release asset %s does not match its recorded sha256/size" % asset["name"])
         if asset["role"] == "sbom":
             validate_sbom(data, asset["name"])
-    overlay = read_bytes(os.path.join(directory, OVERLAY))
+    try:
+        overlay = read_bytes(os.path.join(directory, OVERLAY))
+    except OSError as exc:
+        raise ReleaseError(DATA, "cannot read %s: %s" % (OVERLAY, exc.strerror))
     expected = render_overlay(record["version"], record["source"]["commit"],
                               record["image"]["reference"]).encode("utf-8")
     require(overlay == expected,
@@ -281,12 +312,14 @@ def git(source, *args):
     return p.stdout.strip() if p.returncode == 0 else ""
 
 
-def check_source(source, record):
+def check_source(source, record, tag_only=False):
     tag, commit = record["source"]["tag"], record["source"]["commit"]
     tagged = git(source, "rev-parse", "--verify", "--quiet", "refs/tags/%s^{commit}" % tag)
     require(tagged != "", "source %s has no tag %s" % (source, tag), SOURCE)
     require(tagged == commit, "tag %s in %s is commit %s; the release record names %s"
             % (tag, source, tagged, commit), SOURCE)
+    if tag_only:
+        return
     head = git(source, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
     require(head == commit, "%s is at commit %s; release %s is commit %s. Check out %s first."
             % (source, head or "<none>", record["version"], commit, tag), SOURCE)
@@ -313,16 +346,25 @@ def check_selection(model, record):
     reference = record["image"]["reference"]
     services = model.get("services") if isinstance(model, dict) else None
     require(isinstance(services, dict), "the rendered Compose model has no services", SELECTION)
+    effective = {}
     for name in SERVICES:
         service = services.get(name)
         require(isinstance(service, dict),
                 "the rendered Compose model has no %s service" % name, SELECTION)
-        got = service.get("image")
-        require(got == reference,
-                "Compose selects %r for %s; release %s is %r. Select %s directly after "
-                "compose.yaml in COMPOSE_FILE, and remove any later overlay that sets image."
-                % (got, name, record["version"], reference, OVERLAY), SELECTION)
-        platform = service.get("platform", PLATFORM)
+        image = service.get("image")
+        effective[name] = image if isinstance(image, str) else "<none>"
+    if any(effective[name] != reference for name in SERVICES):
+        # Only image references: the rest of the model can hold secret values.
+        raise ReleaseError(SELECTION,
+                           "Compose does not select release %s.\n"
+                           "  expected  %s\n  openclaw  %s\n  cli       %s\n"
+                           "Select %s directly after compose.yaml in COMPOSE_FILE. A later "
+                           "overlay that sets image (for example a restore overlay) overrides "
+                           "it; this check reports that and changes nothing."
+                           % (record["version"], reference, effective["openclaw"],
+                              effective["cli"], OVERLAY))
+    for name in SERVICES:
+        platform = services[name].get("platform", PLATFORM)
         require(platform == PLATFORM, "Compose selects platform %r for %s, expected %r"
                 % (platform, name, PLATFORM), SELECTION)
 
@@ -412,7 +454,7 @@ def finalize(directory):
 
 
 def check(directory, stage="final", version=None, all_assets=False, source=None,
-          model=None):
+          model=None, tag_only=False):
     record = load_record(directory)
     if stage != "any":
         require(record["stage"] == stage,
@@ -422,10 +464,46 @@ def check(directory, stage="final", version=None, all_assets=False, source=None,
                 "release record is version %s, expected %s" % (record["version"], version))
     verify_assets(directory, record, all_assets)
     if source is not None:
-        check_source(source, record)
+        check_source(source, record, tag_only)
     if model is not None:
         check_selection(model, record)
     return record
+
+
+def fetch(version, directory, base=RELEASE_DOWNLOAD):
+    """Download a published release set into an empty directory, then check it."""
+    require_match(VERSION_RE, version, "--version")
+    if os.path.exists(directory):
+        require(os.path.isdir(directory) and not os.listdir(directory),
+                "%s must be an empty directory or not exist" % directory)
+    else:
+        os.makedirs(directory)
+    for name in (RECORD, OVERLAY, sbom_name(version)):
+        url = "%s/v%s/%s" % (base, version, name)
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                data = response.read(FETCH_LIMIT + 1)
+        except urllib.error.HTTPError as exc:
+            raise ReleaseError(DATA if exc.code == 404 else TOOL,
+                               "cannot download %s (HTTP %d). Release v%s may not exist, may be "
+                               "a draft, or may predate release sets." % (url, exc.code, version))
+        except (urllib.error.URLError, OSError) as exc:
+            raise ReleaseError(TOOL, "cannot download %s: %s" % (url, getattr(exc, "reason", exc)))
+        require(len(data) <= FETCH_LIMIT, "%s is larger than %d bytes" % (url, FETCH_LIMIT))
+        write_atomic(os.path.join(directory, name), data)
+    return check(directory, stage="final", version=version, all_assets=True)
+
+
+def read_model(rendered):
+    try:
+        if rendered == "-":
+            return json.load(sys.stdin)
+        with open(rendered) as f:
+            return json.load(f)
+    except (OSError, ValueError) as exc:
+        # The exception text can quote the input; never echo it.
+        raise ReleaseError(USAGE, "cannot read the rendered Compose model from %s (%s)"
+                           % ("stdin" if rendered == "-" else rendered, type(exc).__name__))
 
 
 # --------------------------------------------------------------------------
@@ -579,7 +657,8 @@ def self_test():
             ("checksum", lambda r: r["assets"][1].update(sha256="0" * 64), "sbom-1.2.3"),
             ("extra-asset", lambda r: r["assets"].append(dict(r["assets"][1])), "exactly"),
             ("no-assets", lambda r: r.update(assets=[]), "exactly"),
-            ("signed", lambda r: r["signature"].update(status="signed"), "signature.status"),
+            ("signed", lambda r: r["signature"].update(status="signed"), "no verifier"),
+            ("name-type", lambda r: r["assets"][0].update(name=["x"]), "must be strings"),
             ("extra-field", lambda r: r.update(customer="acme"), "record fields"),
         ):
             d = variant("rec-" + name, edit_record(fn))
@@ -653,6 +732,41 @@ def self_test():
             g("checkout", "-q", first)
             refuses("check --source refuses HEAD at another commit", SOURCE,
                     lambda: check(srcset, stage="any", source=gitdir), "Check out v1.2.3")
+            ok(check(srcset, stage="any", source=gitdir, tag_only=True)["version"] == "1.2.3",
+               "check --source --tag-only accepts the tag without moving HEAD")
+            g("tag", "-d", "v1.2.3")
+            refuses("check --source --tag-only still refuses a missing tag", SOURCE,
+                    lambda: check(srcset, stage="any", source=gitdir, tag_only=True), "no tag")
+
+        # fetch: a published set from a release download location (file:// here).
+        published = os.path.join(tmp, "published", "v1.2.3")
+        shutil.copytree(good, published)
+        base = "file://" + os.path.join(tmp, "published")
+        fetched = os.path.join(tmp, "fetched")
+        ok(fetch("1.2.3", fetched, base)["stage"] == "final", "fetch downloads and checks a final set")
+        ok(sorted(os.listdir(fetched)) == sorted([RECORD, OVERLAY, "sbom-1.2.3.spdx.json"]),
+           "fetch writes exactly the three assets")
+        refuses("fetch refuses a nonempty directory", DATA,
+                lambda: fetch("1.2.3", fetched, base), "empty directory")
+        # A missing file:// asset is a download failure (exit 5); over HTTPS a 404
+        # is exit 1 (no such published set).
+        refuses("fetch refuses a release without a set", TOOL,
+                lambda: fetch("1.2.4", os.path.join(tmp, "f2"), base), "cannot download")
+        cand = os.path.join(tmp, "candpub", "v1.2.3")
+        shutil.copytree(os.path.join(tmp, "srcset") if os.path.isdir(os.path.join(tmp, "srcset"))
+                        else good, cand)
+        if load_record(cand)["stage"] == "candidate":
+            refuses("fetch refuses a candidate set", DATA,
+                    lambda: fetch("1.2.3", os.path.join(tmp, "f3"), "file://" + os.path.dirname(cand)),
+                    "is a candidate")
+        tampered = os.path.join(tmp, "tampub", "v1.2.3")
+        shutil.copytree(good, tampered)
+        append(OVERLAY, "    ports: []\n")(tampered)
+        refuses("fetch refuses a tampered overlay", DATA,
+                lambda: fetch("1.2.3", os.path.join(tmp, "f4"), "file://" + os.path.dirname(tampered)),
+                "does not match")
+        refuses("fetch refuses a malformed version", DATA,
+                lambda: fetch("v1.2.3", os.path.join(tmp, "f5"), base), "--version")
 
         # Exit codes through the command line.
         me = os.path.abspath(__file__)
@@ -668,6 +782,21 @@ def self_test():
             json.dump(model(openclaw="compliance-claw:local"), f)
         ok(cli("check", "--dir", good, "--rendered", rendered).returncode == SELECTION,
            "check --rendered exits 4 on an override")
+        secret_model = model(openclaw="compliance-claw:local")
+        secret_model["services"]["openclaw"]["environment"] = {"X": "CANARY-MODEL-SECRET"}
+        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-"),
+                           input=json.dumps(secret_model), capture_output=True, text=True)
+        ok(p.returncode == SELECTION and "CANARY-MODEL-SECRET" not in p.stdout + p.stderr
+           and "compliance-claw:local" in p.stderr and ref in p.stderr,
+           "check --rendered - reads stdin and prints only image references on exit 4")
+        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-"),
+                           input=json.dumps(model()), capture_output=True, text=True)
+        ok(p.returncode == 0, "check --rendered - accepts a matching model from stdin")
+        p = subprocess.run((sys.executable, me, "check", "--dir", good, "--rendered", "-"),
+                           input='{"secret": "CANARY-MODEL-SECRET"', capture_output=True, text=True)
+        ok(p.returncode == USAGE and "CANARY-MODEL-SECRET" not in p.stderr,
+           "an unreadable model exits 2 without echoing it")
+        ok(cli("check", "--dir", good, "--tag-only").returncode == USAGE, "--tag-only without --source exits 2")
         ok(cli("check", "--dir", os.path.join(tmp, "nowhere")).returncode == DATA,
            "check exits 1 on a missing set")
         ok(cli("check", "--stage", "released").returncode == USAGE, "a bad option exits 2")
@@ -703,10 +832,17 @@ def main(argv):
     chk.add_argument("--version")
     chk.add_argument("--all-assets", action="store_true")
     chk.add_argument("--source")
+    chk.add_argument("--tag-only", action="store_true",
+                     help="with --source: check only that the tag names the record commit")
     how = chk.add_mutually_exclusive_group()
     how.add_argument("--compose", action="store_true")
     how.add_argument("--rendered")
     chk.add_argument("--json", action="store_true")
+
+    fet = sub.add_parser("fetch", help="consumer: download and check a published release set")
+    fet.add_argument("--version", required=True)
+    fet.add_argument("--dir", required=True)
+    fet.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
     if args.self_test:
@@ -725,18 +861,23 @@ def main(argv):
             record, changed = finalize(args.dir)
             print("release-assets: %s %s is final"
                   % ("marked" if changed else "already", record["version"]), file=sys.stderr)
+        elif args.mode == "fetch":
+            record = fetch(args.version, args.dir)
+            if args.json:
+                print(json.dumps(summary(record), sort_keys=True))
+            print("release-assets: fetched and checked final %s %s into %s (%s)"
+                  % (record["version"], record["image"]["reference"], args.dir,
+                     record["signature"]["status"]), file=sys.stderr)
         else:
+            if args.tag_only and not args.source:
+                raise ReleaseError(USAGE, "--tag-only needs --source")
             model = None
             if args.rendered:
-                try:
-                    with open(args.rendered) as f:
-                        model = json.load(f)
-                except (OSError, ValueError) as exc:
-                    raise ReleaseError(USAGE, "cannot read --rendered %s: %s" % (args.rendered, exc))
+                model = read_model(args.rendered)
             elif args.compose:
                 model = render_compose()
             record = check(args.dir, args.stage, args.version, args.all_assets,
-                           args.source, model)
+                           args.source, model, args.tag_only)
             if args.json:
                 print(json.dumps(summary(record), sort_keys=True))
             print("release-assets: %s %s %s is valid%s (%s)"

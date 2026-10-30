@@ -443,7 +443,7 @@ before using it.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `pull access denied` / `unauthorized` | The package is not public | `docker login ghcr.io`; a classic token needs `read:packages` |
-| `deployment is behind the repo pin` | Repo was pulled, deployment never restarted | `scripts/update.sh` |
+| `deployment is not running the selected image` | Selection changed or repo pulled, deployment never restarted | `scripts/update.sh` |
 | Gateway authentication fails at startup | Missing credential or invalid native auth configuration | Check the selected native authentication mode and its secret references. See [secret delivery](docs/file-secrets.md#native-proxy-authentication-and-local-maintenance). |
 | Gateway exits 78 `Missing config` | Config missing or unreadable | Check logs, selected mounts, and file permissions. Preserve state and use [recovery guidance](docs/upgrade.md); do not delete volumes. |
 | Slack never connects | Missing credentials, channel setup, or existing config without Slack | Inspect the Slack warning and current configuration; see [Slack](#slack) and [recovery](docs/upgrade.md). |

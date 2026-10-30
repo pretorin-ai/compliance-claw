@@ -835,9 +835,12 @@ assert not d[\"cli\"].get(\"restart\"), \"cli has a restart policy\"
 # no-credential section stays offline.
 PINNED_DIGEST="$(printf '%s' "${SELECTED_IMAGE:-}" | grep -oE '@sha256:[0-9a-f]+' | head -1 | cut -c2-)"
 RUNNING_CID="$(docker compose ps -q openclaw 2>/dev/null | head -1)"
-if [ -z "$PINNED_DIGEST" ]; then
+if [ -z "${SELECTED_IMAGE:-}" ]; then
   skip "the running image matches the selected digest" \
-       "the selected image ${SELECTED_IMAGE:-<unresolved>} names no digest (build overlay, or a tag-only reference)"
+       "the Compose selection did not render; check: docker compose config"
+elif [ -z "$PINNED_DIGEST" ]; then
+  skip "the running image matches the selected digest" \
+       "the selected image ${SELECTED_IMAGE} names no digest (build overlay, or a tag-only reference)"
 elif [ -z "$RUNNING_CID" ]; then
   skip "the running image matches the selected digest" \
        "no gateway container in this project; nothing to compare"

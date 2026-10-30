@@ -397,7 +397,7 @@ Ordered roughly by how much it matters, not by effort.
    or tagging:
 
    ```sh
-   gh workflow run release.yml -f dry_run=true
+   gh workflow run release.yml -f operation=dry-run
    ```
 
    Kept in the ledger as history, because the reasoning still applies to any new

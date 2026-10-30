@@ -11,6 +11,10 @@ run workflows, and the existing [release workflow](../.github/workflows/release.
 Review its current checks and [.trivyignore.yaml](../.trivyignore.yaml) before
 publication.
 
+`gh release create` is no longer the trigger. The workflow creates the release
+as a draft after its checks, and publishes it only from that draft. Do not
+create or publish the release by hand.
+
 The release tag supplies the image version. Do not bump `IMAGE_VERSION` before
 the release or invent an image digest. That pin describes what the checkout
 deploys, not the next version to publish.
@@ -28,12 +32,14 @@ commit, the version, the immutable image digest, and the deployment files.
 
 [`scripts/release-assets.py`](../scripts/release-assets.py) is the only
 program that writes or reads this set. Its header gives the fields, commands,
-and exit codes. Guided setup and the updater must call its `check` command; they
-must not parse the record themselves.
+and exit codes. Guided setup and the updater must use its `fetch` and `check`
+commands; they must not parse the record themselves. They are not connected to
+it in this version.
 
 The record says `signature.status: unsigned`. The name
 `compliance-claw-release.json.sig` is reserved for a later record signature.
-Nothing signs the record or the image yet.
+Nothing signs the record or the image yet, and `check` refuses any other status
+because this version has no signature verifier.
 
 ## Steps
 
@@ -68,11 +74,13 @@ Replace `X.Y.Z` with the intended release version.
 
    Prepare refuses when the tag is not at the built commit, when release `vX.Y.Z`
    is already published, or when the image tag `X.Y.Z` already exists. If a
-   gate fails, no draft is created. A second prepare run for the same version
-   replaces the candidate set on the draft.
+   gate fails before the draft job, the existing draft (if any) does not change.
+   A second prepare run for the same version replaces the candidate set on the
+   draft. The job summary shows the candidate digest.
 
-3. Qualify the exact candidate. Use the digest and the assets on the draft. Do
-   not rebuild. To check the draft set locally from a checkout of the tag:
+3. Qualify the exact candidate. Record its digest from the prepare job summary.
+   Use the digest and the assets on the draft. Do not rebuild. To check the draft
+   set locally from a checkout of the tag:
 
    ```sh
    gh release download vX.Y.Z --dir /tmp/cc-vX.Y.Z
@@ -83,11 +91,13 @@ Replace `X.Y.Z` with the intended release version.
 4. Publish the qualified candidate:
 
    ```sh
-   gh workflow run release.yml --ref vX.Y.Z -f operation=publish
+   gh workflow run release.yml --ref vX.Y.Z -f operation=publish -f digest=sha256:<qualified digest>
    ```
 
-   Publish does not build. It downloads the draft set, checks it against the tag
-   and `versions.env`, and changes the record `stage` to `final`. It confirms
+   Publish does not build. It refuses when the `digest` input is missing or when
+   the draft record names another digest, so a later prepare cannot cause
+   publication of bytes nobody qualified. It downloads the draft set, checks it
+   against the tag and `versions.env`, and changes the record `stage` to `final`. It confirms
    that `candidate-X.Y.Z` still names the recorded digest, and then applies the
    version tag `X.Y.Z` to that digest. It uploads only the final record (the
    overlay and SBOM bytes do not change), compares every published asset with the
@@ -109,9 +119,19 @@ model, or Slack credentials.
 
 ## Retries and failures
 
-- A publish run is safe to repeat. The record finalization is idempotent, the
-  version tag is applied only when it is absent or already names the recorded
-  digest, and assets are uploaded only while the release is a draft.
+- A publish run is safe to repeat with the same `digest`. The record
+  finalization is idempotent, the version tag is applied only when it is absent
+  or already names the recorded digest, and assets are uploaded only while the
+  release is a draft.
+- If `final-release` fails after the version tag was applied, re-run the failed
+  jobs of that same run (`gh run rerun <run-id> --failed`). That run keeps the
+  checked set as an artifact. The record upload replaces the asset, so a failure
+  between the delete and the upload can leave the draft without a record; a new
+  publish run then stops at "cannot read the release record", and prepare refuses
+  because the version tag exists.
+- If prepare fails after it moved `candidate-X.Y.Z` but before the draft job, the
+  draft and the candidate tag name different digests. Publish then refuses. Run
+  prepare again until it succeeds, and qualify the new digest.
 - A version tag never moves. A published release is never prepared again and its
   assets are never replaced. To correct a published release, publish a new
   version.

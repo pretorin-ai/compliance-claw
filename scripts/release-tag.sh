@@ -54,7 +54,8 @@ CODE="$(curl -sSL -I -o "$WORK/head" -w '%{http_code}' \
   "https://ghcr.io/v2/${REPO_PATH}/manifests/${TAG}")"
 case "$CODE" in
   200)
-    CURRENT="$(awk -F': *' 'tolower($1)=="docker-content-digest"{gsub("\r","",$2); print $2}' "$WORK/head")"
+    # The last header block is the final response when a redirect was followed.
+    CURRENT="$(awk 'tolower($0) ~ /^docker-content-digest:/{sub(/^[^:]*:[ \t]*/, ""); gsub(/\r/, ""); d=$0} END{print d}' "$WORK/head")"
     if [ "$CURRENT" = "$DIGEST" ]; then
       echo "tag ${IMAGE_REPO}:${TAG} already names ${DIGEST}; nothing to do"
       exit 0
