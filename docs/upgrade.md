@@ -242,7 +242,8 @@ names the person who must keep it:
 Prepare the shell first, and again in each new shell. This block resolves the
 saved [Compose selection](../README.md#save-deployment-settings). It defines the
 state list, the selection check, the path of each saved host file, the rule for
-files that Git tracks at a commit, and two copy functions:
+files that Git tracks at a commit, a reader for the set record, and two copy
+functions:
 
 ```sh
 umask 077
@@ -275,6 +276,7 @@ saved_input() {
 tracked_at() {
   test -n "$(git ls-tree --name-only "$1" -- "$2" 2>/dev/null)"
 }
+record() { sed -n "s/^$1=//p" "$BACKUP_DIR/recovery-set.env"; }
 state_sh() {
   docker run --rm -i --network none --platform linux/amd64 --user 0:0 \
     --entrypoint sh --mount "type=volume,src=$1,dst=/state${3:+,$3}" \
@@ -309,6 +311,12 @@ repository, the target directory or a shared directory.
    OPENCLAW_VOLUME="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.openclaw"}}{{.Name}}{{end}}{{end}}' "$GATEWAY")" &&
    PRETORIN_VOLUME="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/home/node/.pretorin"}}{{.Name}}{{end}}{{end}}' "$GATEWAY")" &&
    test "$(docker image inspect --format '{{.Id}}' "$IMAGE_REF")" = "$IMAGE_ID" &&
+   SOURCE_REVISION="$(git rev-parse HEAD)" &&
+   (set -f; IFS="${COMPOSE_PATH_SEPARATOR:-:}"; for f in ${COMPOSE_FILE:-compose.yaml}; do
+     ! tracked_at "$SOURCE_REVISION" "$f" || { git diff --quiet "$SOURCE_REVISION" -- "$f" &&
+       git diff --cached --quiet "$SOURCE_REVISION" -- "$f"; } ||
+       { printf 'STOP: %s is tracked by Git and differs from commit %s\n' "$f" "$SOURCE_REVISION"; exit 1; }
+   done) &&
    mkdir -p "$BACKUP_ROOT" && mkdir "$BACKUP_DIR" "$BACKUP_DIR/host-inputs" &&
    docker compose --profile '*' config --format json |
      python3 -c "$SELECTION_CHECK" "$IMAGE_REF" "$OPENCLAW_VOLUME" "$PRETORIN_VOLUME" \
@@ -321,6 +329,13 @@ repository, the target directory or a shared directory.
    the tag changed. Give the recorded image ID a new private tag, select that tag,
    and start again. Read `host-inputs.txt`. It names each declaration, secret
    file and customer bind mount of this deployment.
+
+   A `STOP:` message that names a Compose file means that a selected Compose
+   file that Git tracks has staged or unsaved changes. The backup does not copy
+   tracked Compose files, and the recorded commit cannot recreate the changed
+   bytes. Do not discard the changes. Move your settings into a private overlay
+   outside Git, or save the changed file separately and return it to its
+   committed version. Then run this block again.
 
 2. Stop all writers. The gateway runs the Pretorin MCP servers, so this stops
    them too. The checks stop on any running container that uses either volume,
@@ -350,7 +365,7 @@ repository, the target directory or a shared directory.
    private record and the checksums:
 
    ```sh
-   SOURCE_REVISION="$(git rev-parse HEAD)" &&
+   test "$(git rev-parse HEAD)" = "$SOURCE_REVISION" &&
    state_sh "$OPENCLAW_VOLUME" "$STATE_LIST" readonly > "$BACKUP_DIR/openclaw-state.list" &&
    state_sh "$OPENCLAW_VOLUME" 'tar --numeric-owner -cpf - .' readonly > "$BACKUP_DIR/openclaw-state.tar" &&
    state_sh "$PRETORIN_VOLUME" "$STATE_LIST" readonly > "$BACKUP_DIR/pretorin-state.list" &&
@@ -394,6 +409,15 @@ repository, the target directory or a shared directory.
    ```sh
    grep -qx "SET_ID=$SET_ID" "$BACKUP_DIR/recovery-set.env" &&
    grep -Eq '^SOURCE_REVISION=[0-9a-f]{40}$' "$BACKUP_DIR/recovery-set.env" &&
+   SOURCE_REVISION="$(record SOURCE_REVISION)" && test -s "$BACKUP_DIR/host-inputs.txt" &&
+   SEPARATOR="$(record COMPOSE_PATH_SEPARATOR)" && SAVED_FILES="$(record COMPOSE_FILE)" &&
+   { awk -F '\t' '$1 == "file" { print $2 }' "$BACKUP_DIR/host-inputs.txt" &&
+     (set -f; IFS="${SEPARATOR:-:}"; for f in ${SAVED_FILES:-compose.yaml}; do
+       tracked_at "$SOURCE_REVISION" "$f" || printf '%s\n' "$f"; done); } |
+     while IFS= read -r f; do s="$(saved_input "$f")" && test -f "$s" &&
+       N="${s#"$BACKUP_DIR"/}" awk 'substr($0, 67) == ENVIRON["N"] { found = 1 } END { exit !found }' "$BACKUP_DIR/SHA256SUMS" ||
+       { printf 'STOP: the set has no saved copy or no checksum for %s\n' "$f"; exit 1; }
+     done &&
    backup_sh "test -s host-inputs.txt &&
      grep -qx '[0-9a-f]\{64\}  host-inputs.txt' SHA256SUMS &&
      sha256sum --strict -c SHA256SUMS &&
@@ -409,7 +433,10 @@ repository, the target directory or a shared directory.
 
    This stops on a missing or changed file, an empty or unchecked
    `host-inputs.txt`, a missing or changed saved host file, a record from a
-   different set, and an archive of the wrong volume. Write down the `SET_ID` and `BACKUP_DIR`
+   different set, and an archive of the wrong volume. It also stops when a host
+   file that the backup copies has no saved copy or no line in `SHA256SUMS`, for
+   example after an interrupted transfer. The checksums find damage; they do not
+   prove who wrote the set. Write down the `SET_ID` and `BACKUP_DIR`
    values outside the shell. A complete and readable set does not prove that an
    image is compatible with it. Only the recorded image is a compatible image.
 
@@ -482,7 +509,6 @@ that state.
    ```
 
    ```sh
-   record() { sed -n "s/^$1=//p" "$BACKUP_DIR/recovery-set.env"; } &&
    PROJECT="$(record PROJECT)" && IMAGE_REF="$(record IMAGE_REF)" && IMAGE_ID="$(record IMAGE_ID)" &&
    OPENCLAW_VOLUME="$(record OPENCLAW_VOLUME)" && PRETORIN_VOLUME="$(record PRETORIN_VOLUME)" &&
    test -n "$PROJECT" && test -n "$IMAGE_REF" && test -n "$IMAGE_ID" &&
@@ -637,8 +663,13 @@ that state.
    or a private overlay stops the step. Each saved copy is under `host-inputs/`
    at the full host path of its original; `saved_input FILE` prints that path.
    Copy the saved file back, or keep the current one only after you check that
-   the restored state supports it. The comparison skips the restore overlay,
-   because step 1 wrote it again for this restore.
+   the restored state supports it. If the switch removed a file that was
+   private at the backup, for example an overlay that the candidate revision
+   added to Git, the block stops with `no such file or directory` for that
+   path. Copy its verified saved copy back with
+   `cp -p -- "$(saved_input FILE)" FILE` and run this block again. The
+   comparison skips the restore overlay, because step 1 wrote it again for this
+   restore.
    This output can contain private configuration; keep it local.
 
 4. Reconcile credentials and access before the gateway starts. The gateway
