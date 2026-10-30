@@ -81,7 +81,7 @@ Keep the failed state and its messages. Do not delete a volume to retry.
 | Model turn | Test connection, then the gateway log | [Providers and models](#providers-and-models); [internal AI endpoint](#internal-ai-endpoint-with-a-private-ca) |
 | Pretorin access | `scripts/clawctl validate` probe rows | [Key permissions](../README.md#read-only-vs-write-enabled-keys) |
 | Slack | Gateway Slack log lines | [Optional Slack](#optional-slack) |
-| Update | The message and exit code of `scripts/update.sh` | [Routine deployment update](upgrade.md#routine-deployment-update) |
+| Update | The message and exit code of `scripts/update.sh` | [Routine deployment update](upgrade.md#routine-deployment-update). The first update to an image with per-effort Plan and preflight roots also needs the manual [record transfer](upgrade.md#transfer-existing-effort-records) before start. |
 
 If the next action does not correct the fault, collect
 [support diagnostics](#support-diagnostics).
@@ -338,7 +338,7 @@ in the volumes it archives.
 | Container output log | Docker log driver on the host | VM operator | `docker compose logs openclaw`. Removed with the container. Docker daemon settings set its rotation. |
 | Target clones | `workspace/targets` on the host | VM operator | Remove the target from `efforts.yaml`, apply, then delete the clone directory. Volume deletion does not remove it. |
 | Host deployment files and private overlays | Checkout, secret directory, private paths | VM operator | Delete the files. Revoke credentials at their issuers first. |
-| Backups, restore tests and rendered `docker compose config` output | Operator-chosen private location | VM operator | Delete them under customer policy. A restore brings back every copy that they hold. |
+| Backups, restore tests and rendered `docker compose config` output | Operator-chosen private location | VM operator | Keep and delete them under customer policy; see [state backup](upgrade.md#openclaw-image-upgrade-and-state-backup). A restore brings back every copy that they hold. A restore does not undo Pretorin platform writes or copies at providers and other remote services. |
 | Prompts, repository content in tool results, and model responses | AI provider or internal endpoint | Customer and the provider | Provider retention terms apply. This repository cannot inspect or delete provider copies. |
 | Evidence, narratives, uploads and other records written with a write-enabled key | Pretorin platform | Customer and Pretorin | Use Pretorin platform controls or Pretorin support. Key revocation does not delete them. |
 | Slack messages and files | Slack workspace | Customer Slack administrator | Slack retention settings apply. |

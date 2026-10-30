@@ -228,4 +228,6 @@ for file in "$TMP"/*.json "$TMP"/*.err "$TMP"/*.out "$TMP"/*.mock "$TMP"/*.gatew
 done
 
 [ "$FAILED" = 0 ] || exit 1
+log "approved-CA request shape seen by the mock endpoint (no content):"
+grep -E '"outcome":"(tool_call|final_after_tool_result)"' "$TMP/approved.mock" | sed 's/^/  /'
 log "PASS — approved CA tool round trip; untrusted CA rejected; overlay selection intact"

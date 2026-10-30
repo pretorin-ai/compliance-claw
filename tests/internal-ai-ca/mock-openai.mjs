@@ -126,6 +126,8 @@ const server = https.createServer(
           outcome: "final_after_tool_result",
           stream: Boolean(body.stream),
           toolResultBytes: content.length,
+          requestKeys: Object.keys(body).sort(),
+          messageRoles: messages.map((m) => m?.role),
           // An error result means the tool call did not run correctly.
           toolResultError: /"isError"\s*:\s*true|"status"\s*:\s*"error"|^\s*error\b/i.test(content),
         });
@@ -144,6 +146,10 @@ const server = https.createServer(
         tool: name,
         toolsOffered: tools.length,
         stream: Boolean(body.stream),
+        // Request shape only: field names, tool names and roles, no content.
+        requestKeys: Object.keys(body).sort(),
+        toolNames: tools.map((tool) => tool?.function?.name).filter(Boolean),
+        messageRoles: messages.map((m) => m?.role),
       });
       const call = {
         id: CALL_ID,
