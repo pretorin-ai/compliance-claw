@@ -34,7 +34,7 @@ Do not describe an intended UI flow as an available feature without evidence.
 | `scripts/sync-targets.sh`, `plugins/target-sync/` | Fast-forward declared targets through host, command, and model-tool routes. |
 | `scripts/pretorin-update*.sh`, `plugins/pretorin-update/` | Install and activate the shared CLI; report installation and activation accurately. |
 | `scripts/*test*`, `scripts/smoke.sh`, `scripts/lint-heredocs.py` | Existing validation. See the contribution guide for selection and prerequisites. |
-| `.github/workflows/build.yml`, `.github/workflows/release.yml` | Candidate checks and release publication. |
+| `.github/workflows/build.yml`, `.github/workflows/release.yml`, `scripts/release-assets.py`, `scripts/release-tag.sh` | Candidate checks, release-set preparation, and release publication. |
 
 The image contains a verified CLI seed. The active CLI lives in `pretorin-state`
 and survives image replacement. `openclaw-state` holds config, sessions, agent

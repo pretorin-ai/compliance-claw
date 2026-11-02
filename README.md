@@ -222,9 +222,13 @@ supply. Those need a Connected Source on the platform side, which is future work
 ## Verifying what you pulled
 
 Pull by digest, not by tag; the pair this checkout deploys is in
-[compose.yaml](compose.yaml). The image is **unsigned**: the digest pin, the
-per-release SBOM, the release-time scan and recorded provenance are its integrity
-controls. Commands and what they do and do not prove:
+[compose.yaml](compose.yaml). A release can also carry a release set: a record,
+a `compose.release.yaml` overlay that selects its digest, and the SBOM. It is
+unsigned today, so `scripts/release-assets.py check` and the customer install
+and update tools refuse it until signing and verification exist. The image and
+the record are **unsigned**: the digest pin, the asset checksums, the per-release SBOM, the
+release-time scan and recorded provenance are its integrity controls. Commands
+and what they do and do not prove:
 [Verifying the image you pulled](docs/image-verification.md).
 
 ## Repositories and targets
@@ -440,7 +444,7 @@ before using it.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `pull access denied` / `unauthorized` | The package is not public | `docker login ghcr.io`; a classic token needs `read:packages` |
-| `deployment is behind the repo pin` | Repo was pulled, deployment never restarted | `scripts/update.sh` |
+| `deployment is not running the selected image` | Selection changed or repo pulled, deployment never restarted | `scripts/update.sh` |
 | Gateway authentication fails at startup | Missing credential or invalid native auth configuration | Check the selected native authentication mode and its secret references. See [secret delivery](docs/file-secrets.md#native-proxy-authentication-and-local-maintenance). |
 | Gateway exits 78 `Missing config` | Config missing or unreadable | Check logs, selected mounts, and file permissions. Preserve state and use [recovery guidance](docs/upgrade.md); do not delete volumes. |
 | Slack never connects | Missing credentials, channel setup, or existing config without Slack | Inspect the Slack warning and current configuration; see [Slack](#slack) and [recovery](docs/upgrade.md). |
@@ -482,8 +486,10 @@ scripts/onboard-targets.sh --verify-only # LEGACY single-effort deployments only
 
 ## Releasing
 
-Maintainers use [How to publish a release](docs/releasing.md). Publishing is
-separate from updating a customer deployment or its active Pretorin CLI.
+Maintainers use [How to publish a release](docs/releasing.md): tag, prepare a
+draft candidate, then publish the same bytes without a rebuild. Publishing is
+separate from updating a customer deployment or its active Pretorin CLI. To learn
+about new releases, use GitHub **Watch → Custom → Releases**.
 
 ## Notes
 

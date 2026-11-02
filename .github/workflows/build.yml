@@ -92,6 +92,14 @@ jobs:
       - name: Saved deployment selection (real Compose, no daemon)
         run: python3 scripts/test-update-compose.py --selection-only
 
+      # Release-set rules and real Compose renders of the release overlay with
+      # inert fixtures, including the v0.5.2 old-tag regression. No daemon, pull
+      # or credential.
+      - name: Release set rules and Compose selection (real Compose, no daemon)
+        run: |
+          python3 scripts/release-assets.py --self-test
+          python3 scripts/test-release-render.py
+
       # efforts.yaml IS THE RUNTIME AUTHORITY AND IS GITIGNORED, so CI has none —
       # it names YOUR systems. It is produced here the same way an operator
       # produces one, from the committed targets.yaml, which keeps CI on the
