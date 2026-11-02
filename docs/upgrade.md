@@ -23,21 +23,11 @@ Preview fetches the tag (Git objects and `FETCH_HEAD` only). Then
 `scripts/release-assets.py` downloads the final
 [release set](image-verification.md#checking-a-release-set) to a temporary
 directory and checks the record and asset checksums. The updater compares the
-record with the tag commit. Preview then renders the release with your saved
-Compose files, in order. It shows:
-
-- the source commit, version, and image changes, what was checked, and the
-  signature status;
-- the checkout change: a branch checkout moves to a detached release tag. That
-  is a deliberate change to release mode; the branch route then refuses;
-- the current and the new `COMPOSE_FILE` value, project, and both state volumes;
-- the secret files that apply creates empty;
-- the required steps: a backup before an OpenClaw version change, npm access
-  for a managed Slack package change, and the
-  [effort-record transfer](#transfer-existing-effort-records) when it applies;
-- the recovery set: the current checkout, images, running image, Compose
-  selection, project, and state volumes;
-- the blockers.
+record with the tag commit. Preview renders your ordered Compose selection and
+reports source/image changes, signature status, project, state volumes, secret
+creation, required maintenance (including npm access after a Slack package
+change), recovery inputs and blockers. Release apply
+changes a branch checkout to a detached tag; the branch route then refuses.
 
 Exit 0 means that apply with the same options would continue. Exit 2 means
 that apply would stop on a blocker. A verification, download, or access failure
@@ -47,33 +37,25 @@ exits 1. Then apply the same release:
 scripts/update.sh --release vX.Y.Z
 ```
 
-Apply does all the checks again; it does not use preview results. Each of these
-conditions stops apply before it changes a file or stops the gateway:
+Apply repeats the checks. It stops before file changes or gateway downtime for:
 
-- the release has no valid final release set (a candidate on a draft release,
-  or a release before release sets), or its record, asset checksums, or source
-  commit does not verify;
-- the release set is unsigned or its signature is not verified. **Today every
-  release set is unsigned, so apply refuses every release** until publisher
-  signing and its verifier exist. Preview still shows the release, marked
-  `UNVERIFIED`. There is no option that bypasses this. See
+- a missing, candidate or invalid release set, or a record, asset checksum or
+  source commit that fails verification;
+- an unsigned or unverified signature. **Today every release set is unsigned,
+  so apply refuses every release** until signing and its verifier exist.
+  Preview marks it `UNVERIFIED`; there is no bypass. See
   [what the checks prove](image-verification.md#what-this-does-and-does-not-prove);
-- tracked files have local changes, or the release adds or renames a file to a
-  path where a local file (also an ignored file) already exists, or at a path
-  under a local file;
-- the checkout has commits that the release does not have, or the release is
-  older than the current release (no downgrade over migrated state). A checkout
-  that follows `master` past a release tag can only move to a later release;
-- a later overlay changes the release image (a custom selection), or the release
-  changes the project or the source of a current volume mount, for example a
-  restored volume. A release can add a volume mount.
+- local tracked changes or an added/renamed file that conflicts with a local
+  file, including an ignored file or one above the destination path;
+- commits absent from the release, or a downgrade over migrated state. A
+  checkout past a release tag can only move to a later release;
+- a later image override, a changed project or a changed source for a current
+  volume mount. A release can add a mount.
   For a [restore overlay](#select-and-save-the-restored-volumes), take a new
   backup, then remove only its two image lines and keep its volume lines;
-- a secret file that a customer overlay names does not exist. Apply creates only
-  the release's built-in secret files, also in the secret directory;
-- the effort-record transfer is necessary and not confirmed;
-- the saved `COMPOSE_FILE` does not select the release overlay, and the change
-  is not confirmed with `--save-selection` (see below).
+- a missing customer secret file. Apply creates only built-in secret files;
+- a required effort-record transfer that is not confirmed;
+- a required `COMPOSE_FILE` change without `--save-selection` (see below).
 
 After these checks, apply pulls the release image. Then it records the tag,
 checks out the tag (detached `HEAD`), and installs the release set
