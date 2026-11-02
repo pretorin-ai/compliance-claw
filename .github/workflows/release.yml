@@ -1,65 +1,35 @@
 # Prepare and publish a Compliance Claw release set: a scanned, SBOM-bearing
-# linux/amd64 image by immutable digest, plus the deployment assets that select it.
+# linux/amd64 image by immutable digest, plus the deployment assets that select it
+# (scripts/release-assets.py). Procedure, commands and retries: docs/releasing.md.
 #
-# THREE OPERATIONS, ALL MANUAL (workflow_dispatch). Maintainer procedure:
-# docs/releasing.md.
-#
-#   git tag -a vX.Y.Z -m vX.Y.Z <reviewed master commit> && git push origin vX.Y.Z
-#   gh workflow run release.yml --ref vX.Y.Z -f operation=prepare
-#   ... check the exact candidate; record its digest from the job summary ...
-#   gh workflow run release.yml --ref vX.Y.Z -f operation=publish -f digest=sha256:<prepared candidate>
-#
-# `gh release create` is NOT the trigger any more: a release is published by
-# this workflow, after its checks, never before them.
-#
-#   dry-run  (default, any ref) build, smoke, contracts, scan, SBOM and the
-#            release-set self-test. No login, no push, no release write.
-#   prepare  (tag ref only) everything in dry-run, then push BY DIGEST, verify the
-#            round trip, tag `candidate-X.Y.Z` on the verified manifest, generate
-#            the release set (scripts/release-assets.py prepare) and attach it to
-#            a DRAFT GitHub release. Drafts are not visible to customers and send
-#            no release notification. The stable version tag is NOT applied.
-#   publish  (tag ref only) NO BUILD. Requires `digest`, the prepared
-#            candidate digest; refuses when the draft record or candidate-X.Y.Z
-#            names other bytes, so a later re-prepare cannot publish bytes the
-#            maintainer did not select. Checks the draft's assets against the
-#            tag, marks the record final, applies the version tag to the SAME
-#            digest, uploads the final record and un-drafts the release. The
-#            release stays unsigned; customer trust and qualification acceptance
-#            is pending, and customer install and update refuse it.
-#
-# THE RELEASE SET (scripts/release-assets.py; interface in docs/releasing.md):
-#   compliance-claw-release.json   source commit, version, image digest, asset
-#                                  checksums, stage candidate|final, signature status
-#   compose.release.yaml           selects the digest for `openclaw` and `cli`
-#   sbom-X.Y.Z.spdx.json           SPDX SBOM of the image
+# workflow_dispatch only; `gh release create` is NOT the trigger.
+#   dry-run  (default, any ref) build, smoke, contracts, scan, SBOM, self-test.
+#            No login, push, tag or release write.
+#   prepare  (tag ref) push by digest, candidate-X.Y.Z, DRAFT release with the set.
+#   publish  (tag ref, NO BUILD) the prepared candidate `digest` only: final
+#            record, version tag on the SAME digest, un-draft. The release stays
+#            unsigned; customer trust and qualification acceptance is pending,
+#            and customer install and update refuse it.
 #
 # WHAT CANNOT HAPPEN. A failed build, smoke, contract test, blocking scan, SBOM
-# check, round trip or asset check stops `prepare` before the draft exists, so
-# `publish` has nothing to finalize. `publish` refuses an asset set that does not
-# match its tag, and a version tag never moves: a retry cannot replace a
-# completed version with different bytes. `prepare` refuses a version whose
-# release or version tag is already published.
+# check, round trip or asset check stops `prepare` before the draft exists.
+# `publish` refuses a set or candidate tag that names other bytes. A version tag
+# never moves, and a version whose release or version tag is published is never
+# prepared again.
 #
-# THE TAG IS THE SOURCE OF TRUTH FOR THE VERSION. NO VERSION-BUMP PR IS REQUIRED
-# BEFOREHAND. `IMAGE_VERSION` in versions.env means "the version this checkout
-# deploys"; it moves together with compose.yaml's digest pin in ONE post-release
-# PR, because the digest cannot be known until the image has been built. The
-# release overlay is what lets the tagged source select its own image before that
-# PR exists. scripts/smoke.sh asserts the default pair agrees.
+# IMAGE_VERSION LAGS. The tag supplies the version; no version-bump PR comes
+# first. `IMAGE_VERSION` in versions.env means "the version this checkout
+# deploys" and moves with compose.yaml's digest pin in ONE post-release PR,
+# because the digest exists only after the build. Until then the release overlay
+# selects the image for the tagged source. scripts/smoke.sh asserts the pair agrees.
 #
-# PUBLISH ORDER, from pretorin-cli: push BY DIGEST first, verify the digest
-# round-trips, and only THEN apply a human-readable tag. A tag must never point at
-# bytes that have not been checked. scripts/release-tag.sh applies both the
-# candidate tag and the version tag by re-PUTting the exact manifest bytes.
+# PUBLISH ORDER, from pretorin-cli: push BY DIGEST first, verify the round trip,
+# and only THEN apply a human-readable tag. scripts/release-tag.sh applies the
+# candidate and version tags by re-PUTting the exact manifest bytes.
 #
-# THE IMAGE AND THE RELEASE RECORD ARE NOT SIGNED. Integrity comes from the
-# immutable digest, the release-time vulnerability scan, the SBOM and the asset
-# checksums. Every `check` here passes --allow-unsigned and prints UNVERIFIED:
-# the publisher prepares and publishes unsigned sets, and customer install and
-# apply refuse them (release-assets.py exit 6) until signing and a verifier exist. The record reserves `compliance-claw-release.json.sig` and says
-# `signature.status: unsigned`; signing (SECURITY.md hardening ledger, image
-# signing) is later work and will sign this record rather than a second format.
+# NOT SIGNED. Every `check` here passes --allow-unsigned (prints UNVERIFIED);
+# customer install and apply refuse unsigned sets (exit 6) until signing and a
+# verifier exist. Signing will sign the record (SECURITY.md hardening ledger).
 #
 # NO CREDENTIALS LIVE HERE beyond the automatic GITHUB_TOKEN. The first step asserts
 # that rather than trusting this comment.
