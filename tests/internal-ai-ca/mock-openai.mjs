@@ -41,33 +41,21 @@ function chunk(model, delta, finishReason = null) {
   };
 }
 
+// Streaming only: the pinned runtime sends every model request with
+// stream=true. A non-streaming request is refused before this point.
 function respond(res, body, message, finishReason) {
   const model = body.model ?? "fixture-model";
-  if (body.stream) {
-    res.writeHead(200, { "content-type": "text/event-stream" });
-    res.write(`data: ${JSON.stringify(chunk(model, { role: "assistant", ...message }))}\n\n`);
-    res.write(`data: ${JSON.stringify(chunk(model, {}, finishReason))}\n\n`);
-    res.write(
-      `data: ${JSON.stringify({
-        ...chunk(model, {}),
-        choices: [],
-        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-      })}\n\n`,
-    );
-    res.end("data: [DONE]\n\n");
-    return;
-  }
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(
-    JSON.stringify({
-      id: "chatcmpl-fixture",
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{ index: 0, message: { role: "assistant", ...message }, finish_reason: finishReason }],
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.write(`data: ${JSON.stringify(chunk(model, { role: "assistant", ...message }))}\n\n`);
+  res.write(`data: ${JSON.stringify(chunk(model, {}, finishReason))}\n\n`);
+  res.write(
+    `data: ${JSON.stringify({
+      ...chunk(model, {}),
+      choices: [],
       usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-    }),
+    })}\n\n`,
   );
+  res.end("data: [DONE]\n\n");
 }
 
 const server = https.createServer(
@@ -88,12 +76,6 @@ const server = https.createServer(
         res.end(JSON.stringify({ error: { message: "invalid fixture key" } }));
         return;
       }
-      if (req.method === "GET" && path.endsWith("/models")) {
-        log({ path, outcome: "models" });
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ object: "list", data: [{ id: "fixture-model", object: "model" }] }));
-        return;
-      }
       if (req.method !== "POST" || !path.endsWith("/chat/completions")) {
         log({ path, method: req.method, outcome: "not_found" });
         res.writeHead(404);
@@ -106,6 +88,16 @@ const server = https.createServer(
       } catch {
         res.writeHead(400);
         res.end();
+        return;
+      }
+      if (!body.stream) {
+        // Not supported: fail loudly. The mock stops after this answer, so the
+        // agent turn fails and run.sh prints this log line.
+        log({ path, outcome: "unexpected non-streaming request" });
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "fixture supports streaming requests only" } }), () =>
+          process.exit(1),
+        );
         return;
       }
       const tools = Array.isArray(body.tools) ? body.tools : [];
