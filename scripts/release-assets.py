@@ -421,7 +421,9 @@ def prepare(version, commit, repository, image_repository, digest, sbom, out, so
     }
     validate_record(record)
     if source is not None:
-        check_source_tag_only(source, record)
+        # The publisher runs from a checkout of the tag, but CI may check out the
+        # commit detached; the tag binding is the part that must hold.
+        check_source(source, record, tag_only=True)
 
     os.makedirs(out, exist_ok=True)
     files = ((OVERLAY, overlay), (sbom_name(version), sbom_data),
@@ -437,15 +439,6 @@ def prepare(version, commit, repository, image_repository, digest, sbom, out, so
         if not os.path.exists(path):
             write_atomic(path, data)
     return record
-
-
-def check_source_tag_only(source, record):
-    # The publisher runs from a checkout of the tag, but CI may check out the
-    # commit detached; the tag binding is the part that must hold.
-    tag, commit = record["source"]["tag"], record["source"]["commit"]
-    tagged = git(source, "rev-parse", "--verify", "--quiet", "refs/tags/%s^{commit}" % tag)
-    require(tagged == commit, "tag %s in %s is %r; --commit is %s"
-            % (tag, source, tagged or "<missing>", commit), SOURCE)
 
 
 def finalize(directory):
@@ -755,7 +748,7 @@ def self_test():
             srcset = os.path.join(tmp, "srcset")
             prep(srcset, commit=second)
             refuses("prepare --source refuses a missing tag", SOURCE,
-                    lambda: prep(os.path.join(tmp, "s2"), commit=second, source=gitdir), "<missing>")
+                    lambda: prep(os.path.join(tmp, "s2"), commit=second, source=gitdir), "no tag")
             g("tag", "v1.2.3", first)
             refuses("prepare --source refuses a tag at another commit", SOURCE,
                     lambda: prep(os.path.join(tmp, "s2"), commit=second, source=gitdir), first)
