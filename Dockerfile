@@ -387,6 +387,7 @@ RUN . /opt/compliance-claw/versions.env \
  && printf '%s\n' \
       "qs 6.16.0 qs@6.16.0 ${QS_VERSION} ${QS_INTEGRITY}" \
       "body-parser 2.3.0 body-parser@2.3.0_supports-color@10.2.2 ${BODY_PARSER_VERSION} ${BODY_PARSER_INTEGRITY}" \
+      "undici 8.11.2 undici@8.11.2 ${UNDICI_VERSION} ${UNDICI_INTEGRITY}" \
       > /tmp/pnpm-corrections \
  && while read -r name from dir to integrity; do \
       p="/app/node_modules/.pnpm/${dir}/node_modules/${name}" \

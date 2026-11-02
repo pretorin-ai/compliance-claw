@@ -391,7 +391,7 @@ Ordered roughly by how much it matters, not by effort.
    2026.10.9. Claw replaces some base packages with official patch releases
    and verifies each pinned integrity: the app-local npm 12.2.0 with npm
    12.2.1, the undici copy that npm 12.2.1 bundles, and the gateway's
-   node_modules copies of body-parser and qs. Reassess each
+   node_modules copies of undici, body-parser and qs. Reassess each
    correction on a base update. Some vulnerable code stays in the image: the
    copies that OpenClaw bundles into its own build output, and the
    dependencies bundled in the official Slack package. Claw does not change
