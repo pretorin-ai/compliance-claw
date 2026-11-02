@@ -369,6 +369,31 @@ RUN . /opt/compliance-claw/versions.env \
  && rm /tmp/npm.tgz \
  && test "$(node /app/node_modules/npm/bin/npm-cli.js --version)" = "$NPM_VERSION"
 
+# Packages in the OpenClaw pnpm store that the gateway loads from node_modules
+# and that have fixable HIGH findings. Each row: name, installed version, store
+# directory, official patch version, integrity. The installed version is asserted
+# before the replacement, so a base update fails here and the row is reassessed.
+RUN . /opt/compliance-claw/versions.env \
+ && printf '%s\n' \
+      "qs 6.16.0 qs@6.16.0 ${QS_VERSION} ${QS_INTEGRITY}" \
+      "body-parser 2.3.0 body-parser@2.3.0_supports-color@10.2.2 ${BODY_PARSER_VERSION} ${BODY_PARSER_INTEGRITY}" \
+      > /tmp/pnpm-corrections \
+ && while read -r name from dir to integrity; do \
+      p="/app/node_modules/.pnpm/${dir}/node_modules/${name}" \
+      && test -d "$p" \
+      && test "$(node -p 'require(process.argv[1]).version' "$p/package.json")" = "$from" \
+      && curl -fsSL --retry 3 --retry-all-errors -o /tmp/pkg.tgz \
+           "https://registry.npmjs.org/${name}/-/${name}-${to}.tgz" \
+      && INTEGRITY="$integrity" node -e 'const fs=require("fs"),c=require("crypto"); const actual="sha512-"+c.createHash("sha512").update(fs.readFileSync("/tmp/pkg.tgz")).digest("base64"); if(actual!==process.env.INTEGRITY) throw Error("integrity mismatch")' \
+      && rm -rf "$p" && mkdir "$p" \
+      && tar -xzf /tmp/pkg.tgz --strip-components=1 -C "$p" \
+      && rm /tmp/pkg.tgz \
+      && test "$(node -p 'require(process.argv[1]).version' "$p/package.json")" = "$to" \
+      && echo "REPLACED: ${name} ${from} -> ${to}" \
+      || exit 1; \
+    done < /tmp/pnpm-corrections \
+ && rm /tmp/pnpm-corrections
+
 RUN . /opt/compliance-claw/versions.env \
  && test -n "${MODEL}" \
  && sed -i "s|@MODEL@|${MODEL}|" /opt/compliance-claw/openclaw-config.template.json \
