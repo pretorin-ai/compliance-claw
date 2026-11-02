@@ -138,6 +138,7 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | Native proxy/local maintenance | `bash scripts/test-proxy-auth.sh compliance-claw:local` | Candidate image; no network or published ports; native requests with synthetic state and password. |
 | Effort credential delivery and local records | `bash scripts/test-effort-credentials.sh compliance-claw:local` | Candidate image; canary credentials, native Plan/preflight reads and resume, stopped-record copy/restore, restart and replacement. Synthetic API, no live platform proof. |
 | Fresh Slack seed | `bash scripts/test-fresh-slack-seed.sh` | Builds an isolated deployment; no live Slack exchange. |
+| Internal AI endpoint example | `bash tests/internal-ai-ca/run.sh compliance-claw:local` | Candidate image, `openssl`; isolated mock and canary keys. Approved-CA tool round trip, untrusted-CA rejection, missing `INTERNAL_AI_CA_FILE` Compose refusal. Native refusal without `request.tls.ca`: manual only. Not real provider or network proof. |
 | Integrated runtime | `bash scripts/smoke.sh --no-creds` | Disposable project and fixtures above; writes test state. |
 | Documentation/templates | Links, anchors, front matter, and command/source checks | Run changed examples only where needed. No artificial tests or full image build solely for prose. |
 
