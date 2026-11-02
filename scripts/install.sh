@@ -59,7 +59,6 @@ GUIDE_ADMIN="docs/administration.md"
 GUIDE_RECOVERY="docs/upgrade.md"
 
 log()   { printf 'install: %s\n' "$*"; }
-warn()  { printf 'install: WARNING — %s\n' "$*" >&2; }
 # A stopped stage names itself and the operator guide's stage-failure section.
 STAGE=""
 die()   {
