@@ -101,6 +101,7 @@ points here rather than restating it, so the two cannot drift.
 | `openai-api-key` | `OPENAI_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
 | `anthropic-api-key` | `ANTHROPIC_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
 | `github-readonly-pat` | *(none — see below)* | only to sync a **private** target from Slack | `openclaw` only |
+| `internal-ai-api-key` | *(none — native file reference)* | only with the [internal AI endpoint overlay](#internal-ai-endpoint-credential) | `openclaw` only |
 
 **Slack needs two files here, not three.** On the multi-effort path those two
 tokens are the whole of what this table owns: which channels are served comes from
@@ -145,6 +146,18 @@ App remains the recommended mechanism for anything past the internal pilot.
 
 Leave the file **empty** if you have no private targets. Empty means "no
 credential"; a private target then reports `auth_failed` and names both fixes.
+
+### Internal AI endpoint credential
+
+The [internal AI endpoint example](administration.md#internal-ai-endpoint-with-a-private-ca)
+adds gateway-only `internal-ai-api-key`. Neither the base overlay nor
+`scripts/init-file-secrets.sh` creates it. The entrypoint does not export it;
+OpenClaw reads it with a native file reference.
+
+Use an approved secret-input method and the example's UID 1000, `0400` or
+`0600` rule. Native references refuse `0440` and the helper's `0604` mode.
+Replace the file by rename with the same owner and mode, then follow
+[rotation](#rotation) to recreate the gateway. The `cli` service has no copy.
 
 ### Upgrading a deployment that predates a secret
 
