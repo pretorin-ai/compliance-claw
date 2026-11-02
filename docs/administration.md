@@ -68,18 +68,23 @@ or proxy changes the network path only. It does not add a user identity.
 
 ### If a setup stage fails
 
-Keep the failed state and its messages. Do not delete a volume to retry.
+The first ten rows match the stage names from `scripts/install.sh`. Use the
+same checks for manual setup. Keep failed state and messages; do not delete a
+volume to retry.
 
 | Stage | First check | Next action |
 | --- | --- | --- |
-| Registry login or pull | The `docker compose pull` error | [Troubleshooting](../README.md#troubleshooting) registry rows; [image verification](image-verification.md) |
-| `scripts/bootstrap.sh` | The prerequisite or target that the message names | Correct it, then run the script again. It is idempotent. |
-| Secret files | File names, owner and mode | [Secret checklist](file-secrets.md#the-checklist--every-secret-file-in-one-place) |
-| `clawctl validate` or `plan` | The effort row status | [Check an effort](efforts.md#3-check-it) |
-| `clawctl apply` | Its diagnostics and rollback result | [Ownership rules](efforts.md#what-apply-does-to-the-openclaw-configuration); keep the diagnostics |
-| Gateway health | `docker compose ps -a` and `docker compose logs --tail 200 openclaw` | [Troubleshooting](../README.md#troubleshooting); [recovery](upgrade.md#openclaw-image-upgrade-and-state-backup) |
+| 1/10 preflight | Missing tools, Docker access, host architecture or writable persistent paths | Correct the named prerequisite; see [Requirements](../README.md#requirements). |
+| 2/10 inspection | Existing-file conflicts, tracked source changes or release-check errors | Keep customer files. Review each conflict and the [release trust check](image-verification.md#checking-a-release-set); do not bypass a refusal. |
+| 3/10 image access | Registry access, selected image or `docker compose pull` error | [Troubleshooting](../README.md#troubleshooting) registry rows; [image verification](image-verification.md) |
+| 4/10 release set | The placed files and helper error | Keep the files for diagnosis. Check the matching source and [release set](image-verification.md#checking-a-release-set). |
+| 5/10 declaration | The named effort file or schema error | Review the file with the [effort procedure](efforts.md#the-main-event-adding-a-second-effort); keep existing declarations. |
+| 6/10 secrets | File names, owner and mode | [Secret checklist](file-secrets.md#the-checklist--every-secret-file-in-one-place) |
+| 7/10 bootstrap | The prerequisite or target named by `scripts/bootstrap.sh` | Correct it, then run the script again. It keeps existing files and clones. |
+| 8/10 validate | The `scripts/clawctl validate` row status and scoped Pretorin probe | [Check an effort](efforts.md#3-check-it); [key permissions](../README.md#read-only-vs-write-enabled-keys) |
+| 9/10 plan/apply | The plan, diagnostics and rollback result | [Ownership rules](efforts.md#what-apply-does-to-the-openclaw-configuration); keep the diagnostics |
+| 10/10 readiness | Gateway and local model status; `docker compose ps -a` and `docker compose logs --tail 200 openclaw` | [Troubleshooting](../README.md#troubleshooting); [model checks](#providers-and-models); [recovery](upgrade.md#openclaw-image-upgrade-and-state-backup). Gateway health and local model status do not prove a provider call or useful task. |
 | Model turn | Test connection, then the gateway log | [Providers and models](#providers-and-models); [internal AI endpoint](#internal-ai-endpoint-with-a-private-ca) |
-| Pretorin access | `scripts/clawctl validate` probe rows | [Key permissions](../README.md#read-only-vs-write-enabled-keys) |
 | Slack | Gateway Slack log lines | [Optional Slack](#optional-slack) |
 | Update | The message and exit code of `scripts/update.sh` | [Routine deployment update](upgrade.md#routine-deployment-update). The first update to an image with per-effort Plan and preflight roots also needs the manual [record transfer](upgrade.md#transfer-existing-effort-records) before start. |
 
@@ -155,10 +160,7 @@ The example uses the native `models.providers.<id>.request.tls.ca` setting. It
 applies to that one provider. Its value is the complete CA list for that
 provider: it replaces the default public CA list for those requests and does not
 change other gateway connections. Put every CA certificate that the endpoint
-chain needs in the file. Keep TLS verification on. The pinned OpenClaw accepts
-`insecureSkipVerify: true` in configuration, then refuses to prepare the model
-runtime; the gateway stays unhealthy until you remove that field and recreate
-the gateway.
+chain needs in the file. Keep TLS verification on.
 
 The files are in [`examples/internal-ai-ca/`](../examples/internal-ai-ca/): a
 private Compose overlay and a native configuration patch. They contain
@@ -224,15 +226,13 @@ and mode, then recreate the gateway. To replace the credential, follow
 | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` in the gateway log; the turn reports that it could not connect | The endpoint certificate does not chain to the configured CA, or `request.tls.ca` is missing | Check the CA file, the chain and the provider setting. Do not disable verification. |
 | `permissions are too open` for a `secrets.providers` path | The group or other users can read the file | Set owner UID 1000 and mode `0400`, then recreate the gateway. |
 | `is not readable` for `/run/secrets/internal_ai_api_key` | The overlay is not selected, the file is missing, or the command ran in `cli` | Check the saved selection and run the command in the gateway. |
-| `Provider transport overrides do not allow insecureSkipVerify` | The bypass field is present | Remove it with `openclaw config unset`, then recreate the gateway. |
+| `Provider transport overrides do not allow insecureSkipVerify` | The pinned runtime accepts the field in configuration, then refuses to prepare the model runtime and keeps the gateway unhealthy | Remove it with `openclaw config unset`, then recreate the gateway. |
 
-Local fixture evidence, pinned OpenClaw 2026.10.5: with the approved test CA, a
-gateway agent turn completed a tool call, tool execution and final answer
-through an OpenAI-compatible mock endpoint on an internal Docker network. The
-same configuration rejected a certificate from another CA, and no request
-reached the mock. A configuration without `request.tls.ca` was also rejected.
-`tests/internal-ai-ca/run.sh` repeats the main checks. This does not prove a
-real endpoint, network path, proxy or model quality.
+`tests/internal-ai-ca/run.sh` checks an approved-CA tool round trip and an
+untrusted-CA refusal on pinned OpenClaw 2026.10.5 with a mock endpoint.
+It also checks Compose refusal without `INTERNAL_AI_CA_FILE`. Native rejection
+without `request.tls.ca` was checked manually. Real endpoints, network paths,
+proxies and model quality need separate checks.
 
 ## Host command fallback
 
@@ -340,8 +340,7 @@ in the volumes it archives.
 | --- | --- | --- | --- |
 | Gateway configuration, sessions and transcripts, agent workspaces and memory, model login, managed Slack package, native and automatic-triage support bundles (`logs/support`) | `openclaw-state` volume | VM operator; Claw administrator for sessions and agent files | `openclaw sessions list` and `openclaw sessions delete <key>` in the gateway container, with the gateway credential loaded as for [agent commands](file-secrets.md#docker-compose-exec-does-not-see-these-secrets). Delete keeps a compressed `<session>.jsonl.deleted.<timestamp>` transcript archive in the volume; indexed memory needs `openclaw memory forget`. Complete removal is deletion of the volume (see [Resetting](upgrade.md#resetting-destructive)). |
 | Active Pretorin CLI, context, preflight resolvers, Plan records, recipes, CLI update and target-sync audit files | `pretorin-state` volume | VM operator | Inspect with the [record procedure](upgrade.md#transfer-existing-effort-records) and `scripts/pretorin-update.sh --status`. This repository has no per-record delete command; complete removal is deletion of the volume. |
-| Gateway file log (`/tmp/openclaw/openclaw-<date>.log`) | Container writable layer | VM operator | Removed when the container is recreated or removed. |
-| Doctor pre-repair captures of configuration and databases | `/home/node/.openclaw.update-captures`, container writable layer, outside both volumes | VM operator | Startup Doctor can create them. Removed when the container is recreated or removed. A volume backup does not include them. |
+| Gateway file log; Doctor pre-repair captures of configuration and databases | `/tmp/openclaw/openclaw-<date>.log`; `/home/node/.openclaw.update-captures`, in the container writable layer outside both volumes | VM operator | Startup Doctor can create captures. A volume backup omits these files; recreation or container removal deletes them. |
 | Container output log | Docker log driver on the host | VM operator | `docker compose logs openclaw`. Removed with the container. Docker daemon settings set its rotation. |
 | Target clones | `workspace/targets` on the host | VM operator | Remove the target from `efforts.yaml`, apply, then delete the clone directory. Volume deletion does not remove it. |
 | Host deployment files and private overlays | Checkout, secret directory, private paths | VM operator | Delete the files. Revoke credentials at their issuers first. |
@@ -367,10 +366,8 @@ files, `.env`, state volume archives, transcripts, heap snapshots or rendered
    scripts/pretorin-update.sh --status
    ```
 
-2. The native sanitized bundle. OpenClaw designs it to omit prompts, tool
-   output and credentials. In the local fixture it held no credential, but it
-   held a short model reply in a log line and the configured endpoint host
-   name. Review it before you send it:
+2. Review the native sanitized bundle before you send it: it can contain model
+   reply text and endpoint host names.
 
    ```sh
    docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint \

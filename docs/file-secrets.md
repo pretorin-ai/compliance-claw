@@ -150,18 +150,14 @@ credential"; a private target then reports `auth_failed` and names both fixes.
 ### Internal AI endpoint credential
 
 The [internal AI endpoint example](administration.md#internal-ai-endpoint-with-a-private-ca)
-adds `internal-ai-api-key` through its own private overlay. The entrypoint does
-not export it. OpenClaw reads it with a native file reference when the gateway
-loads the provider. The base overlay and `scripts/init-file-secrets.sh` do not
-create this file; create it only when you select that overlay.
+adds gateway-only `internal-ai-api-key`. Neither the base overlay nor
+`scripts/init-file-secrets.sh` creates it. The entrypoint does not export it;
+OpenClaw reads it with a native file reference.
 
-The native file reference has stricter checks than the other files here. The
-file must belong to UID 1000 and have an owner-only mode, `0400` or `0600`.
-A local fixture refused `0440` and `0604` as too open, so the `0604` mode that
-the local helper uses for other files on a host user other than UID 1000 does
-not work here. Use an approved secret-input method, set owner UID 1000 and
-mode `0400`, replace the file by rename, then recreate the gateway. The one-off `cli` service does not receive
-this credential.
+Use an approved secret-input method and the example's UID 1000, `0400` or
+`0600` rule. Native references refuse `0440` and the helper's `0604` mode.
+Replace the file by rename with the same owner and mode, then follow
+[rotation](#rotation) to recreate the gateway. The `cli` service has no copy.
 
 ### Upgrading a deployment that predates a secret
 

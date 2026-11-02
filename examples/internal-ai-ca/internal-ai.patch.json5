@@ -1,14 +1,8 @@
-// internal-ai.patch.json5 — example native OpenClaw configuration for an
-// internal OpenAI-compatible AI endpoint with a private CA.
-//
-// Use it with compose.internal-ai-ca.yaml and `openclaw config patch`; see
-// docs/administration.md ("Internal AI endpoint with a private CA").
-// Replace the endpoint and model values. They are placeholders.
-//
-// Values are references, not secrets. The two file providers read the files
-// that the overlay mounts. `request.tls.ca` applies to this provider only: it
-// does not add the CA to other connections from the gateway. The pinned
-// OpenClaw refuses `insecureSkipVerify: true`; do not add it.
+// Native private-CA example; pair with compose.internal-ai-ca.yaml.
+// Replace the endpoint/model values. Keep file references and TLS verification.
+// request.tls.ca replaces the CA list for this provider only.
+// Do not add insecureSkipVerify. Follow
+// docs/administration.md#internal-ai-endpoint-with-a-private-ca.
 {
   secrets: {
     providers: {
