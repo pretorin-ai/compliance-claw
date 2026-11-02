@@ -14,60 +14,37 @@
 
 HOST-ONLY, standard library only. Nothing in the image runs this.
 
-A RELEASE SET binds four things that used to be reconstructed by hand: the source
-commit, the version, the immutable image digest, and the deployment files that
-select that digest. It is three GitHub Release assets:
+A RELEASE SET is three GitHub Release assets: compliance-claw-release.json (the
+record), compose.release.yaml (image selection only) and sbom-X.Y.Z.spdx.json.
+compliance-claw-release.json.sig is RESERVED; nothing produces it yet, and
+`signature.status` says "unsigned". Fields, procedure and placement:
+docs/releasing.md and docs/image-verification.md.
 
-    compliance-claw-release.json   the release record (the later signing target)
-    compose.release.yaml           a native Compose overlay: image selection only
-    sbom-X.Y.Z.spdx.json           the SPDX SBOM of the image
-
-    compliance-claw-release.json.sig is RESERVED for the later record signature.
-    Nothing produces it yet, and `signature.status` says "unsigned".
-
-The publisher (.github/workflows/release.yml) calls `prepare` and `finalize`.
-Guided setup and the updater must use `fetch` and `check` (not yet wired in
-this version). They must not parse the record themselves: one resolver, one
-set of rules.
-
-`fetch` downloads the three assets of a PUBLISHED release of the fixed public
-repository (no credential, no draft), into an empty directory, and then checks
-their INTEGRITY as `check --stage final --all-assets` does. It reports the
-signature status and does not judge it: the signature gate is in `check` alone.
-
-THE RENDERED COMPOSE MODEL IS NEVER PRINTED OR WRITTEN. A legacy `.env`
-selection renders secret values into it. `check --compose` keeps it in memory;
-`--rendered -` reads it from stdin so a caller needs no temporary file. On a
-selection mismatch only the image references are printed.
-
-SIGNATURES FAIL CLOSED. This version has no verifier, so `check` refuses every
-release by default (exit 6): customer install and apply must not run a release
-whose publisher nobody has verified. `--allow-unsigned` admits "unsigned" only,
-and prints "UNVERIFIED: publisher authenticity not checked". Preparation,
-publication, update preview and fixtures pass it; customer install and apply
-never do. Any other status stays refused even with the flag: a claimed
-signature is never treated as verified.
-
-THE OVERLAY IS GENERATED FROM THE RECORD, BYTE FOR BYTE. `check` regenerates it
-and compares, so a key added by hand (a port, a volume, an environment value)
-fails the check. No YAML parser is needed, and the overlay can never carry
-customer settings or a secret value: every value in it comes from a field that a
-strict pattern has already validated.
-
-THE STAGE FIELD separates a prepared candidate (on a DRAFT GitHub release) from a
-final customer release. `finalize` changes only that field. The overlay and SBOM
-bytes do not change, so final publication reuses the prepared bytes. A customer
-flow keeps the default `--stage final` and refuses a candidate.
-
-HOST PLACEMENT. A deployment keeps the verified record and overlay in the
-repository root (both are gitignored) and selects the overlay directly after
-compose.yaml:
-
-    COMPOSE_FILE=compose.yaml:compose.release.yaml:compose.secrets.yaml:compose.efforts.yaml
-
-Secret, effort, customer and restore overlays then keep their order and
-precedence. A later overlay that sets `image` wins in Compose; `check --compose`
-reports that (exit 4) and does not change it.
+INVARIANTS
+- One resolver. The publisher (release.yml) calls `prepare` and `finalize`.
+  Guided setup and the updater use `fetch` and `check` and never parse the
+  record themselves.
+- `fetch` reads only a PUBLISHED release of the fixed public repository (no
+  credential, no draft) into an empty directory, and checks integrity as
+  `check --stage final --all-assets` does. It reports the signature status;
+  the signature gate is in `check` alone.
+- The rendered Compose model is never printed or written: a legacy `.env`
+  selection renders secret values into it. `--rendered -` reads it from stdin.
+  A mismatch prints only image references.
+- Signatures fail closed: `check` refuses every release by default (exit 6).
+  `--allow-unsigned` admits "unsigned" only and prints "UNVERIFIED: publisher
+  authenticity not checked"; preparation, publication, update preview and
+  fixtures pass it, customer install and apply never do. Any other status is
+  refused even with the flag: no verifier exists in this version.
+- The overlay is generated from the record byte for byte, and `check`
+  compares it, so an added key (port, volume, environment) fails. Every value
+  in it comes from a pattern-validated field; no YAML parser is needed.
+- `finalize` changes only `stage` (candidate -> final); the overlay and SBOM
+  bytes are reused. A customer flow keeps `--stage final` and refuses a candidate.
+- Host placement: record and overlay in the repository root (gitignored), the
+  overlay directly after compose.yaml in COMPOSE_FILE. A later overlay that
+  sets `image` wins in Compose; `check --compose` reports it (exit 4) and
+  changes nothing.
 
 EXIT CODES (every subcommand):
     0  valid
