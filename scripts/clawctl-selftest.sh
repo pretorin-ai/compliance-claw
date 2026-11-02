@@ -1413,36 +1413,18 @@ print(ok)")" = "True" ]; then
   else
     st_bad "each agent carries the native access fields" "$(q "print([a.get('tools') for a in cfg['agents']['list']])")"
   fi
-  # Each argPattern is compiled here with Python's engine as a stand-in for the
-  # ECMAScript one. The runtime check proves the real matcher.
+  # The written grants and the record. The patterns themselves are tested in
+  # `openclaw-patch.py --self-test`, and on the real matcher by test-agent-access.sh.
   if python3 - "$AP" "$ST" <<'PYGRANTS'
-import json, re, sys
+import json, sys
 doc, state = [json.load(open(p)) for p in sys.argv[1:]]
-sha = "0123456789abcdef0123456789abcdef01234567"
 for agent in ("crm-soc2", "crm-hipaa"):
     grants = [e for e in doc["agents"][agent]["allowlist"] if e["id"].startswith("compliance-claw:")]
     assert len(grants) == 8 and all(e["pattern"] == "/usr/bin/git" for e in grants), grants
     assert state["approvalGrants"][agent] == grants
-    rx = [re.compile(e["argPattern"]) for e in grants]
-    # The native NUL form: each argv element after argv[0], each followed by NUL.
-    allowed = lambda *argv: any(r.search("".join(x + "\0" for x in argv)) for r in rx)
-    root = ("-c", "safe.directory=/workspace/targets/simple-crm", "-C", "/workspace/targets/simple-crm")
-    for args in (("remote", "get-url", "origin"), ("rev-parse", "HEAD"),
-                 ("ls-tree", "-r", "--name-only", sha), ("ls-tree", "--name-only", sha + ":src/app"),
-                 ("show", sha + ":.github/ci.yml"), ("show", sha + ":policies/Access Control Policy.md")):
-        assert allowed(*root + args), args
-    for args in (("show", "HEAD:README.md"), ("show", sha + ":../x"), ("show", sha + ":a/../../x"),
-                 ("show", sha + ":README.md", "--output=/tmp/x"), ("show", sha + ":/etc/passwd"),
-                 ("show", sha + ":a", "b"), ("rev-parse", "HEAD;", "id"), ("rev-parse HEAD",)):
-        assert not allowed(*root + args), args
-    assert not allowed("-c", "core.pager=id", "-C", "/workspace/targets/simple-crm", "rev-parse", "HEAD")
-    assert not allowed("-c", "safe.directory=/workspace/targets/simple-crmx", "-C", "/workspace/targets/simple-crmx", "rev-parse", "HEAD")
-    assert not allowed("-c", "safe.directory=*", "-C", "/workspace/targets/simple-crm", "rev-parse", "HEAD")
-    assert not allowed("-C", "/workspace/targets/simple-crm", "rev-parse", "HEAD")
-    assert not allowed("-c", "safe.directory=/var/lib/compliance-claw/targets/simple-crm", "-C", "/var/lib/compliance-claw/targets/simple-crm", "rev-parse", "HEAD")
 PYGRANTS
-  then st_ok "fixed git grants: own targets, full SHA, one path argument, no option, escape or composition"
-  else st_bad "fixed git grants are exact and recorded"; fi
+  then st_ok "fixed git grants: 8 per agent, all /usr/bin/git, equal to the state record"
+  else st_bad "fixed git grants: 8 per agent, all /usr/bin/git, equal to the state record"; fi
 
   # Administrator grants and settings survive; only exact recorded grants retire.
   python3 - "$AP" "$ST" <<'PYSEED'
