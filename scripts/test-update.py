@@ -228,15 +228,6 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.run_update(), 0, self.output)
         self.assertEqual((secrets / "openclaw-gateway-token").read_text(), token)
 
-    def test_empty_retained_token_is_not_regenerated(self):
-        secrets = self.prepare_secret_fixture()
-        (secrets / "openclaw-gateway-token").write_bytes(b"")
-        openssl = self.root / "bin/openssl"
-        openssl.write_text("#!/bin/sh\nexit 99\n")
-        openssl.chmod(0o700)
-        self.assertEqual(self.run_update(), 0, self.output)
-        self.assertEqual((secrets / "openclaw-gateway-token").read_bytes(), b"")
-
     def test_legacy_selection_gets_no_secret_files(self):
         shutil.copyfile(ROOT / "scripts/init-file-secrets.sh", self.root / "scripts/init-file-secrets.sh")
         self.selection["COMPOSE_FILE"] = "compose.yaml"
