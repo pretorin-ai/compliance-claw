@@ -1,0 +1,46 @@
+// Native private-CA example; pair with compose.internal-ai-ca.yaml.
+// Replace the endpoint/model values. Keep file references and TLS verification.
+// request.tls.ca replaces the CA list for this provider only.
+// Do not add insecureSkipVerify. Follow
+// docs/administration.md#internal-ai-endpoint-with-a-private-ca.
+{
+  secrets: {
+    providers: {
+      "internal-ai-ca": {
+        source: "file",
+        path: "/etc/compliance-claw/internal-ai/ca.pem",
+        mode: "singleValue",
+      },
+      "internal-ai-key": {
+        source: "file",
+        path: "/run/secrets/internal_ai_api_key",
+        mode: "singleValue",
+      },
+    },
+  },
+  models: {
+    providers: {
+      "internal-ai": {
+        // The name in the URL must match a name in the endpoint certificate.
+        baseUrl: "https://ai.internal.example/v1",
+        api: "openai-completions",
+        apiKey: { source: "file", provider: "internal-ai-key", id: "value" },
+        request: {
+          tls: {
+            ca: { source: "file", provider: "internal-ai-ca", id: "value" },
+          },
+        },
+        models: [
+          {
+            // Use the endpoint's model ID and its real limits.
+            id: "internal-model-id",
+            name: "Internal model",
+            input: ["text"],
+            contextWindow: 128000,
+            maxTokens: 8192,
+          },
+        ],
+      },
+    },
+  },
+}

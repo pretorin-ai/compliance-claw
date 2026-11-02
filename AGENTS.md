@@ -27,14 +27,14 @@ Do not describe an intended UI flow as an available feature without evidence.
 | --- | --- |
 | `Dockerfile`, `versions.env`, `vendor/` | Build the runtime and verify dependency bytes and pins. |
 | `compose*.yaml` | Services, mounts, credentials, build selection, and test isolation. |
-| `scripts/bootstrap.sh`, `scripts/init-file-secrets.sh` | Host prerequisites, target clones, image selection, and initial secret files. |
+| `scripts/bootstrap.sh`, `scripts/init-file-secrets.sh`, `scripts/install.sh`, `scripts/test-install.py` | Host prerequisites, target clones, image selection, and initial secret files. The guided installer only calls these and `clawctl`. |
 | `scripts/entrypoint.sh`, config/Slack templates, `scripts/managed-slack.mjs` | Runtime secret loading, initial config, active CLI seed, and managed Slack installation. |
 | `scripts/clawctl`, `parse-targets.py`, `parse-efforts.py`, `openclaw-patch.py` in `scripts/` | Validate declarations, generate owned configuration, apply, verify, and roll back. |
 | `scripts/onboard-lib.sh`, `scripts/onboard-targets.sh`, `scripts/pretorin-mcp-launch.sh` | Bind source context and start MCP with the effort's scope and credential. |
 | `scripts/sync-targets.sh`, `plugins/target-sync/` | Fast-forward declared targets through host, command, and model-tool routes. |
 | `scripts/pretorin-update*.sh`, `plugins/pretorin-update/` | Install and activate the shared CLI; report installation and activation accurately. |
 | `scripts/*test*`, `scripts/smoke.sh`, `scripts/lint-heredocs.py` | Existing validation. See the contribution guide for selection and prerequisites. |
-| `.github/workflows/build.yml`, `.github/workflows/release.yml` | Candidate checks and release publication. |
+| `.github/workflows/build.yml`, `.github/workflows/release.yml`, `scripts/release-assets.py`, `scripts/release-tag.sh` | Candidate checks, release-set preparation, and release publication. |
 
 The image contains a verified CLI seed. The active CLI lives in `pretorin-state`
 and survives image replacement. `openclaw-state` holds config, sessions, agent

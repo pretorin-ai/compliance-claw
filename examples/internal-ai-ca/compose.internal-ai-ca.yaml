@@ -1,0 +1,28 @@
+# Example private overlay for an internal AI endpoint with a private CA.
+# Copy outside the checkout and add LAST in saved COMPOSE_FILE; keep earlier files.
+#   COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml:/private/path/compose.internal-ai-ca.yaml
+#   INTERNAL_AI_CA_FILE=/private/path/internal-ai-ca.pem
+# Both input files need UID 1000 and mode 0400 or 0600. Put internal-ai-api-key
+# in the secret directory; only the gateway receives it. TLS verification stays on.
+# See internal-ai.patch.json5 and
+# docs/administration.md#internal-ai-endpoint-with-a-private-ca for the procedure.
+
+x-internal-ai-ca-mount: &internal-ai-ca-mount
+  "${INTERNAL_AI_CA_FILE:?Set INTERNAL_AI_CA_FILE to the approved internal AI CA certificate file}:/etc/compliance-claw/internal-ai/ca.pem:ro"
+
+services:
+  openclaw:
+    volumes:
+      - *internal-ai-ca-mount
+    secrets:
+      - internal_ai_api_key
+
+  cli:
+    # The CA also on cli, so one-off configuration commands load the same
+    # provider settings as the gateway. The credential stays gateway-only.
+    volumes:
+      - *internal-ai-ca-mount
+
+secrets:
+  internal_ai_api_key:
+    file: "${COMPLIANCE_CLAW_SECRET_DIR:-./secrets/runtime}/internal-ai-api-key"

@@ -392,12 +392,12 @@ Ordered roughly by how much it matters, not by effort.
 9. **RESOLVED — the release workflow can now be rehearsed.** It previously could
    not: GitHub only exposes `workflow_dispatch` for workflows on the **default
    branch**, and `release.yml` lived on a feature branch, so its first execution
-   was the v0.1.0 tag push. It is now on `master` and carries a `dry_run` input
-   (default true) that builds, smokes, scans and produces an SBOM without pushing
-   or tagging:
+   was the v0.1.0 tag push. It is now on `master` and carries an `operation`
+   input whose default, `dry-run`, builds, smokes, scans and produces an SBOM
+   without pushing or tagging:
 
    ```sh
-   gh workflow run release.yml -f dry_run=true
+   gh workflow run release.yml -f operation=dry-run
    ```
 
    Kept in the ledger as history, because the reasoning still applies to any new
