@@ -156,11 +156,9 @@ What is still true, and enforced:
 - `cli` does not get it. Only the gateway carries the sync routes.
 
 What is **not** true: that this puts the token beyond a prompt-injected agent.
-The agent's native file and command tools refuse the file (see
-[native access limits](#native-access-limits-for-effort-agents)). Those limits
-apply to native agent tools only; gateway-side MCP file operations are outside
-this policy and remain unresolved. The containment that actually bounds the
-damage is GitHub's: read-only, one permission, only the selected repositories.
+Native tools refuse the file, but gateway-side MCP file access remains
+unresolved (see [native access limits](#native-access-limits-for-effort-agents)).
+GitHub bounds the damage: read-only, one permission, only the selected repositories.
 The GitHub App remains the recommended mechanism for anything past this pilot,
 and moving the synchronizer into its own container is the fix — see the ledger.
 
@@ -220,13 +218,10 @@ as the same uid and can reach it. What it buys is that the assessment path, whic
 every evidence citation comes from, stays read-only.
 
 **Neither route is a boundary, and the docs must not imply otherwise.** An
-effort agent's native tools can no longer run the wrapper, replace the binary or
-rewrite the audit file: its file tools stay in its workspace and `exec` runs only
-the fixed git grants. Code in the gateway process is not limited that way —
-plugins and Pretorin MCP children run there as the same uid, and gateway-side MCP
-file operations remain unresolved — and the container has no sandbox (see
-below). What the updater provides is a *narrow, identity-bearing, audited path
-for the supported routes*.
+effort agent's native tools cannot run the wrapper, replace the binary or
+rewrite the audit file. Gateway-side MCP file access remains unresolved, and the
+container has no sandbox (see [native access limits](#native-access-limits-for-effort-agents)).
+The updater provides a *narrow, identity-bearing, audited path for the supported routes*.
 
 ### Separating one effort from another — say it plainly
 
@@ -242,12 +237,9 @@ What it actually consists of:
   prefix, so another effort's tools are not in its catalogue and a call to one is
   refused. This is real and is enforced by OpenClaw, but `mcp.servers` is
   **gateway-wide**: the isolation is in the policy, not in the process.
-- Each agent's native file tools stay in its own workspace, and its `exec`
-  grants name only its own targets, so a native tool call cannot read another
-  effort's clone, workspace or credential. This is enforced by OpenClaw, but it
-  is a tool policy, not process isolation: Pretorin MCP children and plugins run
-  in the one gateway process as the same uid (see
-  [native access limits](#native-access-limits-for-effort-agents)).
+- Native file and command limits restrict each agent to its workspace and target
+  reads. They do not isolate the gateway process or resolve gateway-side MCP
+  file access (see [native access limits](#native-access-limits-for-effort-agents)).
 - Each Pretorin MCP child is started by a launcher that pins
   `PRETORIN_SYSTEM_ID` / `PRETORIN_FRAMEWORK_ID` from the read-only mounted
   `efforts.yaml` and loads that effort's own credential file. It fails closed
@@ -279,10 +271,8 @@ should be able to act in that compliance scope.
   masked prefix/suffix in OpenClaw's error log. Full canary values remained
   absent, but log access and export still require access control and redaction.
 - **A malicious or compromised review target.** The container has **no
-  sandbox** (`sandbox` is off). These controls restrict native OpenClaw agent
-  tools. Gateway-side MCP file operations are outside this policy and remain
-  unresolved. See the boundary statement below — this is the single most
-  important limitation in this document.
+  sandbox** (`sandbox` is off), and gateway-side MCP file access remains
+  unresolved. See [native access limits](#native-access-limits-for-effort-agents).
 - **Any Slack channel member.** Everyone in the allowlisted channel has the same
   authority. There is no per-user policy and no attribution.
 - **A hostile operator.** Anyone who can edit `.env`, `efforts.yaml` or the state

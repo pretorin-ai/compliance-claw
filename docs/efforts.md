@@ -226,10 +226,8 @@ to that system**. If read isolation between efforts matters to you, that is an
 argument for per-system keys, not for a setting here. Measured against CLI
 0.28.7; the evidence is in [plans/effort-config.md](plans/effort-config.md).
 
-**The container has no sandbox.** An effort agent's native file and command tools
-cannot read the credential files. These controls restrict native OpenClaw agent
-tools. Gateway-side MCP file operations are outside this policy and remain
-unresolved. See
+**The container has no sandbox.** Native tools cannot read credential files;
+gateway-side MCP file access remains unresolved. See
 [native access limits](../SECURITY.md#native-access-limits-for-effort-agents).
 
 ---
@@ -324,14 +322,11 @@ so a `G` id is refused rather than half-configured.
 
 **What isolates one effort from another, and what does not.** Each agent's tool
 policy denies every other effort's Pretorin MCP tools, and each agent's
-instructions state its fixed scope and refuse to switch. That is a
-tool-visibility and prompt boundary, plus native file and command limits: an
-agent's file tools stay in its own workspace, and `exec` runs only fixed git reads
-of its own targets. It is **not** a process boundary: `mcp.servers` is global to
-the gateway, and gateway-side MCP file operations are outside this policy and
-remain unresolved. What
-actually protects another system's data is the Pretorin API key's own server-side
-scopes and the platform's cross-scope write guard.
+instructions state its fixed scope and refuse to switch. Native file and command
+limits also apply. This is **not** process isolation: gateway-side MCP file access
+remains unresolved (see [native access limits](../SECURITY.md#native-access-limits-for-effort-agents)).
+The Pretorin API key's server-side scopes and the platform's cross-scope write
+guard protect another system's data.
 
 ---
 

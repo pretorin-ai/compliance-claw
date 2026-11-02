@@ -194,10 +194,9 @@ recommended mechanism for any customer or production deployment. A PAT carries a
 person's identity, expires on a human's schedule, is harder to scope, and —
 unlike the App — is a git credential that lives inside the container. It is never
 an environment variable, never in a URL, `.git/config`, a log, an audit line or a
-Slack message. An agent's native tools cannot read the file, but the container
-has no sandbox, and gateway-side MCP file operations are outside that policy and
-remain unresolved. Read
-[SECURITY.md](../SECURITY.md#the-pat-is-a-deliberately-relaxed-invariant-not-an-oversight)
+Slack message. Native tools cannot read it, but gateway-side MCP file access
+remains unresolved. Read the
+[PAT limits in SECURITY.md](../SECURITY.md#the-pat-is-a-deliberately-relaxed-invariant-not-an-oversight)
 before enabling it.
 
 `bootstrap.sh` prefers the App whenever `GITHUB_APP_ID` is set, and **will not
@@ -282,12 +281,10 @@ synchronizer writes through a second mount of the same host directory,
 
 That is process-level separation inside one container, **not a security
 boundary**: the wrapper, plugins and Pretorin MCP children run as the same uid.
-An agent's native file and command tools refuse the writable path. Gateway-side
-MCP file operations are outside that policy and remain unresolved. What the split
-buys is that the assessment
-path — the one every evidence citation comes from — stays read-only, so an
-accidental write fails instead of silently succeeding. See
-[SECURITY.md](../SECURITY.md#the-sandbox-boundary--say-it-plainly).
+Native tools refuse the writable path, but gateway-side MCP file access remains
+unresolved (see [native access limits](../SECURITY.md#native-access-limits-for-effort-agents)).
+The split keeps the assessment path — the source of evidence citations — read-only,
+so an accidental write fails instead of silently succeeding.
 
 ### The sync audit record
 
