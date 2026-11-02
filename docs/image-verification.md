@@ -144,10 +144,8 @@ The SBOM is not attached to the OCI image and is not signed. It is available
 as a workflow artifact and as an asset on the GitHub Release. See the
 [release procedure](releasing.md).
 
-The release record is not signed. Anyone who can publish a release can publish
-a record that agrees with itself. The record binds the files together; it is no
-proof of who made them. That is why `release-assets.py check` refuses unsigned
-sets by default (exit 6).
+An unsigned record binds files without proving publisher identity. The default
+check refuses it (exit 6); see [release-set checks](#checking-a-release-set).
 
 **Planned, not implemented:** image and record signing backed by **Azure Key
 Vault**, following the approach the Pretorin CLI already uses for its own

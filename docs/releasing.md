@@ -110,10 +110,9 @@ Replace `X.Y.Z` with the intended release version.
    overlay and SBOM bytes do not change), compares every published asset with the
    checked set, and then publishes the release.
 
-   Publication does not qualify the release for customers. The set stays
-   unsigned, customer trust and qualification acceptance is pending, and guided
-   install and the updater refuse it. The job summary and the release notes say
-   so.
+   Publication does not qualify the unsigned set for customers. Guided install
+   and release apply refuse it; see [release trust](image-verification.md#checking-a-release-set).
+   The job summary and release notes retain this limit.
 
 5. Wait for the full workflow to succeed. Then open one post-release PR that
    changes both values from the job summary:
