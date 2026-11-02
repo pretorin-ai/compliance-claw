@@ -126,6 +126,8 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | Host image update | `python3 scripts/test-update.py` | Host tools; runs the real updater with isolated Git and Docker stubs. Does not prove live readiness or Compose merging. |
 | Saved deployment selection | `python3 scripts/test-update-compose.py --selection-only` | Real Compose CLI, no daemon, no credentials; covers saved/explicit settings, restored volumes, secret initialization and refusals. |
 | Host image update with Compose | `python3 scripts/test-update-compose.py LOCAL_IMAGE OTHER_LOCAL_IMAGE` | Two cached images with `sh`, `sleep`, and `test`; synthetic containers, two disposable projects, no registry or service credentials. Does not run OpenClaw or prove channel/MCP operation. |
+| Release set and selection | `python3 scripts/release-assets.py --self-test`; `python3 scripts/test-release-render.py` | Python 3, Git, and the real Compose CLI; no daemon, pull, or credential. Inert digests and v0.5.2 fixtures. Fixture-to-tag byte comparison runs only when the tag is present; the default CI checkout has no tag. Does not run publication or prove a pull. |
+| Guided installer | `python3 scripts/test-install.py` | Host tools; runs the real installer, secret-file script, parsers and `clawctl migrate` with Docker, bootstrap and other `clawctl` stubs. Proves input, order, refusal and rerun rules only; no pull, clone, gateway or service check. |
 | Target sync | `bash scripts/sync-targets.sh --self-test` | Bash, Git, Python 3; creates temporary local repositories. |
 | Shell diagnostic text | `python3 scripts/lint-heredocs.py scripts/*.sh` | Local static check; not a separate build CI step. |
 | CLI updater input | `bash scripts/pretorin-update.sh --self-test` | Docker and the candidate build overlay; the wrapper runs the in-image script. |
@@ -137,6 +139,7 @@ Use the current branch's scripts; do not assume a test from another branch exist
 | Effort credential delivery and local records | `bash scripts/test-effort-credentials.sh compliance-claw:local` | Candidate image; canary credentials, native Plan/preflight reads and resume, stopped-record copy/restore, restart and replacement. Synthetic API, no live platform proof. |
 | Agent file and command access | `bash scripts/test-agent-access.sh compliance-claw:local` | Candidate image and host Git; no network; real native and Tool Search handlers, exec grants and MCP launcher; scripted model, synthetic Pretorin API, fake keys. Not live model, Slack or platform proof. |
 | Fresh Slack seed | `bash scripts/test-fresh-slack-seed.sh` | Builds an isolated deployment; no live Slack exchange. |
+| Internal AI endpoint example | `bash tests/internal-ai-ca/run.sh compliance-claw:local` | Candidate image, `openssl`; isolated mock and canary keys. Approved-CA tool round trip, untrusted-CA rejection, missing `INTERNAL_AI_CA_FILE` Compose refusal. Native refusal without `request.tls.ca`: manual only. Not real provider or network proof. |
 | Integrated runtime | `bash scripts/smoke.sh --no-creds` | Disposable project and fixtures above; writes test state. |
 | Documentation/templates | Links, anchors, front matter, and command/source checks | Run changed examples only where needed. No artificial tests or full image build solely for prose. |
 

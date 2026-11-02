@@ -6,6 +6,7 @@ Usage: python3 scripts/test-update-compose.py LOCAL_IMAGE OTHER_LOCAL_IMAGE
 Uses no registry, credentials, ports, or OpenClaw runtime. Git and image pulls
 are stubbed; Compose selection, startup, wait, and inspection are real.
 """
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -63,7 +64,10 @@ def selection_regression(root, docker, docker_env):
         run("bash", "-c", '. scripts/compose-selection.sh; compose_resolve_selection; '
             'test -z "${UNRELATED_SECRET+x}" && test "$COMPOSE_PROFILES" = cli')
         run("bash", "scripts/clawctl", "plan")
-        run("bash", "scripts/init-file-secrets.sh")
+        init = run("bash", "scripts/init-file-secrets.sh").stdout
+        # The trailer keeps the saved selection: no build overlay, no early `up`.
+        assert "compose.build.yaml" not in init and "docker compose up" not in init, init
+        assert "scripts/clawctl apply" in init, init
         run("bash", "scripts/clawctl", "credential", "add", "fixture-key")
         secret = fixture / "saved secrets=literal"
         assert (secret / "pretorin/fixture-key").exists()
@@ -113,6 +117,245 @@ def selection_regression(root, docker, docker_env):
         print("PASS: saved/explicit native selection, recovered volumes, secret initialization, caller refusals and schema-only independence")
 
 
+def release_repo(base, root, docker_env, digest, populate,
+                 repository="ghcr.io/pretorin-ai/compliance-claw"):
+    """Build a Git checkout with a v0.6.0 tag on a local bare origin.
+
+    The checkout stays one commit behind the tag. The release set is made with
+    the real release helper; only its download base points at local files.
+    Returns the checkout, a Git runner, both commits, the environment and the
+    release image reference.
+    """
+    spec = importlib.util.spec_from_file_location("test_update", root / "scripts/test-update.py")
+    fixture_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture_module)
+    repo = base / "repo"
+    repo.mkdir()
+    populate(repo)
+    (repo / ".gitignore").write_text(".env\nsecrets/\nefforts.yaml\ncompose.release.yaml*\ndeployment/\n")
+    fixture_module.install_release_helper(repo, base / "releases")
+    git_env = {**docker_env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+    def git(*args, cwd=repo):
+        return subprocess.run(["git", *args], cwd=cwd, env=git_env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q", "-b", "master")
+    git("add", "-A")
+    git("commit", "-q", "-m", "current")
+    old = git("rev-parse", "HEAD")
+    (repo / "docs").mkdir(exist_ok=True)
+    (repo / "docs/release-note.txt").write_text("release\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "release")
+    new = git("rev-parse", "HEAD")
+    git("tag", "v0.6.0")
+    git("clone", "-q", "--bare", str(repo), str(base / "origin.git"), cwd=base)
+    git("remote", "add", "origin", str(base / "origin.git"))
+    git("tag", "-d", "v0.6.0")
+    git("reset", "-q", "--hard", old)
+
+    image = fixture_module.make_release_set(base / "releases/v0.6.0", "0.6.0", new, digest,
+                                            image_repository=repository)
+    # The neutral overlay reserves the release overlay's place in COMPOSE_FILE.
+    (repo / "compose.release.yaml").write_text("services: {}\n")
+    # The shim's stand-in for a later verified signature; see test-update.py.
+    return repo, git, old, new, {**git_env, "TMPDIR": str(base), "CC_TEST_RELEASE_SIGNED": "1"}, image
+
+
+def release_regression(root, docker, docker_env):
+    """Real Compose renders the release route; real Git; unreachable daemon."""
+
+    def populate(repo):
+        shutil.copytree(root / "scripts", repo / "scripts")
+        for name in ("compose.yaml", "compose.secrets.yaml", "compose.efforts.yaml",
+                     "compose.build.yaml", ".env.example", "versions.env"):
+            shutil.copyfile(root / name, repo / name)
+
+    with tempfile.TemporaryDirectory(prefix="cc-release-") as tmp:
+        base = Path(tmp).resolve()
+        repo, git, old, new, git_env, new_image = release_repo(
+            base, root, docker_env, "sha256:" + "2" * 64, populate)
+
+        # Saved selection: placeholder release overlay, separator ';', a secret
+        # directory with spaces, and recovered external volumes last.
+        (repo / "efforts.yaml").write_text((root / "efforts.example.yaml").read_text())
+        (repo / "deployment").mkdir()
+        recovered = repo / "deployment/recovered.yaml"
+        recovered.write_text(json.dumps({"volumes": {
+            k: {"external": True, "name": "cc-release-restored-" + k}
+            for k in ("openclaw-state", "pretorin-state")}}))
+        (repo / ".env").write_text(
+            "COMPOSE_FILE='./compose.yaml;compose.release.yaml;./compose.secrets.yaml;"
+            "./compose.efforts.yaml;deployment/recovered.yaml'\n"
+            "COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_PROJECT_NAME=cc-release-saved\n"
+            "COMPLIANCE_CLAW_SECRET_DIR='./saved secrets'\nUNRELATED_SECRET=CANARY-DO-NOT-PRINT\n")
+        env = {**git_env, "DOCKER_HOST": "unix:///nonexistent-cc-release.sock"}
+        env.pop("DOCKER_CONTEXT", None)
+        subprocess.run(["bash", "scripts/init-file-secrets.sh"], cwd=repo, env=env, check=True,
+                       capture_output=True)
+
+        def state():
+            files = sorted((str(p.relative_to(repo)), p.read_bytes() if p.is_file() else b"")
+                           for p in repo.rglob("*") if ".git" not in p.parts)
+            return git("rev-parse", "HEAD"), git("for-each-ref"), files
+
+        def update(*args, rc, extra=None):
+            p = subprocess.run(["bash", "scripts/update.sh", "--release", "v0.6.0", *args],
+                               cwd=repo, env={**env, **(extra or {})}, capture_output=True, text=True)
+            output = p.stdout + p.stderr
+            assert p.returncode == rc, output
+            assert "CANARY-DO-NOT-PRINT" not in output, output
+            assert not list(base.glob("cc-release.*")), "temporary cache left behind"
+            return output
+
+        before = state()
+        # Every release set is unsigned today: preview shows it, apply refuses.
+        output = update("--preview", rc=2, extra={"CC_TEST_RELEASE_SIGNED": "0"})
+        assert "UNVERIFIED: publisher authenticity not checked" in output, output
+        assert state() == before
+        output = update("--preview", rc=0)
+        for text in (new_image, "cc-release-restored-openclaw-state", "cc-release-saved",
+                     "./compose.yaml;compose.release.yaml;./compose.secrets.yaml;./compose.efforts.yaml;"
+                     "deployment/recovered.yaml", "no blockers"):
+            assert text in output, (text, output)
+        assert state() == before
+        # Apply cannot pull without a daemon: it stops before any change.
+        output = update(rc=1)
+        assert "Nothing was changed" in output, output
+        assert state() == before
+        # A later customer image override is a custom selection.
+        (repo / "deployment/custom.yaml").write_text(
+            "services:\n  openclaw:\n    image: registry.example/custom:1\n")
+        (repo / ".env").write_text((repo / ".env").read_text().replace(
+            "deployment/recovered.yaml'", "deployment/recovered.yaml;deployment/custom.yaml'"))
+        output = update("--preview", rc=2)
+        assert "custom selection" in output, output
+        print("PASS: release preview with real Compose keeps ordered overlays, recovered volumes,"
+              " and the secret directory; changes nothing; refuses a custom image")
+
+
+def release_apply_regression(root, docker, docker_env, images, image_ids):
+    """Apply a release with real Compose, real Git and synthetic containers.
+
+    The gateway uses restored external volumes, a customer overlay setting and a
+    customer secret path. Pulls are stubbed; both images are already local. The
+    release reference uses the registry digest of the first image.
+    """
+    digests = json.loads(subprocess.run(
+        [docker, "image", "inspect", "--format", "{{json .RepoDigests}}", images[0]],
+        env=docker_env, capture_output=True, text=True, check=True).stdout) or []
+    qualified = [d for d in digests if "/" in d.split("@")[0]]
+    if not qualified:
+        print("SKIP: release apply needs a first image with a registry digest, for example "
+              "a pulled ghcr.io/pretorin-ai/compliance-claw release")
+        return
+    repository, digest = qualified[0].split("@")
+    def populate(repo):
+        (repo / "scripts").mkdir()
+        for name in ("update.sh", "compose-selection.sh", "init-file-secrets.sh"):
+            shutil.copyfile(root / "scripts" / name, repo / "scripts" / name)
+        shutil.copyfile(root / "versions.env", repo / "versions.env")
+        service = {"image": images[1], "network_mode": "none", "user": "0:0", "entrypoint": ["sh", "-c"],
+                   "volumes": ["openclaw-state:/fixture-openclaw", "pretorin-state:/fixture-pretorin"]}
+        (repo / "compose.yaml").write_text(json.dumps({"services": {
+            "openclaw": {**service, "command": ["touch /tmp/ready; exec sleep infinity"],
+                         "healthcheck": {"test": ["CMD", "test", "-f", "/tmp/ready"],
+                                         "interval": "1s", "timeout": "1s", "retries": 3}},
+            "cli": {**service, "profiles": ["cli"], "entrypoint": [], "command": ["true"]},
+        }, "volumes": {"openclaw-state": {}, "pretorin-state": {}}}))
+
+    with tempfile.TemporaryDirectory(prefix="cc-release-apply-") as tmp:
+        base = Path(tmp).resolve()
+        repo, git, old, new, env, release_image = release_repo(
+            base, root, docker_env, digest, populate, repository)
+        project = "cc-release-" + base.name[len("cc-release-apply-"):].lower()
+        restored = {k: project + "-restored-" + k for k in ("openclaw-state", "pretorin-state")}
+        (repo / "deployment").mkdir()
+        (repo / "custom secrets").mkdir()
+        (repo / "custom secrets/token").write_text("CANARY-CUSTOM-SECRET")
+        (repo / "deployment/customer.yaml").write_text(json.dumps({
+            "services": {"openclaw": {"environment": {"CUSTOMER_SETTING": "kept"},
+                                      "secrets": ["customer_token"]}},
+            "secrets": {"customer_token": {"file": "./custom secrets/token"}},
+            "volumes": {k: {"external": True, "name": v} for k, v in restored.items()}}))
+        (repo / "bin").mkdir()
+        (repo / "bin/docker").write_text('''#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+# Both images are local; no registry call is part of this test.
+if args[:1] == ["compose"] and "pull" in args:
+    sys.exit(0)
+if args[:3] == ["compose", "up", "-d"]:
+    pos = args.index("--wait-timeout")
+    assert args[pos + 1] == "720", args
+    args[pos + 1] = "60"
+os.execv(os.environ["FIXTURE_DOCKER"], [os.environ["FIXTURE_DOCKER"], *args])
+''')
+        (repo / "bin/docker").chmod(0o700)
+        env = {**env, "COMPOSE_PROJECT_NAME": project, "COMPOSE_PROFILES": "cli",
+               "COMPOSE_FILE": "compose.yaml:compose.release.yaml:deployment/customer.yaml",
+               "PATH": str(repo / "bin") + os.pathsep + docker_env["PATH"], "FIXTURE_DOCKER": docker}
+
+        def run(*args, check=True):
+            p = subprocess.run(args, cwd=repo, env=env, capture_output=True, text=True)
+            assert not check or p.returncode == 0, p.stdout + p.stderr
+            return p
+
+        def compose(*args):
+            return run(docker, "compose", *args).stdout.strip()
+
+        def update(*args, rc=0):
+            p = run("bash", "scripts/update.sh", "--release", "v0.6.0", *args, check=False)
+            output = p.stdout + p.stderr
+            assert p.returncode == rc, output
+            assert "CANARY-CUSTOM-SECRET" not in output, output
+            return output
+
+        try:
+            for name in restored.values():
+                run(docker, "volume", "create", name)
+            compose("up", "-d", "--wait", "--wait-timeout", "60", "openclaw")
+            compose("run", "--rm", "-T", "cli", "sh", "-c",
+                    "printf config > /fixture-openclaw/config; printf memory > /fixture-openclaw/memory; "
+                    "printf mcp > /fixture-openclaw/external-mcp; printf cli > /fixture-pretorin/active-cli")
+            old_cid = compose("ps", "-q", "openclaw")
+            containers = run(docker, "ps", "-aq", "--filter", "label=com.docker.compose.project=" + project).stdout
+
+            output = update("--preview")
+            assert compose("ps", "-q", "openclaw") == old_cid, output
+            assert run(docker, "inspect", "--format", "{{.Image}}", old_cid).stdout.strip() == image_ids[1]
+            assert run(docker, "ps", "-aq", "--filter", "label=com.docker.compose.project=" + project).stdout == containers
+            assert git("rev-parse", "HEAD") == old
+            print("PASS: release preview leaves the running gateway, checkout and containers unchanged")
+
+            output = update()
+            assert git("rev-parse", "HEAD") == new, output
+            cid = compose("ps", "-q", "openclaw")
+            assert cid != old_cid
+            inspected = json.loads(run(docker, "inspect", cid).stdout)[0]
+            assert inspected["Image"] == image_ids[0], output
+            assert "CUSTOMER_SETTING=kept" in inspected["Config"]["Env"]
+            assert sorted(m["Name"] for m in inspected["Mounts"] if m["Type"] == "volume") == sorted(restored.values())
+            run(docker, "exec", cid, "sh", "-c", 'test "$(cat /run/secrets/customer_token)" = CANARY-CUSTOM-SECRET')
+            state = compose("run", "--rm", "-T", "cli", "sh", "-c",
+                            "cat /fixture-openclaw/config /fixture-openclaw/memory "
+                            "/fixture-openclaw/external-mcp /fixture-pretorin/active-cli")
+            assert state == "configmemorymcpcli", state
+            print("PASS: release apply keeps restored volumes, overlay order, custom secret path and state")
+
+            output = update()
+            assert "already at v0.6.0" in output, output
+            assert compose("ps", "-q", "openclaw") == cid
+            print("PASS: applying the same release again does not replace the gateway")
+        finally:
+            run(docker, "compose", "down", "-v", check=False)
+            for name in restored.values():
+                run(docker, "volume", "rm", name, check=False)
+
+
 def main():
     if len(sys.argv) != 3 and sys.argv[1:] != ["--selection-only"]:
         sys.exit(__doc__)
@@ -127,6 +370,7 @@ def main():
                   if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG")}
 
     selection_regression(root, docker, docker_env)
+    release_regression(root, docker, docker_env)
     if sys.argv[1:] == ["--selection-only"]:
         return
 
@@ -138,6 +382,7 @@ def main():
                  for image in images]
     if image_ids[0] == image_ids[1]:
         sys.exit("The two fixture images must have different image IDs")
+    release_apply_regression(root, docker, docker_env, images, image_ids)
 
     # Read the real service overrides, not a second production timing policy.
     rendered = json.loads(docker_run("compose", "--profile", "*", "config", "--format", "json", cwd=root).stdout)

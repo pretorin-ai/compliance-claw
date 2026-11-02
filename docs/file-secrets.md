@@ -101,6 +101,7 @@ points here rather than restating it, so the two cannot drift.
 | `openai-api-key` | `OPENAI_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
 | `anthropic-api-key` | `ANTHROPIC_API_KEY` | model API-key mode; one selected provider | `openclaw` only |
 | `github-readonly-pat` | *(none — see below)* | only to sync a **private** target from Slack | `openclaw` only |
+| `internal-ai-api-key` | *(none — native file reference)* | only with the [internal AI endpoint overlay](#internal-ai-endpoint-credential) | `openclaw` only |
 
 **Slack needs two files here, not three.** On the multi-effort path those two
 tokens are the whole of what this table owns: which channels are served comes from
@@ -146,6 +147,18 @@ App remains the recommended mechanism for anything past the internal pilot.
 Leave the file **empty** if you have no private targets. Empty means "no
 credential"; a private target then reports `auth_failed` and names both fixes.
 
+### Internal AI endpoint credential
+
+The [internal AI endpoint example](administration.md#internal-ai-endpoint-with-a-private-ca)
+adds gateway-only `internal-ai-api-key`. Neither the base overlay nor
+`scripts/init-file-secrets.sh` creates it. The entrypoint does not export it;
+OpenClaw reads it with a native file reference.
+
+Use an approved secret-input method and the example's UID 1000, `0400` or
+`0600` rule. Native references refuse `0440` and the helper's `0604` mode.
+Replace the file by rename with the same owner and mode, then follow
+[rotation](#rotation) to recreate the gateway. The `cli` service has no copy.
+
 ### Upgrading a deployment that predates a secret
 
 Compose resolves every secret source when the container is created, and a
@@ -156,9 +169,22 @@ never created — not a warning. So after pulling a release that adds one:
 scripts/init-file-secrets.sh      # write-if-absent; never overwrites a value
 ```
 
-`scripts/bootstrap.sh` already does this, and `scripts/update.sh` does it after
-the fast-forward and **before it stops anything**, so an upgrade cannot turn into
-an outage over a credential the deployment does not even use.
+`scripts/bootstrap.sh` already does this. On the file-secret path,
+`scripts/update.sh` runs it after the source changes and **before it stops
+anything**, so an upgrade cannot turn into an outage over a credential the
+deployment does not even use. If it fails, the update stops and the gateway
+continues to run.
+
+The command creates only missing files. A missing gateway token gets a new
+random value; the other new files are empty. An existing file keeps its bytes,
+owner, and mode, also when it is empty: an intentionally empty token stays
+empty. Modes are set only on the files and the directory that the command
+creates. If an existing file is not readable by the container user (uid/gid
+1000), the command stops and names the fix (`0400` owned by `1000:1000` on the
+VM, or `0604` with the local helper); it does not change that file. The `.env`
+path does not create secret files. `scripts/update.sh` also
+stops before downtime when a secret file that a customer overlay names does not
+exist; create that file yourself with the documented mode.
 
 | Excluded from `cli` | Why |
 | --- | --- |

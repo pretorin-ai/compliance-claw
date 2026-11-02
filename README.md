@@ -106,8 +106,86 @@ release, or now with `scripts/bootstrap.sh --build`.
 - A model-provider key (OpenAI or Anthropic), or an OpenAI device-code login.
 - Optional: a Slack workspace where you can install an app, and a read-only
   GitHub App if you want to review private repositories.
+- Approved outbound connections for the features you use. No inbound
+  connection is required. See [network connections](docs/administration.md#network-connections)
+  and the [operator handoff checklist](docs/administration.md#operator-handoff-checklist).
 
 ## Quickstart
+
+### Guided installation on a Linux amd64 VM
+
+`scripts/install.sh` checks one release and calls the existing declaration,
+secret, bootstrap and `clawctl` commands. It shows the plan before apply.
+
+> **Not available yet.** Every published release set is unsigned, and no
+> signature verifier exists. The installer refuses an unsigned set before any
+> write, and it has no option to accept one. Until signing and verification
+> exist, use the [manual installation](#manual-installation). The steps below
+> describe the guided route for that time.
+
+Check the source and release assets before you run a downloaded script. Use
+tools already on the VM:
+
+```sh
+git clone https://github.com/pretorin-ai/compliance-claw.git ~/compliance-claw
+git -C ~/compliance-claw switch --detach vX.Y.Z
+mkdir ~/cc-release && cd ~/cc-release
+# Download the two assets from the vX.Y.Z GitHub release page, for example:
+curl -fLO https://github.com/pretorin-ai/compliance-claw/releases/download/vX.Y.Z/compliance-claw-release.json
+curl -fLO https://github.com/pretorin-ai/compliance-claw/releases/download/vX.Y.Z/compose.release.yaml
+
+grep -E '"(commit|stage|tag|version)"' compliance-claw-release.json
+git -C ~/compliance-claw rev-parse 'vX.Y.Z^{commit}' 'HEAD^{commit}'
+git -C ~/compliance-claw status --porcelain --untracked-files=no
+grep -A2 '"name": "compose.release.yaml"' compliance-claw-release.json
+sha256sum compose.release.yaml        # macOS: shasum -a 256 compose.release.yaml
+```
+
+Require `stage: final`, the chosen tag/version, both commits equal to the record,
+no tracked change, and matching SHA-256 values. This proves agreement only.
+The files and checker come from the same source; they do not prove publisher
+identity. See [release trust](docs/image-verification.md#checking-a-release-set).
+The installer repeats the checks and requires signature verification.
+
+Put credentials in private files (`chmod 600`). The installer copies values only
+into empty secret files. It accepts no credential value as an argument and does
+not print one. Missing Pretorin and OpenAI keys can use hidden terminal input.
+
+```sh
+cd ~/compliance-claw
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
+
+# Check the host, the release set, the existing files and image access. No writes.
+# Without --release-dir, the helper downloads the set into scratch space.
+scripts/install.sh --check --release X.Y.Z --release-dir ~/cc-release \
+  --effort crm-soc2 --system-id <system-uuid> --framework-id soc2 \
+  --target simple-crm=https://github.com/pretorin-ai/simple-crm.git#main \
+  --pretorin-key-file ~/keys/pretorin --openai-key-file ~/keys/openai
+
+# Install: run the same command without --check. The installer shows the plan
+# and asks before apply; add --yes when no terminal is attached.
+```
+
+Run `scripts/install.sh --help` for private targets, Slack and model-key options.
+Slack needs both tokens before first start. An Anthropic key also needs an
+Anthropic model selected in [model settings](docs/administration.md#providers-and-models).
+With an existing `efforts.yaml`, omit declaration options. After placement, omit
+`--release-dir` to use the checked files in the checkout. The release overlay
+must follow `compose.yaml`; later overlays keep their order.
+
+The installer refuses source changes, image overrides and conflicting inputs
+before writes. It preserves declarations, settings, overlays, clones and secret
+files. After an interruption, correct the cause and repeat the command. Use the
+[rotation procedure](docs/file-secrets.md#rotation) for credential changes.
+
+Readiness reports separate gateway, local model, Pretorin probe and release
+results. It does not prove a live provider, a write or a useful task. Complete the
+[operator handoff](docs/administration.md#operator-handoff-checklist).
+For a failure, use the [stage table](docs/administration.md#if-a-setup-stage-fails)
+or [recovery guide](docs/upgrade.md). VM, Docker, network, identity and model
+service setup remain operator tasks; use the manual route below for other hosts.
+
+### Manual installation
 
 ```sh
 # 0. authenticate to the registry (the package is not public)
@@ -120,7 +198,9 @@ export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
 #    uses a Slack channel, if needed. efforts.yaml is what the deployment reads.
 cp efforts.example.yaml efforts.yaml
 vi efforts.yaml                  # system_id, framework_id, targets; optional slack_channel_id
-#    Already have a single-effort targets.yaml? Convert it instead:
+scripts/clawctl validate --schema-only
+#    Do not edit the committed targets.yaml for a new installation. Only an
+#    existing single-effort deployment converts its targets.yaml:
 #    scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 
 # 3. clone the targets, PULL the released image, create the secret files
@@ -222,9 +302,13 @@ supply. Those need a Connected Source on the platform side, which is future work
 ## Verifying what you pulled
 
 Pull by digest, not by tag; the pair this checkout deploys is in
-[compose.yaml](compose.yaml). The image is **unsigned**: the digest pin, the
-per-release SBOM, the release-time scan and recorded provenance are its integrity
-controls. Commands and what they do and do not prove:
+[compose.yaml](compose.yaml). A release can also carry a release set: a record,
+a `compose.release.yaml` overlay that selects its digest, and the SBOM. It is
+unsigned today, so `scripts/release-assets.py check` and the customer install
+and update tools refuse it until signing and verification exist. The image and
+the record are **unsigned**: the digest pin, the asset checksums, the per-release SBOM, the
+release-time scan and recorded provenance are its integrity controls. Commands
+and what they do and do not prove:
 [Verifying the image you pulled](docs/image-verification.md).
 
 ## Repositories and targets
@@ -420,16 +504,25 @@ Contributor test commands, prerequisites, and disposable container setup are in
 
 ## Updating an existing deployment
 
+Select a published release. Preview it, then apply the same release:
+
 ```sh
-scripts/update.sh
+scripts/update.sh --release vX.Y.Z --preview   # changes nothing
+scripts/update.sh --release vX.Y.Z
 ```
 
-One command: fast-forward the checkout, pull the pinned image, restart the
-selected gateway, verify, and report. What survives an update, the health wait,
-refusals and the template warnings are in
+Preview shows the source, image, and volume selection, the required steps,
+the recovery set, and the blockers. Apply checks everything again, pulls the
+image before it stops anything, then restarts the selected gateway, verifies,
+and reports. Apply refuses an unsigned release, so today it refuses every
+release until release signing exists; preview marks it `UNVERIFIED`. Add
+`--save-selection` once to let apply add the release overlay to the saved
+`COMPOSE_FILE` line. `scripts/update.sh` with no options follows a Git branch
+instead. The first use, blockers, what survives an update, the health wait, and
+the template warnings are in
 [Routine deployment update](docs/upgrade.md#routine-deployment-update). For an
 OpenClaw version change, back up both state volumes first:
-[Update, upgrade and recovery](docs/upgrade.md).
+[OpenClaw image upgrade and state backup](docs/upgrade.md#openclaw-image-upgrade-and-state-backup).
 
 ## Resetting
 
@@ -442,7 +535,7 @@ before using it.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `pull access denied` / `unauthorized` | The package is not public | `docker login ghcr.io`; a classic token needs `read:packages` |
-| `deployment is behind the repo pin` | Repo was pulled, deployment never restarted | `scripts/update.sh` |
+| `deployment is not running the selected image` | Selection changed or repo pulled, deployment never restarted | `scripts/update.sh` |
 | Gateway authentication fails at startup | Missing credential or invalid native auth configuration | Check the selected native authentication mode and its secret references. See [secret delivery](docs/file-secrets.md#native-proxy-authentication-and-local-maintenance). |
 | Gateway exits 78 `Missing config` | Config missing or unreadable | Check logs, selected mounts, and file permissions. Preserve state and use [recovery guidance](docs/upgrade.md); do not delete volumes. |
 | Slack never connects | Missing credentials, channel setup, or existing config without Slack | Inspect the Slack warning and current configuration; see [Slack](#slack) and [recovery](docs/upgrade.md). |
@@ -470,6 +563,8 @@ before using it.
 | `pretorin version` is newer than `versions.env` | The CLI was updated in place | Expected. `versions.env` pins the seed; `scripts/pretorin-update.sh --status` shows both |
 | An image upgrade did not change the CLI | By design | The CLI lives in a volume. Use `scripts/pretorin-update.sh` |
 | Updated the CLI but MCP still reports the old version | The gateway's MCP child is still the old process | `docker compose restart openclaw`, then check the next MCP call. `--status` reports the installed binary only |
+| Model turn fails with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | The AI endpoint certificate does not chain to a trusted CA | Configure the approved CA for that provider; keep verification on. See [internal AI endpoint](docs/administration.md#internal-ai-endpoint-with-a-private-ca). |
+| A setup stage fails and the cause is not in this table | Different causes per stage | Follow [if a setup stage fails](docs/administration.md#if-a-setup-stage-fails); collect [support diagnostics](docs/administration.md#support-diagnostics). |
 | `/compliance-claw /pretorin-update` does nothing in Slack | Existing slash-command configuration or missing owner authority | Check startup warnings, the registered command name, and `commands.ownerAllowFrom`. Preserve state before configuration repair; see [CLI updates](docs/upgrade.md#updating-the-pretorin-cli). |
 
 Logs and state:
@@ -484,8 +579,10 @@ scripts/onboard-targets.sh --verify-only # LEGACY single-effort deployments only
 
 ## Releasing
 
-Maintainers use [How to publish a release](docs/releasing.md). Publishing is
-separate from updating a customer deployment or its active Pretorin CLI.
+Maintainers use [How to publish a release](docs/releasing.md): tag, prepare a
+draft candidate, then publish the same bytes without a rebuild. Publishing is
+separate from updating a customer deployment or its active Pretorin CLI. To learn
+about new releases, use GitHub **Watch → Custom → Releases**.
 
 ## Notes
 
