@@ -395,14 +395,12 @@ repository, the target directory or a shared directory.
    echo "OK: recovery set $SET_ID is in $BACKUP_DIR"
    ```
 
-   The file lists record the type, mode, numeric owner, path and link target of
-   each entry, and a SHA-256 checksum of each regular file. The record holds
-   no secret value. Compose secret files and bind-mounted directories are not
-   copied. Each bind-mounted single file is copied, so a private overlay that
-   mounts a key file puts that key in the set. Read `host-inputs.txt` before
-   this step. An overlay is copied when Git does not track it at the current
-   commit, also when it is only staged. `SHA256SUMS` covers the archives, the
-   file lists, the record, `host-inputs.txt` and each saved host file.
+   File lists record type, mode, numeric owner, path, link target and regular-file
+   SHA-256. The record holds no secret value. Compose secrets and bind-mounted
+   directories are not copied; single bind-mounted files are. A mounted key file
+   therefore puts that key in the set. Read `host-inputs.txt` first. Overlays not
+   tracked at the current commit, including staged-only overlays, are copied.
+   `SHA256SUMS` covers the archives, lists, record, inventory and saved host files.
 
 4. Verify the recovery set. The same block is the first step of a restore:
 
@@ -431,14 +429,10 @@ repository, the target directory or a shared directory.
    echo "OK: recovery set $SET_ID is complete and matches its file lists"
    ```
 
-   This stops on a missing or changed file, an empty or unchecked
-   `host-inputs.txt`, a missing or changed saved host file, a record from a
-   different set, and an archive of the wrong volume. It also stops when a host
-   file that the backup copies has no saved copy or no line in `SHA256SUMS`, for
-   example after an interrupted transfer. The checksums find damage; they do not
-   prove who wrote the set. Write down the `SET_ID` and `BACKUP_DIR`
-   values outside the shell. A complete and readable set does not prove that an
-   image is compatible with it. Only the recorded image is a compatible image.
+   This checks archive identity, inventory, saved files and complete checksum
+   coverage, including paired omissions after an interrupted transfer. Checksums
+   detect damage, not authorship. Record `SET_ID` and `BACKUP_DIR` outside the
+   shell. Use the recorded image with this state.
 
 ### Upgrade with the original volumes
 
@@ -543,17 +537,12 @@ that state.
    echo "OK: the host inputs match set $SET_ID"
    ```
 
-   The block skips files that Git tracks at the recorded revision, because the
-   candidate revision can change them. For a tracked declaration such as
-   `targets.yaml`, the verification block checked its saved copy, and step 3 of
-   [Select and save the restored volumes](#select-and-save-the-restored-volumes)
-   compares it after the checkout returns to that revision. A tracked overlay
-   has no saved copy; that checkout restores it. A `STOP:` line
-   names the first file that differs and prints the command that copies the
-   saved file back. Copy it back and run the block again. Keep a changed file
-   only after you check that the restored state supports it; then copy the
-   current file over its saved copy, so that this block and step 3 compare with
-   it.
+   Tracked files are compared after checkout in step 3 of
+   [Select and save the restored volumes](#select-and-save-the-restored-volumes):
+   the candidate can legitimately change them. That step restores tracked
+   overlays from Git. For other differences, use the copy-back command in the
+   `STOP:` message, then repeat the block. Keep a changed file only after you
+   verify compatibility with the restored state; then update its saved copy too.
 
 3. Stop the candidate and keep its state. The candidate logs and container
    record go to a new private directory:
@@ -738,8 +727,8 @@ that state.
 The saved restore overlay selects the image. Do not run `scripts/update.sh`
 while the overlay sets the image. To try the upgrade again later, make and
 verify a new recovery set from the restored volumes. Then remove only the two
-`image:` lines from the overlay; keep the volume lines. Return the checkout to
-its branch with `git switch` before the update.
+`image:` lines from the overlay; keep the volume lines. Before a branch update,
+return to that branch with `git switch`.
 
 ### What a restore does not recover
 
