@@ -357,6 +357,7 @@ COPY versions.env /opt/compliance-claw/versions.env
 # OpenClaw 2026.10.9 already has the fixed Debian Perl packages. Its app-local
 # npm still bundles vulnerable brace-expansion and undici. Replace that npm
 # package with the official patch release; preserve the existing pnpm links.
+# npm 12.2.1 itself bundles undici 6.29.0, so replace that nested copy too.
 RUN . /opt/compliance-claw/versions.env \
  && test "$(node -p 'require("/app/node_modules/npm/package.json").version')" = 12.2.0 \
  && test "$(readlink -f /app/node_modules/npm)" = /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
@@ -367,7 +368,16 @@ RUN . /opt/compliance-claw/versions.env \
  && mkdir /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
  && tar -xzf /tmp/npm.tgz --strip-components=1 -C /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
  && rm /tmp/npm.tgz \
- && test "$(node /app/node_modules/npm/bin/npm-cli.js --version)" = "$NPM_VERSION"
+ && test "$(node /app/node_modules/npm/bin/npm-cli.js --version)" = "$NPM_VERSION" \
+ && U=/app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/undici \
+ && test "$(node -p 'require(process.argv[1]).version' "$U/package.json")" = 6.29.0 \
+ && curl -fsSL --retry 3 --retry-all-errors -o /tmp/undici.tgz \
+      "https://registry.npmjs.org/undici/-/undici-${NPM_UNDICI_VERSION}.tgz" \
+ && NPM_UNDICI_INTEGRITY="$NPM_UNDICI_INTEGRITY" node -e 'const fs=require("fs"),c=require("crypto"); const actual="sha512-"+c.createHash("sha512").update(fs.readFileSync("/tmp/undici.tgz")).digest("base64"); if(actual!==process.env.NPM_UNDICI_INTEGRITY) throw Error("undici integrity mismatch")' \
+ && rm -rf "$U" && mkdir "$U" \
+ && tar -xzf /tmp/undici.tgz --strip-components=1 -C "$U" \
+ && rm /tmp/undici.tgz \
+ && test "$(node -p 'require(process.argv[1]).version' "$U/package.json")" = "$NPM_UNDICI_VERSION"
 
 # Packages in the OpenClaw pnpm store that the gateway loads from node_modules
 # and that have fixable HIGH findings. Each row: name, installed version, store
