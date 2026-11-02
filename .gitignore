@@ -33,3 +33,9 @@ tamper/
 # secrets/ (already ignored above). This line exists so a fresh clone gets the
 # example and produces its own, not so anything sensitive stays out.
 efforts.yaml
+
+# The verified release set on a deployment host: the record and the Compose
+# overlay that selects its image digest. scripts/release-assets.py checks them;
+# the publisher attaches them to the GitHub Release. Host-local, not source.
+compliance-claw-release.json
+compose.release.yaml

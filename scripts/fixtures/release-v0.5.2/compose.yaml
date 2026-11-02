@@ -1,0 +1,200 @@
+# compliance-claw — local linux/amd64 deployment.
+#
+#   docker login ghcr.io                      # the package is not public
+#   scripts/bootstrap.sh                      # .env, clone targets, PULL the image
+#   scripts/clawctl migrate                   # targets.yaml -> efforts.yaml (once)
+#   scripts/clawctl apply                     # agents, bindings, Pretorin binding
+#   docker compose up -d                      # gateway on http://127.0.0.1:18789
+#   docker compose run --rm cli pretorin version
+#
+# THIS FILE PULLS, IT NEVER BUILDS. There is deliberately no `build:` section:
+# with one present, `docker compose up` builds whenever the image is missing
+# locally, which would let an unscanned local build quietly stand in for the
+# released, scanned image. Development builds are opt-in through an overlay:
+#
+#   export COMPOSE_FILE=compose.yaml:compose.build.yaml
+#   scripts/bootstrap.sh --build
+#
+# COMPOSE_FILE is docker compose's own mechanism, so every script in this repo
+# inherits the choice without a flag of its own.
+#
+# Onboard BEFORE `up`. Onboarding writes host-local Pretorin state, and a running
+# gateway keeps a per-session `pretorin mcp-serve` child alive that can serve the
+# older view (the preflight artifact carries a 3600s TTL). If you must onboard
+# while the gateway is up, follow it with:
+#   docker compose restart openclaw
+#
+# NOT `openclaw mcp reload` from the cli service: that command disposes cached
+# MCP runtimes IN THE CALLING PROCESS ONLY, so a one-off cli container disposes
+# its own empty cache and exits, leaving the gateway's children untouched.
+#
+# The gateway generates ~/.openclaw/openclaw.json into the state volume on first
+# start and never overwrites it. `.env` must supply OPENCLAW_GATEWAY_TOKEN or the
+# gateway exits 1; PRETORIN_API_KEY may be empty, which only costs platform
+# access. See .env.example, docs/plans/phase3.md and docs/plans/phase4.md.
+#
+# `docker compose down -v` deletes BOTH named volumes: the OpenClaw state volume
+# (config, sessions, agent workspace, custom AGENTS.md) AND the Pretorin state
+# volume (active context, preflight resolvers, active recipe set). It does NOT
+# touch the bind-mounted target repositories under workspace/targets. Recovery is
+# re-running bootstrap.sh and `scripts/clawctl apply`; both are idempotent.
+# (Legacy single-effort deployments re-run onboard-targets.sh instead.)
+
+name: compliance-claw
+
+# Both services are the same image with the same mounts; only the gateway
+# publishes a port. The anchor is what keeps them from drifting apart — a `cli`
+# whose mounts differ from the gateway's would debug a different container than
+# the one that runs.
+# EVERY SHARED MOUNT, DEFINED EXACTLY ONCE.
+#
+# These exist as individual anchors because a service that needs the shared set
+# PLUS one more has to restate the whole list — YAML merge keys replace a
+# `volumes:` list, they do not append to it. Anchoring each entry means the
+# restatement below references these definitions instead of copying them, so
+# `openclaw` and `cli` cannot drift apart even though only one of them can use
+# the list wholesale.
+x-mounts:
+  # Named volume, not a bind: auth, gateway and MCP state live here and must
+  # survive `docker compose down`. `down -v` is what deletes it.
+  openclaw-state: &vol-openclaw-state "openclaw-state:/home/node/.openclaw"
+  # Pretorin's own state — active context, preflight source resolvers, active
+  # recipe set — which lives OUTSIDE ~/.openclaw. It needs its own volume, and
+  # it must be mounted on BOTH services: `scripts/clawctl apply` writes it from
+  # a one-off `run --rm cli` container, and the gateway's per-session
+  # `pretorin mcp-serve` children are what read it back. Without this, every
+  # onboarding run would evaporate with the container that performed it.
+  pretorin-state: &vol-pretorin-state "pretorin-state:/home/node/.pretorin"
+  # The PARENT of every review target, mounted read-only — the agent reviews
+  # code, it never edits it. No repo is named here or in the image: efforts.yaml
+  # declares them per effort (targets.yaml on legacy deployments) and
+  # scripts/bootstrap.sh clones them into this directory.
+  #
+  # THIS MOUNT STAYS READ-ONLY, ON BOTH SERVICES. Target synchronization needs a
+  # writable view of the same data and gets one on the gateway only, at a
+  # different path. Making THIS one writable instead would hand it to `cli` too
+  # and would make the assessment path itself writable, which is the property
+  # the agent's instructions depend on.
+  targets-ro: &vol-targets-ro "./workspace/targets:/workspace/targets:ro"
+
+x-shared-mounts: &shared-mounts
+  - *vol-openclaw-state
+  - *vol-pretorin-state
+  - *vol-targets-ro
+
+x-compliance-claw: &compliance-claw
+  # Upstream publishes no linux/arm64 Pretorin binary, so amd64 is the
+  # deployment target even on Apple Silicon (emulated). This belongs to the
+  # service rather than under `build:` — the Compose schema rejects
+  # `build.platform`, and the service key covers both a build and the run.
+  platform: linux/amd64
+  # The published image. IMAGE_REPO and IMAGE_VERSION are authoritative in
+  # versions.env; this literal restates them because compose cannot source a
+  # file, and scripts/smoke.sh asserts the two agree. Same documented-duplication
+  # shape as the digest pins on the Dockerfile's FROM lines.
+  #
+  # PINNED TO THE PUBLISHED DIGEST of the v0.5.1 release run, which verified the
+  # round trip: it deleted the built image, pulled this digest back, ran it, and
+  # confirmed the SBOM regenerated from the pulled bytes matched the built one
+  # (1,977 packages both ways). Re-pin on every release — this line and
+  # IMAGE_VERSION move together in the post-release PR, once the digest exists.
+  #
+  # This is the integrity control, not decoration. A tag is a mutable pointer: the
+  # same :X.Y.Z can be made to resolve to different bytes later, and nothing here
+  # would notice. A digest is a content address — it either resolves to the exact
+  # image the release scanned, or it does not resolve. The image is NOT signed, so
+  # the digest pin is the whole of what guarantees what you are running; see
+  # README.md ('Verifying what you pulled'). The release workflow prints the digest
+  # in its job summary for exactly this step.
+  image: ghcr.io/pretorin-ai/compliance-claw:0.5.1@sha256:b40b96523d696fb20963e5aaee61e26c4526c6e91902a56a5354a262562526da
+  env_file:
+    # Gitignored and dockerignored, so nothing here is ever baked into a layer.
+    # required:false because a fresh clone has no .env — Phase 4's bootstrap
+    # writes it, and `cli` commands still work without one.
+    - path: .env
+      required: false
+  volumes: *shared-mounts
+
+services:
+  openclaw:
+    <<: *compliance-claw
+
+    # The long-running gateway: Docker restarts it after a daemon restart or a
+    # host reboot, and leaves it down after a deliberate `stop` or `down`. This
+    # depends on Docker itself being enabled to start on boot.
+    #
+    # ON THE SERVICE, NOT THE ANCHOR. `cli` merges the same anchor, and a
+    # one-off command runner exiting is the expected outcome, not a failure to
+    # recover from.
+    restart: unless-stopped
+
+    # Allow 325 seconds for gateway shutdown and 5 seconds for its
+    # supervisor. Give it time to drain work and release the gateway-owner
+    # lease before Docker sends SIGKILL. This applies to replacement and stop.
+    stop_grace_period: 330s
+
+    # RESTATED, NOT MERGED — and that is a property of YAML, not a style choice.
+    # A `volumes:` key on the service REPLACES the one the merge key brought in;
+    # it does not append to it. Writing only the two extra mounts here silently
+    # dropped the state volumes and the read-only target mount, and the gateway
+    # came up with neither. So every shared mount is a named scalar anchor
+    # defined exactly once above, referenced by both services: the list is
+    # restated, but no mount is ever DEFINED twice, so the two cannot drift.
+    volumes:
+      - *vol-openclaw-state
+      - *vol-pretorin-state
+      - *vol-targets-ro
+      # THE MAINTENANCE ALIAS. The same host directory as /workspace/targets,
+      # mounted writable at a different path, for scripts/sync-targets.sh — git
+      # has to be able to move refs and update the working tree, which is exactly
+      # what the assessment mount must never allow. Gateway only: `cli` is a
+      # one-off command runner and has no business writing to a review target.
+      #
+      # SAY WHAT THIS IS AND IS NOT. It is process-level separation inside ONE
+      # container: the wrapper runs as `node`, and so does the agent's
+      # unsandboxed tool execution, so a prompt-injected agent can reach this
+      # path directly. It is NOT a security boundary, and SECURITY.md says so.
+      # What it does buy is that the ordinary assessment path — the one the agent
+      # is told to use, and the one every evidence citation comes from — stays
+      # read-only, so an accidental write fails instead of silently succeeding.
+      # A real boundary is a separate container with its own uid; that is
+      # deliberately out of scope for the pilot.
+      - ./workspace/targets:/var/lib/compliance-claw/targets:rw
+      #
+      # THE LEGACY DECLARATION OF WHICH REPOSITORIES EXIST. Read-only, and this
+      # base file is exactly the legacy single-effort deployment: no efforts.yaml,
+      # no overlay. /target-sync runs INSIDE the gateway and validates every
+      # requested name against a mounted declaration file, so without this mount
+      # a legacy deployment's /target-sync fails on every request with an
+      # unreadable target list. It stays until a deployment migrates.
+      #
+      # THE MULTI-EFFORT RUNTIME DOES NOT READ IT. compose.efforts.yaml adds
+      # efforts.yaml beside it, and sync-targets.sh prefers efforts.yaml whenever
+      # it is present or an effort is selected — so once migrated, every name is
+      # scoped to one effort and this file is inert.
+      - ./targets.yaml:/etc/compliance-claw/targets.yaml:ro
+      #
+      # efforts.yaml is mounted by that OVERLAY rather than here because it is
+      # gitignored — it names your systems — and compose resolves every bind
+      # source at `up` time, so naming it in the base file would make a fresh
+      # clone fail with "bind source path does not exist" before anything could
+      # explain why. scripts/bootstrap.sh creates it first; scripts/clawctl
+      # refuses with a named fix if it is missing.
+
+    ports:
+      # Never "18789:18789" — a bare port publishes on 0.0.0.0 and exposes the
+      # gateway to the whole LAN. The 127.0.0.1 prefix is the security control.
+      - "127.0.0.1:18789:18789"
+
+  cli:
+    <<: *compliance-claw
+    # No `volumes:` key, so the anchor's shared list applies unchanged: the three
+    # mounts above and nothing else. In particular NOT the writable maintenance
+    # alias and NOT targets.yaml — a one-off command runner needs neither.
+    #
+    # Run-only: the profile keeps `up` from starting a second gateway.
+    profiles: ["cli"]
+
+volumes:
+  openclaw-state:
+  pretorin-state:

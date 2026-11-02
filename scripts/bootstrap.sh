@@ -534,10 +534,21 @@ if [ "$DO_BUILD" = 1 ]; then
   docker compose build
   log "for later shells, save it in .env (README: Save deployment settings), or export it now:  export COMPOSE_FILE=${COMPOSE_FILE}"
 else
-  # Read from the one place versions are declared, so the message cannot claim a
-  # version the deployment does not use.
-  IMAGE_REF="$(awk -F= '/^IMAGE_REPO=/{r=$2} /^IMAGE_VERSION=/{v=$2} END{print r":"v}' versions.env)"
-  log "pulling ${IMAGE_REF}"
+  # Name the image Compose will actually pull: the EFFECTIVE selection, read
+  # from the merged model, not the base pin. With compose.release.yaml selected,
+  # the release image differs from the pin in compose.yaml and versions.env
+  # (that pair moves only in the post-release commit), and a message naming the
+  # pin would describe an image this deployment does not use.
+  IMAGE_REF="$(docker compose config --format json 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["openclaw"]["image"])' 2>/dev/null || true)"
+  [ -n "$IMAGE_REF" ] \
+    || die "could not determine the selected image from the Compose configuration.
+  Check it renders:  docker compose config"
+  BASE_PIN="$(awk -F= '/^IMAGE_REPO=/{r=$2} /^IMAGE_VERSION=/{v=$2} END{print r":"v}' versions.env)"
+  case "$IMAGE_REF" in
+    "${BASE_PIN}"|"${BASE_PIN}@"*) log "pulling ${IMAGE_REF}" ;;
+    *) log "pulling ${IMAGE_REF} (selected by COMPOSE_FILE; the base pin ${BASE_PIN} is not used)" ;;
+  esac
   if ! docker compose pull --quiet 2>/dev/null; then
     docker compose pull || die "could not pull ${IMAGE_REF}.
   The package is not public, so an anonymous pull is refused. Log in first:
