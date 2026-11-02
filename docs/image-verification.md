@@ -116,10 +116,13 @@ do not save it to a file. A caller that already renders it can pipe it:
 
 Exit 2 is a usage error.
 
-`scripts/update.sh` in this version does not download, check, or replace a
-release set. While `compose.release.yaml` is selected, it keeps selecting its own
-release. `scripts/bootstrap.sh` and `scripts/smoke.sh` report the selected image,
-not the base pin.
+`scripts/update.sh --release vX.Y.Z --preview` downloads and checks a release
+set without a change; apply installs it after the checks in
+[Routine deployment update](upgrade.md#routine-deployment-update). Apply
+refuses an unsigned release set, so today it refuses every release. While
+`compose.release.yaml` is selected, it keeps selecting its own release.
+`scripts/bootstrap.sh` and `scripts/smoke.sh` report the selected image, not
+the base pin.
 
 ## What this does and does not prove
 

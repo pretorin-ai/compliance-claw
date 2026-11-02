@@ -7,17 +7,133 @@ Run every command from the repository root with the deployment's saved
 
 ## Routine deployment update
 
+`scripts/update.sh` has two routes. Use the release route for a published
+release. The branch route follows a Git branch; it is the custom route.
+
+### Release route
+
+Preview the release first. Preview does not change the checkout, the Compose
+selection, secret files, containers, or volumes:
+
+```sh
+scripts/update.sh --release vX.Y.Z --preview
+```
+
+Preview fetches the tag (Git objects and `FETCH_HEAD` only). Then
+`scripts/release-assets.py` downloads the final
+[release set](image-verification.md#checking-a-release-set) to a temporary
+directory and checks the record and asset checksums. The updater compares the
+record with the tag commit. Preview renders your ordered Compose selection and
+reports source/image changes, signature status, project, state volumes, secret
+creation, required maintenance (including npm access after a Slack package
+change), recovery inputs and blockers. Release apply
+changes a branch checkout to a detached tag; the branch route then refuses.
+
+Exit 0 means that apply with the same options would continue. Exit 2 means
+that apply would stop on a blocker. A verification, download, or access failure
+exits 1. Then apply the same release:
+
+```sh
+scripts/update.sh --release vX.Y.Z
+```
+
+Apply repeats the checks. It stops before file changes or gateway downtime for:
+
+- a missing, candidate or invalid release set, or a record, asset checksum or
+  source commit that fails verification;
+- an unsigned or unverified signature. **Today every release set is unsigned,
+  so apply refuses every release** until signing and its verifier exist.
+  Preview marks it `UNVERIFIED`; there is no bypass. See
+  [what the checks prove](image-verification.md#what-this-does-and-does-not-prove);
+- local tracked changes or an added/renamed file that conflicts with a local
+  file, including an ignored file or one above the destination path;
+- commits absent from the release, or a downgrade over migrated state. A
+  checkout past a release tag can only move to a later release;
+- a later image override, a changed project or a changed source for a current
+  volume mount. A release can add a mount.
+  For a [restore overlay](#select-and-save-the-restored-volumes), take a new
+  backup, then remove only its two image lines and keep its volume lines;
+- a missing customer secret file. Apply creates only built-in secret files;
+- a required effort-record transfer that is not confirmed;
+- a required `COMPOSE_FILE` change without `--save-selection` (see below).
+
+After these checks, apply pulls the release image. Then it records the tag,
+checks out the tag (detached `HEAD`), and installs the release set
+(`compliance-claw-release.json` and `compose.release.yaml`) in the repository
+root. It keeps the previous set as `compliance-claw-release.json.previous` and
+`compose.release.yaml.previous`. It checks the installed set, the source, and the saved selection again
+with the release helper, and stops if the result differs from the verified
+result. Then it continues with the [shared steps](#shared-update-steps).
+Apply of the release that is already installed changes no file, and Compose
+does not replace the running gateway.
+
+The saved `COMPOSE_FILE` must select `compose.release.yaml` directly after
+`compose.yaml`. On a deployment that does not select it yet, preview shows the
+current and the new line. Apply changes that line in `.env` only when you add
+`--save-selection`:
+
+```sh
+scripts/update.sh --release vX.Y.Z --preview --save-selection
+scripts/update.sh --release vX.Y.Z --save-selection
+```
+
+Apply changes only the `COMPOSE_FILE` line, after all checks above, and keeps
+every other line, the file mode, the owner, and the group. If this user cannot
+keep the group of `.env`, it stops and does not change the file. It prints the
+previous line. If a later step fails before the gateway is replaced, it puts
+the previous line back. A `COMPOSE_FILE` exported in the shell overrides `.env`, so apply refuses
+and names the value to use. You can also save the line by hand, as described in
+[Save deployment settings](../README.md#save-deployment-settings).
+
+A release that adds per-effort Plan and preflight roots requires the
+[effort-record transfer](#transfer-existing-effort-records). Do the transfer
+first. Then apply with `--effort-records-ready`. The script does not move,
+adopt, or check the records.
+
+A release that changes the OpenClaw version can migrate state at startup.
+Before apply, stop the gateway and verify a backup of both state volumes:
+[OpenClaw image upgrade and state backup](#openclaw-image-upgrade-and-state-backup).
+
+If a step fails after the checkout, the script names the recovery inputs: the
+previous branch or commit, the previous release set (the `.previous` files), the previous
+`COMPOSE_FILE` line, the previous images, and the verified backup. Apart from
+the `COMPOSE_FILE` line before the gateway is replaced, it does not recover
+automatically. The release route does not
+change the active Pretorin CLI.
+
+### Branch route
+
 ```sh
 scripts/update.sh
 ```
 
-One command: fast-forward the checkout, pull the image this checkout pins, restart
-the selected gateway, then report anything you have to act on. Compose waits up
+The branch route fast-forwards the checkout's upstream branch and pulls the
+image that the branch pins. Then it continues with the
+[shared steps](#shared-update-steps). It is not a verified release. It refuses
+when the saved selection includes a release overlay, because branch source with
+a release image is a mixed state.
+
+`update.sh` refuses rather than guessing, and names the exact command each time:
+a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
+diverged from its upstream, or a deployment selection that includes the local build
+overlay (that is a rebuild, not an update).
+
+### Shared update steps
+
+On the [file-secret path](file-secrets.md), the script runs
+`scripts/init-file-secrets.sh` before it stops anything. That command creates
+missing built-in secret files and does not change existing files. Then the
+script checks that every secret file in the Compose selection exists. A failure
+stops the update with the gateway still running. The `.env` path does not create
+secret files.
+
+Then the script pulls the selected image, restarts the selected gateway, and
+reports anything you have to act on. Compose waits up
 to 720 seconds for the gateway to report healthy (15-second probe interval,
 720-second startup grace). Your own Compose overlays still take precedence over
 these values. The wait covers gateway startup only: the Git fetch, the image
 pull and the 330-second stop grace add their own time. The script then checks
-that the running container is healthy and runs the pinned image, with your
+that the running container is healthy and runs the selected image, with your
 overlays applied, and checks the gateway again after diagnostics. A second run
 changes nothing.
 
@@ -33,17 +149,6 @@ without a completion report. A failed diagnostic reports configuration status as
 unknown. Inspect the reported error and `docker compose ps -a` with the same
 deployment selection. No automatic recovery is attempted. Gateway health does
 not prove that Slack or Pretorin MCP calls succeed.
-
-On `master` the digest pin and `IMAGE_VERSION` are already set to the current
-release, so updating means pulling `master` rather than editing anything. To move
-to a *specific* release instead, point `compose.yaml` at that digest and set the
-matching `IMAGE_VERSION` in `versions.env` before running it — `smoke.sh` asserts
-the two agree.
-
-`update.sh` refuses rather than guessing, and names the exact command each time:
-a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
-diverged from its upstream, or a deployment selection that includes the local build
-overlay (that is a rebuild, not an update).
 
 ### What survives an update, and what does not
 
@@ -77,9 +182,9 @@ is idempotent either way.
 `smoke.sh` also reports this state on its own:
 
 ```
-NOTE  deployment is behind the repo pin: run scripts/update.sh
-      running sha256:58690e31...
-      pinned  sha256:e123bf53...
+NOTE  deployment is not running the selected image: run scripts/update.sh
+        running  sha256:58690e31...
+        selected sha256:e123bf53...
 ```
 
 A warning, not a failure — being mid-update is not being broken.
