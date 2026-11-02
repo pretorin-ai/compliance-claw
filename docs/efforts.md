@@ -226,8 +226,9 @@ to that system**. If read isolation between efforts matters to you, that is an
 argument for per-system keys, not for a setting here. Measured against CLI
 0.28.7; the evidence is in [plans/effort-config.md](plans/effort-config.md).
 
-**Tool execution is unsandboxed.** The credential files are readable by the
-container user, and so is anything else that user can reach. See `SECURITY.md`.
+**The container has no sandbox.** Native tools cannot read credential files;
+gateway-side MCP file access remains unresolved. See
+[native access limits](../SECURITY.md#native-access-limits-for-effort-agents).
 
 ---
 
@@ -321,12 +322,11 @@ so a `G` id is refused rather than half-configured.
 
 **What isolates one effort from another, and what does not.** Each agent's tool
 policy denies every other effort's Pretorin MCP tools, and each agent's
-instructions state its fixed scope and refuse to switch. That is a
-tool-visibility and prompt boundary. It is **not** a process or filesystem
-boundary: `mcp.servers` is global to the gateway, tool execution is unsandboxed,
-and an absolute path still reaches another effort's clone. What actually protects
-another system's data is the Pretorin API key's own server-side scopes and the
-platform's cross-scope write guard.
+instructions state its fixed scope and refuse to switch. Native file and command
+limits also apply. This is **not** process isolation: gateway-side MCP file access
+remains unresolved (see [native access limits](../SECURITY.md#native-access-limits-for-effort-agents)).
+The Pretorin API key's server-side scopes and the platform's cross-scope write
+guard protect another system's data.
 
 ---
 
