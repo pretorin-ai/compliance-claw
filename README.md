@@ -111,13 +111,8 @@ release, or now with `scripts/bootstrap.sh --build`.
 
 ### Guided installation on a Linux amd64 VM
 
-`scripts/install.sh` guides a VM operator through a first installation of one
-chosen release. It does not build source. It checks the release set with
-`scripts/release-assets.py`, then calls the existing host scripts in this order:
-`clawctl migrate` for a new declaration, `init-file-secrets.sh`, `bootstrap.sh`,
-`clawctl validate`, `clawctl plan` and, after your approval, `clawctl apply`.
-It needs a release that publishes a release set
-([checking a release set](docs/image-verification.md#checking-a-release-set)).
+`scripts/install.sh` checks one release and calls the existing declaration,
+secret, bootstrap and `clawctl` commands. It shows the plan before apply.
 
 > **Not available yet.** Every published release set is unsigned, and no
 > signature verifier exists. The installer refuses an unsigned set before any
@@ -125,8 +120,8 @@ It needs a release that publishes a release set
 > exist, use the [manual installation](#manual-installation). The steps below
 > describe the guided route for that time.
 
-**1. Get the release and check it before you run any script from it.** Use
-only Git and a SHA-256 tool that are already on the VM:
+Check the source and release assets before you run a downloaded script. Use
+tools already on the VM:
 
 ```sh
 git clone https://github.com/pretorin-ai/compliance-claw.git ~/compliance-claw
@@ -143,19 +138,15 @@ grep -A2 '"name": "compose.release.yaml"' compliance-claw-release.json
 sha256sum compose.release.yaml        # macOS: shasum -a 256 compose.release.yaml
 ```
 
-Continue only when `stage` is `final`, the tag and version are the release you
-chose, both `rev-parse` lines equal `commit`, `git status` shows no line, and
-the two SHA-256 values are equal. These checks show that the clone, the record
-and the overlay agree. The record is **not signed** and all of these files come
-from GitHub, so the checks do not prove who published the release. A
-downloaded checker cannot prove its own origin; signing is planned work. The
-installer repeats these checks with the helper and adds the signature check,
-but the helper comes from the same clone.
+Require `stage: final`, the chosen tag/version, both commits equal to the record,
+no tracked change, and matching SHA-256 values. This proves agreement only.
+The files and checker come from the same source; they do not prove publisher
+identity. See [release trust](docs/image-verification.md#checking-a-release-set).
+The installer repeats the checks and requires signature verification.
 
-**2. Run the installer.** Put each credential in a file that only you can read
-(`chmod 600`). The installer copies a value into an empty secret file only. It
-never accepts a value as an argument and never shows one. In a terminal, it asks
-for a missing Pretorin or OpenAI key with hidden input.
+Put credentials in private files (`chmod 600`). The installer copies values only
+into empty secret files. It accepts no credential value as an argument and does
+not print one. Missing Pretorin and OpenAI keys can use hidden terminal input.
 
 ```sh
 cd ~/compliance-claw
@@ -172,55 +163,24 @@ scripts/install.sh --check --release X.Y.Z --release-dir ~/cc-release \
 # and asks before apply; add --yes when no terminal is attached.
 ```
 
-The installer stops before any write when the release set fails a check (an
-unsigned set included), the checkout is not the release commit, a tracked file
-in the checkout has a local change, or a later
-Compose overlay selects another image. It places `compose.release.yaml` and `compliance-claw-release.json` in
-the checkout and saves this selection in `.env`:
-`COMPOSE_FILE=compose.yaml:compose.release.yaml:compose.secrets.yaml:compose.efforts.yaml`.
-A saved selection must list `compose.release.yaml` directly after
-`compose.yaml`; other overlays keep their order.
+Run `scripts/install.sh --help` for private targets, Slack and model-key options.
+Slack needs both tokens before first start. An Anthropic key also needs an
+Anthropic model selected in [model settings](docs/administration.md#providers-and-models).
+With an existing `efforts.yaml`, omit declaration options. After placement, omit
+`--release-dir` to use the checked files in the checkout. The release overlay
+must follow `compose.yaml`; later overlays keep their order.
 
-Options:
+The installer refuses source changes, image overrides and conflicting inputs
+before writes. It preserves declarations, settings, overlays, clones and secret
+files. After an interruption, correct the cause and repeat the command. Use the
+[rotation procedure](docs/file-secrets.md#rotation) for credential changes.
 
-- `--private-target NAME=URL[#BRANCH]` declares a private repository. Supply its
-  credential first; see [private repositories](docs/repositories.md#private-repositories).
-- `--slack-channel-id C...` routes the effort to a Slack channel. Then give
-  `--slack-app-token-file` and `--slack-bot-token-file` too: the installer stops
-  before the first start if a declared channel has no tokens. Omit the channel
-  for browser-only access.
-- `--anthropic-key-file` replaces `--openai-key-file`. Then select an Anthropic
-  model in the Control UI ([providers and models](docs/administration.md#providers-and-models)).
-- With an existing `efforts.yaml`, omit the declaration options. The installer
-  uses the file as it is. After the first run, you can omit `--release-dir`;
-  the installer checks the placed release files again.
-
-The installer reports an exact conflict and changes nothing when an existing
-file disagrees with an input. It keeps `efforts.yaml`, `.env`, the saved
-Compose selection with its overlay order, the placed release files, clones, and
-every secret file, empty or not. After an interruption, fix the reported cause
-and run the same command again. To rotate a credential, use the
-[rotation procedure](docs/file-secrets.md#rotation).
-
-The last stage reports separate results: gateway health, a local model
-configuration check (the provider is not contacted), the Pretorin scope probe
-from `clawctl validate` (writes are not tested), the release set check, and the
-first useful task. The installer cannot do that task. A healthy
-container or a saved key does not show that the Claw works. The Claw
-administrator then follows the
-[operator handoff checklist](docs/administration.md#operator-handoff-checklist) to test
-the model connection and run one approved task. If a stage stops, the
-installer names it; see [if a setup stage fails](docs/administration.md#if-a-setup-stage-fails).
-Use [update, upgrade and recovery](docs/upgrade.md) for problems after installation.
-
-The installer does not set up the VM, Docker, the network, an identity provider
-or a model service. Providers, models, external MCP connections and agent
-settings stay in the native Control UI. A custom endpoint
-([internal AI endpoint](docs/administration.md#internal-ai-endpoint-with-a-private-ca))
-or another mounted credential stays an operator task. The VM needs the
-[network connections](docs/administration.md#network-connections) for the
-registry, GitHub and the services you use. For other hosts, a custom selection, or
-full control of each step, use the manual installation below.
+Readiness reports separate gateway, local model, Pretorin probe and release
+results. It does not prove a live provider, a write or a useful task. Complete the
+[operator handoff](docs/administration.md#operator-handoff-checklist).
+For a failure, use the [stage table](docs/administration.md#if-a-setup-stage-fails)
+or [recovery guide](docs/upgrade.md). VM, Docker, network, identity and model
+service setup remain operator tasks; use the manual route below for other hosts.
 
 ### Manual installation
 
