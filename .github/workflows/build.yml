@@ -100,6 +100,10 @@ jobs:
           python3 scripts/release-assets.py --self-test
           python3 scripts/test-release-render.py
 
+      # Input, order, refusal and rerun rules only; Docker and bootstrap are stubs.
+      - name: Guided installer rules (isolated command stubs)
+        run: python3 scripts/test-install.py
+
       # efforts.yaml IS THE RUNTIME AUTHORITY AND IS GITIGNORED, so CI has none —
       # it names YOUR systems. It is produced here the same way an operator
       # produces one, from the committed targets.yaml, which keeps CI on the

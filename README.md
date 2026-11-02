@@ -109,6 +109,81 @@ release, or now with `scripts/bootstrap.sh --build`.
 
 ## Quickstart
 
+### Guided installation on a Linux amd64 VM
+
+`scripts/install.sh` checks one release and calls the existing declaration,
+secret, bootstrap and `clawctl` commands. It shows the plan before apply.
+
+> **Not available yet.** Every published release set is unsigned, and no
+> signature verifier exists. The installer refuses an unsigned set before any
+> write, and it has no option to accept one. Until signing and verification
+> exist, use the [manual installation](#manual-installation). The steps below
+> describe the guided route for that time.
+
+Check the source and release assets before you run a downloaded script. Use
+tools already on the VM:
+
+```sh
+git clone https://github.com/pretorin-ai/compliance-claw.git ~/compliance-claw
+git -C ~/compliance-claw switch --detach vX.Y.Z
+mkdir ~/cc-release && cd ~/cc-release
+# Download the two assets from the vX.Y.Z GitHub release page, for example:
+curl -fLO https://github.com/pretorin-ai/compliance-claw/releases/download/vX.Y.Z/compliance-claw-release.json
+curl -fLO https://github.com/pretorin-ai/compliance-claw/releases/download/vX.Y.Z/compose.release.yaml
+
+grep -E '"(commit|stage|tag|version)"' compliance-claw-release.json
+git -C ~/compliance-claw rev-parse 'vX.Y.Z^{commit}' 'HEAD^{commit}'
+git -C ~/compliance-claw status --porcelain --untracked-files=no
+grep -A2 '"name": "compose.release.yaml"' compliance-claw-release.json
+sha256sum compose.release.yaml        # macOS: shasum -a 256 compose.release.yaml
+```
+
+Require `stage: final`, the chosen tag/version, both commits equal to the record,
+no tracked change, and matching SHA-256 values. This proves agreement only.
+The files and checker come from the same source; they do not prove publisher
+identity. See [release trust](docs/image-verification.md#checking-a-release-set).
+The installer repeats the checks and requires signature verification.
+
+Put credentials in private files (`chmod 600`). The installer copies values only
+into empty secret files. It accepts no credential value as an argument and does
+not print one. Missing Pretorin and OpenAI keys can use hidden terminal input.
+
+```sh
+cd ~/compliance-claw
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
+
+# Check the host, the release set, the existing files and image access. No writes.
+# Without --release-dir, the helper downloads the set into scratch space.
+scripts/install.sh --check --release X.Y.Z --release-dir ~/cc-release \
+  --effort crm-soc2 --system-id <system-uuid> --framework-id soc2 \
+  --target simple-crm=https://github.com/pretorin-ai/simple-crm.git#main \
+  --pretorin-key-file ~/keys/pretorin --openai-key-file ~/keys/openai
+
+# Install: run the same command without --check. The installer shows the plan
+# and asks before apply; add --yes when no terminal is attached.
+```
+
+Run `scripts/install.sh --help` for private targets, Slack and model-key options.
+Slack needs both tokens before first start. An Anthropic key also needs an
+Anthropic model selected in [model settings](docs/administration.md#providers-and-models).
+With an existing `efforts.yaml`, omit declaration options. After placement, omit
+`--release-dir` to use the checked files in the checkout. The release overlay
+must follow `compose.yaml`; later overlays keep their order.
+
+The installer refuses source changes, image overrides and conflicting inputs
+before writes. It preserves declarations, settings, overlays, clones and secret
+files. After an interruption, correct the cause and repeat the command. Use the
+[rotation procedure](docs/file-secrets.md#rotation) for credential changes.
+
+Readiness reports separate gateway, local model, Pretorin probe and release
+results. It does not prove a live provider, a write or a useful task. Complete the
+[operator handoff](docs/administration.md#operator-handoff-checklist).
+For a failure, use the [stage table](docs/administration.md#if-a-setup-stage-fails)
+or [recovery guide](docs/upgrade.md). VM, Docker, network, identity and model
+service setup remain operator tasks; use the manual route below for other hosts.
+
+### Manual installation
+
 ```sh
 # 0. authenticate to the registry (the package is not public)
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
@@ -120,7 +195,9 @@ export COMPOSE_FILE=compose.yaml:compose.secrets.yaml:compose.efforts.yaml
 #    uses a Slack channel, if needed. efforts.yaml is what the deployment reads.
 cp efforts.example.yaml efforts.yaml
 vi efforts.yaml                  # system_id, framework_id, targets; optional slack_channel_id
-#    Already have a single-effort targets.yaml? Convert it instead:
+scripts/clawctl validate --schema-only
+#    Do not edit the committed targets.yaml for a new installation. Only an
+#    existing single-effort deployment converts its targets.yaml:
 #    scripts/clawctl migrate --name crm-soc2 --slack-channel-id C0123ABCDEF
 
 # 3. clone the targets, PULL the released image, create the secret files
