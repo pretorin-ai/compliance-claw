@@ -191,11 +191,11 @@ test('native linked administrator, analyst, account, and removal authority', { s
     assert.ok(name, `Pinned OpenClaw module missing: ${prefix}`);
     return import(pathToFileURL(`/app/dist/${name}`));
   };
-  const { n: ensureProfile } = await native('user-profiles-TnhRRQbQ');
-  const { c: setRole } = await native('user-profile-writes-B1SBdDHz');
+  const { n: ensureProfile } = await native('user-profiles-C9fRzhrI');
+  const { c: setRole } = await native('user-profile-writes-Bd8MyOtp');
   const { a: link, f: unlink } = await native('user-channel-identities-');
-  const { r: prepareOwner } = await native('command-auth-CgunTpMG');
-  const { executeRegisteredPluginCommand: dispatch } = await native('plugin-command-execution-Z3W9SKd9');
+  const { r: prepareOwner } = await native('command-auth-BHrKDij6');
+  const { executeRegisteredPluginCommand: dispatch } = await native('plugin-command-execution-JgmeuDdK');
   const root = await mkdtemp(join(tmpdir(), 'cc-updater-native-'));
   const options = { path: join(root, 'openclaw.sqlite') };
   try {
