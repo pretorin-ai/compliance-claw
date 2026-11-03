@@ -93,7 +93,7 @@ If the next action does not correct the fault, collect
 
 ## Setting ownership and checks
 
-These paths were checked in the pinned 2026.10.5 UI and local fixtures. A visible
+These paths were checked in the OpenClaw 2026.10.5 UI and local fixtures. A visible
 credential control or successful save is not live service authentication.
 
 | Setting | Role and edit path | Storage/owner | Check |
@@ -229,7 +229,7 @@ and mode, then recreate the gateway. To replace the credential, follow
 | `Provider transport overrides do not allow insecureSkipVerify` | The pinned runtime accepts the field in configuration, then refuses to prepare the model runtime and keeps the gateway unhealthy | Remove it with `openclaw config unset`, then recreate the gateway. |
 
 `tests/internal-ai-ca/run.sh` checks an approved-CA tool round trip and an
-untrusted-CA refusal on pinned OpenClaw 2026.10.5 with a mock endpoint.
+untrusted-CA refusal on pinned OpenClaw 2026.10.9 with a mock endpoint.
 It also checks Compose refusal without `INTERNAL_AI_CA_FILE`. Native rejection
 without `request.tls.ca` was checked manually. Real endpoints, network paths,
 proxies and model quality need separate checks.

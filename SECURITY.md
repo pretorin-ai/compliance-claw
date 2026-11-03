@@ -388,11 +388,17 @@ Ordered roughly by how much it matters, not by effort.
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
 6. **Keep base-image vulnerabilities under review.** The build pins OpenClaw
-   2026.10.5. This base already contains the four fixed Debian Perl packages;
-   Claw no longer installs them again. Its app-local npm 12.2.0 still contains
-   three fixable HIGH findings in brace-expansion and undici. Claw replaces
-   that package with official npm 12.2.1 and verifies its pinned integrity.
-   The release gate blocks fixable HIGH and CRITICAL findings. Unfixed findings
+   2026.10.9. Claw replaces some base packages with official patch releases
+   and verifies each pinned integrity: the app-local npm 12.2.0 with npm
+   12.2.1, the undici copy that npm 12.2.1 bundles, and the gateway's
+   node_modules copies of body-parser and qs. Reassess each
+   correction on a base update. Some vulnerable code stays in the image: the
+   copies that OpenClaw bundles into its own build output, and the
+   dependencies bundled in the official Slack package. Claw does not change
+   these copies. Where only such a bundled copy runs, the scanner-visible
+   package copy also stays unchanged, so the report continues to show the
+   finding. The release gate blocks fixable HIGH and CRITICAL findings, so a
+   release waits for official fixes of these copies. Unfixed findings
    remain in the report. Exceptions require a reason and expiry; the list is
    empty. A passing gate is not proof that the image has no vulnerabilities.
 7. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release

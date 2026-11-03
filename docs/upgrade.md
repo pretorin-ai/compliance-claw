@@ -301,14 +301,14 @@ The version command checks the installed file. Confirm that the restart and next
 Pretorin MCP call succeed before treating the update as complete. Failed automatic
 verification reports installation success with unverified activation.
 
-Automatic verification supports the pinned OpenClaw `2026.10.5` Linux container,
+Automatic verification supports the pinned OpenClaw `2026.10.9` Linux container,
 the canonical Pretorin MCP command, and the shipped effort launcher. See
 [activation, pending results, and recovery limits](#pretorin-cli-activation-and-results)
 and the [update audit record](#pretorin-cli-update-audit).
 
 ## OpenClaw image upgrade and state backup
 
-The build pins OpenClaw 2026.10.5 and Pretorin CLI seed 0.30.4. A fresh
+The build pins OpenClaw 2026.10.9 and Pretorin CLI seed 0.30.4. A fresh
 installation uses this seed. An image upgrade keeps the active CLI in the
 Pretorin state volume. Use the CLI update command to change that active copy.
 
@@ -547,7 +547,7 @@ package, and the active Pretorin CLI. Send a test request through the approved
 test channel. Replace the container once more and repeat the checks. The
 replacement must use the same state volumes.
 
-The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.10.5 allows
+The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.10.9 allows
 325 seconds for shutdown and 5 more seconds for its supervisor. Compose uses
 this limit for a service stop or replacement. A stop can take several minutes
 when work is active.
