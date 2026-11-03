@@ -517,34 +517,42 @@ if [ -e "$CONFIG" ]; then
   fi
 else
   echo "compliance-claw: seeding ${CONFIG}" >&2
-  if [ "$SLACK_EFFORTS_OWNED" = 1 ]; then
-    # Name every declared agent before OpenClaw makes its first config write.
-    # An absent roster creates implicit main; growing a one-agent roster also
-    # changes upstream defaults. clawctl apply supplies all other agent fields.
-    install -d -m 0700 "$(dirname "$CONFIG")"
-    node - "${TEMPLATES}/openclaw-config.template.json" "$CONFIG" "$EFFORTS_FILE" <<'NODE'
+  # PLAIN JSON, WITH THE TEMPLATE'S VALUES. OpenClaw 2026.10.10 records the first
+  # config it reads as the last-known-good size, and Doctor restores
+  # openclaw.json.bak over a later config under half that size. The comments
+  # made the template about 9 KB against a config of about 1.3 KB, so the
+  # startup Doctor reverted the Slack patch on every fresh seed. The commented
+  # template stays in the image as the reference.
+  #
+  # With efforts.yaml, also name every declared agent before OpenClaw makes its
+  # first config write. An absent roster creates implicit main; growing a
+  # one-agent roster also changes upstream defaults. clawctl apply supplies all
+  # other agent fields.
+  SEED_EFFORTS=""
+  [ "$SLACK_EFFORTS_OWNED" = 1 ] && SEED_EFFORTS="$EFFORTS_FILE"
+  install -d -m 0700 "$(dirname "$CONFIG")"
+  node - "${TEMPLATES}/openclaw-config.template.json" "$CONFIG" "$SEED_EFFORTS" <<'NODE'
 const fs = require('node:fs');
 const { createRequire } = require('node:module');
 const { spawnSync } = require('node:child_process');
 const JSON5 = createRequire('/app/package.json')('json5');
-const parsed = spawnSync('python3', ['/opt/compliance-claw/parse-efforts.py', 'agents', process.argv[4]],
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
-if (parsed.status !== 0) process.exit(1);
-const ids = parsed.stdout.trim().split('\n').filter(Boolean).map((line) => line.split('\t')[1]);
-if (!ids.length || ids.some((id) => !id)) throw new Error('No declared agent IDs were parsed.');
 const config = JSON5.parse(fs.readFileSync(process.argv[2], 'utf8'));
-config.agents = { ...config.agents, ownership: 'explicit',
-  entries: Object.fromEntries(ids.map((id) => [id, {}])) };
+if (process.argv[4]) {
+  const parsed = spawnSync('python3', ['/opt/compliance-claw/parse-efforts.py', 'agents', process.argv[4]],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+  if (parsed.status !== 0) process.exit(1);
+  const ids = parsed.stdout.trim().split('\n').filter(Boolean).map((line) => line.split('\t')[1]);
+  if (!ids.length || ids.some((id) => !id)) throw new Error('No declared agent IDs were parsed.');
+  config.agents = { ...config.agents, ownership: 'explicit',
+    entries: Object.fromEntries(ids.map((id) => [id, {}])) };
+}
 fs.writeFileSync(process.argv[3], JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
 NODE
-  else
-    install -D -m 0600 "${TEMPLATES}/openclaw-config.template.json" "$CONFIG"
-  fi
 
   # Slack, applied on top of the freshly seeded base — the only moment it is ever
   # applied, because the branch above never rewrites an existing config. A
-  # deployment with no Slack variables skips this entirely and ends up with a
-  # config byte-identical to Phase 4's.
+  # deployment with no Slack variables skips this entirely and ends up with
+  # exactly the template's values.
   #
   # A failure here is deliberately NOT fatal: the gateway is still perfectly
   # usable over its loopback port and through `docker compose run --rm cli`, and

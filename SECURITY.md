@@ -455,8 +455,8 @@ Ordered roughly by how much it matters, not by effort.
 12. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
    observed working (`cataloged 223 tools behind compact directory surface`) but
    upstream marks all Tool Search modes experimental. If it regresses, the prompt
-   returns to roughly 40k tokens per turn and the commented `toolFilter` block is
-   the lever.
+   returns to roughly 40k tokens per turn and `toolFilter` (commented in the
+   image template, absent from the seeded config) is the lever.
 13. **Per-repository authorization.** Every target shares one Pretorin key and one
    scope. A reviewer who should see one repository sees all of them.
 14. **`mcp.sessionIdleTtlMs` is untuned.** Default 600000 ms — ten minutes of

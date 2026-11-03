@@ -279,6 +279,13 @@ jobs:
       - name: Fresh deployment configures Slack by itself (isolated project)
         run: bash scripts/test-fresh-slack-seed.sh
 
+      # The seed above is not the end state: the gateway's startup Doctor can
+      # still revert the Slack patch. Both seed branches start a fresh gateway
+      # and must keep channels.slack and start the native provider. Canary
+      # tokens; Slack and Pretorin hosts on loopback; no credentials.
+      - name: Fresh gateway keeps Slack and starts the provider (isolated projects)
+        run: bash scripts/test-fresh-slack-start.sh compliance-claw:local
+
       # The internal AI endpoint example: the committed overlay and native patch
       # against a generated test CA and a mock endpoint on an internal network.
       # Approved CA must complete a tool round trip; another CA must be refused.

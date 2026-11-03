@@ -1,9 +1,11 @@
-// openclaw-config.template.json — the config entrypoint.sh installs to
+// openclaw-config.template.json — the values entrypoint.sh seeds into
 // ~/.openclaw/openclaw.json on first start, and never overwrites afterwards.
 //
 // Parsed as JSON5 (OpenClaw's documented config format), which is why the
-// comments below are legal. They live in the state volume once installed, and
-// would be lost only if OpenClaw ever rewrites the file itself (doctor --fix).
+// comments below are legal. The seed is plain JSON with these values and no
+// comments: OpenClaw 2026.10.10 takes the first config size as its baseline,
+// and a commented seed made the startup Doctor revert the Slack patch. This
+// commented file stays in the image at /opt/compliance-claw as the reference.
 //
 // @MODEL@ is substituted at BUILD time from versions.env, so the copy inside
 // the image is concrete and the build fails if MODEL is ever unset.
@@ -133,8 +135,9 @@
         // scopes, enforced server-side by the platform: a read-only key
         // rejects write tools no matter what is listed here.
         //
-        // Uncomment and edit only to shrink the prompt further, or as a
-        // fallback if tools.toolSearch above misbehaves.
+        // The seeded config does not have it. Add it to the config only to
+        // shrink the prompt further, or as a fallback if tools.toolSearch above
+        // misbehaves.
         // toolFilter: {
         //   include: ["check_context", "list_frameworks", "list_controls", "get_control"],
         // },
