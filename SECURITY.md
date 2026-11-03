@@ -388,14 +388,14 @@ Ordered roughly by how much it matters, not by effort.
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
 6. **Keep base-image vulnerabilities under review.** The build pins OpenClaw
-   2026.10.9. Claw replaces some base packages with official patch releases
+   2026.10.10. Claw replaces some base packages with official patch releases
    and verifies each pinned integrity: the app-local npm 12.2.0 with npm
-   12.2.1, the undici copy that npm 12.2.1 bundles, and the gateway's
-   node_modules copies of undici, body-parser and qs. Reassess each
-   correction on a base update. Some vulnerable code stays in the image: the
-   copies that OpenClaw bundles into its own build output, and the
-   dependencies bundled in the official Slack package. Claw does not correct
-   these copies yet. Where only such a bundled copy runs, the scanner-visible
+   12.2.1, the undici and ip-address copies that npm 12.2.1 bundles, and the
+   node_modules copies of undici and qs. Reassess each correction on a base
+   update. Some vulnerable code stays in the image: the copies that OpenClaw
+   bundles into its own build output, for example dompurify, markdown-it and
+   joi, and the qs copy bundled in the official Slack package. Claw does not
+   correct these copies yet. Where only such a bundled copy runs, the scanner-visible
    package copy also stays unchanged, so the report continues to show the
    finding. An official upstream release is the lowest-maintenance
    correction. A source rebuild of the affected OpenClaw outputs, or verified
