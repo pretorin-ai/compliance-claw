@@ -1,0 +1,15 @@
+64a65,70
+>   # Claw experiment 2: official patch releases for scanner findings.
+>   # mermaid 12.2.0 brings katex 0.18; it is assessed here, not approved.
+>   dompurify: 3.4.17
+>   markdown-it: 15.0.3
+>   mermaid: 12.2.0
+>   undici@8.11.2: 8.12.2
+100c106
+<   ip-address: 10.7.3
+---
+>   ip-address: 10.7.4
+106c112
+<   qs: 6.16.0
+---
+>   qs: 6.16.1

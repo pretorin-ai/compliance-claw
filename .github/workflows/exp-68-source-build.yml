@@ -1,0 +1,139 @@
+# TEMPORARY experiment for issue #68 (experiment 2). This file exists only on
+# branch exp/68-source-build-ci. Keep the Actions run history; the branch can
+# go after the evidence is downloaded and hashed.
+#
+# Builds the official OpenClaw v2026.10.10 source to its runtime-assets stage:
+#   unmodified        the exact source, for comparison with the official image
+#   overrides-no-joi  the same source with the reviewed overrides and lock in
+#                     .github/exp-68/ (joi waits for minimumReleaseAge; mermaid
+#                     12.2.0 is an assessment input, not an approved upgrade)
+# Uploads the dist tree, its manifest and a receipt for one day. No secrets, no
+# registry push, no release. The upstream memory guard and supply-chain policy
+# are not changed: OPENCLAW_DOCKER_BUILD_TSDOWN_MAX_OLD_SPACE_MB is not set.
+name: exp-68-source-build
+
+on:
+  push:
+    branches: [exp/68-source-build-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: exp-68-source-build
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [unmodified, overrides-no-joi]
+    env:
+      SRC_COMMIT: 7dc3350cb9f08fcf9a0af5c4845a20d5b2f1a8be
+      SRC_SHA256: 91f191e11ac7d02d97dc7246f4a713aee57c17de34c9771d7ad2951b5605d0bf
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Record the runner and remove unused toolchains
+        run: |
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"; echo "OUT=$OUT" >> "$GITHUB_ENV"
+          { echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; uname -a; nproc; free -m; df -h /; docker version; docker buildx version; } > "$OUT/runner.txt" 2>&1
+          # Runner only: preinstalled SDKs that the build never reads.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          df -h / >> "$OUT/runner.txt"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+          path: claw
+
+      - name: Get and verify the official source
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/src.tgz" "https://github.com/openclaw/openclaw/archive/${SRC_COMMIT}.tar.gz"
+          echo "${SRC_SHA256}  $RUNNER_TEMP/src.tgz" | sha256sum -c -
+          test "$(gzip -dc "$RUNNER_TEMP/src.tgz" | git get-tar-commit-id)" = "$SRC_COMMIT"
+          mkdir "$RUNNER_TEMP/src"
+          tar -xzf "$RUNNER_TEMP/src.tgz" -C "$RUNNER_TEMP/src" --strip-components=1
+          cd "$RUNNER_TEMP/src"
+          sha256sum -c - <<'EOF'
+          1973dab73364587aa1e2979893e13c57797fd94580e2668a2ecbafcd41691571  Dockerfile
+          5af51204804d9eaabf3c16b23a9489f72e3b7cb7b302867219aab9b9e5853cbe  pnpm-workspace.yaml
+          cac4e3810242167d941d14b6befd63959ca76bd10289437c33caa5366eeb383c  pnpm-lock.yaml
+          EOF
+          {
+            echo "variant=$VARIANT repository=$GITHUB_REPOSITORY ref=$GITHUB_REF commit=$GITHUB_SHA run_id=$GITHUB_RUN_ID run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "runner=$ImageOS/$ImageVersion actions=checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09,upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+            (cd "$GITHUB_WORKSPACE/claw" && sha256sum .github/workflows/exp-68-source-build.yml .github/exp-68/*) | sed 's/^/claw_file /'
+            echo "source_url=https://github.com/openclaw/openclaw/archive/${SRC_COMMIT}.tar.gz"
+            echo "source_sha256=$(sha256sum "$RUNNER_TEMP/src.tgz" | cut -d' ' -f1) source_bytes=$(stat -c %s "$RUNNER_TEMP/src.tgz") tar_commit=$(gzip -dc "$RUNNER_TEMP/src.tgz" | git get-tar-commit-id)"
+            sha256sum Dockerfile pnpm-workspace.yaml pnpm-lock.yaml | sed 's/^/source_file /'
+            grep -E '^ARG OPENCLAW_(NODE_BOOKWORM|NODE_BOOKWORM_SLIM|BUN)_IMAGE=' Dockerfile
+            grep -o '"packageManager": *"[^"]*"' package.json
+          } > "$OUT/receipt.txt"
+
+      - name: Apply the reviewed overrides and lock
+        if: matrix.variant != 'unmodified'
+        run: |
+          D="$GITHUB_WORKSPACE/claw/.github/exp-68"
+          sha256sum -c - <<EOF
+          ce278eb7a6f9f58cd2b1bda051bc0200dc035dbb8e3c2342ad450e2820596b21  $D/overrides-no-joi.diff
+          ea26809f2c97eb7cdf272c385d8f06ccd34b82372e6d93e8935a48587f53daf1  $D/lock-no-joi.diff
+          EOF
+          cd "$RUNNER_TEMP/src"
+          patch pnpm-workspace.yaml < "$D/overrides-no-joi.diff"
+          patch pnpm-lock.yaml < "$D/lock-no-joi.diff"
+          sha256sum -c - <<'EOF'
+          f30c0bfd6ff11d398f1ee73a7614bbd3bb881c9942e4473f5922676ab5abd042  pnpm-workspace.yaml
+          e179ea7d0cde3cfb33ee3651a2122f2effe8317058ad638d2f8bb33e5ee0b602  pnpm-lock.yaml
+          EOF
+          { echo "patch=$(patch --version | head -1)"; sha256sum pnpm-workspace.yaml pnpm-lock.yaml | sed 's/^/patched_file /'; } >> "$OUT/receipt.txt"
+
+      - name: Build to the runtime-assets stage
+        run: |
+          (while sleep 5; do echo "$(date -u +%T) used_mb=$(free -m | awk '/^Mem:/{print $3}') avail_mb=$(free -m | awk '/^Mem:/{print $7}')"; done) > "$OUT/mem.log" &
+          SAMPLER=$!; trap 'kill "$SAMPLER"' EXIT
+          BUILD=(docker build --progress=plain --platform linux/amd64 --target runtime-assets
+            --build-arg GIT_COMMIT="$SRC_COMMIT"
+            --build-arg OPENCLAW_BUILD_TIMESTAMP=2026-11-02T19:42:22.573Z
+            --build-arg OPENCLAW_DOCKER_BUILD_VERSION=2026.10.10
+            --build-arg OPENCLAW_EXTENSIONS=diagnostics-otel,codex
+            --build-arg GITHUB_ACTIONS=true
+            -t "exp68:$VARIANT" "$RUNNER_TEMP/src")
+          echo "build_command=${BUILD[*]}" >> "$OUT/receipt.txt"
+          "${BUILD[@]}" 2>&1 | tee "$OUT/build.log"
+          {
+            echo "image_id=$(docker image inspect --format '{{.Id}}' "exp68:$VARIANT")"
+            docker run --rm --network none --entrypoint sh "exp68:$VARIANT" -c \
+              'echo "image_node=$(node --version)"; echo "image_pnpm=$(COREPACK_ENABLE_NETWORK=0 pnpm --version 2>/dev/null || echo unavailable-offline)"'
+          } >> "$OUT/receipt.txt"
+
+      - name: Record the dist tree
+        run: |
+          docker run --rm --network none --entrypoint sh "exp68:$VARIANT" -c \
+            'cd /app && find dist -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum' > "$OUT/dist.sha256"
+          docker run --rm --network none --entrypoint sh "exp68:$VARIANT" -c \
+            'cd /app && sha256sum package.json pnpm-lock.yaml pnpm-workspace.yaml' > "$OUT/app-meta.sha256"
+          # Production dependency graph of the same build (names and versions only).
+          docker run --rm --network none --entrypoint sh "exp68:$VARIANT" -c \
+            'ls -1 /app/node_modules/.pnpm | LC_ALL=C sort' > "$OUT/pnpm-store.txt"
+          id=$(docker create "exp68:$VARIANT")
+          docker cp "$id:/app/dist" - | gzip -6 > "$OUT/dist-$VARIANT.tar.gz"
+          docker rm "$id"
+          (cd "$OUT" && sha256sum "dist-$VARIANT.tar.gz" dist.sha256 app-meta.sha256 pnpm-store.txt > outputs.sha256)
+          df -h / >> "$OUT/runner.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: exp68-${{ matrix.variant }}
+          path: ${{ runner.temp }}/out
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
