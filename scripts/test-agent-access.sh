@@ -119,7 +119,9 @@ http.createServer((req, res) => {
   req.on('end', () => {
     if (req.method !== 'POST') { res.writeHead(200); res.end('{"data":[{"id":"m1"}]}'); return; }
     const data = JSON.parse(body || '{}');
-    const messages = data.messages || [];
+    // OpenClaw 2026.10.10 adds a runtime-context user message; the script is in the turn's own message.
+    const runtimeContext = (m) => m.role === 'user' && text(m.content).startsWith('OpenClaw runtime context:');
+    const messages = (data.messages || []).filter((m) => !runtimeContext(m));
     const last = messages[messages.length - 1] || {};
     const user = [...messages].reverse().find((m) => m.role === 'user');
     const match = /SCRIPT:([A-Za-z0-9+/=]+)/.exec(text(user?.content));
