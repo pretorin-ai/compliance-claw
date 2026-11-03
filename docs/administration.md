@@ -242,7 +242,6 @@ namespace and the existing entrypoint to load mounted credentials:
 ```sh
 docker compose exec openclaw /usr/local/bin/compliance-claw-entrypoint openclaw models list
 docker compose exec openclaw /usr/local/bin/compliance-claw-entrypoint openclaw models set <provider/model>
-docker compose exec openclaw /usr/local/bin/compliance-claw-entrypoint openclaw mcp probe <external-name> --json
 ```
 
 `models set` changes the **global default**, not one agent's override. A one-off
@@ -250,6 +249,17 @@ docker compose exec openclaw /usr/local/bin/compliance-claw-entrypoint openclaw 
 must not bypass the native live-state owner check. Use the
 [file-secret-aware agent command](file-secrets.md#docker-compose-exec-does-not-see-these-secrets)
 for a turn against the running gateway.
+
+In OpenClaw 2026.10.10, `openclaw mcp probe` needs exclusive offline state
+ownership. It refuses while the gateway runs. Stop the gateway through Compose,
+run the probe in the one-off CLI container, then start the gateway again. The
+Claw does not answer during this procedure.
+
+```sh
+docker compose stop openclaw
+docker compose run --rm cli openclaw mcp probe <external-name> --json
+docker compose up -d --wait --wait-timeout 720 openclaw
+```
 
 For interactive device-code login, the native command is
 `openclaw models auth login --provider openai --device-code`; run it through the

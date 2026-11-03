@@ -113,7 +113,6 @@ hasnt() { case "$3" in *"$2"*) fail "$1" "did not expect to find: $2" ;; *) pass
 # compared a version number against a container id.
 cli()  { docker compose run --rm -T cli "$@"; }
 val()  { docker compose run --rm -T cli "$@" 2>/dev/null | tr -d '\r'; }
-inbox() { docker compose exec -T openclaw bash -s; }   # script arrives on stdin
 
 SCRATCH_SYS="smoke-system"
 SCRATCH_FW="smoke-framework"
@@ -1191,9 +1190,24 @@ else
 fi
 
 head2 "A6. THE CWD FIX — the mcp-serve child's working directory"
-CWD_OUT="$(inbox <<'EOF' 2>&1
+# OpenClaw 2026.10.10 admits `mcp probe` only with exclusive offline state
+# ownership and refuses while a gateway owns the state. So stop this disposable
+# project's gateway through its service owner, Compose, and run the native probe
+# in the one-off CLI container, as clawctl's oc_cli does with the gateway stopped.
+# The probe still loads the configured server from the same state volume.
+A6_STOPPED=0
+if docker compose ps --status running --services 2>/dev/null | grep -x openclaw >/dev/null; then
+  if docker compose stop openclaw >/dev/null 2>&1; then
+    A6_STOPPED=1
+  else
+    fail "the gateway stops through Compose for the offline probe"
+  fi
+fi
+CWD_OUT="$(cli bash -s <<'EOF' 2>&1
 set -u
-nohup openclaw mcp probe pretorin >/tmp/smoke-probe.out 2>&1 &
+timeout 120 openclaw mcp probe pretorin >/tmp/smoke-probe.out 2>&1 &
+probe=$!
+found=CHILD_NOT_FOUND
 for _ in $(seq 1 60); do
   for d in /proc/[0-9]*; do
     cl="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | sed 's/ *$//')"
@@ -1202,15 +1216,21 @@ for _ in $(seq 1 60); do
     # (No apostrophes in this heredoc: bash 3.2 scans quotes inside a heredoc
     #  nested in $( ), so a contraction here breaks the enclosing parse.)
     if [ "$cl" = "/home/node/.pretorin/bin/pretorin mcp-serve" ]; then
-      echo "CHILD_CWD=$(readlink "$d/cwd")"
-      exit 0
+      found="CHILD_CWD=$(readlink "$d/cwd")"
+      break 2
     fi
   done
   sleep 0.25
 done
-echo "CHILD_NOT_FOUND"
+echo "$found"
+# Let the probe exit and release offline ownership before the gateway starts.
+wait "$probe"
 EOF
 )"
+if [ "$A6_STOPPED" = 1 ]; then
+  ok "the gateway is healthy again after the offline probe" \
+     docker compose up -d --wait --wait-timeout 720 openclaw
+fi
 has   "mcp-serve child runs in the sentinel directory" "CHILD_CWD=/opt/compliance-claw/no-repo" "$CWD_OUT"
 hasnt "mcp-serve child does NOT run in /app"           "CHILD_CWD=/app" "$CWD_OUT"
 ok    "sentinel directory holds no repo and no markdown" \
