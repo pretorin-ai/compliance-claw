@@ -394,11 +394,15 @@ Ordered roughly by how much it matters, not by effort.
    node_modules copies of undici, body-parser and qs. Reassess each
    correction on a base update. Some vulnerable code stays in the image: the
    copies that OpenClaw bundles into its own build output, and the
-   dependencies bundled in the official Slack package. Claw does not change
-   these copies. Where only such a bundled copy runs, the scanner-visible
+   dependencies bundled in the official Slack package. Claw does not correct
+   these copies yet. Where only such a bundled copy runs, the scanner-visible
    package copy also stays unchanged, so the report continues to show the
-   finding. The release gate blocks fixable HIGH and CRITICAL findings, so a
-   release waits for official fixes of these copies. Unfixed findings
+   finding. An official upstream release is the lowest-maintenance
+   correction. A source rebuild of the affected OpenClaw outputs, or verified
+   dependency corrections after the official Slack install, are possible
+   local routes; neither is implemented or proved. The release gate blocks
+   fixable HIGH and CRITICAL findings, so it stays red until these copies are
+   corrected. Unfixed findings
    remain in the report. Exceptions require a reason and expiry; the list is
    empty. A passing gate is not proof that the image has no vulnerabilities.
 7. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
