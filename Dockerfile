@@ -357,7 +357,8 @@ COPY versions.env /opt/compliance-claw/versions.env
 # OpenClaw 2026.10.10 already has the fixed Debian Perl packages. Its app-local
 # npm still bundles vulnerable brace-expansion and undici. Replace that npm
 # package with the official patch release; preserve the existing pnpm links.
-# npm 12.2.1 itself bundles undici 6.29.0, so replace that nested copy too.
+# npm 12.2.1 itself bundles undici 6.29.0 and ip-address 10.7.2, so replace
+# those nested copies too.
 RUN . /opt/compliance-claw/versions.env \
  && test "$(node -p 'require("/app/node_modules/npm/package.json").version')" = 12.2.0 \
  && test "$(readlink -f /app/node_modules/npm)" = /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
@@ -377,7 +378,16 @@ RUN . /opt/compliance-claw/versions.env \
  && rm -rf "$U" && mkdir "$U" \
  && tar -xzf /tmp/undici.tgz --strip-components=1 -C "$U" \
  && rm /tmp/undici.tgz \
- && test "$(node -p 'require(process.argv[1]).version' "$U/package.json")" = "$NPM_UNDICI_VERSION"
+ && test "$(node -p 'require(process.argv[1]).version' "$U/package.json")" = "$NPM_UNDICI_VERSION" \
+ && A=/app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/ip-address \
+ && test "$(node -p 'require(process.argv[1]).version' "$A/package.json")" = 10.7.2 \
+ && curl -fsSL --retry 3 --retry-all-errors -o /tmp/ip-address.tgz \
+      "https://registry.npmjs.org/ip-address/-/ip-address-${NPM_IP_ADDRESS_VERSION}.tgz" \
+ && NPM_IP_ADDRESS_INTEGRITY="$NPM_IP_ADDRESS_INTEGRITY" node -e 'const fs=require("fs"),c=require("crypto"); const actual="sha512-"+c.createHash("sha512").update(fs.readFileSync("/tmp/ip-address.tgz")).digest("base64"); if(actual!==process.env.NPM_IP_ADDRESS_INTEGRITY) throw Error("ip-address integrity mismatch")' \
+ && rm -rf "$A" && mkdir "$A" \
+ && tar -xzf /tmp/ip-address.tgz --strip-components=1 -C "$A" \
+ && rm /tmp/ip-address.tgz \
+ && test "$(node -p 'require(process.argv[1]).version' "$A/package.json")" = "$NPM_IP_ADDRESS_VERSION"
 
 # Packages in the OpenClaw pnpm store with fixable findings. versions.env gives
 # the reason for each row. Each row: name, installed version, store
