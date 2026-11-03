@@ -379,14 +379,13 @@ RUN . /opt/compliance-claw/versions.env \
  && rm /tmp/undici.tgz \
  && test "$(node -p 'require(process.argv[1]).version' "$U/package.json")" = "$NPM_UNDICI_VERSION"
 
-# Packages in the OpenClaw pnpm store that the gateway loads from node_modules
-# and that have fixable HIGH findings. Each row: name, installed version, store
+# Packages in the OpenClaw pnpm store with fixable findings. versions.env gives
+# the reason for each row. Each row: name, installed version, store
 # directory, official patch version, integrity. The installed version is asserted
 # before the replacement, so a base update fails here and the row is reassessed.
 RUN . /opt/compliance-claw/versions.env \
  && printf '%s\n' \
       "qs 6.16.0 qs@6.16.0 ${QS_VERSION} ${QS_INTEGRITY}" \
-      "body-parser 2.3.0 body-parser@2.3.0_supports-color@10.2.2 ${BODY_PARSER_VERSION} ${BODY_PARSER_INTEGRITY}" \
       "undici 8.11.2 undici@8.11.2 ${UNDICI_VERSION} ${UNDICI_INTEGRITY}" \
       > /tmp/pnpm-corrections \
  && while read -r name from dir to integrity; do \
