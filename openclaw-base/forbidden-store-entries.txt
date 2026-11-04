@@ -1,0 +1,12 @@
+# pnpm store entries (name@version) that must not exist in the source-built
+# base or in a Claw image built on it. The reviewed override set replaces each
+# one (README.md). The guard also refuses the same name with a _peer suffix.
+dompurify@3.4.16
+markdown-it@15.0.2
+mermaid@12.1.0
+katex@0.16.47
+undici@8.11.2
+ip-address@10.7.3
+qs@6.16.0
+seroval@1.6.8
+joi@18.2.9
