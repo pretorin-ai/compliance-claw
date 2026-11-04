@@ -16,6 +16,166 @@
 #   3. `statement` says what it is, why it is not fixable HERE, and how reachable
 #      it actually is. "Low risk" on its own is not a statement.
 #
-# The OpenClaw 2026.9.8 image no longer reports the previously accepted IDs.
-# The release scan must pass without those exceptions.
-vulnerabilities: []
+# SCOPE: findings inherited from official upstream bytes only. Claw uses the
+# official OpenClaw image (Dockerfile FROM digest sha256:1e5ee6c7...f799) as
+# supplied and does not replace its packages. Each entry names the package
+# path inside that image (`paths` for language packages, `purls` for OS
+# packages), so the same id at a Claw-owned path still blocks. A finding in the
+# official @openclaw/slack package can have an entry scoped to
+# opt/compliance-claw/slack-seed/. A Claw-owned finding never gets an entry.
+# The release report runs without this file, so accepted findings stay visible
+# until upstream fixes them. A change of the OpenClaw FROM digest requires a
+# new derivation of this list from a scan of the new image.
+#
+# Derived on 2026-11-04 from Trivy 0.73.0 (DB schema 2, updated
+# 2026-11-04T13:16:53Z) with the release flags. Every fixable HIGH or CRITICAL
+# finding of that scan is in the official image; none is in a Claw path or in
+# the Slack seed. The OS findings in that scan have no fix and do not block.
+vulnerabilities:
+  - id: CVE-2026-102276
+    paths:
+      - "app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/brace-expansion/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. brace-expansion 5.0.9
+      bundled in the app-local npm 12.2.0. Loaded when OpenClaw runs its bundled
+      npm, for example for a plugin install such as the managed Slack install.
+      Claw does not replace official upstream packages; the fix (brace-expansion
+      5.0.9 fixed in 5.0.10, 3.0.7, 2.1.5, 1.1.19) needs an upstream OpenClaw
+      release. Entry dated 2026-11-04.
+  - id: CVE-2026-102278
+    paths:
+      - "app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/brace-expansion/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. brace-expansion 5.0.9
+      bundled in the app-local npm 12.2.0. Loaded when OpenClaw runs its bundled
+      npm, for example for a plugin install such as the managed Slack install.
+      Claw does not replace official upstream packages; the fix (brace-expansion
+      5.0.9 fixed in 5.0.11, 3.0.8, 2.1.6, 1.1.20) needs an upstream OpenClaw
+      release. Entry dated 2026-11-04.
+  - id: GHSA-cg2g-xh64-v4q7
+    paths:
+      - "app/node_modules/.pnpm/dompurify@3.4.16/node_modules/dompurify/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      CRITICAL finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. dompurify 3.4.16 in the
+      pnpm store. OpenClaw also bundles a copy into its build output; which copy
+      runs is not established. Claw does not replace official upstream packages;
+      the fix (dompurify 3.4.16 fixed in 3.4.17) needs an upstream OpenClaw
+      release. Entry dated 2026-11-04.
+  - id: GHSA-mrv2-3pqr-j5jr
+    paths:
+      - "app/node_modules/.pnpm/dompurify@3.4.16/node_modules/dompurify/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. dompurify 3.4.16 in the
+      pnpm store. OpenClaw also bundles a copy into its build output; which copy
+      runs is not established. Claw does not replace official upstream packages;
+      the fix (dompurify 3.4.16 fixed in 3.4.17) needs an upstream OpenClaw
+      release. Entry dated 2026-11-04.
+  - id: CVE-2026-118772
+    paths:
+      - "app/node_modules/.pnpm/joi@18.2.9/node_modules/joi/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. joi 18.2.9 in the pnpm
+      store. OpenClaw also bundles a copy into its build output; which copy runs
+      is not established. Claw does not replace official upstream packages; the
+      fix (joi 18.2.9 fixed in 17.13.9, 18.3.1) needs an upstream OpenClaw
+      release. Entry dated 2026-11-04.
+  - id: CVE-2026-111758
+    paths:
+      - "app/node_modules/.pnpm/markdown-it@15.0.2/node_modules/markdown-it/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. markdown-it 15.0.2 in the
+      pnpm store. OpenClaw also bundles a copy into its build output; which copy
+      runs is not established. Claw does not replace official upstream packages;
+      the fix (markdown-it 15.0.2 fixed in 14.3.3, 15.0.3) needs an upstream
+      OpenClaw release. Entry dated 2026-11-04.
+  - id: CVE-2026-109383
+    paths:
+      - "app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/undici/package.json"
+      - "app/node_modules/.pnpm/undici@8.11.2/node_modules/undici/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. undici 6.28.0 bundled in
+      the app-local npm 12.2.0. Loaded when OpenClaw runs its bundled npm, for
+      example for a plugin install such as the managed Slack install. undici
+      8.11.2 in the pnpm store. mailauth 7.1.1 pins exactly this version; /app
+      resolves undici 8.12.2, and no loader of this copy is known. Claw does not
+      replace official upstream packages; the fix (undici 6.28.0 fixed in
+      6.29.1, 7.30.1, 8.12.2; undici 8.11.2 fixed in 6.29.1, 7.30.1, 8.12.2)
+      needs an upstream OpenClaw release. Entry dated 2026-11-04.
+  - id: CVE-2026-109869
+    paths:
+      - "app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/undici/package.json"
+      - "app/node_modules/.pnpm/undici@8.11.2/node_modules/undici/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. undici 6.28.0 bundled in
+      the app-local npm 12.2.0. Loaded when OpenClaw runs its bundled npm, for
+      example for a plugin install such as the managed Slack install. undici
+      8.11.2 in the pnpm store. mailauth 7.1.1 pins exactly this version; /app
+      resolves undici 8.12.2, and no loader of this copy is known. Claw does not
+      replace official upstream packages; the fix (undici 6.28.0 fixed in
+      6.29.1, 7.30.1, 8.12.2; undici 8.11.2 fixed in 6.29.1, 7.30.1, 8.12.2)
+      needs an upstream OpenClaw release. Entry dated 2026-11-04.
+  - id: CVE-2026-19534
+    paths:
+      - "app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/undici/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. undici 6.28.0 bundled in
+      the app-local npm 12.2.0. Loaded when OpenClaw runs its bundled npm, for
+      example for a plugin install such as the managed Slack install. Claw does
+      not replace official upstream packages; the fix (undici 6.28.0 fixed in
+      6.28.1, 7.29.1, 8.10.2) needs an upstream OpenClaw release. Entry dated
+      2026-11-04.
+  - id: CVE-2026-87018
+    paths:
+      - "app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/undici/package.json"
+      - "app/node_modules/.pnpm/undici@8.11.2/node_modules/undici/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. undici 6.28.0 bundled in
+      the app-local npm 12.2.0. Loaded when OpenClaw runs its bundled npm, for
+      example for a plugin install such as the managed Slack install. undici
+      8.11.2 in the pnpm store. mailauth 7.1.1 pins exactly this version; /app
+      resolves undici 8.12.2, and no loader of this copy is known. Claw does not
+      replace official upstream packages; the fix (undici 6.28.0 fixed in
+      6.29.1, 7.30.1, 8.12.2; undici 8.11.2 fixed in 6.29.1, 7.30.1, 8.12.2)
+      needs an upstream OpenClaw release. Entry dated 2026-11-04.
+  - id: CVE-2026-109829
+    paths:
+      - "app/node_modules/.pnpm/undici@8.11.2/node_modules/undici/package.json"
+    expired_at: 2027-02-02
+    statement: >-
+      HIGH finding inherited from the official image
+      ghcr.io/openclaw/openclaw:2026.10.10@sha256:1e5ee6c7d02d5b5f64f9cf26a30c7ef7d4ec292f0d25fa590f4b7e103e8bf799;
+      the package bytes are identical to that image. undici 8.11.2 in the pnpm
+      store. mailauth 7.1.1 pins exactly this version; /app resolves undici
+      8.12.2, and no loader of this copy is known. Claw does not replace
+      official upstream packages; the fix (undici 8.11.2 fixed in 7.30.1,
+      8.12.2) needs an upstream OpenClaw release. Entry dated 2026-11-04.

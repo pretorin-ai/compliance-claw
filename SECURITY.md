@@ -388,23 +388,20 @@ Ordered roughly by how much it matters, not by effort.
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
 6. **Keep base-image vulnerabilities under review.** The build pins OpenClaw
-   2026.10.10. Claw replaces some base packages with official patch releases
-   and verifies each pinned integrity: the app-local npm 12.2.0 with npm
-   12.2.1, the undici and ip-address copies that npm 12.2.1 bundles, and the
-   node_modules copies of undici and qs. Reassess each correction on a base
-   update. Some vulnerable code stays in the image: the copies that OpenClaw
-   bundles into its own build output, for example dompurify, markdown-it and
-   joi, and the qs copy bundled in the official Slack package. Claw does not
-   correct these copies yet. Where only such a bundled copy runs, the scanner-visible
-   package copy also stays unchanged, so the report continues to show the
-   finding. An official upstream release is the lowest-maintenance
-   correction. A source rebuild of the affected OpenClaw outputs, or verified
-   dependency corrections after the official Slack install, are possible
-   local routes; neither is implemented or proved. The release gate blocks
-   fixable HIGH and CRITICAL findings, so it stays red until these copies are
-   corrected. Unfixed findings
-   remain in the report. Exceptions require a reason and expiry; the list is
-   empty. A passing gate is not proof that the image has no vulnerabilities.
+   2026.10.10 by digest and uses the official image as supplied. Claw does not
+   replace OpenClaw packages and does not rebuild OpenClaw. Findings inherited
+   from the official image, and from the official Slack package, stay until an
+   upstream release fixes them. The 2026.10.10 image has fixable HIGH and
+   CRITICAL findings in its app-local npm 12.2.0 (brace-expansion, undici) and
+   in its pnpm store (dompurify, joi, markdown-it, undici).
+   `.trivyignore.yaml` lists each one by vulnerability id and exact package path
+   in the official image, with a statement and an expiry. The same id at a
+   Claw-owned path still blocks. A Claw-owned finding, a new upstream finding,
+   an expired entry or a scanner failure also blocks the release. The report
+   step runs without the exception file, so accepted findings stay visible.
+   Derive the list again from a scan when the OpenClaw digest changes.
+   Unfixed findings remain in the report. A passing gate is not proof that the
+   image has no vulnerabilities.
 7. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
    publishes and verifies an immutable digest, which is integrity but not
    authenticity: nothing attests *who* built a given digest. **The image is
