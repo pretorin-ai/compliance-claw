@@ -21,10 +21,24 @@
   diffids --image-json FILE [--platform linux/amd64]
       Print the RootFS diffIDs from `docker buildx imagetools inspect --format
       '{{json .Image}}'` output (one image, or a map by platform).
-  environment --json FILE --name NAME
-      The publish gate: the GitHub environment (REST "Get an environment")
-      must have a required_reviewers rule with at least one reviewer and
-      self-review prevented.
+  publish-inputs --run-id N --attempt N --artifact-id N --archive-sha256 H --top-digest D
+      The format of the five publish dispatch inputs.
+  publish-run --json FILE --run-id N --attempt N --repository R --repository-id N
+      The build run attempt (REST "Get a workflow run attempt"): completed,
+      successful, this workflow, workflow_dispatch, master, this repository and
+      not a fork. Prints its head_sha.
+  publish-artifact --json FILE --artifact-id N --run-id N --head-sha S --name NAME
+                   --repository-id N
+      The artifact (REST "Get an artifact") of that run: name, head_sha, not
+      expired. Prints its API digest.
+  artifact-extract --zip FILE --digest sha256:H --out DIR
+      Unpack the downloaded artifact only if its bytes hash to the API digest.
+  publish-binding --dir DIR --oci-json FILE --trusted-guard FILE --run-url U
+                  --commit S --run-id N --attempt N --artifact-name NAME
+                  --archive-sha256 H --top-digest D
+      The unpacked artifact against the inputs: archive hash, OCI top digest
+      (read now and in the receipt), receipt run, attempt, commit and name, and
+      the guard copy against the guard at the build commit.
   registry-tag --rc N --stderr FILE
       Classify a `skopeo inspect --raw` result: present (rc 0), absent (only a
       definite MANIFEST_UNKNOWN or NAME_UNKNOWN) or error. Prints the word;
@@ -367,22 +381,177 @@ def lock_changes(upstream, patched):
     return sorted(a - b), sorted(b - a)
 
 
-def environment_gate(doc, name):
-    """Errors unless the environment requires a reviewer and prevents self-review.
+# Manual publication (README.md "Publication"): a later `operation=publish`
+# dispatch names one successful build run attempt and its artifact, and
+# pushes exactly those bytes. Nothing here trusts the artifact about itself.
+WORKFLOW_PATH = ".github/workflows/openclaw-base.yml"
+RUN_NUMBER = re.compile(r"^[1-9][0-9]{0,19}$")
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+RECEIPT_KEYS = ("builder_run", "builder_commit", "run_id", "run_attempt", "artifact_name", "archive_sha256")
 
-    GitHub creates a referenced environment with NO protection rules, so a
-    missing rule must refuse, never pass.
-    """
-    if not isinstance(doc, dict) or doc.get("name") != name:
-        return ["environment response is not for %r" % name]
-    rules = [r for r in doc.get("protection_rules") or [] if r.get("type") == "required_reviewers"]
-    if not rules:
-        return ["environment %r has no required_reviewers rule" % name]
+
+def artifact_name(tag, attempt):
+    return "openclaw-base-%s-attempt-%s" % (tag, attempt)
+
+
+def publish_inputs(run_id, attempt, artifact_id, archive_sha256, top_digest):
     errors = []
-    if not any(r.get("reviewers") for r in rules):
-        errors.append("environment %r required_reviewers rule names no reviewer" % name)
-    if not all(r.get("prevent_self_review") is True for r in rules):
-        errors.append("environment %r does not prevent self-review" % name)
+    for name, value, rule in (("build_run_id", run_id, RUN_NUMBER), ("build_run_attempt", attempt, RUN_NUMBER),
+                              ("artifact_id", artifact_id, RUN_NUMBER), ("archive_sha256", archive_sha256, SHA256_HEX),
+                              ("top_digest", top_digest, SHA256_DIGEST)):
+        if not isinstance(value, str) or not rule.match(value):
+            errors.append("input %s is not valid: %r" % (name, value))
+    return errors
+
+
+def _want(errors, what, got, expected):
+    # `is` for booleans: 0 must not pass as False.
+    same = got is expected if isinstance(expected, bool) else (type(got) is type(expected) and got == expected)
+    if not same:
+        errors.append("%s is %r, expected %r" % (what, got, expected))
+
+
+def _numbers(**values):
+    bad = sorted(k for k, v in values.items() if not RUN_NUMBER.match(str(v)))
+    return ["not a positive number: %s" % ", ".join(bad)] if bad else []
+
+
+def publish_run(doc, run_id, attempt, repository, repository_id):
+    """The REST "Get a workflow run attempt" response of the build: a completed,
+    successful workflow_dispatch of this workflow on master in this repository."""
+    bad = _numbers(run_id=run_id, attempt=attempt, repository_id=repository_id)
+    if bad:
+        return bad
+    if not isinstance(doc, dict):
+        return ["run response is not an object"]
+    errors = []
+    _want(errors, "run id", doc.get("id"), int(run_id))
+    _want(errors, "run run_attempt", doc.get("run_attempt"), int(attempt))
+    _want(errors, "run path", doc.get("path"), WORKFLOW_PATH)
+    _want(errors, "run event", doc.get("event"), "workflow_dispatch")
+    _want(errors, "run head_branch", doc.get("head_branch"), "master")
+    _want(errors, "run status", doc.get("status"), "completed")
+    _want(errors, "run conclusion", doc.get("conclusion"), "success")
+    if not COMMIT_SHA.match(str(doc.get("head_sha"))):
+        errors.append("run head_sha is not a commit: %r" % doc.get("head_sha"))
+    for key in ("repository", "head_repository"):
+        repo = doc.get(key)
+        if not isinstance(repo, dict):
+            errors.append("run %s is not a repository object" % key)
+            continue
+        _want(errors, "run %s.full_name" % key, repo.get("full_name"), repository)
+        _want(errors, "run %s.id" % key, repo.get("id"), int(repository_id))
+        _want(errors, "run %s.fork" % key, repo.get("fork"), False)
+    return errors
+
+
+def publish_artifact(doc, artifact_id, run_id, head_sha, name, repository_id):
+    """The REST "Get an artifact" response: that run's unexpired artifact with
+    the expected name, and an authenticated sha256 digest."""
+    bad = _numbers(artifact_id=artifact_id, run_id=run_id, repository_id=repository_id)
+    if not COMMIT_SHA.match(str(head_sha)):
+        bad.append("head_sha is not a commit: %r" % head_sha)
+    if bad:
+        return bad
+    if not isinstance(doc, dict):
+        return ["artifact response is not an object"]
+    errors = []
+    _want(errors, "artifact id", doc.get("id"), int(artifact_id))
+    _want(errors, "artifact name", doc.get("name"), name)
+    _want(errors, "artifact expired", doc.get("expired"), False)
+    if not SHA256_DIGEST.match(str(doc.get("digest"))):
+        errors.append("artifact has no sha256 digest: %r" % doc.get("digest"))
+    run = doc.get("workflow_run")
+    if not isinstance(run, dict):
+        return errors + ["artifact workflow_run is not an object"]
+    _want(errors, "artifact workflow_run.id", run.get("id"), int(run_id))
+    _want(errors, "artifact workflow_run.head_sha", run.get("head_sha"), head_sha)
+    _want(errors, "artifact workflow_run.head_branch", run.get("head_branch"), "master")
+    _want(errors, "artifact workflow_run.repository_id", run.get("repository_id"), int(repository_id))
+    _want(errors, "artifact workflow_run.head_repository_id", run.get("head_repository_id"), int(repository_id))
+    return errors
+
+
+def extract_artifact(zip_path, digest, out):
+    """Unpack the downloaded artifact only after its bytes hash to the API digest.
+    Regular files only: no absolute path, no `..`, no link."""
+    import stat
+    import zipfile
+    if not SHA256_DIGEST.match(str(digest)):
+        return ["artifact digest is not sha256: %r" % digest]
+    have = "sha256:" + sha256_file(zip_path)
+    if have != digest:
+        return ["downloaded artifact is %s; the API digest is %s" % (have, digest)]
+    if os.path.exists(out):
+        return ["%s exists" % out]
+    with zipfile.ZipFile(zip_path) as z:
+        infos = z.infolist()
+        for i in infos:
+            parts = i.filename.replace("\\", "/").split("/")
+            kind = stat.S_IFMT(i.external_attr >> 16)   # 0 when the zip records no type
+            if (i.filename.startswith(("/", "\\")) or ".." in parts or ":" in parts[0]
+                    or kind not in (0, stat.S_IFREG, stat.S_IFDIR)):
+                return ["artifact entry %r is not a plain relative file" % i.filename]
+        os.makedirs(out)
+        for i in infos:
+            target = os.path.join(out, *[p for p in i.filename.split("/") if p])
+            if i.is_dir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with z.open(i) as src, open(target, "xb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+    return []
+
+
+def receipt_fields(path):
+    """receipt.env lines hold one or more key=value words. A key with two values is ambiguous."""
+    fields = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            for word in line.split():
+                if "=" in word:
+                    k, v = word.split("=", 1)
+                    fields.setdefault(k, set()).add(v)
+    return fields
+
+
+def publish_binding(base, fresh_top_digest, trusted_guard, expect):
+    """The extracted artifact against the inputs, the run and the trusted guard.
+
+    expect: run_url, commit, run_id, attempt, artifact_name, archive_sha256, top_digest.
+    """
+    errors = []
+    archive = os.path.join(base, "base.oci.tar")
+    have = sha256_file(archive) if os.path.isfile(archive) else None
+    _want(errors, "base.oci.tar sha256", have, expect["archive_sha256"])
+    _want(errors, "OCI top digest read now", fresh_top_digest, expect["top_digest"])
+    try:
+        recorded = read_json(os.path.join(base, "receipt", "oci.json")).get("top_digest")
+    except (OSError, ValueError):
+        recorded = None
+    _want(errors, "receipt oci.json top_digest", recorded, expect["top_digest"])
+    try:
+        fields = receipt_fields(os.path.join(base, "receipt", "receipt.env"))
+    except OSError:
+        fields = {}
+    wanted = {"builder_run": expect["run_url"], "builder_commit": expect["commit"],
+              "run_id": expect["run_id"], "run_attempt": expect["attempt"],
+              "artifact_name": expect["artifact_name"], "archive_sha256": expect["archive_sha256"]}
+    for key in RECEIPT_KEYS:
+        values = fields.get(key, set())
+        got = next(iter(values)) if len(values) == 1 else sorted(values) or None
+        _want(errors, "receipt %s" % key, got, wanted[key])
+    copy = os.path.join(base, "tools", "openclaw-base-guard.py")
+    try:
+        with open(copy, "rb") as f1, open(trusted_guard, "rb") as f2:
+            same = f1.read() == f2.read()
+    except OSError:
+        same = False
+    if not same:
+        errors.append("the artifact's guard copy is not the guard at the build commit")
     return errors
 
 
@@ -825,23 +994,161 @@ def self_test():
         case("diffIDs are read from one image and from a platform map",
              image_json_diffids(one) == ["sha256:a"] and image_json_diffids(many) == ["sha256:b"])
 
-        env = "openclaw-base-publish"
-        reviewer = {"type": "User", "reviewer": {"login": "someone", "id": 1}}
-        good_env = {"name": env, "protection_rules": [
-            {"id": 1, "node_id": "x", "type": "required_reviewers", "prevent_self_review": True,
-             "reviewers": [reviewer]}]}
-        case("protected publish environment passes", environment_gate(good_env, env) == [])
-        case("environment created without rules is refused",
-             environment_gate({"name": env, "protection_rules": []}, env) != [])
-        case("environment with only a wait timer is refused",
-             environment_gate({"name": env, "protection_rules": [{"type": "wait_timer", "wait_timer": 5}]}, env) != [])
-        case("required_reviewers rule without a reviewer is refused",
-             environment_gate({"name": env, "protection_rules": [
-                 {"type": "required_reviewers", "prevent_self_review": True, "reviewers": []}]}, env) != [])
-        case("environment that allows self-review is refused",
-             environment_gate({"name": env, "protection_rules": [
-                 {"type": "required_reviewers", "prevent_self_review": False, "reviewers": [reviewer]}]}, env) != [])
-        case("response for another environment is refused", environment_gate(good_env, "other") != [])
+        # Manual publication. Response shapes follow REST "Get a workflow run
+        # attempt" and "Get an artifact" (field names read back from run
+        # 41690155854 and its artifacts; repository objects as the REST schema).
+        gh_repo, gh_id = "pretorin-ai/compliance-claw", 1322225829
+        commit, rid, att, aid = "a" * 40, "41700000001", "2", "13300000001"
+        h, top = "c" * 64, "sha256:" + "d" * 64
+        repo_obj = {"id": gh_id, "full_name": gh_repo, "fork": False}
+
+        def run_doc(**change):
+            doc = {"id": int(rid), "run_attempt": int(att), "path": WORKFLOW_PATH, "event": "workflow_dispatch",
+                   "head_branch": "master", "head_sha": commit, "status": "completed", "conclusion": "success",
+                   "repository": dict(repo_obj), "head_repository": dict(repo_obj)}
+            doc.update(change)
+            return doc
+
+        def run_refused(doc, run_id=rid, attempt=att):
+            return publish_run(doc, run_id, attempt, gh_repo, str(gh_id)) != []
+
+        case("publish inputs in the right format pass", publish_inputs(rid, att, aid, h, top) == [])
+        case("publish inputs in a wrong format are refused",
+             all(publish_inputs(*bad) != [] for bad in (
+                 ("41700000001x", att, aid, h, top), ("0", att, aid, h, top), (rid, "01", aid, h, top),
+                 (rid, att, "", h, top), (rid, att, aid, h.upper(), top), (rid, att, aid, h[:63], top),
+                 (rid, att, aid, h, "d" * 64), (rid, att, aid, h, "sha256:" + "d" * 63), (rid, "1;id", aid, h, top))))
+        case("successful master dispatch of this workflow is accepted",
+             publish_run(run_doc(), rid, att, gh_repo, str(gh_id)) == [])
+        historical = run_doc(id=41690155854, run_attempt=1, path=".github/workflows/exp-68-source-build.yml",
+                             event="push", head_branch="exp/68-source-build-ci",
+                             head_sha="3b9b2498997588ddf4f2375b4daa3540d2502ff6")
+        errs = publish_run(historical, "41690155854", "1", gh_repo, str(gh_id))
+        case("historical experiment run 41690155854 (push, experiment branch) is refused",
+             any("path" in e for e in errs) and any("event" in e for e in errs)
+             and any("head_branch" in e for e in errs))
+        case("run with another id is refused", run_refused(run_doc(), run_id="41700000002"))
+        case("run with another attempt is refused", run_refused(run_doc(), attempt="1"))
+        case("run of another workflow path is refused",
+             run_refused(run_doc(path=".github/workflows/release.yml")))
+        case("run of another event is refused", run_refused(run_doc(event="push")))
+        case("run on another branch is refused", run_refused(run_doc(head_branch="codex/x")))
+        case("run in another repository is refused",
+             run_refused(run_doc(repository={"id": 9, "full_name": "other/compliance-claw", "fork": False})))
+        case("run from a fork is refused",
+             run_refused(run_doc(head_repository={"id": 9, "full_name": "someone/compliance-claw", "fork": True})))
+        case("run that is not completed is refused", run_refused(run_doc(status="in_progress", conclusion=None)))
+        case("failed or cancelled run is refused",
+             run_refused(run_doc(conclusion="failure")) and run_refused(run_doc(conclusion="cancelled")))
+        case("run response with a flat repository string is refused", run_refused(run_doc(repository=gh_repo)))
+
+        name = artifact_name("2026.10.10-src.1", att)
+        api_digest = "sha256:" + "e" * 64
+
+        def art_doc(**change):
+            doc = {"id": int(aid), "name": name, "digest": api_digest, "expired": False,
+                   "expires_at": "2026-12-04T00:00:00Z",
+                   "workflow_run": {"id": int(rid), "repository_id": gh_id, "head_repository_id": gh_id,
+                                    "head_branch": "master", "head_sha": commit}}
+            for k, v in change.items():
+                if k.startswith("run_"):
+                    doc["workflow_run"][k[4:]] = v
+                else:
+                    doc[k] = v
+            return doc
+
+        def art_refused(doc, art_name=name):
+            return publish_artifact(doc, aid, rid, commit, art_name, str(gh_id)) != []
+
+        case("artifact of the named run, unexpired, with a digest is accepted",
+             publish_artifact(art_doc(), aid, rid, commit, name, str(gh_id)) == [])
+        case("artifact of another run is refused", art_refused(art_doc(run_id=41700000009)))
+        case("artifact of another head_sha is refused", art_refused(art_doc(run_head_sha="b" * 40)))
+        case("artifact from a fork head repository is refused", art_refused(art_doc(run_head_repository_id=9)))
+        case("artifact with another tag in its name is refused",
+             art_refused(art_doc(name=artifact_name("2026.10.5-src.1", att))))
+        case("artifact of another attempt is refused", art_refused(art_doc(name=artifact_name("2026.10.10-src.1", "1"))))
+        case("expired artifact is refused", art_refused(art_doc(expired=True)))
+        case("artifact without an API digest is refused",
+             art_refused(art_doc(digest=None)) and art_refused(art_doc(digest="sha1:" + "e" * 40)))
+        case("historical experiment artifact is refused",
+             publish_artifact({"digest": "sha256:" + "f" * 64, "expired": False, "id": 13257712762,
+                               "name": "exp68-unmodified",
+                               "workflow_run": {"head_branch": "exp/68-source-build-ci", "head_repository_id": gh_id,
+                                                "head_sha": "3b9b2498997588ddf4f2375b4daa3540d2502ff6",
+                                                "id": 41690155854, "repository_id": gh_id}},
+                              "13257712762", "41690155854", "3b9b2498997588ddf4f2375b4daa3540d2502ff6",
+                              artifact_name("2026.10.10-src.1", "1"), str(gh_id)) != [])
+
+        import zipfile
+
+        def zipped(zname, entries, link=None):
+            path = os.path.join(tmp, zname)
+            with zipfile.ZipFile(path, "w") as z:
+                for n, data in entries:
+                    z.writestr(n, data)
+                if link:
+                    info = zipfile.ZipInfo(link)
+                    info.external_attr = (0o120777 << 16)
+                    z.writestr(info, "/etc/passwd")
+            return path, "sha256:" + sha256_file(path)
+
+        trusted = os.path.join(tmp, "trusted-guard.py")
+        _write(trusted, "guard v1\n")
+        run_url = "https://github.com/%s/actions/runs/%s/attempts/%s" % (gh_repo, rid, att)
+        archive = b"oci archive bytes"
+        good_receipt = ("builder_run=%s\nbuilder_commit=%s\nrun_id=%s run_attempt=%s artifact_name=%s\n"
+                        "source=https://x bytes=1 sha256=%s commit=%s\narchive_sha256=%s archive_bytes=%d\n"
+                        % (run_url, commit, rid, att, name, "9" * 64, commit, sha256_bytes(archive), len(archive)))
+
+        def artifact_zip(zname, receipt=good_receipt, oci_top=top, guard="guard v1\n", data=archive):
+            return zipped(zname, [("base.oci.tar", data), ("receipt/receipt.env", receipt),
+                                  ("receipt/oci.json", json.dumps({"top_digest": oci_top})),
+                                  ("tools/openclaw-base-guard.py", guard)])
+
+        zpath, zdigest = artifact_zip("good.zip")
+        ok_dir = os.path.join(tmp, "unpacked-good")
+        case("artifact that hashes to the API digest is unpacked", extract_artifact(zpath, zdigest, ok_dir) == []
+             and os.path.isfile(os.path.join(ok_dir, "receipt", "receipt.env")))
+        no_dir = os.path.join(tmp, "unpacked-bad")
+        case("artifact that differs from the API digest is refused before unpacking",
+             extract_artifact(zpath, "sha256:" + "0" * 64, no_dir) != [] and not os.path.exists(no_dir))
+        case("missing API digest is refused", extract_artifact(zpath, "", no_dir) != [] and not os.path.exists(no_dir))
+        for label, entries, link in (("a .. path", [("../escape", "x")], None),
+                                     ("an absolute path", [("/tmp/escape", "x")], None),
+                                     ("a symlink", [("ok.txt", "x")], "tools/link")):
+            p, d = zipped("evil-%d.zip" % len(label), entries, link)
+            case("artifact entry with %s is refused" % label,
+                 extract_artifact(p, d, no_dir) != [] and not os.path.exists(no_dir))
+
+        expect = {"run_url": run_url, "commit": commit, "run_id": rid, "attempt": att, "artifact_name": name,
+                  "archive_sha256": sha256_bytes(archive), "top_digest": top}
+
+        def binding(zname, fresh=top, **zip_change):
+            p, d = artifact_zip(zname + ".zip", **zip_change)
+            out = os.path.join(tmp, "unpacked-" + zname)
+            assert extract_artifact(p, d, out) == []
+            return publish_binding(out, fresh, trusted, expect)
+
+        case("artifact bound to the inputs, run and trusted guard passes", binding("bind-ok") == [])
+        case("receipt of another run attempt is refused",
+             binding("bind-att", receipt=good_receipt.replace("/attempts/%s" % att, "/attempts/1")
+                     .replace("run_attempt=%s" % att, "run_attempt=1")) != [])
+        case("receipt of another run is refused",
+             binding("bind-run", receipt=good_receipt.replace(rid, "41700000002")) != [])
+        case("receipt of another commit is refused",
+             binding("bind-commit", receipt=good_receipt.replace(commit, "b" * 40)) != [])
+        case("receipt with another artifact name is refused",
+             binding("bind-name", receipt=good_receipt.replace(name, artifact_name("2026.10.10-src.1", "1"))) != [])
+        case("receipt with two values for one key is refused",
+             binding("bind-dup", receipt=good_receipt + "run_attempt=1\n") != [])
+        case("archive with other bytes is refused", binding("bind-bytes", data=b"other bytes") != [])
+        case("OCI top digest read now that differs from the input is refused",
+             binding("bind-top", fresh="sha256:" + "1" * 64) != [])
+        case("receipt oci.json top digest that differs is refused",
+             binding("bind-rtop", oci_top="sha256:" + "1" * 64) != [])
+        case("artifact guard that differs from the build-commit guard is refused",
+             binding("bind-guard", guard="guard v2\n") != [])
 
         case("existing tag is present", registry_tag_state(0, "") == "present")
         case("manifest unknown is absent", registry_tag_state(
@@ -892,9 +1199,22 @@ def main(argv):
     d = sub.add_parser("diffids")
     d.add_argument("--image-json", required=True)
     d.add_argument("--platform", default="linux/amd64")
-    e = sub.add_parser("environment")
-    e.add_argument("--json", required=True)
-    e.add_argument("--name", required=True)
+    pi = sub.add_parser("publish-inputs")
+    for flag in ("--run-id", "--attempt", "--artifact-id", "--archive-sha256", "--top-digest"):
+        pi.add_argument(flag, required=True)
+    pr = sub.add_parser("publish-run")
+    for flag in ("--json", "--run-id", "--attempt", "--repository", "--repository-id"):
+        pr.add_argument(flag, required=True)
+    pa = sub.add_parser("publish-artifact")
+    for flag in ("--json", "--artifact-id", "--run-id", "--head-sha", "--name", "--repository-id"):
+        pa.add_argument(flag, required=True)
+    ax = sub.add_parser("artifact-extract")
+    for flag in ("--zip", "--digest", "--out"):
+        ax.add_argument(flag, required=True)
+    pb = sub.add_parser("publish-binding")
+    for flag in ("--dir", "--oci-json", "--trusted-guard", "--run-url", "--commit", "--run-id",
+                 "--attempt", "--artifact-name", "--archive-sha256", "--top-digest"):
+        pb.add_argument(flag, required=True)
     t = sub.add_parser("registry-tag")
     t.add_argument("--rc", type=int, required=True)
     t.add_argument("--stderr", required=True)
@@ -905,12 +1225,34 @@ def main(argv):
                 state = registry_tag_state(a.rc, f.read())
             print(state)
             return 1 if state == "error" else 0
-        if a.cmd == "environment":
-            errors = environment_gate(read_json(a.json), a.name)
+        if a.cmd in ("publish-run", "publish-artifact"):
+            doc = read_json(a.json)
+            if a.cmd == "publish-run":
+                errors = publish_run(doc, a.run_id, a.attempt, a.repository, a.repository_id)
+                value = doc.get("head_sha") if isinstance(doc, dict) else None
+            else:
+                errors = publish_artifact(doc, a.artifact_id, a.run_id, a.head_sha, a.name, a.repository_id)
+                value = doc.get("digest") if isinstance(doc, dict) else None
             for err in errors:
                 print("REFUSED: %s" % err, file=sys.stderr)
             if not errors:
-                print("openclaw-base-guard: environment %s is protected" % a.name)
+                print(value)
+            return 1 if errors else 0
+        if a.cmd == "publish-inputs":
+            errors = publish_inputs(a.run_id, a.attempt, a.artifact_id, a.archive_sha256, a.top_digest)
+        elif a.cmd == "artifact-extract":
+            errors = extract_artifact(a.zip, a.digest, a.out)
+        elif a.cmd == "publish-binding":
+            fresh = read_json(a.oci_json).get("top_digest")
+            errors = publish_binding(a.dir, fresh, a.trusted_guard, {
+                "run_url": a.run_url, "commit": a.commit, "run_id": a.run_id, "attempt": a.attempt,
+                "artifact_name": a.artifact_name, "archive_sha256": a.archive_sha256,
+                "top_digest": a.top_digest})
+        if a.cmd in ("publish-inputs", "artifact-extract", "publish-binding"):
+            for err in errors:
+                print("REFUSED: %s" % err, file=sys.stderr)
+            if not errors:
+                print("openclaw-base-guard: %s passed" % a.cmd)
             return 1 if errors else 0
         if a.cmd == "diffids":
             print("".join(i + "\n" for i in image_json_diffids(a.image_json, a.platform)), end="")
