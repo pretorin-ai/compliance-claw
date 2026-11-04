@@ -402,6 +402,23 @@ Ordered roughly by how much it matters, not by effort.
    Derive the list again from a scan when the OpenClaw digest changes.
    Unfixed findings remain in the report. A passing gate is not proof that the
    image has no vulnerabilities.
+
+   Known MEDIUM finding, recorded 2026-11-02: the official
+   `@openclaw/slack` package bundles qs 6.16.0 at
+   `opt/compliance-claw/slack-seed/node_modules/@slack/bolt/node_modules/qs`.
+   The advisory is
+   [GHSA-6pq8-jhm2-2vcw](https://github.com/advisories/GHSA-6pq8-jhm2-2vcw);
+   qs 6.16.1 has the fix. The record comes from an all-severity Trivy scan of
+   the earlier combined candidate `combined-6479603`, built on OpenClaw
+   2026.10.9; the scan date itself was not saved. An earlier byte comparison
+   found the Bolt qs copy equal in Slack 2026.10.9 and 2026.10.10. On
+   2026-11-04, the 2026.10.10 candidate image contained
+   `@openclaw/slack@2026.10.10` with qs 6.16.0 at this path. The release scan
+   checks only HIGH and CRITICAL, so it does not check this finding again, and
+   the 2026-11-04 candidate scan did not include MEDIUM. This is not a release
+   exception and has no `.trivyignore.yaml` entry. The advisory needs qs
+   serialization with the comma array option; the checked Slack receiver paths
+   call only qs parsing. That check does not cover every dynamic path.
 7. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
    publishes and verifies an immutable digest, which is integrity but not
    authenticity: nothing attests *who* built a given digest. **The image is
