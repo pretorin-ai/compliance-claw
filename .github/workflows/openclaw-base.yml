@@ -199,6 +199,8 @@ jobs:
       # sha256 match its descriptor. The index must carry SLSA provenance and
       # SPDX SBOM attestations for the image. The checked image is loaded from
       # the archive's own bytes, and the pushed object is that same archive.
+      # The load view adds the Docker manifest.json (config and layers in
+      # diff_ids order) that the classic image store needs to load it.
       - name: Read the OCI archive and load its image
         id: oci
         run: |

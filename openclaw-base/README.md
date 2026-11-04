@@ -72,7 +72,7 @@ The upstream Dockerfile is not changed. It builds to its own final stage.
 | `forbidden-store-entries.txt` | Store entries that must not exist in the base or in the Claw image. |
 | `receipts/<tag>/` | The reviewed receipt of one base build (added at promotion step 3). |
 | `../.github/workflows/openclaw-base.yml` | `operation=build` and, in a later dispatch, `operation=publish` of that build (master only; see "Publication"). |
-| `../scripts/openclaw-base-guard.py` | Collect, compare, policy, lock-change, OCI, diffID, publish-binding and registry-tag checks, with `--self-test`. |
+| `../scripts/openclaw-base-guard.py` | Collect, compare, policy, lock-change, OCI, `docker load` view, diffID, publish-binding and registry-tag checks, with `--self-test`. |
 | `../scripts/test-openclaw-base.sh` | Checks a built Claw image against the receipt. |
 
 ## The override set
@@ -186,6 +186,12 @@ So the order is fixed:
      archive:
      - each manifest, config and layer is used only after its size and
        SHA-256 match its descriptor;
+     - the archive for `docker load` holds those same blobs. Its
+       `manifest.json` names the config and the layers in `diff_ids` order,
+       as `docker save` writes it. The runner's classic image store (Docker
+       28) reads that file and not the OCI index. Without it, the load fails
+       (run 41785277435). Each layer's uncompressed SHA-256 must equal its
+       diffID before the load;
      - the loaded image ID must equal the archive's config or manifest
        digest, which binds the full image config, not only the layers;
      - the index must carry SLSA provenance and SPDX SBOM attestations.
