@@ -209,9 +209,10 @@ compliance-claw: WARNING — this volume's config predates the image.
 ```
 
 For a template change, merge the change by hand — compare the values in your
-`~/.openclaw/openclaw.json` (plain JSON) with
+`~/.openclaw/openclaw.json` with
 `/opt/compliance-claw/openclaw-config.template.json` in the image (commented
-JSON5), then
+JSON5). Your config can be plain JSON, or JSON5 with comments that an
+administrator kept. Compare values, not lines. Then
 `echo 3 > ~/.openclaw/.compliance-claw-templates`. Back up the state before
 repair. Do not delete volumes to apply a template change.
 

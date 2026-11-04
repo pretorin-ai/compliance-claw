@@ -519,10 +519,11 @@ else
   echo "compliance-claw: seeding ${CONFIG}" >&2
   # PLAIN JSON, WITH THE TEMPLATE'S VALUES. OpenClaw 2026.10.10 records the first
   # config it reads as the last-known-good size, and Doctor restores
-  # openclaw.json.bak over a later config under half that size. The comments
-  # made the template about 9 KB against a config of about 1.3 KB, so the
-  # startup Doctor reverted the Slack patch on every fresh seed. The commented
-  # template stays in the image as the reference.
+  # openclaw.json.bak over a later config under half that size. The legacy
+  # branch (no efforts.yaml) copied the commented template, about 9 KB against a
+  # config of about 1.3 KB, so the startup Doctor reverted its Slack patch. The
+  # efforts-owned branch already wrote plain JSON. The commented template stays
+  # in the image as the reference.
   #
   # With efforts.yaml, also name every declared agent before OpenClaw makes its
   # first config write. An absent roster creates implicit main; growing a
