@@ -1,0 +1,373 @@
+# Build the Compliance Claw source-built OpenClaw base: a Claw-built DERIVATIVE
+# of openclaw/openclaw at the exact commit in openclaw-base/inputs.env, plus the
+# reviewed dependency overrides and lock. It is not an official OpenClaw image
+# and carries no OpenClaw signature or build attestation. Its BuildKit
+# provenance and SBOM are unsigned records of this build, not publisher proof.
+# Design, receipts and the promotion order: openclaw-base/README.md.
+#
+# workflow_dispatch, master only. Two jobs, one write purpose each:
+#   build    contents: read. Builds the UNMODIFIED upstream Dockerfile to its
+#            final stage on the standard public runner, checks it, writes the
+#            receipt and uploads the OCI archive. No registry write.
+#   publish  packages: write (its one write) and actions: read (to read the
+#            environment). Runs only with `publish: true` and after the
+#            openclaw-base-publish environment approves. It first refuses unless
+#            that environment requires a reviewer and prevents self-review.
+#            Pushes the exact OCI archive that `build` checked, by digest; it
+#            never rebuilds and never moves a tag.
+#
+# One attempt per dispatch: no retry, no larger or paid runner, no memory
+# setting change. Keep failed runs; their artifacts are evidence.
+name: openclaw-base
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the checked OCI archive to GHCR (needs openclaw-base-publish approval)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: openclaw-base
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      archive_sha256: ${{ steps.oci.outputs.archive_sha256 }}
+      top_digest: ${{ steps.oci.outputs.top_digest }}
+      guard_sha256: ${{ steps.oci.outputs.guard_sha256 }}
+      repo: ${{ steps.inputs.outputs.repo }}
+      tag: ${{ steps.inputs.outputs.tag }}
+    steps:
+      - name: Refuse any ref other than master
+        run: |
+          [ "$GITHUB_REF" = refs/heads/master ] \
+            || { echo "::error::openclaw-base runs only on refs/heads/master (got $GITHUB_REF)"; exit 1; }
+
+      - name: Record the runner and remove unused toolchains
+        run: |
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT/receipt"; echo "OUT=$OUT" >> "$GITHUB_ENV"
+          { echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"; uname -a; nproc; free -m; df -h /; docker version; docker buildx version; } > "$OUT/runner.txt" 2>&1
+          # Runner only: preinstalled SDKs that the build never reads.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          df -h / >> "$OUT/runner.txt"
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /openclaw-base/
+            /scripts/openclaw-base-guard.py
+            /versions.env
+            /.github/workflows/openclaw-base.yml
+          path: claw
+
+      - name: Load the pinned inputs
+        id: inputs
+        run: |
+          set -euo pipefail
+          C="$GITHUB_WORKSPACE/claw"
+          set -a; . "$C/openclaw-base/inputs.env"; set +a
+          for k in OPENCLAW_VERSION OPENCLAW_SOURCE_COMMIT OPENCLAW_SOURCE_URL OPENCLAW_SOURCE_BYTES \
+                   OPENCLAW_SOURCE_SHA256 UPSTREAM_DOCKERFILE_SHA256 UPSTREAM_WORKSPACE_SHA256 \
+                   UPSTREAM_LOCK_SHA256 WORKSPACE_DIFF_SHA256 PATCHED_WORKSPACE_SHA256 \
+                   LOCK_DIFF_SHA256 PATCHED_LOCK_SHA256 BUILD_ARG_GIT_COMMIT \
+                   BUILD_ARG_OPENCLAW_BUILD_TIMESTAMP BUILD_ARG_OPENCLAW_DOCKER_BUILD_VERSION \
+                   BUILD_ARG_OPENCLAW_EXTENSIONS BUILD_ARG_GITHUB_ACTIONS BUILD_PLATFORM \
+                   OFFICIAL_IMAGE NODE_SLIM_IMAGE BUILDKIT_IMAGE SBOM_GENERATOR \
+                   BASE_IMAGE_REPO BASE_IMAGE_TAG; do
+            v="${!k:-}"
+            # The combined lock exists only after its review (README.md); refuse until then.
+            [ -n "$v" ] || { echo "::error::inputs.env: $k is empty"; exit 1; }
+            [[ "$v" =~ ^[A-Za-z0-9._:/@=,+-]+$ ]] || { echo "::error::inputs.env: $k has unexpected characters"; exit 1; }
+            echo "$k=$v" >> "$GITHUB_ENV"
+          done
+          [ -f "$C/openclaw-base/lock.diff" ] || { echo "::error::openclaw-base/lock.diff is missing"; exit 1; }
+          { echo "repo=$BASE_IMAGE_REPO"; echo "tag=$BASE_IMAGE_TAG"; } >> "$GITHUB_OUTPUT"
+
+      - name: Get and verify the upstream source
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/src.tgz" "$OPENCLAW_SOURCE_URL"
+          test "$(stat -c %s "$RUNNER_TEMP/src.tgz")" = "$OPENCLAW_SOURCE_BYTES"
+          echo "${OPENCLAW_SOURCE_SHA256}  $RUNNER_TEMP/src.tgz" | sha256sum -c -
+          test "$(gzip -dc "$RUNNER_TEMP/src.tgz" | git get-tar-commit-id)" = "$OPENCLAW_SOURCE_COMMIT"
+          mkdir "$RUNNER_TEMP/src"
+          tar -xzf "$RUNNER_TEMP/src.tgz" -C "$RUNNER_TEMP/src" --strip-components=1
+          cd "$RUNNER_TEMP/src"
+          sha256sum -c - <<EOF
+          ${UPSTREAM_DOCKERFILE_SHA256}  Dockerfile
+          ${UPSTREAM_WORKSPACE_SHA256}  pnpm-workspace.yaml
+          ${UPSTREAM_LOCK_SHA256}  pnpm-lock.yaml
+          EOF
+          cp pnpm-workspace.yaml "$RUNNER_TEMP/workspace.upstream.yaml"
+
+      - name: Apply the reviewed overrides and lock
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/claw/openclaw-base"
+          sha256sum -c - <<EOF
+          ${WORKSPACE_DIFF_SHA256}  $D/workspace.diff
+          ${LOCK_DIFF_SHA256}  $D/lock.diff
+          EOF
+          cd "$RUNNER_TEMP/src"
+          patch pnpm-workspace.yaml < "$D/workspace.diff"
+          patch pnpm-lock.yaml < "$D/lock.diff"
+          sha256sum -c - <<EOF
+          ${PATCHED_WORKSPACE_SHA256}  pnpm-workspace.yaml
+          ${PATCHED_LOCK_SHA256}  pnpm-lock.yaml
+          EOF
+          # The age, trust and exclude rules are outside `overrides:` and stay unchanged.
+          python3 -I "$GITHUB_WORKSPACE/claw/scripts/openclaw-base-guard.py" policy \
+            --upstream "$RUNNER_TEMP/workspace.upstream.yaml" --patched pnpm-workspace.yaml
+
+      - name: Build the upstream final stage
+        run: |
+          set -euo pipefail
+          (while sleep 5; do echo "$(date -u +%T) used_mb=$(free -m | awk '/^Mem:/{print $3}') avail_mb=$(free -m | awk '/^Mem:/{print $7}')"; done) > "$OUT/mem.log" &
+          SAMPLER=$!; trap 'kill "$SAMPLER"' EXIT
+          echo "BUILD_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          docker buildx create --name openclaw-base --driver docker-container \
+            --driver-opt "image=${BUILDKIT_IMAGE}" --use
+          # Source origin (upstream labels in the Dockerfile, revision, version)
+          # and builder identity (ai.pretorin.* labels) stay distinct.
+          ARGS=(--builder openclaw-base --progress=plain --platform "$BUILD_PLATFORM"
+            --build-arg "GIT_COMMIT=${BUILD_ARG_GIT_COMMIT}"
+            --build-arg "OPENCLAW_BUILD_TIMESTAMP=${BUILD_ARG_OPENCLAW_BUILD_TIMESTAMP}"
+            --build-arg "OPENCLAW_DOCKER_BUILD_VERSION=${BUILD_ARG_OPENCLAW_DOCKER_BUILD_VERSION}"
+            --build-arg "OPENCLAW_EXTENSIONS=${BUILD_ARG_OPENCLAW_EXTENSIONS}"
+            --build-arg "GITHUB_ACTIONS=${BUILD_ARG_GITHUB_ACTIONS}"
+            --label "org.opencontainers.image.title=OpenClaw runtime, Compliance Claw source build"
+            --label "org.opencontainers.image.description=Claw-built derivative of openclaw/openclaw@${OPENCLAW_SOURCE_COMMIT} with reviewed dependency overrides. Not an official OpenClaw image; no OpenClaw signature or attestation."
+            --label "org.opencontainers.image.revision=${OPENCLAW_SOURCE_COMMIT}"
+            --label "org.opencontainers.image.version=${OPENCLAW_VERSION}"
+            --label "ai.pretorin.openclaw-base.derivative=true"
+            --label "ai.pretorin.openclaw-base.upstream=https://github.com/openclaw/openclaw/tree/${OPENCLAW_SOURCE_COMMIT}"
+            --label "ai.pretorin.openclaw-base.source-sha256=${OPENCLAW_SOURCE_SHA256}"
+            --label "ai.pretorin.openclaw-base.workspace-sha256=${PATCHED_WORKSPACE_SHA256}"
+            --label "ai.pretorin.openclaw-base.lock-sha256=${PATCHED_LOCK_SHA256}"
+            --label "ai.pretorin.openclaw-base.builder=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+            --label "ai.pretorin.openclaw-base.builder-commit=${GITHUB_SHA}")
+          echo "build_args=${ARGS[*]}" > "$OUT/receipt/build-command.txt"
+          # ONE build: the archive that publish pushes, with unsigned provenance
+          # and SBOM records. No secret or token is passed to the build. The
+          # checks below load the image from this archive; nothing is rebuilt.
+          docker buildx build "${ARGS[@]}" --provenance=mode=max --sbom="generator=${SBOM_GENERATOR}" \
+            --output "type=oci,dest=$OUT/base.oci.tar,name=${BASE_IMAGE_REPO}:${BASE_IMAGE_TAG}" \
+            "$RUNNER_TEMP/src" 2>&1 | tee "$OUT/build.log"
+          echo "BUILD_FINISHED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      # Every manifest, config and layer is used only after its size and
+      # sha256 match its descriptor. The index must carry SLSA provenance and
+      # SPDX SBOM attestations for the image. The checked image is loaded from
+      # the archive's own bytes, and the pushed object is that same archive.
+      - name: Read the OCI archive and load its image
+        id: oci
+        run: |
+          set -euo pipefail
+          G="$GITHUB_WORKSPACE/claw/scripts/openclaw-base-guard.py"
+          R="$OUT/receipt"
+          python3 -I "$G" oci --archive "$OUT/base.oci.tar" --platform "$BUILD_PLATFORM" \
+            --require-attestations --image-out "$RUNNER_TEMP/image.oci.tar" \
+            --image-name openclaw-base:candidate > "$R/oci.json"
+          docker load -i "$RUNNER_TEMP/image.oci.tar"
+          rm -f "$RUNNER_TEMP/image.oci.tar"
+          field() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$R/oci.json" "$1"; }
+          python3 -I -c 'import json,sys; [print(d) for d in json.load(open(sys.argv[1]))["diff_ids"]]' \
+            "$R/oci.json" > "$R/rootfs-diffids.txt"
+          # The loaded ID is the config digest (classic store) or the manifest
+          # digest (containerd store). Either binds the full image config.
+          loaded="$(docker image inspect -f '{{.Id}}' openclaw-base:candidate)"
+          case "$loaded" in
+            "$(field config_digest)"|"$(field manifest_digest)") echo "loaded image ${loaded} is the archived image" ;;
+            *) echo "::error::the loaded image ${loaded} is not the archived image"; exit 1 ;;
+          esac
+          docker image inspect -f '{{range .RootFS.Layers}}{{println .}}{{end}}' openclaw-base:candidate > "$OUT/loaded-diffids.txt"
+          cmp "$R/rootfs-diffids.txt" "$OUT/loaded-diffids.txt" \
+            || { echo "::error::the loaded image's diffIDs differ from the archive"; exit 1; }
+          # The publish job has no checkout; it uses this copy of the guard,
+          # bound by the hash below.
+          mkdir -p "$OUT/tools"
+          cp "$G" "$OUT/tools/openclaw-base-guard.py"
+          {
+            echo "archive_sha256=$(sha256sum "$OUT/base.oci.tar" | cut -d' ' -f1)"
+            echo "top_digest=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["top_digest"])' "$OUT/receipt/oci.json")"
+            echo "guard_sha256=$(sha256sum "$OUT/tools/openclaw-base-guard.py" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Collect the receipt and check the base
+        run: |
+          set -euo pipefail
+          C="$GITHUB_WORKSPACE/claw"
+          G="$C/scripts/openclaw-base-guard.py"
+          R="$OUT/receipt"
+          chmod 0777 "$R"
+          docker run --rm --platform "$BUILD_PLATFORM" --network none --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges --user 1000:1000 \
+            -v "$G:/guard/openclaw-base-guard.py:ro" -v "$R:/out" \
+            --entrypoint python3 openclaw-base:candidate -I /guard/openclaw-base-guard.py collect --root / --out /out
+          docker buildx imagetools inspect "$OFFICIAL_IMAGE" --format '{{json .Image}}' > "$OUT/official-image.json"
+          docker buildx imagetools inspect "$NODE_SLIM_IMAGE" --format '{{json .Image}}' > "$OUT/node-slim-image.json"
+          python3 -I "$G" diffids --image-json "$OUT/official-image.json" --platform "$BUILD_PLATFORM" > "$R/official-diffids.txt"
+          python3 -I "$G" diffids --image-json "$OUT/node-slim-image.json" --platform "$BUILD_PLATFORM" > "$R/node-slim-diffids.txt"
+          # The base against itself: forbidden store entries, the Node base
+          # prefix, no official-only layer, and the version surfaces.
+          python3 -I "$G" compare --receipt "$R" --observed "$R" \
+            --forbidden "$C/openclaw-base/forbidden-store-entries.txt" --diffids "$R/rootfs-diffids.txt" \
+            --expect-version "$OPENCLAW_VERSION" --expect-commit "$OPENCLAW_SOURCE_COMMIT"
+
+      - name: Install pinned trivy
+        run: |
+          set -euo pipefail
+          set -a; . "$GITHUB_WORKSPACE/claw/versions.env"; set +a
+          cd "$(mktemp -d)"
+          TRIVY_TGZ="trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
+          curl -fsSL --retry 3 --retry-all-errors -o "$TRIVY_TGZ" \
+            "https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/${TRIVY_TGZ}"
+          echo "${TRIVY_SHA256}  ${TRIVY_TGZ}" | sha256sum -c -
+          tar xzf "$TRIVY_TGZ" trivy
+          sudo install -m 0755 trivy /usr/local/bin/trivy
+          trivy --version | head -1
+
+      # A record for the receipt review, not a gate: the blocking scan runs on
+      # the final Claw image (release.yml). Base findings are mapped there to
+      # the Claw correction that handles each one (README.md).
+      - name: Base vulnerability report (all severities, record only)
+        run: |
+          set -euo pipefail
+          trivy image --scanners vuln --format json --exit-code 0 openclaw-base:candidate > "$OUT/trivy-base-all.json"
+          trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 openclaw-base:candidate > "$OUT/trivy-base-high.txt"
+
+      - name: Write the receipt
+        run: |
+          set -euo pipefail
+          C="$GITHUB_WORKSPACE/claw"
+          R="$OUT/receipt"
+          {
+            echo "builder_repository=$GITHUB_REPOSITORY"
+            echo "builder_ref=$GITHUB_REF"
+            echo "builder_commit=$GITHUB_SHA"
+            echo "builder_run=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+            echo "runner=$ImageOS/$ImageVersion"
+            echo "workflow_sha256=$(sha256sum "$C/.github/workflows/openclaw-base.yml" | cut -d' ' -f1)"
+            echo "inputs_sha256=$(sha256sum "$C/openclaw-base/inputs.env" | cut -d' ' -f1)"
+            echo "guard_sha256=$(sha256sum "$C/scripts/openclaw-base-guard.py" | cut -d' ' -f1)"
+            echo "actions=checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09,upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+            echo "source=${OPENCLAW_SOURCE_URL} bytes=${OPENCLAW_SOURCE_BYTES} sha256=${OPENCLAW_SOURCE_SHA256} commit=${OPENCLAW_SOURCE_COMMIT}"
+            echo "workspace_diff_sha256=${WORKSPACE_DIFF_SHA256} patched_workspace_sha256=${PATCHED_WORKSPACE_SHA256}"
+            echo "lock_diff_sha256=${LOCK_DIFF_SHA256} patched_lock_sha256=${PATCHED_LOCK_SHA256}"
+            grep -E '^ARG OPENCLAW_(NODE_BOOKWORM|NODE_BOOKWORM_SLIM|BUN)_IMAGE=' "$RUNNER_TEMP/src/Dockerfile"
+            echo "buildkit_image=${BUILDKIT_IMAGE} sbom_generator=${SBOM_GENERATOR}"
+            echo "build_started=${BUILD_STARTED} build_finished=${BUILD_FINISHED}"
+            echo "archive_sha256=$(sha256sum "$OUT/base.oci.tar" | cut -d' ' -f1) archive_bytes=$(stat -c %s "$OUT/base.oci.tar")"
+            echo "image_repo=${BASE_IMAGE_REPO} image_tag=${BASE_IMAGE_TAG}"
+            echo "loaded_image_id=$(docker image inspect -f '{{.Id}}' openclaw-base:candidate)"
+            echo "node=$(docker run --rm --network none --entrypoint node openclaw-base:candidate --version)"
+            echo "openclaw=$(docker run --rm --network none --entrypoint node openclaw-base:candidate /app/openclaw.mjs --version)"
+            echo "trivy_base_all_sha256=$(sha256sum "$OUT/trivy-base-all.json" | cut -d' ' -f1)"
+          } > "$R/receipt.env"
+          # oci.json holds top_digest, manifest_digest, config_digest and the attestation
+          # manifests; facts.json holds the dist and store hashes, the app and global npm
+          # versions with their bundled packages, and the dpkg list hash.
+          cat "$R/receipt.env"
+          python3 -I -m json.tool "$R/oci.json" | head -40
+          df -h / >> "$OUT/runner.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: openclaw-base-${{ steps.inputs.outputs.tag || 'unknown' }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: openclaw-base-publish
+    permissions:
+      packages: write   # push the checked archive: the only write
+      actions: read     # "Get an environment" for the gate below (GitHub App "Actions" read)
+    env:
+      ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
+      TOP_DIGEST: ${{ needs.build.outputs.top_digest }}
+      GUARD_SHA256: ${{ needs.build.outputs.guard_sha256 }}
+      REPO: ${{ needs.build.outputs.repo }}
+      TAG: ${{ needs.build.outputs.tag }}
+      PUBLISH_ENVIRONMENT: openclaw-base-publish
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: openclaw-base-${{ needs.build.outputs.tag }}
+          path: base
+
+      # GitHub creates a referenced environment that does not exist yet, with
+      # NO protection rules, and then runs this job at once. So the approval
+      # gate is checked here and fails closed: no required reviewer, no
+      # self-review prevention, or any read error stops the job before login.
+      - name: Refuse unless the publish environment requires review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          G=base/tools/openclaw-base-guard.py
+          echo "${GUARD_SHA256}  $G" | sha256sum -c -
+          code="$(curl -sS -o environment.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/environments/${PUBLISH_ENVIRONMENT}")" \
+            || { echo "::error::cannot read environment ${PUBLISH_ENVIRONMENT}"; exit 1; }
+          [ "$code" = 200 ] || { echo "::error::reading environment ${PUBLISH_ENVIRONMENT} returned HTTP ${code}"; exit 1; }
+          python3 -I "$G" environment --json environment.json --name "$PUBLISH_ENVIRONMENT"
+
+      - name: Push the checked archive by digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          G=base/tools/openclaw-base-guard.py
+          [[ "$TOP_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest from build"; exit 1; }
+          echo "${ARCHIVE_SHA256}  base/base.oci.tar" | sha256sum -c -
+          echo "${GUARD_SHA256}  $G" | sha256sum -c -
+          command -v skopeo >/dev/null || { echo "::error::skopeo is not on this runner image"; exit 1; }
+          printf '%s' "$GH_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'skopeo logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          # A tag is never moved. Push only when the registry says definitely
+          # that the tag or repository does not exist (MANIFEST_UNKNOWN or
+          # NAME_UNKNOWN). Any other error (network, auth, denied) refuses.
+          # Raw manifests are hashed from files; $(...) would strip bytes.
+          rc=0; skopeo inspect --raw "docker://${REPO}:${TAG}" > existing.json 2> inspect.err || rc=$?
+          state="$(python3 -I "$G" registry-tag --rc "$rc" --stderr inspect.err)" \
+            || { echo "::error::cannot tell whether ${REPO}:${TAG} exists:"; cat inspect.err; exit 1; }
+          case "$state" in
+            present)
+              have="sha256:$(sha256sum existing.json | cut -d' ' -f1)"
+              [ "$have" = "$TOP_DIGEST" ] || { echo "::error::${REPO}:${TAG} already names ${have}"; exit 1; }
+              echo "${REPO}:${TAG} already names ${TOP_DIGEST}; nothing to push" ;;
+            absent)
+              skopeo copy --all --preserve-digests "oci-archive:base/base.oci.tar" "docker://${REPO}:${TAG}" ;;
+            *) echo "::error::unexpected registry state ${state}"; exit 1 ;;
+          esac
+          # After the push: the registry's top manifest bytes hash to the archive's
+          # top digest, so it is the same index, with the same image manifest and
+          # the same provenance and SBOM attestation descriptors.
+          skopeo inspect --raw "docker://${REPO}@${TOP_DIGEST}" > pushed.json
+          pushed="sha256:$(sha256sum pushed.json | cut -d' ' -f1)"
+          [ "$pushed" = "$TOP_DIGEST" ] || { echo "::error::registry returned ${pushed}"; exit 1; }
+          echo "pushed ${REPO}:${TAG}@${TOP_DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"

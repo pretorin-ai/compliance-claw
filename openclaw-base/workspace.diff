@@ -1,0 +1,33 @@
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -62,6 +62,14 @@
+ blockExoticSubdeps: true
+ 
+ overrides:
++  # Compliance Claw source-built base: official patch releases for scanner findings.
++  # Reviewed set: pretorin-ai/compliance-claw openclaw-base/README.md.
++  dompurify: 3.4.17
++  markdown-it: 15.0.3
++  mermaid: 12.2.0
++  undici@8.11.2: 8.12.2
++  seroval: 1.6.11
++  joi@18.2.9: 18.3.1
+   "@microsoft/teams.apps@2.1.0>@azure/msal-node": 7.1.1
+   "@azure/identity@4.13.3>@azure/msal-node": 7.1.1
+   # Memory LanceDB supplies vectors; WhatsApp prepares thumbnails with Rastermill.
+@@ -97,13 +105,13 @@
+   source-map-js: 1.2.2
+   file-type: 22.1.1
+   form-data: 4.0.6
+-  ip-address: 10.7.3
++  ip-address: 10.7.4
+   "mailauth@7.1.1>nodemailer": 10.1.4
+   "mailparser@3.9.36>nodemailer": 10.1.4
+   minimatch: 10.2.6
+   path-to-regexp: 8.4.2
+   proxy-addr: 2.0.8
+-  qs: 6.16.0
++  qs: 6.16.1
+   node-domexception: "npm:@nolyfill/domexception@1.0.28"
+   typebox: 1.3.35
+   tar: 7.5.22
