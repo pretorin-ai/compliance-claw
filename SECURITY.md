@@ -388,13 +388,37 @@ Ordered roughly by how much it matters, not by effort.
    `toolFilter`. A startup assertion that refuses to serve on the wrong runtime
    would make this fail closed instead of fail quietly.
 6. **Keep base-image vulnerabilities under review.** The build pins OpenClaw
-   2026.10.5. This base already contains the four fixed Debian Perl packages;
-   Claw no longer installs them again. Its app-local npm 12.2.0 still contains
-   three fixable HIGH findings in brace-expansion and undici. Claw replaces
-   that package with official npm 12.2.1 and verifies its pinned integrity.
-   The release gate blocks fixable HIGH and CRITICAL findings. Unfixed findings
-   remain in the report. Exceptions require a reason and expiry; the list is
-   empty. A passing gate is not proof that the image has no vulnerabilities.
+   2026.10.10 by digest and uses the official image as supplied. Claw does not
+   replace OpenClaw packages and does not rebuild OpenClaw. Findings inherited
+   from the official image, and from the official Slack package, stay until an
+   upstream release fixes them. The 2026.10.10 image has fixable HIGH and
+   CRITICAL findings in its app-local npm 12.2.0 (brace-expansion, undici) and
+   in its pnpm store (dompurify, joi, markdown-it, undici).
+   `.trivyignore.yaml` lists each one by vulnerability id and exact package path
+   in the official image, with a statement and an expiry. The same id at a
+   Claw-owned path still blocks. A Claw-owned finding, a new upstream finding,
+   an expired entry or a scanner failure also blocks the release. The report
+   step runs without the exception file, so accepted findings stay visible.
+   Derive the list again from a scan when the OpenClaw digest changes.
+   Unfixed findings remain in the report. A passing gate is not proof that the
+   image has no vulnerabilities.
+
+   Known MEDIUM finding, recorded 2026-11-02: the official
+   `@openclaw/slack` package bundles qs 6.16.0 at
+   `opt/compliance-claw/slack-seed/node_modules/@slack/bolt/node_modules/qs`.
+   The advisory is
+   [GHSA-6pq8-jhm2-2vcw](https://github.com/advisories/GHSA-6pq8-jhm2-2vcw);
+   qs 6.16.1 has the fix. The record comes from an all-severity Trivy scan of
+   the earlier combined candidate `combined-6479603`, built on OpenClaw
+   2026.10.9; the scan date itself was not saved. An earlier byte comparison
+   found the Bolt qs copy equal in Slack 2026.10.9 and 2026.10.10. On
+   2026-11-04, the 2026.10.10 candidate image contained
+   `@openclaw/slack@2026.10.10` with qs 6.16.0 at this path. The release scan
+   checks only HIGH and CRITICAL, so it does not check this finding again, and
+   the 2026-11-04 candidate scan did not include MEDIUM. This is not a release
+   exception and has no `.trivyignore.yaml` entry. The advisory needs qs
+   serialization with the comma array option; the checked Slack receiver paths
+   call only qs parsing. That check does not cover every dynamic path.
 7. **Image signing — Azure Key Vault, following the Pretorin CLI.** The release
    publishes and verifies an immutable digest, which is integrity but not
    authenticity: nothing attests *who* built a given digest. **The image is
@@ -445,8 +469,8 @@ Ordered roughly by how much it matters, not by effort.
 12. **`tools.toolSearch` is experimental upstream.** Its runtime behaviour is
    observed working (`cataloged 223 tools behind compact directory surface`) but
    upstream marks all Tool Search modes experimental. If it regresses, the prompt
-   returns to roughly 40k tokens per turn and the commented `toolFilter` block is
-   the lever.
+   returns to roughly 40k tokens per turn and `toolFilter` (commented in the
+   image template, absent from the seeded config) is the lever.
 13. **Per-repository authorization.** Every target shares one Pretorin key and one
    scope. A reviewer who should see one repository sees all of them.
 14. **`mcp.sessionIdleTtlMs` is untuned.** Default 600000 ms — ten minutes of

@@ -93,7 +93,7 @@ If the next action does not correct the fault, collect
 
 ## Setting ownership and checks
 
-These paths were checked in the pinned 2026.10.5 UI and local fixtures. A visible
+These paths were checked in the OpenClaw 2026.10.5 UI and local fixtures. A visible
 credential control or successful save is not live service authentication.
 
 | Setting | Role and edit path | Storage/owner | Check |
@@ -229,7 +229,7 @@ and mode, then recreate the gateway. To replace the credential, follow
 | `Provider transport overrides do not allow insecureSkipVerify` | The pinned runtime accepts the field in configuration, then refuses to prepare the model runtime and keeps the gateway unhealthy | Remove it with `openclaw config unset`, then recreate the gateway. |
 
 `tests/internal-ai-ca/run.sh` checks an approved-CA tool round trip and an
-untrusted-CA refusal on pinned OpenClaw 2026.10.5 with a mock endpoint.
+untrusted-CA refusal on pinned OpenClaw 2026.10.10 with a mock endpoint.
 It also checks Compose refusal without `INTERNAL_AI_CA_FILE`. Native rejection
 without `request.tls.ca` was checked manually. Real endpoints, network paths,
 proxies and model quality need separate checks.
@@ -242,7 +242,6 @@ namespace and the existing entrypoint to load mounted credentials:
 ```sh
 docker compose exec openclaw /usr/local/bin/compliance-claw-entrypoint openclaw models list
 docker compose exec openclaw /usr/local/bin/compliance-claw-entrypoint openclaw models set <provider/model>
-docker compose exec openclaw /usr/local/bin/compliance-claw-entrypoint openclaw mcp probe <external-name> --json
 ```
 
 `models set` changes the **global default**, not one agent's override. A one-off
@@ -250,6 +249,17 @@ docker compose exec openclaw /usr/local/bin/compliance-claw-entrypoint openclaw 
 must not bypass the native live-state owner check. Use the
 [file-secret-aware agent command](file-secrets.md#docker-compose-exec-does-not-see-these-secrets)
 for a turn against the running gateway.
+
+In OpenClaw 2026.10.10, `openclaw mcp probe` needs exclusive offline state
+ownership. It refuses while the gateway runs. Stop the gateway through Compose,
+run the probe in the one-off CLI container, then start the gateway again. The
+Claw does not answer during this procedure.
+
+```sh
+docker compose stop openclaw
+docker compose run --rm cli openclaw mcp probe <external-name> --json
+docker compose up -d --wait --wait-timeout 720 openclaw
+```
 
 For interactive device-code login, the native command is
 `openclaw models auth login --provider openai --device-code`; run it through the

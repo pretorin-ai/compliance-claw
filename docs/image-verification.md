@@ -139,7 +139,7 @@ The image's current integrity controls, in full:
 | --- | --- |
 | GHCR image pinned by **immutable digest** | the bytes are the bytes that were built and scanned |
 | **SBOM** generated per release (SPDX JSON) | a package inventory, retained as a workflow artifact on the release run |
-| **Vulnerability scan** at release | fixable HIGH and CRITICAL findings block publication |
+| **Vulnerability scan** at release | fixable HIGH and CRITICAL findings block publication, except the findings inherited from the official upstream image that [.trivyignore.yaml](../.trivyignore.yaml) lists; those stay in the report |
 | **Release record** with asset checksums | the source commit, version, digest, overlay, and SBOM belong together |
 | Documented release provenance | the workflow, the digest, and the version pin are all recorded |
 

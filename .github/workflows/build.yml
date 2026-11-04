@@ -31,7 +31,7 @@ concurrency:
 jobs:
   build-and-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     # compose.yaml pulls the published image by default, which is wrong for CI:
     # the point here is to test the code in this commit, not whatever was last
@@ -278,6 +278,13 @@ jobs:
       # between them. Its own isolated project, canary tokens, no credentials.
       - name: Fresh deployment configures Slack by itself (isolated project)
         run: bash scripts/test-fresh-slack-seed.sh
+
+      # The seed above is not the end state: the gateway's startup Doctor can
+      # still revert the Slack patch. Both seed branches start a fresh gateway
+      # and must keep channels.slack and start the native provider. Canary
+      # tokens; Slack and Pretorin hosts on loopback; no credentials.
+      - name: Fresh gateway keeps Slack and starts the provider (isolated projects)
+        run: bash scripts/test-fresh-slack-start.sh compliance-claw:local
 
       # The internal AI endpoint example: the committed overlay and native patch
       # against a generated test CA and a mock endpoint on an internal network.

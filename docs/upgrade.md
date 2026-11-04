@@ -208,9 +208,11 @@ compliance-claw: WARNING — this volume's config predates the image.
   volume template version 2, image ships 3.
 ```
 
-For a template change, merge the change by hand — diff your
-`~/.openclaw/openclaw.json` against
-`/opt/compliance-claw/openclaw-config.template.json` in the image, then
+For a template change, merge the change by hand — compare the values in your
+`~/.openclaw/openclaw.json` with
+`/opt/compliance-claw/openclaw-config.template.json` in the image (commented
+JSON5). Your config can be plain JSON, or JSON5 with comments that an
+administrator kept. Compare values, not lines. Then
 `echo 3 > ~/.openclaw/.compliance-claw-templates`. Back up the state before
 repair. Do not delete volumes to apply a template change.
 
@@ -225,6 +227,30 @@ That means the Slack credentials this deployment requires — both tokens on the
 multi-effort path, all three variables on the legacy one — are set while the
 existing config predates them. It names the managed install and configuration
 steps. It does not replace the existing configuration.
+
+Run both steps in the **running** gateway, not in a one-off `cli` container with
+the gateway stopped. On OpenClaw 2026.10.10, a state first seeded with the
+commented template can keep a large last-known-good size. A Slack change written
+with the gateway stopped can then be restored away by Doctor at the next start.
+Through the running gateway, the gateway commits the change as the config owner.
+This route does not change the stored last-known-good size. The
+commands below are for the legacy single-effort path, with `SLACK_CHANNEL_ID` set
+together with the tokens. They are not for an `efforts.yaml` deployment:
+
+```sh
+docker compose up -d --wait --wait-timeout 720 openclaw
+docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint \
+  node /opt/compliance-claw/managed-slack.mjs prepare --required
+docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint sh -c '
+  sed "s/@SLACK_CHANNEL_ID@/$SLACK_CHANNEL_ID/" \
+    /opt/compliance-claw/slack-channel.patch.json5 > /tmp/slack.patch.json5
+  openclaw config patch --file /tmp/slack.patch.json5 --dry-run &&
+    openclaw config patch --file /tmp/slack.patch.json5'
+docker compose up -d --force-recreate --wait --wait-timeout 720 openclaw
+```
+
+Back up both state volumes first. `scripts/test-retained-slack-add.sh` checks this
+sequence on a state first seeded by release 0.5.2.
 
 ## Updating the Pretorin CLI
 
@@ -301,14 +327,14 @@ The version command checks the installed file. Confirm that the restart and next
 Pretorin MCP call succeed before treating the update as complete. Failed automatic
 verification reports installation success with unverified activation.
 
-Automatic verification supports the pinned OpenClaw `2026.10.5` Linux container,
+Automatic verification supports the pinned OpenClaw `2026.10.10` Linux container,
 the canonical Pretorin MCP command, and the shipped effort launcher. See
 [activation, pending results, and recovery limits](#pretorin-cli-activation-and-results)
 and the [update audit record](#pretorin-cli-update-audit).
 
 ## OpenClaw image upgrade and state backup
 
-The build pins OpenClaw 2026.10.5 and Pretorin CLI seed 0.30.9. A fresh
+The build pins OpenClaw 2026.10.10 and Pretorin CLI seed 0.30.9. A fresh
 installation uses this seed. An image upgrade keeps the active CLI in the
 Pretorin state volume. Use the CLI update command to change that active copy.
 
@@ -547,7 +573,7 @@ package, and the active Pretorin CLI. Send a test request through the approved
 test channel. Replace the container once more and repeat the checks. The
 replacement must use the same state volumes.
 
-The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.10.5 allows
+The gateway service has `stop_grace_period: 330s`. OpenClaw 2026.10.10 allows
 325 seconds for shutdown and 5 more seconds for its supervisor. Compose uses
 this limit for a service stop or replacement. A stop can take several minutes
 when work is active.
