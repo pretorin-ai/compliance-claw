@@ -31,7 +31,7 @@ concurrency:
 jobs:
   build-and-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     # compose.yaml pulls the published image by default, which is wrong for CI:
     # the point here is to test the code in this commit, not whatever was last
