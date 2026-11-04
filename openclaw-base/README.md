@@ -43,7 +43,7 @@ The upstream Dockerfile is not changed. It builds to its own final stage.
 - The order is:
   1. this support on master;
   2. the reviewed combined lock (r3 + Seroval + joi), in a separate reviewed
-     commit after the age boundary;
+     commit, made with the one joi age exception (see "joi age exception");
   3. dispatch and receipt review;
   4. the `FROM` promotion, together with #71.
 - Some items below exist only on the #71 branch, not on master: the `qs` and
@@ -65,10 +65,10 @@ The upstream Dockerfile is not changed. It builds to its own final stage.
 
 | File | Purpose |
 | --- | --- |
-| `inputs.env` | Exact source, file hashes, diff and result hashes, build arguments, tool pins, target name. The `LOCK_*` values stay empty until the combined lock is reviewed. The workflow refuses to build while they are empty. |
-| `workspace.diff` | The reviewed override set in `pnpm-workspace.yaml` (see below). It changes only the `overrides:` block (`openclaw-base-guard.py policy`). Line 5 is a single space: the context line of a blank upstream line. The patch needs it, so `git diff --check` reports it; do not strip it. |
-| `lock.diff` | The combined lock. It does not exist yet (see "joi boundary"). |
-| `regenerate-lock.sh` | Makes the combined lock ONCE with the reviewed r3 method: the pinned `node:24.22.1-bookworm` image, corepack pnpm from `packageManager`, `pnpm install --lockfile-only --ignore-scripts`. It refuses before `LOCK_NOT_BEFORE`. `REGEN_DRY_RUN=1` verifies all inputs and stops before pnpm. |
+| `inputs.env` | Exact source, file hashes, diff and result hashes, the age exception, build arguments, tool pins, target name. The `LOCK_*` values are set only in the separate lock commit. The workflow refuses to build while they are empty. |
+| `workspace.diff` | The reviewed override set in `pnpm-workspace.yaml` (see below), plus the one exact `minimumReleaseAgeExclude` entry `AGE_EXCLUDE_EXCEPTION`. Nothing else may change (`openclaw-base-guard.py policy --allow-exclude`). Context lines of blank upstream lines are a single space. The patch needs them, so `git diff --check` reports them; do not strip them. |
+| `lock.diff` | The combined lock against the upstream `pnpm-lock.yaml`, made with the joi age exception (see "joi age exception"). |
+| `regenerate-lock.sh` | Makes the combined lock ONCE with the reviewed r3 method: the pinned `node:24.22.1-bookworm` image, corepack pnpm from `packageManager`, `pnpm install --lockfile-only --ignore-scripts`. It refuses before `LOCK_NOT_BEFORE`, unless `AGE_EXCLUDE_EXCEPTION` is set and `workspace.diff` appends that entry. `REGEN_DRY_RUN=1` verifies all inputs and stops before pnpm. |
 | `forbidden-store-entries.txt` | Store entries that must not exist in the base or in the Claw image. |
 | `receipts/<tag>/` | The reviewed receipt of one base build (added at promotion step 3). |
 | `../.github/workflows/openclaw-base.yml` | Build and publish (master only). |
@@ -85,33 +85,83 @@ joi 18.3.1. The workspace result of each step is:
 | upstream `v2026.10.10` | `5af51204…` |
 | plus r3 overrides (`ce278eb7…`): dompurify 3.4.17, markdown-it 15.0.3, mermaid 12.2.0, `undici@8.11.2` → 8.12.2, ip-address 10.7.4, qs 6.16.1 | `f30c0bfd…` (reviewed) |
 | plus Seroval (`seroval: 1.6.11`) | `43a3622a…` (reviewed) |
-| plus `joi@18.2.9: 18.3.1`, and the r3 experiment comment replaced by a product comment | `43cc82fd…` (`workspace.diff`, `0f1a3314…`) |
+| plus `joi@18.2.9: 18.3.1`, and the r3 experiment comment replaced by a product comment | `43cc82fd…` (reviewed) |
+| plus the joi age exception: one comment and `- "joi@18.3.1"` at the end of `minimumReleaseAgeExclude` | `5ebab17a…` (`workspace.diff`, `4c8e59a6…`) |
 
-- The only non-functional change against the reviewed chain is the two comment
+- The only non-functional changes against the reviewed chain are comment
   lines. The file ships in the image (`/app/pnpm-workspace.yaml`), so it must
   not call the set an experiment.
-- The age, trust and exclude rules are unchanged:
-  `minimumReleaseAge: 10080`, `minimumReleaseAgeStrict: true`, and the same
-  `minimumReleaseAgeExclude`.
+- The age and trust rules are unchanged: `minimumReleaseAge: 10080` and
+  `minimumReleaseAgeStrict: true`. Every upstream `minimumReleaseAgeExclude`
+  entry is unchanged. The only addition is the joi entry below.
 - mermaid 12.2.0 (with KaTeX 0.18.10) is part of the r3 set. The KaTeX runtime
   is not exercised by the checked render path. The final qualification keeps
   that limit visible.
 
-## joi boundary
+## joi age exception
 
 - joi 18.3.1 was published at 2026-10-28T09:59:49.641Z.
 - The strict 10,080-minute release age therefore admits it at
   2026-11-04T09:59:49.641Z, so `LOCK_NOT_BEFORE` is `2026-11-04T09:59:50Z`.
-- The combined lock cannot exist before then, and no exception is made.
+- **Decision.** On 2026-11-04 the user approved one narrow exception, in place
+  of the wait: `AGE_EXCLUDE_EXCEPTION=joi@18.3.1`. This changes no other
+  policy.
+- **Reason.** joi 18.3.1 fixes GHSA-4528-x5fx-h6hg (CVE-2026-118772, HIGH). It
+  is the only package in the set that is younger than the release age.
+- **Form.** The exception follows upstream's own style: one comment with a
+  "remove after" time and one exact `name@version` entry, appended to
+  `minimumReleaseAgeExclude`. pnpm applies an exact entry to that version
+  only; a bare name would apply to all versions, so it is not used.
+- **Guard.** The permission is the literal `APPROVED_EXCLUDE = "joi@18.3.1"`
+  in `openclaw-base-guard.py`. A change to `inputs.env` alone cannot widen it:
+  `policy --allow-exclude` refuses every other value, also another exact
+  selector with a matching workspace line. With the literal, it accepts only
+  that one insert, at the end of the list, with the comment. It refuses a bare
+  name, another version, a range, a `||` disjunction, a scope wildcard, a
+  second entry, an insert in another place, any change to an upstream entry,
+  to the age rules or to the trust rules, and the entry without
+  `--allow-exclude`. With an empty value, the rule is the overrides-only rule.
+- **Compensating checks before the lock.**
+  - Both npm registry signatures of joi 18.3.1 verify against the current npm
+    public key (OpenSSL). This proves the registry bytes, not source
+    provenance: joi publishes no attestations.
+  - The 18.3.0 → 18.3.1 tarball diff is reviewed (5 files, no install script).
+  - Each frozen install (`trustLockfile` is not set) applies the age rule
+    again to every lock entry with the same exclude list. Without the entry,
+    the frozen install of this lock fails on joi 18.3.1 only.
+- **Expiry.** After 2026-11-04T09:59:49.641Z the entry has no effect. It stays
+  in `/app/pnpm-workspace.yaml` of a base built from this input.
+- **Removal.** The next base regeneration removes the two workspace lines,
+  sets `AGE_EXCLUDE_EXCEPTION` empty (and removes it from the workflow's
+  required inputs), updates the workspace hashes and makes a new lock, in its
+  own reviewed change.
 
-After the boundary:
+To make the lock:
 
 1. Run `openclaw-base/regenerate-lock.sh <new dir>` once.
 2. Review `lock.diff`, `package-changes.txt`, `lockfile-only.log` and
    `sha256.txt`. Expected package changes: the r3 list (`argparse` 3.0.2→3.0.4,
    `commander@8.3.0` removed, dompurify, ip-address, katex, markdown-it,
    mermaid, qs and `undici@8.11.2`), plus `seroval@1.6.8`→`1.6.11` and
-   `joi@18.2.9`→`18.3.1`. Any other change must be explained.
+   `joi@18.2.9`→`18.3.1`. Any other change must be explained. The committed
+   lock has exactly these package changes. Its other changes add no package
+   version (`lock.diff` line numbers):
+   - The `overrides:` record, the importer specifiers and versions, and the
+     snapshot dependency entries follow the new versions.
+   - The overrides also rewrite peer ranges:
+     - `@openclaw/proxyline@0.4.0`: `undici: '>=8.5.0 <9'` → `8.12.2` (130-131);
+     - `@slack/socket-mode@3.1.0`: `undici: ^7.0.0 || ^8.0.0` → `8.12.2` (155-156);
+     - `markdown-it-anchor@10.0.0` and `markdown-it-cjk-friendly@3.0.0`:
+       `markdown-it: '*'` → `15.0.3` (250-251, 258-259);
+     - `openai@7.28.0`: `undici: '>=5 <9'` → `8.12.2` (289-290);
+     - `seroval-plugins@1.6.8`: `seroval: ^1.0` → `1.6.11` (309-310).
+   - Snapshot keys with peer suffixes follow the new versions:
+     `markdown-it-anchor`, `markdown-it-cjk-friendly` and `seroval-plugins`.
+   - Three `deprecated:` strings are added from current registry data:
+     `@opentelemetry/propagator-jaeger@2.11.0`,
+     `@opentelemetry/sdk-trace-node@2.11.0` and `@smithy/core@3.35.1`
+     (139, 147, 164).
+   - `ajv-formats@3.0.1` gets optional peer data `ajv: ^8.0.0` (172-176).
 3. Commit `lock.diff` and the two `LOCK_*` hashes in **one separate commit**,
    and stop for review.
 
@@ -123,8 +173,8 @@ So the order is fixed:
 1. **Support lands on master.**
    - Contents: this directory, the workflow, the guard, and the guard's
      fixture self-test in `build.yml`.
-   - The reviewed combined lock follows in a separate reviewed commit, because
-     it cannot exist before the joi boundary. Until it is there, the `LOCK_*`
+   - The reviewed combined lock follows in a separate reviewed commit, made
+     with the joi age exception. Until it is there, the `LOCK_*`
      values stay empty and the workflow refuses to build.
    - The Dockerfile keeps its official `FROM` pins (lines 70 and 128; 2026.10.5
      on master). The Claw image does not change.

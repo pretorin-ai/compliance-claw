@@ -1,6 +1,15 @@
 --- a/pnpm-workspace.yaml
 +++ b/pnpm-workspace.yaml
-@@ -62,6 +62,14 @@
+@@ -52,6 +52,8 @@
+   - "@anthropic-ai/claude-agent-sdk-linux-x64@0.3.309"
+   - "@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.309"
+   - "@anthropic-ai/claude-agent-sdk-win32-x64@0.3.309"
++  # Compliance Claw: joi 18.3.1 for GHSA-4528-x5fx-h6hg (CVE-2026-118772); remove after 2026-11-04T09:59:49.641Z.
++  - "joi@18.3.1"
+ 
+ # Isolated installs let pnpm reuse whole-package APFS clones instead of relinking every file.
+ nodeLinker: isolated
+@@ -62,6 +64,14 @@
  blockExoticSubdeps: true
  
  overrides:
@@ -15,7 +24,7 @@
    "@microsoft/teams.apps@2.1.0>@azure/msal-node": 7.1.1
    "@azure/identity@4.13.3>@azure/msal-node": 7.1.1
    # Memory LanceDB supplies vectors; WhatsApp prepares thumbnails with Rastermill.
-@@ -97,13 +105,13 @@
+@@ -97,13 +107,13 @@
    source-map-js: 1.2.2
    file-type: 22.1.1
    form-data: 4.0.6
