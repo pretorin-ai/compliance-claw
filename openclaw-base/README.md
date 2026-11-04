@@ -65,9 +65,9 @@ The upstream Dockerfile is not changed. It builds to its own final stage.
 
 | File | Purpose |
 | --- | --- |
-| `inputs.env` | Exact source, file hashes, diff and result hashes, the age exception, build arguments, tool pins, target name. The `LOCK_*` values stay empty until the combined lock is reviewed. The workflow refuses to build while they are empty. |
+| `inputs.env` | Exact source, file hashes, diff and result hashes, the age exception, build arguments, tool pins, target name. The `LOCK_*` values are set only in the separate lock commit. The workflow refuses to build while they are empty. |
 | `workspace.diff` | The reviewed override set in `pnpm-workspace.yaml` (see below), plus the one exact `minimumReleaseAgeExclude` entry `AGE_EXCLUDE_EXCEPTION`. Nothing else may change (`openclaw-base-guard.py policy --allow-exclude`). Context lines of blank upstream lines are a single space. The patch needs them, so `git diff --check` reports them; do not strip them. |
-| `lock.diff` | The combined lock. It does not exist yet (see "joi age exception"). |
+| `lock.diff` | The combined lock against the upstream `pnpm-lock.yaml`, made with the joi age exception (see "joi age exception"). |
 | `regenerate-lock.sh` | Makes the combined lock ONCE with the reviewed r3 method: the pinned `node:24.22.1-bookworm` image, corepack pnpm from `packageManager`, `pnpm install --lockfile-only --ignore-scripts`. It refuses before `LOCK_NOT_BEFORE`, unless `AGE_EXCLUDE_EXCEPTION` is set and `workspace.diff` appends that entry. `REGEN_DRY_RUN=1` verifies all inputs and stops before pnpm. |
 | `forbidden-store-entries.txt` | Store entries that must not exist in the base or in the Claw image. |
 | `receipts/<tag>/` | The reviewed receipt of one base build (added at promotion step 3). |
@@ -112,16 +112,23 @@ joi 18.3.1. The workspace result of each step is:
   "remove after" time and one exact `name@version` entry, appended to
   `minimumReleaseAgeExclude`. pnpm applies an exact entry to that version
   only; a bare name would apply to all versions, so it is not used.
-- **Guard.** `openclaw-base-guard.py policy --allow-exclude joi@18.3.1` accepts
-  only that one insert, at the end of the list, with the comment. It refuses a
-  bare name, another version, a range, a `||` disjunction, a scope wildcard, a
-  second entry, an insert in another place, any change to an upstream entry or
-  to the age rules, and the entry without `--allow-exclude`. With an empty
-  value, the rule is the overrides-only rule.
-- **Compensating checks before the lock.** The npm registry signatures of
-  joi 18.3.1 are verified against the npm public keys, and the 18.3.0 → 18.3.1
-  tarball diff is reviewed. Each frozen install (`trustLockfile` is not set)
-  applies the age rule again to every lock entry with the same exclude list.
+- **Guard.** The permission is the literal `APPROVED_EXCLUDE = "joi@18.3.1"`
+  in `openclaw-base-guard.py`. A change to `inputs.env` alone cannot widen it:
+  `policy --allow-exclude` refuses every other value, also another exact
+  selector with a matching workspace line. With the literal, it accepts only
+  that one insert, at the end of the list, with the comment. It refuses a bare
+  name, another version, a range, a `||` disjunction, a scope wildcard, a
+  second entry, an insert in another place, any change to an upstream entry,
+  to the age rules or to the trust rules, and the entry without
+  `--allow-exclude`. With an empty value, the rule is the overrides-only rule.
+- **Compensating checks before the lock.**
+  - Both npm registry signatures of joi 18.3.1 verify against the current npm
+    public key (OpenSSL). This proves the registry bytes, not source
+    provenance: joi publishes no attestations.
+  - The 18.3.0 → 18.3.1 tarball diff is reviewed (5 files, no install script).
+  - Each frozen install (`trustLockfile` is not set) applies the age rule
+    again to every lock entry with the same exclude list. Without the entry,
+    the frozen install of this lock fails on joi 18.3.1 only.
 - **Expiry.** After 2026-11-04T09:59:49.641Z the entry has no effect. It stays
   in `/app/pnpm-workspace.yaml` of a base built from this input.
 - **Removal.** The next base regeneration removes the two workspace lines,
@@ -136,7 +143,10 @@ To make the lock:
    `sha256.txt`. Expected package changes: the r3 list (`argparse` 3.0.2→3.0.4,
    `commander@8.3.0` removed, dompurify, ip-address, katex, markdown-it,
    mermaid, qs and `undici@8.11.2`), plus `seroval@1.6.8`→`1.6.11` and
-   `joi@18.2.9`→`18.3.1`. Any other change must be explained.
+   `joi@18.2.9`→`18.3.1`. Any other change must be explained. The committed
+   lock has exactly these package changes. Its one non-package change: the
+   `seroval-plugins@1.6.8` peer range `seroval: ^1.0` becomes `1.6.11`, because
+   pnpm applies the bare `seroval` override to peer ranges too.
 3. Commit `lock.diff` and the two `LOCK_*` hashes in **one separate commit**,
    and stop for review.
 
