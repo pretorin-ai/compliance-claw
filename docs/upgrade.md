@@ -334,7 +334,7 @@ and the [update audit record](#pretorin-cli-update-audit).
 
 ## OpenClaw image upgrade and state backup
 
-The build pins OpenClaw 2026.10.10 and Pretorin CLI seed 0.30.4. A fresh
+The build pins OpenClaw 2026.10.10 and Pretorin CLI seed 0.30.9. A fresh
 installation uses this seed. An image upgrade keeps the active CLI in the
 Pretorin state volume. Use the CLI update command to change that active copy.
 
