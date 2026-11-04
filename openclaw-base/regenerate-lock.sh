@@ -7,7 +7,9 @@
 # upstream archive and files, apply workspace.diff, then
 #   pnpm install --lockfile-only --ignore-scripts
 # with the workspace's own strict minimumReleaseAge policy, which this script
-# never changes. It refuses to start before LOCK_NOT_BEFORE (inputs.env).
+# never changes. It refuses to start before LOCK_NOT_BEFORE (inputs.env),
+# unless AGE_EXCLUDE_EXCEPTION is set and workspace.diff appends exactly that
+# entry to minimumReleaseAgeExclude (checked again by the guard in the image).
 #
 # OUTDIR must not exist. It receives pnpm-lock.yaml, pnpm-workspace.yaml,
 # lock.diff (unified, a/ b/ labels), package-changes.txt, lockfile-only.log and
@@ -25,10 +27,13 @@ set -a
 . "$HERE/inputs.env"
 set +a
 
+export AGE_EXCLUDE_EXCEPTION="${AGE_EXCLUDE_EXCEPTION:-}"
 now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-if [ "$DRY_RUN" != 1 ] && [[ "$now" < "$LOCK_NOT_BEFORE" ]]; then
+if [ "$DRY_RUN" != 1 ] && [[ "$now" < "$LOCK_NOT_BEFORE" ]] \
+   && ! { [ -n "$AGE_EXCLUDE_EXCEPTION" ] \
+          && grep -qxF "+  - \"$AGE_EXCLUDE_EXCEPTION\"" "$HERE/workspace.diff"; }; then
   echo "REFUSED: $now is before $LOCK_NOT_BEFORE (joi 18.3.1 is younger than the" >&2
-  echo "workspace minimumReleaseAge). The age rule is not changed; run again later." >&2
+  echo "workspace minimumReleaseAge) and no age exception is in workspace.diff." >&2
   exit 3
 fi
 [ ! -e "$OUT" ] || { echo "REFUSED: $OUT exists" >&2; exit 2; }
@@ -43,6 +48,7 @@ docker run --rm --platform "$REGEN_PLATFORM" --network bridge \
   -e OPENCLAW_SOURCE_URL -e OPENCLAW_SOURCE_BYTES -e OPENCLAW_SOURCE_SHA256 \
   -e OPENCLAW_SOURCE_COMMIT -e UPSTREAM_DOCKERFILE_SHA256 -e UPSTREAM_WORKSPACE_SHA256 \
   -e UPSTREAM_LOCK_SHA256 -e PATCHED_WORKSPACE_SHA256 -e REGEN_NODE_IMAGE -e REGEN_PLATFORM -e DRY_RUN \
+  -e AGE_EXCLUDE_EXCEPTION \
   -v "$HERE:/in:ro" -v "$REPO/scripts/openclaw-base-guard.py:/g/openclaw-base-guard.py:ro" \
   -v "$OUT:/out" "$REGEN_NODE_IMAGE" bash -euo pipefail -c '
     started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -60,7 +66,8 @@ EOF
     cp pnpm-lock.yaml /tmp/lock.upstream.yaml
     patch pnpm-workspace.yaml < /in/workspace.diff
     echo "$PATCHED_WORKSPACE_SHA256  pnpm-workspace.yaml" | sha256sum -c -
-    python3 -I /g/openclaw-base-guard.py policy --upstream /tmp/workspace.upstream.yaml --patched pnpm-workspace.yaml
+    python3 -I /g/openclaw-base-guard.py policy --upstream /tmp/workspace.upstream.yaml --patched pnpm-workspace.yaml \
+      --allow-exclude "$AGE_EXCLUDE_EXCEPTION"
     if [ "$DRY_RUN" = 1 ]; then echo "DRY RUN: inputs verified; no lock was made"; exit 0; fi
 
     corepack enable

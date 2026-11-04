@@ -8,8 +8,10 @@
   compare --receipt DIR --observed DIR --forbidden FILE [--diffids FILE]
           [--versions-env FILE] [--expect-version V] [--expect-commit C]
       On the host: compare an observed collection with a committed receipt.
-  policy --upstream FILE --patched FILE
+  policy --upstream FILE --patched FILE [--allow-exclude NAME@X.Y.Z]
       A workspace change may touch only the top-level `overrides:` block.
+      With --allow-exclude (AGE_EXCLUDE_EXCEPTION), it must also append that
+      one exact entry and its expiry comment to `minimumReleaseAgeExclude:`.
   lock-changes --upstream FILE --patched FILE
       List the package keys that a lock change removes (-) and adds (+).
   oci --archive FILE [--platform linux/amd64]
@@ -279,8 +281,8 @@ def compare(receipt, observed, forbidden, diffids=None, versions_env=None,
     return errors
 
 
-def overrides_span(lines):
-    start = next((i for i, l in enumerate(lines) if l.rstrip("\n") == "overrides:"), None)
+def block_span(lines, key="overrides"):
+    start = next((i for i, l in enumerate(lines) if l.rstrip("\n") == key + ":"), None)
     if start is None:
         return None
     end = start + 1
@@ -289,21 +291,55 @@ def overrides_span(lines):
     return start + 1, end
 
 
-def policy(upstream, patched):
+# One user-approved age exception (openclaw-base/README.md): one exact
+# name@x.y.z, never a bare name, scope wildcard, range or disjunction.
+EXACT_EXCLUDE = re.compile(r"^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*@\d+\.\d+\.\d+$")
+EXCLUDE_EXPIRY = re.compile(r"; remove after \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z\.$")
+
+
+def exclude_insert_ok(a, b, ea, tag, i1, i2, j1, j2, allow):
+    """True only for the comment and the allowed entry, appended to the upstream list."""
+    end = ea[1]
+    while end > ea[0] and not a[end - 1].strip():
+        end -= 1
+    name, version = allow.rsplit("@", 1)
+    comment = b[j1].rstrip("\n") if j2 - j1 == 2 else ""
+    return (tag == "insert" and i1 == i2 == end and j2 - j1 == 2
+            and comment.startswith("  # Compliance Claw: %s %s " % (name, version))
+            and EXCLUDE_EXPIRY.search(comment) is not None
+            and b[j1 + 1] == '  - "%s"\n' % allow)
+
+
+def policy(upstream, patched, allow_exclude=""):
+    """A workspace change may touch only `overrides:`. With allow_exclude, it
+    may also append exactly one comment and that one exact entry at the end of
+    `minimumReleaseAgeExclude:`. Nothing else in the age policy may change."""
+    if allow_exclude and not EXACT_EXCLUDE.match(allow_exclude):
+        return ["--allow-exclude must be one exact name@x.y.z, not %r" % allow_exclude]
     with open(upstream, encoding="utf-8") as f:
         a = f.readlines()
     with open(patched, encoding="utf-8") as f:
         b = f.readlines()
-    sa, sb = overrides_span(a), overrides_span(b)
+    sa, sb = block_span(a), block_span(b)
     if not sa or not sb:
         return ["no top-level overrides: block"]
-    errors = []
+    ea = block_span(a, "minimumReleaseAgeExclude")
+    if allow_exclude and not ea:
+        return ["no top-level minimumReleaseAgeExclude: block"]
+    errors, allowed = [], 0
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
-        if not (sa[0] <= i1 and i2 <= sa[1] and sb[0] <= j1 and j2 <= sb[1]):
-            errors.append("change outside overrides: upstream lines %d-%d, patched lines %d-%d"
-                          % (i1 + 1, i2, j1 + 1, j2))
+        if sa[0] <= i1 and i2 <= sa[1] and sb[0] <= j1 and j2 <= sb[1]:
+            continue
+        if allow_exclude and exclude_insert_ok(a, b, ea, tag, i1, i2, j1, j2, allow_exclude):
+            allowed += 1
+            continue
+        errors.append("change outside overrides: upstream lines %d-%d, patched lines %d-%d"
+                      % (i1 + 1, i2, j1 + 1, j2))
+    if allow_exclude and allowed != 1:
+        errors.append("%s is not appended exactly once, with its expiry comment, at the end of "
+                      "minimumReleaseAgeExclude" % allow_exclude)
     return errors
 
 
@@ -617,6 +653,51 @@ def self_test():
         case("workspace change inside overrides is accepted", policy(up, ok) == [])
         case("workspace change outside overrides (age rule) is refused", policy(up, bad) != [])
 
+        def ws(name, exclude, age="10080", strict="true"):
+            path = os.path.join(tmp, "ws-x-%s.yaml" % name)
+            _write(path, "packages:\n  - .\n\nminimumReleaseAge: %s\nminimumReleaseAgeStrict: %s\n\n"
+                         "minimumReleaseAgeExclude:\n  - \"solid-js\"\n"
+                         "  # Upstream: remove after 2026-10-21T13:01:12.291Z.\n  - \"@o/fs@0.26.5\"\n%s\n"
+                         "overrides:\n  qs: 6.16.1\n\ntrust: a\n" % (age, strict, exclude))
+            return path
+        note = "  # Compliance Claw: joi 18.3.1 for GHSA-x; remove after 2026-11-04T09:59:49.641Z.\n"
+        entry = '  - "joi@18.3.1"\n'
+        xup = ws("up", "")
+        xok = ws("ok", note + entry)
+        j = "joi@18.3.1"
+        case("exact exclude entry with its expiry comment is accepted", policy(xup, xok, j) == [])
+        case("exclude entry without --allow-exclude is refused", policy(xup, xok) != [])
+        case("allowed exclude entry that is missing is refused", policy(xup, ws("none", ""), j) != [])
+        case("second exclude entry is refused",
+             policy(xup, ws("two", note + entry + '  - "joi@18.3.2"\n'), j) != []
+             and policy(xup, ws("two-c", note + entry + note + '  - "joi@18.3.2"\n'), j) != [])
+        case("name-only exclude entry is refused",
+             policy(xup, ws("bare", note + '  - "joi"\n'), j) != [] and policy(xup, xok, "joi") != [])
+        case("other version of the exclude entry is refused",
+             policy(xup, ws("v", note.replace("18.3.1", "18.3.0") + '  - "joi@18.3.0"\n'), j) != [])
+        case("exclude disjunction is refused",
+             policy(xup, ws("or", note + '  - "joi@18.3.1 || 18.3.2"\n'), "joi@18.3.1 || 18.3.2") != [])
+        case("exclude range is refused",
+             policy(xup, ws("range", note + '  - "joi@^18.3.1"\n'), "joi@^18.3.1") != [])
+        case("exclude scope wildcard is refused",
+             policy(xup, ws("scope", note + '  - "@hapi/*"\n'), "@hapi/*") != [])
+        def edit(path, old, new):
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            assert old in text
+            _write(path, text.replace(old, new, 1))
+            return path
+        case("exclude entry not at the end of the list is refused",
+             policy(xup, edit(ws("mid", ""), '  - "solid-js"\n', '  - "solid-js"\n' + note + entry), j) != [])
+        case("changed or removed upstream exclude entry is refused",
+             policy(xup, edit(ws("mod", note + entry), '"@o/fs@0.26.5"', '"@o/fs@0.26.6"'), j) != []
+             and policy(xup, edit(ws("rm", note + entry), '  - "solid-js"\n', ""), j) != [])
+        case("age rule change with the exclude entry is refused",
+             policy(xup, ws("age", note + entry, age="0"), j) != []
+             and policy(xup, ws("strict", note + entry, strict="false"), j) != [])
+        case("exclude entry without an expiry comment is refused",
+             policy(xup, ws("nonote", "  # Compliance Claw: joi 18.3.1.\n" + entry), j) != [])
+
         la = os.path.join(tmp, "lock-a.yaml")
         _write(la, "lockfileVersion: '9.0'\n\npackages:\n\n  joi@18.2.9:\n    resolution: {}\n\n"
                    "  '@a/b@1.0.0':\n    resolution: {}\n\nsnapshots:\n\n  joi@18.2.9: {}\n")
@@ -784,6 +865,8 @@ def main(argv):
         q = sub.add_parser(name)
         q.add_argument("--upstream", required=True)
         q.add_argument("--patched", required=True)
+        if name == "policy":
+            q.add_argument("--allow-exclude", default="")
     o = sub.add_parser("oci")
     o.add_argument("--archive", required=True)
     o.add_argument("--platform", default="linux/amd64")
@@ -835,7 +918,7 @@ def main(argv):
             errors = compare(a.receipt, a.observed, a.forbidden, a.diffids, a.versions_env,
                              a.expect_version, a.expect_commit)
         else:
-            errors = policy(a.upstream, a.patched)
+            errors = policy(a.upstream, a.patched, a.allow_exclude)
     except (OSError, ValueError) as e:
         print("openclaw-base-guard: %s" % e, file=sys.stderr)
         return 2

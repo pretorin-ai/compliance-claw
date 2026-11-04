@@ -84,7 +84,7 @@ jobs:
           for k in OPENCLAW_VERSION OPENCLAW_SOURCE_COMMIT OPENCLAW_SOURCE_URL OPENCLAW_SOURCE_BYTES \
                    OPENCLAW_SOURCE_SHA256 UPSTREAM_DOCKERFILE_SHA256 UPSTREAM_WORKSPACE_SHA256 \
                    UPSTREAM_LOCK_SHA256 WORKSPACE_DIFF_SHA256 PATCHED_WORKSPACE_SHA256 \
-                   LOCK_DIFF_SHA256 PATCHED_LOCK_SHA256 BUILD_ARG_GIT_COMMIT \
+                   AGE_EXCLUDE_EXCEPTION LOCK_DIFF_SHA256 PATCHED_LOCK_SHA256 BUILD_ARG_GIT_COMMIT \
                    BUILD_ARG_OPENCLAW_BUILD_TIMESTAMP BUILD_ARG_OPENCLAW_DOCKER_BUILD_VERSION \
                    BUILD_ARG_OPENCLAW_EXTENSIONS BUILD_ARG_GITHUB_ACTIONS BUILD_PLATFORM \
                    OFFICIAL_IMAGE NODE_SLIM_IMAGE BUILDKIT_IMAGE SBOM_GENERATOR \
@@ -130,9 +130,11 @@ jobs:
           ${PATCHED_WORKSPACE_SHA256}  pnpm-workspace.yaml
           ${PATCHED_LOCK_SHA256}  pnpm-lock.yaml
           EOF
-          # The age, trust and exclude rules are outside `overrides:` and stay unchanged.
+          # The age and trust rules stay unchanged. The exclude list gains only the
+          # one exact AGE_EXCLUDE_EXCEPTION entry, appended (openclaw-base/README.md).
           python3 -I "$GITHUB_WORKSPACE/claw/scripts/openclaw-base-guard.py" policy \
-            --upstream "$RUNNER_TEMP/workspace.upstream.yaml" --patched pnpm-workspace.yaml
+            --upstream "$RUNNER_TEMP/workspace.upstream.yaml" --patched pnpm-workspace.yaml \
+            --allow-exclude "$AGE_EXCLUDE_EXCEPTION"
 
       - name: Build the upstream final stage
         run: |
@@ -268,6 +270,7 @@ jobs:
             echo "actions=checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09,upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
             echo "source=${OPENCLAW_SOURCE_URL} bytes=${OPENCLAW_SOURCE_BYTES} sha256=${OPENCLAW_SOURCE_SHA256} commit=${OPENCLAW_SOURCE_COMMIT}"
             echo "workspace_diff_sha256=${WORKSPACE_DIFF_SHA256} patched_workspace_sha256=${PATCHED_WORKSPACE_SHA256}"
+            echo "age_exclude_exception=${AGE_EXCLUDE_EXCEPTION}"
             echo "lock_diff_sha256=${LOCK_DIFF_SHA256} patched_lock_sha256=${PATCHED_LOCK_SHA256}"
             grep -E '^ARG OPENCLAW_(NODE_BOOKWORM|NODE_BOOKWORM_SLIM|BUN)_IMAGE=' "$RUNNER_TEMP/src/Dockerfile"
             echo "buildkit_image=${BUILDKIT_IMAGE} sbom_generator=${SBOM_GENERATOR}"
