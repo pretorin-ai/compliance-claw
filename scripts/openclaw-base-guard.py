@@ -682,16 +682,115 @@ def oci_facts(archive, platform="linux/amd64", require_attestations=False):
     }
 
 
+GZIP_LAYERS = ("application/vnd.oci.image.layer.v1.tar+gzip",
+               "application/vnd.docker.image.rootfs.diff.tar.gzip")
+TAR_LAYERS = ("application/vnd.oci.image.layer.v1.tar",)
+IMAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+
+def layer_diff_id(f, media_type):
+    """The sha256 of a layer's uncompressed tar: the diffID its config names."""
+    import zlib
+    h = hashlib.sha256()
+    if media_type in TAR_LAYERS:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+        return "sha256:" + h.hexdigest()
+    if media_type not in GZIP_LAYERS:
+        raise ValueError("layer media type %s is not supported" % media_type)
+    d, fed = zlib.decompressobj(31), False
+    try:
+        for data in iter(lambda: f.read(1 << 20), b""):
+            while data:
+                fed = True
+                # max_length keeps a small compressed chunk from filling memory.
+                h.update(d.decompress(data, 1 << 24))
+                if d.eof:
+                    # Another gzip member follows, as Go's gzip reader accepts.
+                    data, d, fed = d.unused_data, zlib.decompressobj(31), False
+                else:
+                    data = d.unconsumed_tail
+    except zlib.error as e:
+        raise ValueError("gzip layer cannot be read: %s" % e)
+    if fed and not d.eof:
+        raise ValueError("gzip layer is truncated")
+    return "sha256:" + h.hexdigest()
+
+
+def load_view_errors(path, facts, layer_diff_ids, name):
+    """Why a load view is not the verified image in Docker's archive form.
+
+    Moby's classic loader (image/tarexport/load.go) reads manifest.json:
+    Config is the config blob, Layers[i] is the blob for rootfs diff_ids[i],
+    and RepoTags are the names it tags. Without manifest.json it falls back
+    to the legacy layout and reads blobs/json. `layer_diff_ids` maps each
+    layer blob digest to the diffID of its uncompressed bytes.
+    """
+    import tarfile
+
+    def blob(digest):
+        return "blobs/sha256/" + digest.split(":", 1)[1]
+
+    want = ([blob(facts["manifest_digest"]), blob(facts["config_digest"])]
+            + [blob(d["digest"]) for d in facts["layers"]])
+    errors = []
+    with tarfile.open(path) as tar:
+        names = []
+        for m in tar.getmembers():
+            names.append(m.name)
+            if m.name.startswith("/") or ".." in m.name.split("/") or not m.isreg():
+                errors.append("entry %s is not a plain relative file" % m.name)
+        if len(set(names)) != len(names):
+            errors.append("an entry name occurs twice")
+        expected = set(want) | {"index.json", "oci-layout", "manifest.json"}
+        for n in sorted(expected - set(names)):
+            errors.append("entry %s is missing" % n)
+        for n in sorted(set(names) - expected):
+            errors.append("entry %s is not part of the image" % n)
+        if errors:
+            return errors
+        doc = json.loads(tar.extractfile("manifest.json").read())
+        index = json.loads(tar.extractfile("index.json").read())
+    if not isinstance(doc, list) or len(doc) != 1 or not isinstance(doc[0], dict):
+        return ["manifest.json must hold exactly one image"]
+    item = doc[0]
+    if sorted(item) != ["Config", "Layers", "RepoTags"]:
+        errors.append("manifest.json keys are %s" % sorted(item))
+    if item.get("Config") != blob(facts["config_digest"]):
+        errors.append("manifest.json Config is not the verified config blob")
+    if item.get("RepoTags") != [name]:
+        errors.append("manifest.json RepoTags is not [%s]" % name)
+    layers = item.get("Layers")
+    if layers != [blob(d["digest"]) for d in facts["layers"]]:
+        errors.append("manifest.json Layers are not the verified layer blobs in manifest order")
+    elif [layer_diff_ids.get(d["digest"]) for d in facts["layers"]] != facts["diff_ids"]:
+        errors.append("the layer blobs do not agree with the config diff_ids in order")
+    if [m.get("digest") for m in index.get("manifests") or []] != [facts["manifest_digest"]]:
+        errors.append("index.json does not name the verified image manifest")
+    return errors
+
+
 def oci_image_archive(archive, out, platform="linux/amd64", name="openclaw-base:candidate"):
-    """Write a single-image OCI archive for `docker load` from the same bytes.
+    """Write a single-image archive for `docker load` from the same bytes.
 
     It holds the selected platform manifest, its config and its layers, each
-    copied only after its size and sha256 match. The pushed archive names the
-    same manifest digest, so the loaded image is the image that is published.
+    copied once only after its size and sha256 match. Every later descriptor
+    of the same blob must give the same size and media type. Each layer's
+    uncompressed sha256 must be its config diffID. manifest.json is the
+    Docker archive record that `docker save` writes for the classic image
+    store; index.json is the OCI record for the containerd store. The pushed
+    archive names the same manifest digest, so the loaded image is the image
+    that is published.
     """
     import io
     import tarfile
+    if not IMAGE_NAME.match(name):
+        raise ValueError("image name %s must be name:tag" % name)
     facts = oci_facts(archive, platform)
+    if len(facts["layers"]) != len(facts["diff_ids"]):
+        raise ValueError("the manifest has %d layers, the config %d diff_ids"
+                         % (len(facts["layers"]), len(facts["diff_ids"])))
+    diff_of, first = {}, {}
     with tarfile.open(archive) as src, tarfile.open(out, "w") as dst:
         def add(n, data):
             ti = tarfile.TarInfo(n)
@@ -703,6 +802,14 @@ def oci_image_archive(archive, out, platform="linux/amd64", name="openclaw-base:
             add("blobs/sha256/" + d["digest"].split(":", 1)[1], verified_blob(src, d, "image blob"))
         for i, layer in enumerate(facts["layers"]):
             member, hexd = _blob_member(src, layer, "layer %d" % i)
+            if layer["digest"] in first:
+                # The same blob again (for example an empty layer): one copy.
+                # Every occurrence must describe it as the verified first one.
+                j, size, media = first[layer["digest"]]
+                if (layer["size"], layer.get("mediaType")) != (size, media):
+                    raise ValueError("layer %d does not match its descriptor (size or media type differs "
+                                     "from layer %d, the same blob)" % (i, j))
+                continue
             h, n, f = hashlib.sha256(), 0, src.extractfile(member)
             spool = tempfile.TemporaryFile()
             for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -711,6 +818,9 @@ def oci_image_archive(archive, out, platform="linux/amd64", name="openclaw-base:
                 spool.write(chunk)
             if n != layer["size"] or h.hexdigest() != hexd:
                 raise ValueError("layer %d does not match its descriptor" % i)
+            spool.seek(0)
+            diff_of[layer["digest"]] = layer_diff_id(spool, layer.get("mediaType"))
+            first[layer["digest"]] = (i, layer["size"], layer.get("mediaType"))
             spool.seek(0)
             ti = tarfile.TarInfo("blobs/sha256/" + hexd)
             ti.size = n
@@ -723,6 +833,15 @@ def oci_image_archive(archive, out, platform="linux/amd64", name="openclaw-base:
             "digest": facts["manifest_digest"], "size": facts["manifest_size"],
             "annotations": {"io.containerd.image.name": "docker.io/library/" + name,
                             "org.opencontainers.image.ref.name": tag}}]}).encode())
+        add("manifest.json", (json.dumps([{
+            "Config": "blobs/sha256/" + facts["config_digest"].split(":", 1)[1],
+            "RepoTags": [name],
+            "Layers": ["blobs/sha256/" + d["digest"].split(":", 1)[1] for d in facts["layers"]],
+        }], separators=(",", ":")) + "\n").encode())
+    errors = load_view_errors(out, facts, diff_of, name)
+    if errors:
+        os.remove(out)
+        raise ValueError("the load view is refused: " + "; ".join(errors))
     return facts
 
 
@@ -891,8 +1010,16 @@ def self_test():
                    "  '@a/b@1.0.0':\n    resolution: {}\n\nsnapshots:\n\n  joi@18.3.1: {}\n")
         case("lock package changes are listed", lock_changes(la, lb) == (["joi@18.2.9"], ["joi@18.3.1"]))
 
+        # Layer tars as BuildKit writes them: gzip, and an empty layer twice
+        # (one blob, two diff_ids), as in the real base image.
+        import gzip
+        layer_plain = [b"layer-a", b"", b"layer-b", b""]
+        layer_gz = [gzip.compress(p, mtime=0) for p in layer_plain]
+        diff_ids = ["sha256:" + sha256_bytes(p) for p in layer_plain]
+
         def oci_archive(name, extra_platform=False, single=False, corrupt_manifest=False,
-                        wrong_config_size=False, sbom=True):
+                        wrong_config_size=False, sbom=True, swap_diff_ids=False,
+                        layer_type="application/vnd.oci.image.layer.v1.tar+gzip", repeat=None):
             import io
             import tarfile
             blobs = {}
@@ -903,14 +1030,23 @@ def self_test():
                 blobs[d] = data
                 return d, len(data)
 
-            layer, layer_n = put(None, b"layer-bytes")
+            layers = []
+            for data in layer_gz:
+                d, n = put(None, data)
+                layers.append({"mediaType": layer_type, "digest": d, "size": n})
+            if repeat:
+                # Layer 3 repeats the blob of layer 1 (the empty layer).
+                layers[3].update(repeat)
+            layer, layer_n = layers[0]["digest"], layers[0]["size"]
+            ids = list(diff_ids)
+            if swap_diff_ids:
+                ids[0], ids[2] = ids[2], ids[0]
             cfg, cfg_n = put({"os": "linux", "architecture": "amd64",
-                              "rootfs": {"type": "layers", "diff_ids": ["sha256:l1", "sha256:l2"]},
+                              "rootfs": {"type": "layers", "diff_ids": ids},
                               "config": {"Labels": {"a": "b"}}})
             img, img_n = put({"schemaVersion": 2,
                               "config": {"digest": cfg, "size": cfg_n + (1 if wrong_config_size else 0)},
-                              "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                                          "digest": layer, "size": layer_n}]})
+                              "layers": layers})
             if corrupt_manifest:
                 # Same name, one changed byte: the digest no longer matches.
                 data = bytearray(blobs[img])
@@ -946,17 +1082,144 @@ def self_test():
         path, top, img = oci_archive("index.tar")
         f = oci_facts(path, require_attestations=True)
         case("OCI index with one amd64 image plus provenance and SBOM attestations is read",
-             f["top_digest"] == top and f["manifest_digest"] == img and f["diff_ids"] == ["sha256:l1", "sha256:l2"]
+             f["top_digest"] == top and f["manifest_digest"] == img and f["diff_ids"] == diff_ids
              and len(f["attestation_manifests"]) == 1 and len(f["attestation_predicates"]) == 2)
         single_out = os.path.join(tmp, "single-out.tar")
         g = oci_image_archive(path, single_out)
+        import io
         import tarfile
         with tarfile.open(single_out) as t:
             names = sorted(t.getnames())
             idx = json.loads(t.extractfile("index.json").read())
+            view = {n: t.extractfile(n).read() for n in names}
         case("single-image archive holds the same manifest, config and layer",
              g["manifest_digest"] == img and idx["manifests"][0]["digest"] == img
-             and len([n for n in names if n.startswith("blobs/")]) == 3 and "oci-layout" in names)
+             and len([n for n in names if n.startswith("blobs/")]) == 5 and "oci-layout" in names)
+
+        # Docker 28 classic `docker load` reads manifest.json; without it, it
+        # reads the legacy layout and fails on blobs/json (run 41785277435).
+        def blob_name(digest):
+            return "blobs/sha256/" + digest.split(":", 1)[1]
+        name = "openclaw-base:candidate"
+        doc = json.loads(view.get("manifest.json", b"[]"))
+        item = doc[0] if isinstance(doc, list) and len(doc) == 1 else {"Layers": [None] * 4}
+        case("load view has manifest.json: Config is the verified config blob, RepoTags the image name",
+             sorted(item) == ["Config", "Layers", "RepoTags"]
+             and item["Config"] == blob_name(g["config_digest"])
+             and "sha256:" + sha256_bytes(view[item["Config"]]) == g["config_digest"]
+             and item["RepoTags"] == [name] and "blobs/json" not in view)
+        case("load view Layers are the verified layer blobs in diff_ids order",
+             item["Layers"] == [blob_name(d["digest"]) for d in g["layers"]]
+             and ["sha256:" + sha256_bytes(gzip.decompress(view[n])) for n in item["Layers"]] == g["diff_ids"])
+        case("load view stores a repeated layer blob once and names it twice",
+             names.count(item["Layers"][1]) == 1 and item["Layers"][1] == item["Layers"][3])
+        diff_of = {d["digest"]: "sha256:" + sha256_bytes(gzip.decompress(view[blob_name(d["digest"])]))
+                   for d in g["layers"]}
+        case("load view check passes the written view", load_view_errors(single_out, g, diff_of, name) == [])
+
+        def tampered(label, drop=(), extra=(), manifest=None, symlink=None):
+            out = os.path.join(tmp, "view-" + label + ".tar")
+            with tarfile.open(out, "w") as t:
+                files = [(n, b) for n, b in view.items() if n not in drop] + list(extra)
+                if manifest is not None:
+                    files = [(n, b) for n, b in files if n != "manifest.json"] + \
+                            [("manifest.json", json.dumps([manifest]).encode())]
+                for n, b in files:
+                    ti = tarfile.TarInfo(n)
+                    ti.size = len(b)
+                    t.addfile(ti, io.BytesIO(b))
+                if symlink:
+                    ti = tarfile.TarInfo(symlink)
+                    ti.type, ti.linkname = tarfile.SYMTYPE, "/etc/passwd"
+                    t.addfile(ti)
+            return load_view_errors(out, g, diff_of, name)
+
+        cfg_blob = blob_name(g["config_digest"])
+        lay = [blob_name(d["digest"]) for d in g["layers"]]
+        l0, l2 = lay[0], lay[2]
+
+        def edit(**kw):
+            m = {"Config": cfg_blob, "RepoTags": [name], "Layers": lay}
+            m.update(kw)
+            return m
+
+        for label, errs, word in (
+                ("without manifest.json (the failed run's view)", tampered("old", drop=["manifest.json"]),
+                 "manifest.json is missing"),
+                ("with a missing layer blob", tampered("miss", drop=[l2]), "is missing"),
+                ("with a missing config blob", tampered("nocfg", drop=[cfg_blob]), "is missing"),
+                ("with an extra blob", tampered("extra", extra=[("blobs/sha256/" + "0" * 64, b"x")]),
+                 "not part of the image"),
+                ("with a legacy blobs/json entry", tampered("json", extra=[("blobs/json", b"{}")]),
+                 "not part of the image"),
+                ("with a path escape entry", tampered("dots", extra=[("../escape", b"x")]),
+                 "not a plain relative file"),
+                ("with an absolute entry", tampered("abs", extra=[("/etc/x", b"x")]), "not a plain relative file"),
+                ("with a symlink entry", tampered("link", symlink="blobs/sha256/" + "1" * 64),
+                 "not a plain relative file"),
+                ("with an entry twice", tampered("twice", extra=[("oci-layout", b"{}")]), "occurs twice"),
+                ("whose Config is the manifest blob", tampered("cfg", manifest=edit(Config=blob_name(img))),
+                 "Config is not the verified config blob"),
+                ("whose Config escapes the archive",
+                 tampered("cfgesc", manifest=edit(Config="../" + cfg_blob)), "Config is not"),
+                ("with a wrong layer reference",
+                 tampered("lref", manifest=edit(Layers=[l2] + lay[1:])), "Layers are not"),
+                ("whose layer order does not follow the diff_ids",
+                 tampered("lorder", manifest=edit(Layers=[l2, lay[1], l0, lay[3]])),
+                 "Layers are not"),
+                ("with a layer missing from Layers", tampered("lshort", manifest=edit(Layers=lay[:3])),
+                 "Layers are not"),
+                ("whose layer path escapes the archive",
+                 tampered("lesc", manifest=edit(Layers=["../../" + l0] + lay[1:])), "Layers are not"),
+                ("with other RepoTags", tampered("tag", manifest=edit(RepoTags=["openclaw-base:other"])),
+                 "RepoTags"),
+                ("with an extra manifest.json key", tampered("key", manifest=edit(Parent="sha256:" + "2" * 64)),
+                 "keys are"),
+        ):
+            case("load view %s is refused" % label, any(word in e for e in errs))
+        case("load view whose blobs do not give the diff_ids in order is refused",
+             any("do not agree with the config diff_ids" in e
+                 for e in load_view_errors(single_out, g, dict(diff_of, **{g["layers"][0]["digest"]: diff_ids[2]}),
+                                           name)))
+
+        def writer_refusal(archive, out, **kw):
+            try:
+                oci_image_archive(archive, out, **kw)
+                return ""
+            except ValueError as e:
+                return str(e)
+        p, _, _ = oci_archive("swapped.tar", swap_diff_ids=True)
+        out = os.path.join(tmp, "swapped-view.tar")
+        msg = writer_refusal(p, out)
+        case("a source whose layers do not give the config diff_ids in order makes no load view",
+             "do not agree with the config diff_ids" in msg and not os.path.exists(out))
+        p, _, _ = oci_archive("zstd.tar", layer_type="application/vnd.oci.image.layer.v1.tar+zstd")
+        case("a layer media type the guard cannot read is refused",
+             "is not supported" in writer_refusal(p, os.path.join(tmp, "zstd-view.tar")))
+        # A repeated blob is copied once, so its later descriptors must
+        # agree with the first, checked one: same size and media type.
+        for label, repeat in (("a wrong size", {"size": len(layer_gz[1]) + 1}),
+                              ("an unsupported media type",
+                               {"mediaType": "application/vnd.oci.image.layer.v1.tar+zstd"}),
+                              ("another gzip media type",
+                               {"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip"})):
+            p, _, _ = oci_archive("repeat-%d.tar" % len(label), repeat=repeat)
+            case("a repeated layer blob whose later descriptor has %s is refused" % label,
+                 "layer 3 does not match its descriptor"
+                 in writer_refusal(p, os.path.join(tmp, "repeat-%d-view.tar" % len(label))))
+        case("an image name without a tag is refused",
+             "name:tag" in writer_refusal(path, os.path.join(tmp, "notag.tar"), name="openclaw-base"))
+        for label, data, word in (("truncated", layer_gz[0][:-6], "truncated"),
+                                  ("corrupt", layer_gz[0][:10] + b"\xff" * 8 + layer_gz[0][18:], "cannot be read")):
+            try:
+                layer_diff_id(io.BytesIO(data), "application/vnd.oci.image.layer.v1.tar+gzip")
+                msg = ""
+            except ValueError as e:
+                msg = str(e)
+            case("a %s gzip layer is refused" % label, word in msg)
+        case("a gzip layer of two members gives the diffID of both parts",
+             layer_diff_id(io.BytesIO(layer_gz[0] + layer_gz[2]), "application/vnd.oci.image.layer.v1.tar+gzip")
+             == "sha256:" + sha256_bytes(layer_plain[0] + layer_plain[2]))
         for label, kw, word in (("changed child manifest byte", {"corrupt_manifest": True}, "image manifest"),
                                 ("wrong config size", {"wrong_config_size": True}, "image config")):
             p, _, _ = oci_archive(label.replace(" ", "-") + ".tar", **kw)
