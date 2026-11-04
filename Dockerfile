@@ -354,66 +354,6 @@ LABEL org.opencontainers.image.version="${IMAGE_SELF_VERSION}"
 
 COPY versions.env /opt/compliance-claw/versions.env
 
-# OpenClaw 2026.10.10 already has the fixed Debian Perl packages. Its app-local
-# npm still bundles vulnerable brace-expansion and undici. Replace that npm
-# package with the official patch release; preserve the existing pnpm links.
-# npm 12.2.1 itself bundles undici 6.29.0 and ip-address 10.7.2, so replace
-# those nested copies too.
-RUN . /opt/compliance-claw/versions.env \
- && test "$(node -p 'require("/app/node_modules/npm/package.json").version')" = 12.2.0 \
- && test "$(readlink -f /app/node_modules/npm)" = /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
- && curl -fsSL --retry 3 --retry-all-errors -o /tmp/npm.tgz \
-      "https://registry.npmjs.org/npm/-/npm-${NPM_VERSION}.tgz" \
- && NPM_INTEGRITY="$NPM_INTEGRITY" node -e 'const fs=require("fs"),c=require("crypto"); const actual="sha512-"+c.createHash("sha512").update(fs.readFileSync("/tmp/npm.tgz")).digest("base64"); if(actual!==process.env.NPM_INTEGRITY) throw Error("npm integrity mismatch")' \
- && rm -rf /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
- && mkdir /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
- && tar -xzf /tmp/npm.tgz --strip-components=1 -C /app/node_modules/.pnpm/npm@12.2.0/node_modules/npm \
- && rm /tmp/npm.tgz \
- && test "$(node /app/node_modules/npm/bin/npm-cli.js --version)" = "$NPM_VERSION" \
- && U=/app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/undici \
- && test "$(node -p 'require(process.argv[1]).version' "$U/package.json")" = 6.29.0 \
- && curl -fsSL --retry 3 --retry-all-errors -o /tmp/undici.tgz \
-      "https://registry.npmjs.org/undici/-/undici-${NPM_UNDICI_VERSION}.tgz" \
- && NPM_UNDICI_INTEGRITY="$NPM_UNDICI_INTEGRITY" node -e 'const fs=require("fs"),c=require("crypto"); const actual="sha512-"+c.createHash("sha512").update(fs.readFileSync("/tmp/undici.tgz")).digest("base64"); if(actual!==process.env.NPM_UNDICI_INTEGRITY) throw Error("undici integrity mismatch")' \
- && rm -rf "$U" && mkdir "$U" \
- && tar -xzf /tmp/undici.tgz --strip-components=1 -C "$U" \
- && rm /tmp/undici.tgz \
- && test "$(node -p 'require(process.argv[1]).version' "$U/package.json")" = "$NPM_UNDICI_VERSION" \
- && A=/app/node_modules/.pnpm/npm@12.2.0/node_modules/npm/node_modules/ip-address \
- && test "$(node -p 'require(process.argv[1]).version' "$A/package.json")" = 10.7.2 \
- && curl -fsSL --retry 3 --retry-all-errors -o /tmp/ip-address.tgz \
-      "https://registry.npmjs.org/ip-address/-/ip-address-${NPM_IP_ADDRESS_VERSION}.tgz" \
- && NPM_IP_ADDRESS_INTEGRITY="$NPM_IP_ADDRESS_INTEGRITY" node -e 'const fs=require("fs"),c=require("crypto"); const actual="sha512-"+c.createHash("sha512").update(fs.readFileSync("/tmp/ip-address.tgz")).digest("base64"); if(actual!==process.env.NPM_IP_ADDRESS_INTEGRITY) throw Error("ip-address integrity mismatch")' \
- && rm -rf "$A" && mkdir "$A" \
- && tar -xzf /tmp/ip-address.tgz --strip-components=1 -C "$A" \
- && rm /tmp/ip-address.tgz \
- && test "$(node -p 'require(process.argv[1]).version' "$A/package.json")" = "$NPM_IP_ADDRESS_VERSION"
-
-# Packages in the OpenClaw pnpm store with fixable findings. versions.env gives
-# the reason for each row. Each row: name, installed version, store
-# directory, official patch version, integrity. The installed version is asserted
-# before the replacement, so a base update fails here and the row is reassessed.
-RUN . /opt/compliance-claw/versions.env \
- && printf '%s\n' \
-      "qs 6.16.0 qs@6.16.0 ${QS_VERSION} ${QS_INTEGRITY}" \
-      "undici 8.11.2 undici@8.11.2 ${UNDICI_VERSION} ${UNDICI_INTEGRITY}" \
-      > /tmp/pnpm-corrections \
- && while read -r name from dir to integrity; do \
-      p="/app/node_modules/.pnpm/${dir}/node_modules/${name}" \
-      && test -d "$p" \
-      && test "$(node -p 'require(process.argv[1]).version' "$p/package.json")" = "$from" \
-      && curl -fsSL --retry 3 --retry-all-errors -o /tmp/pkg.tgz \
-           "https://registry.npmjs.org/${name}/-/${name}-${to}.tgz" \
-      && INTEGRITY="$integrity" node -e 'const fs=require("fs"),c=require("crypto"); const actual="sha512-"+c.createHash("sha512").update(fs.readFileSync("/tmp/pkg.tgz")).digest("base64"); if(actual!==process.env.INTEGRITY) throw Error("integrity mismatch")' \
-      && rm -rf "$p" && mkdir "$p" \
-      && tar -xzf /tmp/pkg.tgz --strip-components=1 -C "$p" \
-      && rm /tmp/pkg.tgz \
-      && test "$(node -p 'require(process.argv[1]).version' "$p/package.json")" = "$to" \
-      && echo "REPLACED: ${name} ${from} -> ${to}" \
-      || exit 1; \
-    done < /tmp/pnpm-corrections \
- && rm /tmp/pnpm-corrections
-
 RUN . /opt/compliance-claw/versions.env \
  && test -n "${MODEL}" \
  && sed -i "s|@MODEL@|${MODEL}|" /opt/compliance-claw/openclaw-config.template.json \
