@@ -8,10 +8,11 @@
   compare --receipt DIR --observed DIR --forbidden FILE [--diffids FILE]
           [--versions-env FILE] [--expect-version V] [--expect-commit C]
       On the host: compare an observed collection with a committed receipt.
-  policy --upstream FILE --patched FILE [--allow-exclude NAME@X.Y.Z]
+  policy --upstream FILE --patched FILE [--allow-exclude joi@18.3.1]
       A workspace change may touch only the top-level `overrides:` block.
-      With --allow-exclude (AGE_EXCLUDE_EXCEPTION), it must also append that
-      one exact entry and its expiry comment to `minimumReleaseAgeExclude:`.
+      With --allow-exclude (AGE_EXCLUDE_EXCEPTION), which must be the literal
+      joi@18.3.1, it must also append that entry and its expiry comment to
+      `minimumReleaseAgeExclude:`.
   lock-changes --upstream FILE --patched FILE
       List the package keys that a lock change removes (-) and adds (+).
   oci --archive FILE [--platform linux/amd64]
@@ -291,9 +292,10 @@ def block_span(lines, key="overrides"):
     return start + 1, end
 
 
-# One user-approved age exception (openclaw-base/README.md): one exact
-# name@x.y.z, never a bare name, scope wildcard, range or disjunction.
-EXACT_EXCLUDE = re.compile(r"^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*@\d+\.\d+\.\d+$")
+# The one user-approved age exception (openclaw-base/README.md). This literal
+# is the whole permission: inputs.env cannot widen it. Another value needs a
+# reviewed change here.
+APPROVED_EXCLUDE = "joi@18.3.1"
 EXCLUDE_EXPIRY = re.compile(r"; remove after \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z\.$")
 
 
@@ -311,11 +313,12 @@ def exclude_insert_ok(a, b, ea, tag, i1, i2, j1, j2, allow):
 
 
 def policy(upstream, patched, allow_exclude=""):
-    """A workspace change may touch only `overrides:`. With allow_exclude, it
-    may also append exactly one comment and that one exact entry at the end of
-    `minimumReleaseAgeExclude:`. Nothing else in the age policy may change."""
-    if allow_exclude and not EXACT_EXCLUDE.match(allow_exclude):
-        return ["--allow-exclude must be one exact name@x.y.z, not %r" % allow_exclude]
+    """A workspace change may touch only `overrides:`. With allow_exclude (only
+    APPROVED_EXCLUDE), it may also append exactly one comment and that entry at
+    the end of `minimumReleaseAgeExclude:`. Nothing else in the age policy may
+    change."""
+    if allow_exclude and allow_exclude != APPROVED_EXCLUDE:
+        return ["--allow-exclude must be %s, not %r" % (APPROVED_EXCLUDE, allow_exclude)]
     with open(upstream, encoding="utf-8") as f:
         a = f.readlines()
     with open(patched, encoding="utf-8") as f:
@@ -653,13 +656,18 @@ def self_test():
         case("workspace change inside overrides is accepted", policy(up, ok) == [])
         case("workspace change outside overrides (age rule) is refused", policy(up, bad) != [])
 
-        def ws(name, exclude, age="10080", strict="true"):
+        def ws(name, exclude, age="10080", strict="true", trust="trustPolicy: no-downgrade\n"):
             path = os.path.join(tmp, "ws-x-%s.yaml" % name)
             _write(path, "packages:\n  - .\n\nminimumReleaseAge: %s\nminimumReleaseAgeStrict: %s\n\n"
                          "minimumReleaseAgeExclude:\n  - \"solid-js\"\n"
                          "  # Upstream: remove after 2026-10-21T13:01:12.291Z.\n  - \"@o/fs@0.26.5\"\n%s\n"
-                         "overrides:\n  qs: 6.16.1\n\ntrust: a\n" % (age, strict, exclude))
+                         "%s\noverrides:\n  qs: 6.16.1\n\ntrust: a\n" % (age, strict, exclude, trust))
             return path
+
+        def agreeing(selector):
+            name, version = selector.rsplit("@", 1)
+            return ("  # Compliance Claw: %s %s for GHSA-x; remove after 2026-11-04T09:59:49.641Z.\n"
+                    '  - "%s"\n' % (name, version, selector))
         note = "  # Compliance Claw: joi 18.3.1 for GHSA-x; remove after 2026-11-04T09:59:49.641Z.\n"
         entry = '  - "joi@18.3.1"\n'
         xup = ws("up", "")
@@ -695,6 +703,14 @@ def self_test():
         case("age rule change with the exclude entry is refused",
              policy(xup, ws("age", note + entry, age="0"), j) != []
              and policy(xup, ws("strict", note + entry, strict="false"), j) != [])
+        case("trust rule change with the exclude entry is refused",
+             policy(xup, ws("tp", note + entry, trust="trustPolicy: off\n"), j) != []
+             and policy(xup, ws("tl", note + entry, trust="trustPolicy: no-downgrade\ntrustLockfile: true\n"),
+                        j) != [])
+        for other in ("other-package@1.2.3", "joi@18.3.0", "lodash@4.17.21"):
+            case("other exact selector %s, with a matching line and comment, is refused" % other,
+                 any("must be joi@18.3.1" in e
+                     for e in policy(xup, ws("sel-" + other, agreeing(other)), other)))
         case("exclude entry without an expiry comment is refused",
              policy(xup, ws("nonote", "  # Compliance Claw: joi 18.3.1.\n" + entry), j) != [])
 
