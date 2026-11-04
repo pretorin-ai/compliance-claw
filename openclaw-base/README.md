@@ -71,8 +71,8 @@ The upstream Dockerfile is not changed. It builds to its own final stage.
 | `regenerate-lock.sh` | Makes the combined lock ONCE with the reviewed r3 method: the pinned `node:24.22.1-bookworm` image, corepack pnpm from `packageManager`, `pnpm install --lockfile-only --ignore-scripts`. It refuses before `LOCK_NOT_BEFORE`, unless `AGE_EXCLUDE_EXCEPTION` is set and `workspace.diff` appends that entry. `REGEN_DRY_RUN=1` verifies all inputs and stops before pnpm. |
 | `forbidden-store-entries.txt` | Store entries that must not exist in the base or in the Claw image. |
 | `receipts/<tag>/` | The reviewed receipt of one base build (added at promotion step 3). |
-| `../.github/workflows/openclaw-base.yml` | Build and publish (master only). |
-| `../scripts/openclaw-base-guard.py` | Collect, compare, policy, lock-change, OCI and diffID checks, with `--self-test`. |
+| `../.github/workflows/openclaw-base.yml` | `operation=build` and, in a later dispatch, `operation=publish` of that build (master only; see "Publication"). |
+| `../scripts/openclaw-base-guard.py` | Collect, compare, policy, lock-change, OCI, diffID, publish-binding and registry-tag checks, with `--self-test`. |
 | `../scripts/test-openclaw-base.sh` | Checks a built Claw image against the receipt. |
 
 ## The override set
@@ -178,42 +178,24 @@ So the order is fixed:
      values stay empty and the workflow refuses to build.
    - The Dockerfile keeps its official `FROM` pins (lines 70 and 128; 2026.10.5
      on master). The Claw image does not change.
-   - **Prerequisite before any dispatch with `publish: true`:** a repository
-     administrator creates the `openclaw-base-publish` environment with a
-     required-reviewers rule (at least one reviewer) and "Prevent
-     self-review".
-     - GitHub creates a referenced environment that does not exist yet, with
-       no protection rules, and runs the job at once.
-     - So the publish job reads the environment first (REST "Get an
-       environment", which needs `actions: read`). It refuses unless both
-       rules are present, or if the read fails.
-2. **Dispatch** `openclaw-base.yml` on master with `publish: true`.
+2. **Build dispatch:** `gh workflow run openclaw-base.yml --ref master`
+   (`operation=build`, the default).
    - The `build` job runs on `ubuntu-24.04` (the standard public 16 GB runner),
-     with `contents: read` only. It uploads the OCI archive and the receipt.
+     with `contents: read` only. It writes to no registry.
    - The build runs once. Every check runs on the image loaded from that
      archive:
      - each manifest, config and layer is used only after its size and
        SHA-256 match its descriptor;
      - the loaded image ID must equal the archive's config or manifest
        digest, which binds the full image config, not only the layers;
-     - the index must carry SLSA provenance and SPDX SBOM attestations;
-     - publish pushes that same archive and checks the pushed index digest.
-   - The `publish` job (`packages: write` plus `actions: read`) waits for the
-     `openclaw-base-publish` environment approval.
-   - It refuses if the environment is unprotected.
-   - Nothing is pushed before that approval, and publish pushes only the
-     archive that `build` checked.
-   - The tag is pushed only when the registry answers MANIFEST_UNKNOWN or
-     NAME_UNKNOWN for it. An existing tag must already name the same digest.
-     Any other error (network, authentication, `denied`) refuses, so a
-     transient error cannot move a tag. If GHCR answers `denied` for a package
-     that does not exist yet, the first publish refuses and needs a review.
+     - the index must carry SLSA provenance and SPDX SBOM attestations.
+   - It uploads the run directory (OCI archive, receipt, guard copy) as
+     artifact `openclaw-base-<tag>-attempt-<attempt>` for 30 days. The step
+     summary prints the run, attempt, artifact ID, archive SHA-256, top digest
+     and the exact publish command.
    - Keep failed runs. Do not retry on another runner or with other memory
      settings.
-   - A run with `publish: false` is a build-only rehearsal. Its output is never
-     pushed later, because a new run can produce different floating bytes
-     (below).
-3. **Receipt review** before the approval.
+3. **Receipt review, then the publish dispatch** (see "Publication").
    - Commit `receipts/<tag>/` with the small files: `receipt.env`,
      `facts.json`, `oci.json`, `pnpm-store.txt`, `dpkg.txt`,
      `rootfs-diffids.txt`, `official-diffids.txt`, `node-slim-diffids.txt`,
@@ -234,6 +216,8 @@ So the order is fixed:
        the Claw correction that handles it, or reported as open. No exception
        is added.
    - Package visibility (public pull for PR CI) is set only at this review.
+   - After the review, dispatch publish with the five values from the build
+     summary. Publish only a build whose receipt was reviewed.
 4. **FROM-bump commit, together with #71** (its OpenClaw 2026.10.10 runtime
    changes). One commit:
    - both `FROM` lines become `ghcr.io/pretorin-ai/compliance-claw-openclaw-base:<tag>@<top_digest>`;
@@ -248,6 +232,67 @@ So the order is fixed:
    - `SECURITY.md` and the administration docs describe the derivative base.
 
    The full exact-image qualification then runs on the new Claw candidate.
+
+## Publication
+
+Publication follows the `release.yml` model: one checked build, then a
+separate, explicit dispatch that pushes exactly those bytes. There is no
+build in publish.
+
+```sh
+gh workflow run openclaw-base.yml --ref master -f operation=publish \
+  -f build_run_id=<id> -f build_run_attempt=<n> -f artifact_id=<id> \
+  -f archive_sha256=<64 hex> -f top_digest=sha256:<64 hex>
+```
+
+The `publish` job has `packages: write` (its one write), `actions: read` and
+`contents: read`. Values from the dispatch reach the scripts only through
+`env:`. It refuses at the first failed check, in this order:
+
+1. The ref is master, and each input has its exact format.
+2. The run (REST "Get a workflow run attempt") is that ID and attempt, of
+   `.github/workflows/openclaw-base.yml`, event `workflow_dispatch`, branch
+   master, completed with `success`, in this repository, and not from a fork.
+3. The build commit (the run's `head_sha`) is checked out. Its `inputs.env`
+   gives the destination repository, tag and platform. The artifact does not.
+4. The artifact (REST "Get an artifact") is that ID, of that run and commit,
+   named `openclaw-base-<tag>-attempt-<attempt>`, and not expired.
+5. The downloaded zip must hash to the API's `digest` before it is unpacked.
+   A missing or different digest refuses. The artifact cannot vouch for
+   itself. Unpacking accepts only plain relative files.
+6. Only guards checked out from master code run: this run's own guard, and the
+   build commit's guard for comparison. The guard copy in the artifact must be
+   byte-equal to the build commit's guard; it is never run.
+7. The archive SHA-256, the OCI top digest (read again with `guard oci
+   --require-attestations`) and the receipt (`builder_run` with run and
+   attempt, `builder_commit`, `run_id`, `run_attempt`, `artifact_name`,
+   `archive_sha256`, and `oci.json`) agree with the inputs.
+8. The registry check and push are unchanged:
+   - the tag is pushed only when the registry answers MANIFEST_UNKNOWN or
+     NAME_UNKNOWN for it;
+   - an existing tag must already name the same digest, so a repeat publish
+     is a no-op;
+   - any other error (network, authentication, `denied`) refuses, so a
+     transient error cannot move a tag. If GHCR answers `denied` for a
+     package that does not exist yet, the first publish refuses and needs a
+     review;
+   - the pushed top manifest must hash to the top digest.
+9. The publication record (inputs, both API responses, the artifact digest,
+   the receipt, the registry answers) is kept as artifact
+   `openclaw-base-publish-<run>-attempt-<attempt>` for 30 days, also for a
+   failed run.
+
+**What this does not give.**
+- **No second person.** Any account that can dispatch workflows (write access)
+  can build and then publish. The user chose this model on 2026-11-04 in
+  place of the earlier `openclaw-base-publish` approval environment. The
+  controls are the master ruleset (a reviewed PR for every workflow and guard
+  change), the checks above, and the receipt review, which is a procedure the
+  workflow cannot enforce.
+- **Time limit.** Publish only within the 30-day artifact retention. After
+  that, the artifact is expired and publish refuses. A new build is a new
+  archive with a new receipt to review.
+- **Not signed.** As before, provenance and SBOM are unsigned records.
 
 **Why the image guard is wired at step 4, not earlier:**
 

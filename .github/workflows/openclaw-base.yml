@@ -5,16 +5,22 @@
 # provenance and SBOM are unsigned records of this build, not publisher proof.
 # Design, receipts and the promotion order: openclaw-base/README.md.
 #
-# workflow_dispatch, master only. Two jobs, one write purpose each:
-#   build    contents: read. Builds the UNMODIFIED upstream Dockerfile to its
-#            final stage on the standard public runner, checks it, writes the
-#            receipt and uploads the OCI archive. No registry write.
-#   publish  packages: write (its one write) and actions: read (to read the
-#            environment). Runs only with `publish: true` and after the
-#            openclaw-base-publish environment approves. It first refuses unless
-#            that environment requires a reviewer and prevents self-review.
-#            Pushes the exact OCI archive that `build` checked, by digest; it
-#            never rebuilds and never moves a tag.
+# workflow_dispatch, master only. Two operations, two dispatches, one job each
+# (the release.yml prepare-then-publish model):
+#   build    (default) contents: read. Builds the UNMODIFIED upstream
+#            Dockerfile to its final stage on the standard public runner,
+#            checks it, writes the receipt and uploads the run directory as
+#            artifact openclaw-base-<tag>-attempt-<attempt>. No registry write.
+#            The summary prints the exact publish command.
+#   publish  packages: write (its one write), actions: read, contents: read.
+#            NO BUILD. Takes the build run ID and attempt, the artifact ID, the
+#            archive SHA-256 and the top digest. Refuses unless the run is a
+#            successful master dispatch of this workflow in this repository,
+#            the artifact is that run's, its bytes hash to the API digest, and
+#            the archive, OCI index and receipt agree with the inputs. Pushes
+#            that exact archive by digest; it never moves a tag.
+# No second person is enforced (README.md "Publication"): read the receipt
+# before you dispatch publish.
 #
 # One attempt per dispatch: no retry, no larger or paid runner, no memory
 # setting change. Keep failed runs; their artifacts are evidence.
@@ -23,10 +29,31 @@ name: openclaw-base
 on:
   workflow_dispatch:
     inputs:
-      publish:
-        description: "Push the checked OCI archive to GHCR (needs openclaw-base-publish approval)"
-        type: boolean
-        default: false
+      operation:
+        description: "build: build, check and upload the archive (no registry write). publish: push one checked build's archive (no build)."
+        type: choice
+        options: [build, publish]
+        default: build
+      build_run_id:
+        description: "publish only: the build run ID (from the build summary)"
+        type: string
+        default: ""
+      build_run_attempt:
+        description: "publish only: the build run attempt"
+        type: string
+        default: ""
+      artifact_id:
+        description: "publish only: the build artifact ID"
+        type: string
+        default: ""
+      archive_sha256:
+        description: "publish only: the base.oci.tar SHA-256 (64 hex)"
+        type: string
+        default: ""
+      top_digest:
+        description: "publish only: the OCI top digest (sha256:...)"
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -40,16 +67,11 @@ defaults:
 
 jobs:
   build:
+    if: ${{ inputs.operation == 'build' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
       contents: read
-    outputs:
-      archive_sha256: ${{ steps.oci.outputs.archive_sha256 }}
-      top_digest: ${{ steps.oci.outputs.top_digest }}
-      guard_sha256: ${{ steps.oci.outputs.guard_sha256 }}
-      repo: ${{ steps.inputs.outputs.repo }}
-      tag: ${{ steps.inputs.outputs.tag }}
     steps:
       - name: Refuse any ref other than master
         run: |
@@ -97,6 +119,7 @@ jobs:
           done
           [ -f "$C/openclaw-base/lock.diff" ] || { echo "::error::openclaw-base/lock.diff is missing"; exit 1; }
           { echo "repo=$BASE_IMAGE_REPO"; echo "tag=$BASE_IMAGE_TAG"; } >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT_NAME=openclaw-base-${BASE_IMAGE_TAG}-attempt-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
 
       - name: Get and verify the upstream source
         run: |
@@ -200,14 +223,13 @@ jobs:
           docker image inspect -f '{{range .RootFS.Layers}}{{println .}}{{end}}' openclaw-base:candidate > "$OUT/loaded-diffids.txt"
           cmp "$R/rootfs-diffids.txt" "$OUT/loaded-diffids.txt" \
             || { echo "::error::the loaded image's diffIDs differ from the archive"; exit 1; }
-          # The publish job has no checkout; it uses this copy of the guard,
-          # bound by the hash below.
+          # A record of the guard that checked this build. publish never runs
+          # it: it requires it to equal the guard at the build commit.
           mkdir -p "$OUT/tools"
           cp "$G" "$OUT/tools/openclaw-base-guard.py"
           {
             echo "archive_sha256=$(sha256sum "$OUT/base.oci.tar" | cut -d' ' -f1)"
             echo "top_digest=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["top_digest"])' "$OUT/receipt/oci.json")"
-            echo "guard_sha256=$(sha256sum "$OUT/tools/openclaw-base-guard.py" | cut -d' ' -f1)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Collect the receipt and check the base
@@ -263,6 +285,7 @@ jobs:
             echo "builder_ref=$GITHUB_REF"
             echo "builder_commit=$GITHUB_SHA"
             echo "builder_run=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+            echo "run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} artifact_name=${ARTIFACT_NAME}"
             echo "runner=$ImageOS/$ImageVersion"
             echo "workflow_sha256=$(sha256sum "$C/.github/workflows/openclaw-base.yml" | cut -d' ' -f1)"
             echo "inputs_sha256=$(sha256sum "$C/openclaw-base/inputs.env" | cut -d' ' -f1)"
@@ -290,64 +313,162 @@ jobs:
           df -h / >> "$OUT/runner.txt"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        id: upload
         if: always()
         with:
-          name: openclaw-base-${{ steps.inputs.outputs.tag || 'unknown' }}
+          name: openclaw-base-${{ steps.inputs.outputs.tag || 'unknown' }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
           retention-days: 30
           compression-level: 0
           if-no-files-found: error
 
+      # Read the receipt in the artifact first. Publication is a separate,
+      # explicit dispatch; nothing here writes to a registry.
+      - name: Print the publish command
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          ARCHIVE_SHA256: ${{ steps.oci.outputs.archive_sha256 }}
+          TOP_DIGEST: ${{ steps.oci.outputs.top_digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Checked build (no registry write)"
+            echo "- run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}, commit ${GITHUB_SHA}"
+            echo "- artifact ${ARTIFACT_NAME}, id ${ARTIFACT_ID}, digest sha256:${ARTIFACT_DIGEST#sha256:}"
+            echo "- base.oci.tar sha256 ${ARCHIVE_SHA256}; top digest ${TOP_DIGEST}"
+            echo ""
+            echo "Review the receipt in the artifact. Then publish exactly these bytes:"
+            echo '```'
+            echo "gh workflow run openclaw-base.yml --ref master -f operation=publish \\"
+            echo "  -f build_run_id=${GITHUB_RUN_ID} -f build_run_attempt=${GITHUB_RUN_ATTEMPT} -f artifact_id=${ARTIFACT_ID} \\"
+            echo "  -f archive_sha256=${ARCHIVE_SHA256} -f top_digest=${TOP_DIGEST}"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # NO BUILD. Every value from the dispatch is checked before use; the API,
+  # not the artifact, vouches for the artifact. Only guards checked out from
+  # master code run here, never the copy inside the artifact.
   publish:
-    needs: build
-    if: ${{ inputs.publish }}
+    if: ${{ inputs.operation == 'publish' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: openclaw-base-publish
     permissions:
+      contents: read    # check out the guard and the build commit's inputs.env
+      actions: read     # read the build run and its artifact
       packages: write   # push the checked archive: the only write
-      actions: read     # "Get an environment" for the gate below (GitHub App "Actions" read)
     env:
-      ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
-      TOP_DIGEST: ${{ needs.build.outputs.top_digest }}
-      GUARD_SHA256: ${{ needs.build.outputs.guard_sha256 }}
-      REPO: ${{ needs.build.outputs.repo }}
-      TAG: ${{ needs.build.outputs.tag }}
-      PUBLISH_ENVIRONMENT: openclaw-base-publish
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+      ARTIFACT_ID: ${{ inputs.artifact_id }}
+      ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+      TOP_DIGEST: ${{ inputs.top_digest }}
+      G: ${{ github.workspace }}/publisher/scripts/openclaw-base-guard.py
+      REC: ${{ github.workspace }}/record
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: openclaw-base-${{ needs.build.outputs.tag }}
-          path: base
+      - name: Refuse any ref other than master
+        run: |
+          [ "$GITHUB_REF" = refs/heads/master ] \
+            || { echo "::error::openclaw-base runs only on refs/heads/master (got $GITHUB_REF)"; exit 1; }
 
-      # GitHub creates a referenced environment that does not exist yet, with
-      # NO protection rules, and then runs this job at once. So the approval
-      # gate is checked here and fails closed: no required reviewer, no
-      # self-review prevention, or any read error stops the job before login.
-      - name: Refuse unless the publish environment requires review
+      # This run's own master commit: no dispatch value is used here.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/openclaw-base-guard.py
+          path: publisher
+
+      - name: Check the publish inputs
+        run: |
+          set -euo pipefail
+          mkdir -p "$REC"
+          python3 -I "$G" publish-inputs --run-id "$BUILD_RUN_ID" --attempt "$BUILD_RUN_ATTEMPT" \
+            --artifact-id "$ARTIFACT_ID" --archive-sha256 "$ARCHIVE_SHA256" --top-digest "$TOP_DIGEST"
+
+      - name: Check the build run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          G=base/tools/openclaw-base-guard.py
-          echo "${GUARD_SHA256}  $G" | sha256sum -c -
-          code="$(curl -sS -o environment.json -w '%{http_code}' \
+          code="$(curl -sS -o "$REC/run.json" -w '%{http_code}' \
             -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/environments/${PUBLISH_ENVIRONMENT}")" \
-            || { echo "::error::cannot read environment ${PUBLISH_ENVIRONMENT}"; exit 1; }
-          [ "$code" = 200 ] || { echo "::error::reading environment ${PUBLISH_ENVIRONMENT} returned HTTP ${code}"; exit 1; }
-          python3 -I "$G" environment --json environment.json --name "$PUBLISH_ENVIRONMENT"
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/attempts/${BUILD_RUN_ATTEMPT}")" \
+            || { echo "::error::cannot read build run ${BUILD_RUN_ID} attempt ${BUILD_RUN_ATTEMPT}"; exit 1; }
+          [ "$code" = 200 ] || { echo "::error::reading the build run returned HTTP ${code}"; exit 1; }
+          commit="$(python3 -I "$G" publish-run --json "$REC/run.json" --run-id "$BUILD_RUN_ID" \
+            --attempt "$BUILD_RUN_ATTEMPT" --repository "$GITHUB_REPOSITORY" --repository-id "$GITHUB_REPOSITORY_ID")"
+          echo "BUILD_COMMIT=${commit}" >> "$GITHUB_ENV"
+
+      # The build commit's own inputs and guard: master code at a commit that
+      # publish-run accepted. REPO and TAG come from here, not from the artifact.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ env.BUILD_COMMIT }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/openclaw-base-guard.py
+            /openclaw-base/inputs.env
+          path: build-src
+
+      - name: Load the destination from the build commit
+        run: |
+          set -euo pipefail
+          test "$(git -C build-src rev-parse HEAD)" = "$BUILD_COMMIT"
+          set -a; . build-src/openclaw-base/inputs.env; set +a
+          for k in BASE_IMAGE_REPO BASE_IMAGE_TAG BUILD_PLATFORM; do
+            v="${!k:-}"
+            [[ "$v" =~ ^[A-Za-z0-9._:/@=,+-]+$ ]] || { echo "::error::inputs.env: $k is empty or unexpected"; exit 1; }
+          done
+          { echo "REPO=${BASE_IMAGE_REPO}"; echo "TAG=${BASE_IMAGE_TAG}"; echo "PLATFORM=${BUILD_PLATFORM}"
+            echo "ARTIFACT_NAME=openclaw-base-${BASE_IMAGE_TAG}-attempt-${BUILD_RUN_ATTEMPT}"; } >> "$GITHUB_ENV"
+
+      # The artifact must be that run's, and its downloaded bytes must hash to
+      # the digest that the authenticated API reports. A missing or different
+      # digest refuses before anything is unpacked.
+      - name: Check, download and unpack the build artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          api() { curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
+          code="$(api -o "$REC/artifact.json" -w '%{http_code}' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")" \
+            || { echo "::error::cannot read artifact ${ARTIFACT_ID}"; exit 1; }
+          [ "$code" = 200 ] || { echo "::error::reading artifact ${ARTIFACT_ID} returned HTTP ${code}"; exit 1; }
+          digest="$(python3 -I "$G" publish-artifact --json "$REC/artifact.json" --artifact-id "$ARTIFACT_ID" \
+            --run-id "$BUILD_RUN_ID" --head-sha "$BUILD_COMMIT" --name "$ARTIFACT_NAME" \
+            --repository-id "$GITHUB_REPOSITORY_ID")"
+          # The zip URL redirects to blob storage; curl does not send the
+          # Authorization header to the other host.
+          api -fL -o "$RUNNER_TEMP/artifact.zip" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip"
+          python3 -I "$G" artifact-extract --zip "$RUNNER_TEMP/artifact.zip" --digest "$digest" --out base
+          rm -f "$RUNNER_TEMP/artifact.zip"
+          echo "$digest" > "$REC/artifact-digest.txt"
+
+      - name: Bind the archive to the inputs and the build
+        run: |
+          set -euo pipefail
+          echo "${ARCHIVE_SHA256}  base/base.oci.tar" | sha256sum -c -
+          python3 -I "$G" oci --archive base/base.oci.tar --platform "$PLATFORM" --require-attestations > "$REC/oci-now.json"
+          python3 -I "$G" publish-binding --dir base --oci-json "$REC/oci-now.json" \
+            --trusted-guard build-src/scripts/openclaw-base-guard.py \
+            --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/attempts/${BUILD_RUN_ATTEMPT}" \
+            --commit "$BUILD_COMMIT" --run-id "$BUILD_RUN_ID" --attempt "$BUILD_RUN_ATTEMPT" \
+            --artifact-name "$ARTIFACT_NAME" --archive-sha256 "$ARCHIVE_SHA256" --top-digest "$TOP_DIGEST"
+          cp base/receipt/receipt.env "$REC/receipt.env"
 
       - name: Push the checked archive by digest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          G=base/tools/openclaw-base-guard.py
-          [[ "$TOP_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest from build"; exit 1; }
           echo "${ARCHIVE_SHA256}  base/base.oci.tar" | sha256sum -c -
-          echo "${GUARD_SHA256}  $G" | sha256sum -c -
           command -v skopeo >/dev/null || { echo "::error::skopeo is not on this runner image"; exit 1; }
           printf '%s' "$GH_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           trap 'skopeo logout ghcr.io >/dev/null 2>&1 || true' EXIT
@@ -374,3 +495,30 @@ jobs:
           pushed="sha256:$(sha256sum pushed.json | cut -d' ' -f1)"
           [ "$pushed" = "$TOP_DIGEST" ] || { echo "::error::registry returned ${pushed}"; exit 1; }
           echo "pushed ${REPO}:${TAG}@${TOP_DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The publication record: what was asked, what the API said, what the
+      # registry held before and after. Kept for failed runs too.
+      - name: Write the publication record
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p "$REC"
+          cp existing.json inspect.err pushed.json "$REC/" 2>/dev/null || true
+          {
+            echo "publish_run=https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+            echo "publish_commit=${GITHUB_SHA} publish_actor=${GITHUB_ACTOR}"
+            echo "build_run_id=${BUILD_RUN_ID} build_run_attempt=${BUILD_RUN_ATTEMPT} build_commit=${BUILD_COMMIT:-}"
+            echo "artifact_id=${ARTIFACT_ID} artifact_name=${ARTIFACT_NAME:-}"
+            echo "archive_sha256=${ARCHIVE_SHA256} top_digest=${TOP_DIGEST}"
+            echo "destination=${REPO:-}:${TAG:-}"
+            echo "guard_sha256=$(sha256sum "$G" | cut -d' ' -f1)"
+          } > "$REC/publication.env"
+          cat "$REC/publication.env"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: openclaw-base-publish-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/record
+          retention-days: 30
+          if-no-files-found: error
