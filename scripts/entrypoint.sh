@@ -476,11 +476,14 @@ if [ -e "$CONFIG" ]; then
     # DRIFT-WARNING: Slack credentials are supplied but NOT
     echo "compliance-claw: WARNING — Slack credentials are supplied but NOT in this volume's config." >&2
     echo "  ${CONFIG} has no channels.slack. The config was kept." >&2
-    echo "  Install the pinned package with node ${SLACK_HELPER} prepare --required." >&2
-    echo "  Review ${SLACK_PATCH}, then use openclaw config patch to add the Slack" >&2
-    echo "  settings. Keep your plugin allowlist and channel settings." >&2
+    echo "  With the gateway RUNNING, run both steps in it (docker compose exec openclaw" >&2
+    echo "  /usr/local/bin/compliance-claw-entrypoint ...):" >&2
+    echo "  node ${SLACK_HELPER} prepare --required, then" >&2
+    echo "  openclaw config patch with ${SLACK_PATCH} and your channel." >&2
+    echo "  A change written with the gateway stopped can be reverted by Doctor at the" >&2
+    echo "  next start. Keep your plugin allowlist and channel settings." >&2
     echo "  With efforts.yaml, run scripts/clawctl apply to admit the effort channels." >&2
-    echo "  Restart the gateway after you apply the config." >&2
+    echo "  Restart the gateway after you apply the config. See docs/upgrade.md." >&2
   fi
 
   # A third drift case, and the worst-behaved of the three: an existing config

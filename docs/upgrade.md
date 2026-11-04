@@ -228,6 +228,30 @@ multi-effort path, all three variables on the legacy one — are set while the
 existing config predates them. It names the managed install and configuration
 steps. It does not replace the existing configuration.
 
+Run both steps in the **running** gateway, not in a one-off `cli` container with
+the gateway stopped. On OpenClaw 2026.10.10, a state first seeded with the
+commented template can keep a large last-known-good size. A Slack change written
+with the gateway stopped can then be restored away by Doctor at the next start.
+Through the running gateway, the gateway commits the change as the config owner.
+This route does not change the stored last-known-good size. The
+commands below are for the legacy single-effort path, with `SLACK_CHANNEL_ID` set
+together with the tokens. They are not for an `efforts.yaml` deployment:
+
+```sh
+docker compose up -d --wait --wait-timeout 720 openclaw
+docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint \
+  node /opt/compliance-claw/managed-slack.mjs prepare --required
+docker compose exec -T openclaw /usr/local/bin/compliance-claw-entrypoint sh -c '
+  sed "s/@SLACK_CHANNEL_ID@/$SLACK_CHANNEL_ID/" \
+    /opt/compliance-claw/slack-channel.patch.json5 > /tmp/slack.patch.json5
+  openclaw config patch --file /tmp/slack.patch.json5 --dry-run &&
+    openclaw config patch --file /tmp/slack.patch.json5'
+docker compose up -d --force-recreate --wait --wait-timeout 720 openclaw
+```
+
+Back up both state volumes first. `scripts/test-retained-slack-add.sh` checks this
+sequence on a state first seeded by release 0.5.2.
+
 ## Updating the Pretorin CLI
 
 The active CLI is `/home/node/.pretorin/bin/pretorin` in `pretorin-state`.
