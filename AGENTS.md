@@ -35,7 +35,6 @@ Do not describe an intended UI flow as an available feature without evidence.
 | `scripts/pretorin-update*.sh`, `plugins/pretorin-update/` | Install and activate the shared CLI; report installation and activation accurately. |
 | `scripts/*test*`, `scripts/smoke.sh`, `scripts/lint-heredocs.py` | Existing validation. See the contribution guide for selection and prerequisites. |
 | `.github/workflows/build.yml`, `.github/workflows/release.yml`, `scripts/release-assets.py`, `scripts/release-tag.sh` | Candidate checks, release-set preparation, and release publication. |
-| `openclaw-base/`, `.github/workflows/openclaw-base.yml`, `scripts/openclaw-base-guard.py`, `scripts/test-openclaw-base.sh` | Build, receipt, guard and manual publication (a build dispatch, then a separate publish dispatch of the same bytes) of the source-built OpenClaw base, a Claw-built derivative of an exact upstream commit plus reviewed dependency overrides. |
 
 The image contains a verified CLI seed. The active CLI lives in `pretorin-state`
 and survives image replacement. `openclaw-state` holds config, sessions, agent
