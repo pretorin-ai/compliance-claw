@@ -774,7 +774,8 @@ def oci_image_archive(archive, out, platform="linux/amd64", name="openclaw-base:
     """Write a single-image archive for `docker load` from the same bytes.
 
     It holds the selected platform manifest, its config and its layers, each
-    copied once only after its size and sha256 match, and each layer's
+    copied once only after its size and sha256 match. Every later descriptor
+    of the same blob must give the same size and media type. Each layer's
     uncompressed sha256 must be its config diffID. manifest.json is the
     Docker archive record that `docker save` writes for the classic image
     store; index.json is the OCI record for the containerd store. The pushed
@@ -789,7 +790,7 @@ def oci_image_archive(archive, out, platform="linux/amd64", name="openclaw-base:
     if len(facts["layers"]) != len(facts["diff_ids"]):
         raise ValueError("the manifest has %d layers, the config %d diff_ids"
                          % (len(facts["layers"]), len(facts["diff_ids"])))
-    diff_of = {}
+    diff_of, first = {}, {}
     with tarfile.open(archive) as src, tarfile.open(out, "w") as dst:
         def add(n, data):
             ti = tarfile.TarInfo(n)
@@ -801,8 +802,13 @@ def oci_image_archive(archive, out, platform="linux/amd64", name="openclaw-base:
             add("blobs/sha256/" + d["digest"].split(":", 1)[1], verified_blob(src, d, "image blob"))
         for i, layer in enumerate(facts["layers"]):
             member, hexd = _blob_member(src, layer, "layer %d" % i)
-            if layer["digest"] in diff_of:
+            if layer["digest"] in first:
                 # The same blob again (for example an empty layer): one copy.
+                # Every occurrence must describe it as the verified first one.
+                j, size, media = first[layer["digest"]]
+                if (layer["size"], layer.get("mediaType")) != (size, media):
+                    raise ValueError("layer %d does not match its descriptor (size or media type differs "
+                                     "from layer %d, the same blob)" % (i, j))
                 continue
             h, n, f = hashlib.sha256(), 0, src.extractfile(member)
             spool = tempfile.TemporaryFile()
@@ -814,6 +820,7 @@ def oci_image_archive(archive, out, platform="linux/amd64", name="openclaw-base:
                 raise ValueError("layer %d does not match its descriptor" % i)
             spool.seek(0)
             diff_of[layer["digest"]] = layer_diff_id(spool, layer.get("mediaType"))
+            first[layer["digest"]] = (i, layer["size"], layer.get("mediaType"))
             spool.seek(0)
             ti = tarfile.TarInfo("blobs/sha256/" + hexd)
             ti.size = n
@@ -1012,7 +1019,7 @@ def self_test():
 
         def oci_archive(name, extra_platform=False, single=False, corrupt_manifest=False,
                         wrong_config_size=False, sbom=True, swap_diff_ids=False,
-                        layer_type="application/vnd.oci.image.layer.v1.tar+gzip"):
+                        layer_type="application/vnd.oci.image.layer.v1.tar+gzip", repeat=None):
             import io
             import tarfile
             blobs = {}
@@ -1027,6 +1034,9 @@ def self_test():
             for data in layer_gz:
                 d, n = put(None, data)
                 layers.append({"mediaType": layer_type, "digest": d, "size": n})
+            if repeat:
+                # Layer 3 repeats the blob of layer 1 (the empty layer).
+                layers[3].update(repeat)
             layer, layer_n = layers[0]["digest"], layers[0]["size"]
             ids = list(diff_ids)
             if swap_diff_ids:
@@ -1186,6 +1196,17 @@ def self_test():
         p, _, _ = oci_archive("zstd.tar", layer_type="application/vnd.oci.image.layer.v1.tar+zstd")
         case("a layer media type the guard cannot read is refused",
              "is not supported" in writer_refusal(p, os.path.join(tmp, "zstd-view.tar")))
+        # A repeated blob is copied once, so its later descriptors must
+        # agree with the first, checked one: same size and media type.
+        for label, repeat in (("a wrong size", {"size": len(layer_gz[1]) + 1}),
+                              ("an unsupported media type",
+                               {"mediaType": "application/vnd.oci.image.layer.v1.tar+zstd"}),
+                              ("another gzip media type",
+                               {"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip"})):
+            p, _, _ = oci_archive("repeat-%d.tar" % len(label), repeat=repeat)
+            case("a repeated layer blob whose later descriptor has %s is refused" % label,
+                 "layer 3 does not match its descriptor"
+                 in writer_refusal(p, os.path.join(tmp, "repeat-%d-view.tar" % len(label))))
         case("an image name without a tag is refused",
              "name:tag" in writer_refusal(path, os.path.join(tmp, "notag.tar"), name="openclaw-base"))
         for label, data, word in (("truncated", layer_gz[0][:-6], "truncated"),
