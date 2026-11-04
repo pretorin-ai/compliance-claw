@@ -144,9 +144,24 @@ To make the lock:
    `commander@8.3.0` removed, dompurify, ip-address, katex, markdown-it,
    mermaid, qs and `undici@8.11.2`), plus `seroval@1.6.8`→`1.6.11` and
    `joi@18.2.9`→`18.3.1`. Any other change must be explained. The committed
-   lock has exactly these package changes. Its one non-package change: the
-   `seroval-plugins@1.6.8` peer range `seroval: ^1.0` becomes `1.6.11`, because
-   pnpm applies the bare `seroval` override to peer ranges too.
+   lock has exactly these package changes. Its other changes add no package
+   version (`lock.diff` line numbers):
+   - The `overrides:` record, the importer specifiers and versions, and the
+     snapshot dependency entries follow the new versions.
+   - The overrides also rewrite peer ranges:
+     - `@openclaw/proxyline@0.4.0`: `undici: '>=8.5.0 <9'` → `8.12.2` (130-131);
+     - `@slack/socket-mode@3.1.0`: `undici: ^7.0.0 || ^8.0.0` → `8.12.2` (155-156);
+     - `markdown-it-anchor@10.0.0` and `markdown-it-cjk-friendly@3.0.0`:
+       `markdown-it: '*'` → `15.0.3` (250-251, 258-259);
+     - `openai@7.28.0`: `undici: '>=5 <9'` → `8.12.2` (289-290);
+     - `seroval-plugins@1.6.8`: `seroval: ^1.0` → `1.6.11` (309-310).
+   - Snapshot keys with peer suffixes follow the new versions:
+     `markdown-it-anchor`, `markdown-it-cjk-friendly` and `seroval-plugins`.
+   - Three `deprecated:` strings are added from current registry data:
+     `@opentelemetry/propagator-jaeger@2.11.0`,
+     `@opentelemetry/sdk-trace-node@2.11.0` and `@smithy/core@3.35.1`
+     (139, 147, 164).
+   - `ajv-formats@3.0.1` gets optional peer data `ajv: ^8.0.0` (172-176).
 3. Commit `lock.diff` and the two `LOCK_*` hashes in **one separate commit**,
    and stop for review.
 
