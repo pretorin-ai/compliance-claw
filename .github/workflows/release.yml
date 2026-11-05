@@ -897,9 +897,11 @@ jobs:
       # the same trust key. Only then the stable tag.
       - name: Verify the record and image signatures
         env:
+          TAG: ${{ needs.final-assets.outputs.tag }}
           VERSION: ${{ needs.final-assets.outputs.version }}
         run: |
           set -euo pipefail
+          git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
           # Default for a signed record: the record signature, then the image
           # signature at the digest with the pinned cosign (versions.env) and
           # the same key. Any failure stops here: no version tag, still a draft.
@@ -940,6 +942,7 @@ jobs:
           VERSION: ${{ needs.final-assets.outputs.version }}
         run: |
           set -euo pipefail
+          git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
           python3 scripts/release-assets.py check --dir release-set --all-assets --version "$VERSION" --source . --record-only
           STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
           # Byte readback: the draft must hold exactly the verified set. Nothing
