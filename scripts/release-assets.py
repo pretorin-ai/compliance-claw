@@ -10,7 +10,7 @@
                                [--source DIR [--tag-only]] [--allow-unsigned]
                                [--record-only]
                                [--compose | --rendered FILE|-] [--json]
-    release-assets.py fetch    --version X.Y.Z --dir DIR [--json] [--image-access]
+    release-assets.py fetch    --version X.Y.Z --dir DIR [--json]
     release-assets.py cosign
     release-assets.py --self-test
 
@@ -1651,8 +1651,6 @@ def main(argv):
     fet.add_argument("--version", required=True)
     fet.add_argument("--dir", required=True)
     fet.add_argument("--json", action="store_true")
-    fet.add_argument("--image-access", action="store_true",
-                     help="also report whether the digest can be pulled without a login")
 
     args = parser.parse_args(argv)
     if args.self_test:
@@ -1680,19 +1678,14 @@ def main(argv):
             print(pinned_cosign())
         elif args.mode == "fetch":
             record = fetch(args.version, args.dir)
-            out = summary(record)
-            if args.image_access:
-                # A report only, and a registry call: install and update do not ask for it.
-                out["image_access"] = image_access(record["image"]["repository"],
-                                                   record["image"]["digest"])
+            access = image_access(record["image"]["repository"], record["image"]["digest"])
             if args.json:
-                print(json.dumps(out, sort_keys=True))
+                print(json.dumps(dict(summary(record), image_access=access), sort_keys=True))
             print("release-assets: fetched final %s %s into %s; integrity checked. "
-                  "signature.status: %s (not verified here; check decides).%s"
+                  "signature.status: %s (not verified here; check decides). "
+                  "Image pull without a login: %s"
                   % (record["version"], record["image"]["reference"], args.dir,
-                     record["signature"]["status"],
-                     " Image pull without a login: %s" % out["image_access"]
-                     if args.image_access else ""), file=sys.stderr)
+                     record["signature"]["status"], access), file=sys.stderr)
         else:
             if args.tag_only and not args.source:
                 raise ReleaseError(USAGE, "--tag-only needs --source")
