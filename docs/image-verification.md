@@ -125,15 +125,17 @@ is needed; the directory must be empty or absent) and check it against a
 checkout of the release tag:
 
 ```sh
-python3 scripts/release-assets.py fetch --version X.Y.Z --dir /tmp/cc-vX.Y.Z --json
+python3 scripts/release-assets.py fetch --version X.Y.Z --dir /tmp/cc-vX.Y.Z --json --image-access
 python3 scripts/release-assets.py check --dir /tmp/cc-vX.Y.Z --version X.Y.Z --source .
 ```
 
 `fetch` downloads the record, the overlay, the SBOM and, for a signed record,
 the record signature. It checks the download integrity only and reports the
-signature status. It also reports `image_access`: whether the registry serves
-the digest without a login (`anonymous`), refuses it (`login-required`), or
-cannot tell (`unknown: …`). Today it reports `login-required`.
+signature status. With `--image-access` it also asks the registry, without a
+credential, and reports `image_access`: whether the registry serves the digest
+without a login (`anonymous`), refuses it (`login-required`), or cannot tell
+(`unknown: …`). Today it reports `login-required`. Install and update do not
+make this call.
 
 `check` refuses a candidate or draft record, a changed or extended overlay, an
 asset whose SHA-256 or size differs from the record, and a checkout whose tag or

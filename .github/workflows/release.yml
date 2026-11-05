@@ -1019,7 +1019,7 @@ jobs:
         run: |
           set -euo pipefail
           env -u GH_TOKEN -u GITHUB_TOKEN python3 scripts/release-assets.py fetch \
-            --version "$VERSION" --dir customer-readback --json | tee customer.json
+            --version "$VERSION" --dir customer-readback --json --image-access | tee customer.json
           python3 scripts/release-assets.py check --dir customer-readback --all-assets --version "$VERSION" --record-only
           for f in release-set/*; do
             cmp "$f" "customer-readback/$(basename "$f")" \
