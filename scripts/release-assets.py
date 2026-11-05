@@ -1114,6 +1114,9 @@ def self_test():
             g("checkout", "-q", first)
             refuses("check --source refuses HEAD at another commit", SOURCE,
                     lambda: ck(srcset, stage="any", source=gitdir), "Check out v1.2.3")
+            refuses("finalize --source refuses HEAD at another commit (the key comes from HEAD)",
+                    SOURCE, lambda: finalize(srcset, allow_unsigned=True, source=gitdir), "Check out v1.2.3")
+            ok(load_record(srcset)["stage"] == "candidate", "a refused finalize --source writes nothing")
             ok(ck(srcset, stage="any", source=gitdir, tag_only=True)["version"] == "1.2.3",
                "check --source --tag-only accepts the tag without moving HEAD")
             g("tag", "-d", "v1.2.3")

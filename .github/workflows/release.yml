@@ -801,8 +801,8 @@ jobs:
             --pattern compose.release.yaml --pattern "sbom-${VERSION}.spdx.json" \
             || { echo "::error::cannot download the signed set of ${TAG}. Run operation=finalize, then the release signer, first."; exit 1; }
 
-          # No --allow-unsigned: the record must be final, name the trust key at
-          # this tag, and its signature must verify over the exact record bytes.
+          # Signed only: the record must be final, name the trust key at this
+          # tag, and its signature must verify over the exact record bytes.
           SUMMARY="$(python3 scripts/release-assets.py check --dir release-set --stage final \
             --all-assets --version "$VERSION" --source . --json)"
           REC_DIGEST="$(printf '%s' "$SUMMARY" | jq -r .digest)"

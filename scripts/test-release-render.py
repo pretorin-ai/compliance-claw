@@ -18,10 +18,15 @@ Proves:
   3. `release-assets.py check --compose` accepts that selection, and reports a
      missing overlay or a later image override with exit 4.
   4. The release assets contain no customer data or secret values.
+  5. release.yml (static text, no run): finalize applies no version tag and
+     stays a draft; publish verifies the record and image signatures before the
+     version tag, never rewrites the record, and un-drafts after the readback;
+     package cleanup cannot select a signature tag.
 """
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -54,7 +59,48 @@ def ok(cond, label, detail=""):
     failures += 0 if cond else 1
 
 
+def jobs(text):
+    """{job name: its text} for the top-level jobs of a workflow file."""
+    body = text.split("\njobs:\n", 1)[1]
+    parts = re.split(r"^  ([a-z][a-z0-9-]*):\n", body, flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def workflow_order():
+    """5. Static order of the publication gates in release.yml (no run)."""
+    text = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    j = jobs(text)
+    ok(set(j) == {"candidate", "draft", "final-record", "final-assets", "final-image", "final-release"},
+       "release.yml has the prepare, finalize and publish jobs (%s)" % sorted(j))
+    unsigned = [name for name, body in j.items() if "--allow-unsigned" in body]
+    ok(unsigned == ["candidate", "draft"],
+       "only the candidate checks of prepare pass --allow-unsigned (%s)" % unsigned)
+    ok("finalize --allow-unsigned" not in text and "finalize --dir release-set --source ." in j["final-record"],
+       "finalize writes the signed final record from the tag checkout, never an unsigned one")
+    record = j["final-record"]
+    ok("release-tag.sh" not in record and "--draft=false" not in record,
+       "finalize applies no version tag and leaves the release a draft")
+    publish = j["final-assets"] + j["final-image"] + j["final-release"]
+    ok("gh release upload" not in publish and "release-assets.py finalize" not in publish,
+       "publish never rewrites or uploads the signed record")
+    ok("--pattern compliance-claw-release.json.sig" in j["final-assets"],
+       "publish requires the record signature asset from the draft")
+    image = j["final-image"]
+    verify = image.find("--verify-image")
+    ok(0 < verify < image.find("release-tag.sh") and "needs: final-assets" in image,
+       "the image signature is verified before the version tag")
+    release = j["final-release"]
+    ok("needs: [final-assets, final-image]" in release
+       and 0 < release.find("cmp \"$f\"") < release.find("--draft=false"),
+       "un-draft comes after the signature jobs and the byte readback")
+    reclaim = j["candidate"][j["candidate"].find("Reclaim the digest"):]
+    ok("select(.name==$d)" in reclaim and '[ "${TAGS:-}" != "build" ]' in reclaim
+       and "operation == 'prepare'" in reclaim.split("run:")[0],
+       "package cleanup deletes only an untagged prepare digest, never a signature tag")
+
+
 def main():
+    workflow_order()
     docker = shutil.which("docker")
     if docker is None:
         print("SKIP  docker CLI not installed; this test needs the Compose CLI")
