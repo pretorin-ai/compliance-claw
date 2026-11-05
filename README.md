@@ -42,7 +42,7 @@ are not guarantees for every current deployment.
 
 The table below records earlier published-image and isolated validation.
 Target synchronization and the fresh Slack-seeding fix were included in v0.5.1.
-This checkout now pins v0.5.2. The table is not evidence that every current-source
+This checkout now pins v0.5.3. The table is not evidence that every current-source
 change passed a live service test.
 
 | | |
@@ -79,12 +79,13 @@ provenance — see [Verifying the image you pulled](docs/image-verification.md).
 
 ### Source versus the published image
 
-This checkout pins the published **v0.5.2** image but its host scripts and
-guides are newer. Script changes (saved Compose selection, the 720-second
-update wait, secret-file creation during update) apply as soon as you pull
-`master`. Changes inside the image (efforts without a Slack channel, per-effort
-records, proxy authentication, Slack CLI-update authority) arrive with the next
-release, or now with `scripts/bootstrap.sh --build`.
+This checkout pins the published **v0.5.3** image. The release includes saved
+Compose selection, the 720-second update wait, update secret-file creation,
+efforts without Slack, per-effort records, proxy authentication and Slack
+CLI-update authority. Updating a checkout does not replace a running gateway;
+follow the existing [update guide](docs/upgrade.md#routine-deployment-update).
+The image and release record remain unsigned, and customer install/apply refuse
+them until signature verification exists.
 
 ## Requirements
 
