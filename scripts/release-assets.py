@@ -1321,6 +1321,40 @@ def self_test():
                     lambda: pinned_cosign(tool_root("tools-3", asset="cosign-darwin-arm64"), **linux),
                     "expected cosign-linux-amd64")
 
+            # The real pinned cosign (CI asks for it; it downloads): the record
+            # signature form of cosign sign-blob verifies here, and the openssl
+            # form verifies in cosign. No registry, no transparency log.
+            if os.environ.get("CC_TEST_PINNED_COSIGN") != "1":
+                print("SKIP  real pinned cosign interop (set CC_TEST_PINNED_COSIGN=1 on Linux amd64)")
+            else:
+                real = pinned_cosign()
+                ok(os.path.dirname(real) == os.path.join(checkout_root(), COSIGN_CACHE),
+                   "the real pinned cosign downloads and matches COSIGN_SHA256 (%s)" % real)
+                env = dict(os.environ, COSIGN_PASSWORD="")
+                keydir = os.path.join(tmp, "cosign-keys")
+                os.makedirs(keydir)
+                subprocess.run((real, "generate-key-pair", "--output-key-prefix", "release"), cwd=keydir,
+                               env=env, check=True, capture_output=True)
+                cpub = os.path.join(keydir, "release.pub")
+                cs = os.path.join(tmp, "cosign-signed")
+                prep(cs)
+                finalize(cs, trust_key=cpub)
+                subprocess.run((real, "sign-blob", "--key", os.path.join(keydir, "release.key"),
+                                "--tlog-upload=false", "--yes", "--output-signature",
+                                os.path.join(cs, RECORD_SIGNATURE), os.path.join(cs, RECORD)),
+                               env=env, check=True, capture_output=True)
+                ok(rck(cs, trust_key=cpub)["signature"]["key_sha256"] == load_trust_key(cpub)[1],
+                   "a record signature from cosign sign-blob verifies with the cosign public key")
+                p = subprocess.run((real, "verify-blob", "--key", pub_a, "--signature",
+                                    os.path.join(sa, RECORD_SIGNATURE), "--insecure-ignore-tlog=true",
+                                    os.path.join(sa, RECORD)), env=env, capture_output=True, text=True)
+                ok(p.returncode == 0, "cosign verify-blob accepts the openssl record signature (%s)"
+                   % p.stderr.strip()[-120:])
+                p = subprocess.run((real, "verify-blob", "--key", pub_b, "--signature",
+                                    os.path.join(sa, RECORD_SIGNATURE), "--insecure-ignore-tlog=true",
+                                    os.path.join(sa, RECORD)), env=env, capture_output=True, text=True)
+                ok(p.returncode != 0, "cosign verify-blob refuses that signature with another key")
+
         # Effective selection.
         def model(openclaw=ref, cli=ref, **extra):
             services = {}

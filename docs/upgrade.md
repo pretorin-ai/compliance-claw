@@ -22,7 +22,12 @@ scripts/update.sh --release vX.Y.Z --preview
 Preview fetches the tag (Git objects and `FETCH_HEAD` only). Then
 `scripts/release-assets.py` downloads the final
 [release set](image-verification.md#checking-a-release-set) to a temporary
-directory and checks the record and asset checksums. The updater compares the
+directory and checks the record and asset checksums. For a signed release it
+then verifies the record signature and the image signature with the release
+key of **your current checkout**, before it reads the source of the tag
+([what `check` verifies](image-verification.md#what-check-verifies-for-a-signed-release)).
+The image check needs a Linux amd64 host, the pinned cosign (downloaded and
+checked by the helper) and your `docker login ghcr.io`. The updater compares the
 record with the tag commit. Preview renders your ordered Compose selection and
 reports source/image changes, signature status, project, state volumes, secret
 creation, required maintenance (including npm access after a Slack package
@@ -41,9 +46,11 @@ Apply repeats the checks. It stops before file changes or gateway downtime for:
 
 - a missing, candidate or invalid release set, or a record, asset checksum or
   source commit that fails verification;
-- an unsigned or unverified signature. **Today every release set is unsigned,
-  so apply refuses every release** until signing and its verifier exist.
-  Preview marks it `UNVERIFIED`; there is no bypass. See
+- an unsigned release, or a record or image signature that does not verify
+  with your checkout's release key, or a signature check that cannot run.
+  Releases v0.5.3 and earlier are unsigned, and no signed release exists yet,
+  so apply refuses every release today. Preview marks an unsigned release
+  `UNVERIFIED`; there is no bypass. See
   [what the checks prove](image-verification.md#what-this-does-and-does-not-prove);
 - local tracked changes or an added/renamed file that conflicts with a local
   file, including an ignored file or one above the destination path;
@@ -59,9 +66,10 @@ Apply repeats the checks. It stops before file changes or gateway downtime for:
 
 After these checks, apply pulls the release image. Then it records the tag,
 checks out the tag (detached `HEAD`), and installs the release set
-(`compliance-claw-release.json` and `compose.release.yaml`) in the repository
-root. It keeps the previous set as `compliance-claw-release.json.previous` and
-`compose.release.yaml.previous`. It checks the installed set, the source, and the saved selection again
+(`compliance-claw-release.json`, `compliance-claw-release.json.sig` and
+`compose.release.yaml`) in the repository root. It keeps the previous set as
+`.previous` files beside them. It checks the installed set, its record
+signature, the source, and the saved selection again
 with the release helper, and stops if the result differs from the verified
 result. Then it continues with the [shared steps](#shared-update-steps).
 Apply of the release that is already installed changes no file, and Compose
@@ -100,6 +108,26 @@ previous branch or commit, the previous release set (the `.previous` files), the
 the `COMPOSE_FILE` line before the gateway is replaced, it does not recover
 automatically. The release route does not
 change the active Pretorin CLI.
+
+### Moving from an unsigned release
+
+The verifier in v0.5.3 and earlier checkouts refuses every signed release, and
+those checkouts have no release key. The release route cannot move such a
+deployment to the first signed release. Do it once by hand:
+
+1. Read the release notes and the diff to the signed release tag.
+2. Back up the recovery set as for any
+   [OpenClaw image upgrade](#openclaw-image-upgrade-and-state-backup).
+3. Fetch and check out the signed release tag (`git fetch --tags origin`, then
+   `git checkout vX.Y.Z`). Check that the tag names the commit that the release
+   notes give.
+4. Compare the release key fingerprint as in
+   [first trust in the release key](image-verification.md#first-trust-in-the-release-key).
+   Stop if it differs.
+5. From that checkout, run `scripts/update.sh --release vX.Y.Z --preview`, then
+   apply. The checkout now verifies the release with its own reviewed key.
+
+Later updates use the release route as usual.
 
 ### Branch route
 

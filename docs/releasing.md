@@ -89,8 +89,9 @@ Replace `X.Y.Z` with the intended release version.
    Prepare refuses when the tag is not at the built commit, when release `vX.Y.Z`
    is already published, or when the image tag `X.Y.Z` already exists. If a
    gate fails before the draft job, the existing draft (if any) does not change.
-   A second prepare run for the same version replaces the candidate set on the
-   draft. The job summary shows the candidate digest.
+   A second prepare run for the same version deletes an earlier record
+   signature from the draft, then replaces the candidate set. The job summary
+   shows the candidate digest.
 
 3. Check the exact candidate. Record its digest from the prepare job summary.
    Use the digest and the assets on the draft. Do not rebuild. To check the draft
@@ -112,8 +113,9 @@ Replace `X.Y.Z` with the intended release version.
    draft. It refuses when the `digest` input is missing, when the draft record
    names another digest, when `candidate-X.Y.Z` names another digest, when the
    checkout is not the tag commit, or when the tag has no trust key. It replaces
-   only the record on the draft, then reads it back. The job summary shows the
-   record SHA-256 and the key fingerprint.
+   only the record on the draft, then reads it back. The log and the job
+   summary say **NOT PUBLISHED — awaiting signatures**, with the record SHA-256
+   and the key fingerprint.
 
 5. Dispatch the protected release signer for tag `vX.Y.Z` and the same digest.
    It checks the draft set, signs the exact final record and the image digest
@@ -155,6 +157,12 @@ Each job has one write permission: GHCR packages or GitHub Release contents,
 never both. The workflow uses the automatic `GITHUB_TOKEN`, with no Pretorin,
 model, or Slack credentials, and no signing key.
 
+The prepare, finalize and publish jobs use the protected `release`
+environment: each job waits for a required reviewer. One release needs six
+approvals: two for prepare (`candidate`, `draft`), one for finalize
+(`final-record`) and three for publish (`final-assets`, `final-image`,
+`final-release`). A dry run uses no environment.
+
 ## Retries and failures
 
 - Finalize and publish are safe to repeat with the same `digest`. Finalize
@@ -164,10 +172,11 @@ model, or Slack credentials, and no signing key.
 - If publish stops at a signature check, do not edit the record or the
   signature. Find the cause (signer not run, other key, stale signature), fix
   it at the signer, then run publish again.
-- A stale signature is a `.sig` asset that does not verify over the current
-  record, for example after a second prepare. Finalize refuses while it is on
-  the draft. Delete that asset from the draft by hand, run finalize, then run
-  the signer again.
+- A new candidate invalidates every earlier signature. A second prepare on a
+  draft deletes the `.sig` asset first, then replaces the set. Run finalize and
+  the signer again. Finalize also refuses a `.sig` beside a candidate record;
+  if one is there, delete it from the draft by hand. An earlier image signature
+  names only the earlier digest, which no record names any more.
 - If `final-release` fails after the version tag was applied, re-run the failed
   jobs of that same run (`gh run rerun <run-id> --failed`), or run publish again.
 - If prepare fails after it moved `candidate-X.Y.Z` but before the draft job, the
