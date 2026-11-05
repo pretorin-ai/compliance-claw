@@ -21,7 +21,9 @@
 # come from the same checkout, so the manual git check and the first-trust key
 # fingerprint comparison in README.md come first. THE SIGNATURE CHECK FAILS
 # CLOSED: an unsigned release (v0.5.3 and earlier) is refused, and there is
-# deliberately no option to accept one here.
+# deliberately no option to accept one here. The image check can add the pinned
+# cosign to .cache/release-tools/ (gitignored); "Nothing was changed" below
+# means no deployment file, container or volume.
 #
 # Declaration, only for a new efforts.yaml. A rerun with the same values reuses it:
 #   --effort NAME --system-id UUID --framework-id ID
@@ -70,7 +72,7 @@ die()   {
 }
 stage() { STAGE="$*"; printf '\ninstall: == %s ==\n' "$*"; }
 
-usage() { sed -n '2,39p' "$0"; }
+usage() { sed -n '2,43p' "$0"; }
 
 CHECK_ONLY=0 ASSUME_YES=0 RELEASE="" RELEASE_DIR=""
 EFFORT="" SYSTEM_ID="" FRAMEWORK_ID="" CHANNEL=""
@@ -242,12 +244,14 @@ case "$rc" in
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   Releases v0.5.3 and earlier are unsigned and cannot be installed by this guide.
   Do not edit, re-sign or replace the files or the key. Use a signed release, or
-  the manual installation (README.md#manual-installation). Nothing was changed." ;;
+  the manual installation (README.md#manual-installation). Nothing was changed
+  except the cached pinned cosign (.cache/release-tools/, gitignored)." ;;
   5) die "the release signatures could not be checked:
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   The image signature check downloads the cosign that versions.env pins and reads
   the registry with this host's docker login (docker login ghcr.io). Fix the cause,
-  then re-run. Nothing was changed." ;;
+  then re-run. Nothing was changed except the cached pinned cosign
+  (.cache/release-tools/, gitignored)." ;;
   3) die "this checkout is not the source of the release:
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   Check out the release tag, repeat the trust check, then re-run. Nothing was changed." ;;
@@ -256,6 +260,13 @@ $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   Do not edit release files. Download the set again, or use the files that were
   placed by an earlier run with --release-dir. Nothing was changed." ;;
 esac
+# The bytes that passed: placement copies from here, and the source directory
+# must still hold the same bytes when they are placed.
+VERIFIED="${WORK_DIR}/verified"
+mkdir -p "$VERIFIED"
+for f in $RELEASE_FILES; do
+  [ ! -e "${RELEASE_SRC}/${f}" ] || cp -p -- "${RELEASE_SRC}/${f}" "${VERIFIED}/${f}"
+done
 RELEASE_TO_PLACE=""
 if [ "$RELEASE_SRC" != "$REPO_ROOT" ]; then
   for f in $RELEASE_FILES; do
@@ -482,7 +493,9 @@ stage "4/10 release set"
 # ---------------------------------------------------------------------------
 for f in $RELEASE_TO_PLACE; do
   [ ! -e "$f" ] || die "${f} appeared during this run. Nothing more was changed. Re-run."
-  cp -- "${RELEASE_SRC}/${f}" "$f"
+  cmp -s "${RELEASE_SRC}/${f}" "${VERIFIED}/${f}" \
+    || die "${RELEASE_SRC}/${f} changed after it was verified. Nothing more was changed. Re-run."
+  cp -- "${VERIFIED}/${f}" "$f"
   chmod 644 "$f"
   log "placed ${f}"
 done

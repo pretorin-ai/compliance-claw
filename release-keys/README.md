@@ -41,8 +41,12 @@ public key in a reviewed PR:
 3. Record the fingerprint and the date here. The release workflow and this
    directory need code-owner review (`.github/CODEOWNERS`).
 
-A changed key does not verify releases signed with the earlier key.
-Deployments on an earlier checkout keep their earlier key until they update.
+A changed key does not verify releases signed with the earlier key, and
+`scripts/update.sh` in a checkout with the earlier key refuses a release signed
+with the new key (exit 6). Such a deployment moves once by hand: check out the
+new tag, compare the new fingerprint through a separate channel, then run the
+release route from that checkout, as in
+[moving from an unsigned release](../docs/upgrade.md#moving-from-an-unsigned-release).
 
 ## First trust on a deployment
 

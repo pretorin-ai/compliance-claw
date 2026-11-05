@@ -748,7 +748,8 @@ class ReleaseTest(unittest.TestCase):
             with self.subTest(name):
                 self.write_release("v0.6.0", self.new)
                 prepare_set()
-                self.assert_blocked(text)
+                self.assert_blocked(text, preview_rc=1)
+                self.assertNotIn("recovery set", self.output, "the tag source was read before the refusal")
                 self.assertIn("a release signature does not verify with this checkout's release key", self.output)
                 self.assertEqual(self.cosign_calls(), [], "cosign ran after a record refusal")
         self.write_release("v0.6.0", self.new)
@@ -765,7 +766,8 @@ class ReleaseTest(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.cosign_does(**behavior)
-                self.assert_blocked(text)
+                self.assert_blocked(text, preview_rc=1)
+                self.assertNotIn("recovery set", self.output, "the tag source was read before the refusal")
         (self.fixture / "cosign-behavior.json").unlink()
 
     def test_matching_local_tag_is_kept(self):

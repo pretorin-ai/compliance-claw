@@ -658,8 +658,9 @@ jobs:
               # A new candidate invalidates any earlier signature, so the record
               # signature goes FIRST; no stale .sig survives a re-prepare. (An
               # earlier image signature names only the earlier digest.)
-              if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
-                 | grep -qx 'compliance-claw-release.json.sig'; then
+              # Listed first, so that an API error stops here instead of reading as "no .sig".
+              ASSETS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+              if printf '%s\n' "$ASSETS" | grep -qx 'compliance-claw-release.json.sig'; then
                 gh release delete-asset "$TAG" compliance-claw-release.json.sig \
                   --repo "$GITHUB_REPOSITORY" --yes
                 echo "::notice::deleted the record signature of the earlier candidate; finalize and sign again"
@@ -719,8 +720,9 @@ jobs:
             --pattern compliance-claw-release.json --pattern compose.release.yaml \
             --pattern "sbom-${VERSION}.spdx.json"
           # A signature beside a candidate signs other bytes; finalize refuses it.
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
-             | grep -qx 'compliance-claw-release.json.sig'; then
+          # Listed first, so that an API error stops here instead of reading as "no .sig".
+          ASSETS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          if printf '%s\n' "$ASSETS" | grep -qx 'compliance-claw-release.json.sig'; then
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-set \
               --pattern compliance-claw-release.json.sig
           fi

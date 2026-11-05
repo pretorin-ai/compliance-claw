@@ -385,9 +385,11 @@ resolve_release() {
   R_OVERLAY="${RELEASE_CACHE}/assets/${RELEASE_OVERLAY}"
   R_RECORD="${RELEASE_CACHE}/assets/${RELEASE_RECORD}"
 
-  # AUTHENTICITY, before the source of the tag is read or anything changes: the
-  # record signature and the image signature, with the release key of THIS
-  # checkout (the one being updated), never a key from the new tag.
+  # AUTHENTICITY, before anything changes: the record signature and the image
+  # signature, with the release key of THIS checkout (the one being updated),
+  # never a key from the new tag. A signed set that does not verify stops here,
+  # before the source of the tag is read. An unsigned set (v0.5.3 and earlier)
+  # is still shown for inspection, and apply refuses it on the blocker.
   rc=0
   R_VERIFY_OUT="$(release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" 2>&1 >/dev/null)" || rc=$?
   R_VERIFY_LAST="$(printf '%s\n' "$R_VERIFY_OUT" | grep 'ERROR' | tail -1 | sed 's/^release-assets: ERROR — //' || true)"
@@ -397,9 +399,13 @@ resolve_release() {
     6) if [ "$R_SIGNATURE" = unsigned ]; then
          blocker "UNVERIFIED: publisher authenticity not checked (signature unsigned); apply refuses an unsigned release."
        else
-         blocker "a release signature does not verify with this checkout's release key: ${R_VERIFY_LAST}"
+         die "a release signature does not verify with this checkout's release key: ${R_VERIFY_LAST}
+  Do not edit, re-sign or replace the release files or the key. Nothing was changed."
        fi ;;
-    5) blocker "the release signatures could not be checked: ${R_VERIFY_LAST}. The image check needs a Linux amd64 host, the cosign that versions.env pins, and this host's docker login (docker login ghcr.io)." ;;
+    5) die "the release signatures could not be checked: ${R_VERIFY_LAST}
+  The image check needs a Linux amd64 host, the cosign that versions.env pins, and
+  registry access with this host's docker login (docker login ghcr.io).
+  Nothing was changed except the cached pinned cosign (.cache/release-tools/)." ;;
     *) die "the release set for ${tag} did not pass the apply check (exit ${rc}): ${R_VERIFY_LAST}. Nothing was changed." ;;
   esac
 
@@ -516,7 +522,10 @@ sys.exit(any(candidate.get(s, {}).get(t) != v
     | release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" --allow-unsigned --record-only --rendered - 2>&1 >/dev/null)" || rc=$?
   case "$rc" in
     0) ;;
-    6) ;;  # the signature blocker above already stops apply
+    6) # Only an unsigned set reaches this point unverified; its blocker stops apply.
+       if [ "$R_VERIFIED" = 1 ]; then
+         die "the verified release set did not pass its selection check (exit 6). Nothing was changed."
+       fi ;;
     4) blocker "the effective openclaw or cli image is not the release image: a later overlay sets image (for example a restore overlay). That is a custom selection, which the release route does not apply. Take a new backup, then remove only the two image lines from that overlay and keep its volume lines." ;;
     *) printf '%s\n' "$selection_err" >&2; die "could not check the release image selection. Nothing was changed." ;;
   esac
