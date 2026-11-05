@@ -390,7 +390,7 @@ def make_release_set(out, version, commit, digest=NEW_DIGEST, final=True,
                     image_repository, "--digest", digest, "--sbom", str(sbom), "--out", str(out)],
                    check=True, capture_output=True)
     if final:
-        subprocess.run(["python3", str(HELPER), "finalize", "--dir", str(out)],
+        subprocess.run(["python3", str(HELPER), "finalize", "--dir", str(out), "--allow-unsigned"],
                        check=True, capture_output=True)
     return image_repository + ":" + version + "@" + digest
 

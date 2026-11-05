@@ -104,7 +104,7 @@ def main():
                      "--image-repository", REPO, "--digest", digest, "--sbom", str(sbom),
                      "--out", str(out)], tmp)
             assert p.returncode == 0, p.stderr
-            p = run([sys.executable, str(HELPER), "finalize", "--dir", str(out)], tmp)
+            p = run([sys.executable, str(HELPER), "finalize", "--dir", str(out), "--allow-unsigned"], tmp)
             assert p.returncode == 0, p.stderr
             return out
 

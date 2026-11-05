@@ -1,0 +1,5 @@
+# Release trust paths: the release workflow, the release-set verifier and the
+# release trust key. Review rules are set in the repository settings.
+/.github/workflows/release.yml @harshavardhan-pretorin @iankloo
+/scripts/release-assets.py @harshavardhan-pretorin @iankloo
+/release-keys/ @harshavardhan-pretorin @iankloo

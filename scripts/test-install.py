@@ -193,7 +193,7 @@ class InstallTest(unittest.TestCase):
                         "--digest", "sha256:" + digest, "--sbom", str(sbom), "--out", str(out)],
                        check=True, capture_output=True)
         if final:
-            subprocess.run([*helper, "finalize", "--dir", str(out)], check=True, capture_output=True)
+            subprocess.run([*helper, "finalize", "--dir", str(out), "--allow-unsigned"], check=True, capture_output=True)
         return out
 
     def rel(self, directory=None, version=VERSION):

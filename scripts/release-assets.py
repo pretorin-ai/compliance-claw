@@ -4,7 +4,7 @@
     release-assets.py prepare  --version X.Y.Z --commit SHA --repository OWNER/NAME
                                --image-repository REPO --digest sha256:HEX
                                --sbom PATH --out DIR [--source DIR]
-    release-assets.py finalize --dir DIR
+    release-assets.py finalize --dir DIR [--allow-unsigned]
     release-assets.py check    [--dir DIR] [--stage final|candidate|any]
                                [--version X.Y.Z] [--all-assets]
                                [--source DIR [--tag-only]] [--allow-unsigned]
@@ -16,31 +16,37 @@ HOST-ONLY, standard library only. Nothing in the image runs this.
 
 A RELEASE SET is three GitHub Release assets: compliance-claw-release.json (the
 record), compose.release.yaml (image selection only) and sbom-X.Y.Z.spdx.json.
-compliance-claw-release.json.sig is RESERVED; nothing produces it yet, and
-`signature.status` says "unsigned". Fields, procedure and placement:
-docs/releasing.md and docs/image-verification.md.
+A signed set adds compliance-claw-release.json.sig: one line of base64 of the
+DER ECDSA P-256 SHA-256 signature over the exact record bytes. Fields,
+procedure and placement: docs/releasing.md and docs/image-verification.md.
 
 INVARIANTS
 - One resolver. The publisher (release.yml) calls `prepare` and `finalize`.
   Guided setup and the updater use `fetch` and `check` and never parse the
   record themselves.
+- One trust key: release-keys/compliance-claw-release.pub in the checkout that
+  holds this file. No option, variable or downloaded file supplies a key.
+- `finalize` (candidate -> final) writes status "signed" and the key
+  fingerprint (sha256 of the DER SPKI) BEFORE the signer signs. It reuses the
+  overlay and SBOM bytes, refuses without the trust key, and nothing rewrites
+  the final record. `finalize --allow-unsigned` is for test fixtures only.
 - `fetch` reads only a PUBLISHED release of the fixed public repository (no
-  credential, no draft) into an empty directory, and checks integrity as
-  `check --stage final --all-assets` does. It reports the signature status;
-  the signature gate is in `check` alone.
+  credential, no draft) into an empty directory, with the record signature of
+  a signed set, and checks integrity as `check --stage final --all-assets`
+  does. The signature gate is in `check` alone.
+- Signatures fail closed (exit 6). "signed" passes only when the record names
+  the trust key and the signature verifies over the record bytes (openssl);
+  the record binds the overlay and SBOM hashes. `--allow-unsigned` admits
+  "unsigned" only, prints "UNVERIFIED: publisher authenticity not checked",
+  and never relaxes a signed check. Preparation, update preview and fixtures
+  pass it; customer install and apply never do.
 - The rendered Compose model is never printed or written: a legacy `.env`
   selection renders secret values into it. `--rendered -` reads it from stdin.
   A mismatch prints only image references.
-- Signatures fail closed: `check` refuses every release by default (exit 6).
-  `--allow-unsigned` admits "unsigned" only and prints "UNVERIFIED: publisher
-  authenticity not checked"; preparation, publication, update preview and
-  fixtures pass it, customer install and apply never do. Any other status is
-  refused even with the flag: no verifier exists in this version.
 - The overlay is generated from the record byte for byte, and `check`
   compares it, so an added key (port, volume, environment) fails. Every value
   in it comes from a pattern-validated field; no YAML parser is needed.
-- `finalize` changes only `stage` (candidate -> final); the overlay and SBOM
-  bytes are reused. A customer flow keeps `--stage final` and refuses a candidate.
+- A customer flow keeps `--stage final` and refuses a candidate.
 - Host placement: record and overlay in the repository root (gitignored), the
   overlay directly after compose.yaml in COMPOSE_FILE. A later overlay that
   sets `image` wins in Compose; `check --compose` reports it (exit 4) and
@@ -55,12 +61,15 @@ EXIT CODES (every subcommand):
        commit, or HEAD is another commit; --tag-only skips the HEAD check)
     4  the effective Compose selection does not select the release image
        (overlay not selected, or a later overlay overrides it)
-    5  a required tool or download cannot run (git, docker compose, the
-       release download)
-    6  the release is not signed or its signature is not verified (every
-       release in this version, unless --allow-unsigned admits "unsigned")
+    5  a required tool or download cannot run (git, docker compose, openssl,
+       the release download)
+    6  the release is not signed or its signature is not verified (unsigned
+       without --allow-unsigned; no trust key or another key; a missing,
+       altered, stale or wrong-key signature)
 """
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -78,9 +87,15 @@ RECORD_SIGNATURE = RECORD + ".sig"
 PLATFORM = "linux/amd64"
 SCHEMA = 1
 STAGES = ("candidate", "final")
-# Later signing adds its own status values and a verifier. Until then `check`
-# refuses every value except "unsigned", and that one only with --allow-unsigned.
-SIGNATURE_STATUS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+SIGNATURE_STATUSES = ("unsigned", "signed")
+# The reviewed Compliance Claw release key, read from THIS checkout only. It is
+# never taken from a release set, an option or the environment. It is separate
+# from vendor/cosign.pub (the Pretorin CLI key). See release-keys/README.md.
+TRUST_KEY = os.path.join("release-keys", "compliance-claw-release.pub")
+# DER SubjectPublicKeyInfo header of an uncompressed ECDSA P-256 key.
+P256_SPKI_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
+P256_P = 2 ** 256 - 2 ** 224 + 2 ** 192 + 2 ** 96 - 1
+P256_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
 SERVICES = ("openclaw", "cli")
 # fetch reads only published releases of this repository.
 RELEASE_REPOSITORY = "pretorin-ai/compliance-claw"
@@ -237,14 +252,28 @@ def validate_record(record):
             "assets are %s, expected exactly %s" % (sorted(names), sorted(expected)))
 
     signature = record["signature"]
-    require_keys(signature, ("status", "record_signature_asset"), "signature")
-    require_match(SIGNATURE_STATUS_RE, signature["status"], "signature.status")
+    require(isinstance(signature, dict) and signature.get("status") in SIGNATURE_STATUSES,
+            "signature.status is %r, expected one of %s"
+            % (signature.get("status") if isinstance(signature, dict) else signature,
+               SIGNATURE_STATUSES))
+    if signature["status"] == "signed":
+        # finalize fixes these fields BEFORE the signer signs; nothing rewrites them.
+        require(record["stage"] == "final", "a %s record cannot be signed" % record["stage"])
+        require_keys(signature, ("status", "record_signature_asset", "key_sha256"), "signature")
+        require_match(SHA256_RE, signature["key_sha256"], "signature.key_sha256")
+    else:
+        require_keys(signature, ("status", "record_signature_asset"), "signature")
     require(signature["record_signature_asset"] == RECORD_SIGNATURE,
             "signature.record_signature_asset is %r, expected %r"
             % (signature["record_signature_asset"], RECORD_SIGNATURE))
 
 
 def load_record(directory):
+    return load_record_bytes(directory)[0]
+
+
+def load_record_bytes(directory):
+    """The record and the exact bytes that the record signature covers."""
     path = os.path.join(directory, RECORD)
     try:
         data = read_bytes(path)
@@ -258,7 +287,7 @@ def load_record(directory):
     # One byte form, so the later signature covers exactly one thing.
     require(data == dump_record(record).encode("utf-8"),
             "%s is not in canonical form (it was edited after generation)" % path)
-    return record
+    return record, data
 
 
 def verify_assets(directory, record, all_assets):
@@ -306,6 +335,100 @@ def check_source(source, record, tag_only=False):
     head = git(source, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
     require(head == commit, "%s is at commit %s; release %s is commit %s. Check out %s first."
             % (source, head or "<none>", record["version"], commit, tag), SOURCE)
+
+
+def default_trust_key():
+    # The checkout that holds this helper: the reviewed checkout, never the set.
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), TRUST_KEY)
+
+
+def load_trust_key(path):
+    """(DER SPKI, fingerprint) of the one P-256 public key in a PEM file."""
+    try:
+        text = read_bytes(path).decode("ascii")
+    except OSError as exc:
+        raise ReleaseError(UNSIGNED, "no Compliance Claw release trust key at %s (%s). This "
+                           "checkout cannot verify a signed release." % (path, exc.strerror))
+    except UnicodeDecodeError:
+        raise ReleaseError(UNSIGNED, "trust key %s is not PEM text" % path)
+    blocks = re.findall(r"-----BEGIN PUBLIC KEY-----\n([A-Za-z0-9+/=\n]+?)\n?-----END PUBLIC KEY-----",
+                        text.replace("\r\n", "\n"))
+    require(len(blocks) == 1 and text.count("-----BEGIN") == 1,
+            "trust key %s must hold exactly one PEM PUBLIC KEY block" % path, UNSIGNED)
+    try:
+        der = base64.b64decode(blocks[0].replace("\n", ""), validate=True)
+    except (binascii.Error, ValueError):
+        raise ReleaseError(UNSIGNED, "trust key %s is not valid base64" % path)
+    require(len(der) == len(P256_SPKI_PREFIX) + 65 and der.startswith(P256_SPKI_PREFIX)
+            and der[len(P256_SPKI_PREFIX)] == 4,
+            "trust key %s is not an uncompressed ECDSA P-256 public key" % path, UNSIGNED)
+    point = der[len(P256_SPKI_PREFIX) + 1:]
+    x, y = int.from_bytes(point[:32], "big"), int.from_bytes(point[32:], "big")
+    require(x < P256_P and y < P256_P and (y * y - x ** 3 + 3 * x - P256_B) % P256_P == 0,
+            "trust key %s is not a point on P-256" % path, UNSIGNED)
+    return der, sha256_bytes(der)
+
+
+def pem(der):
+    body = base64.b64encode(der).decode("ascii")
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    return ("-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n" % "\n".join(lines)).encode()
+
+
+def parse_signature(data, what):
+    """One line of base64 (optional final newline) of an ASN.1 DER ECDSA signature."""
+    if data.endswith(b"\n"):
+        data = data[:-1]
+    try:
+        sig = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise ReleaseError(UNSIGNED, "%s is not one line of base64" % what)
+    # SEQUENCE { INTEGER r, INTEGER s }, short-form lengths, at most 72 bytes for P-256.
+    ok = 8 <= len(sig) <= 72 and sig[0] == 0x30 and sig[1] == len(sig) - 2 and sig[2] == 0x02
+    if ok:
+        rlen = sig[3]
+        ok = 4 + rlen + 2 <= len(sig) and sig[4 + rlen] == 0x02 and 6 + rlen + sig[5 + rlen] == len(sig)
+    require(ok, "%s is not a DER ECDSA signature" % what, UNSIGNED)
+    return sig
+
+
+def openssl_verify(der, sig, data, what):
+    """True when `sig` verifies over `data` with the key `der`. openssl is an
+    install prerequisite; every input goes through a private temporary file, so
+    openssl verifies exactly the bytes and the key checked here."""
+    with tempfile.TemporaryDirectory(prefix="cc-verify-") as tmp:
+        paths = {}
+        for name, blob in (("key.pem", pem(der)), ("sig.der", sig), ("data", data)):
+            paths[name] = os.path.join(tmp, name)
+            with open(paths[name], "wb") as f:
+                f.write(blob)
+        try:
+            p = subprocess.run(("openssl", "dgst", "-sha256", "-verify", paths["key.pem"],
+                                "-signature", paths["sig.der"], paths["data"]),
+                               capture_output=True, text=True)
+        except OSError as exc:
+            raise ReleaseError(TOOL, "cannot run openssl to verify %s: %s" % (what, exc.strerror))
+    return p.returncode == 0 and "Verified OK" in p.stdout
+
+
+def check_record_signature(directory, record, data, trust_key):
+    """The record signature asset, over the exact record bytes, with the trust key
+    from this checkout. A downloaded key is never used."""
+    der, fingerprint = load_trust_key(trust_key)
+    require(record["signature"]["key_sha256"] == fingerprint,
+            "release %s names signing key %s; this checkout trusts %s (%s)"
+            % (record["version"], record["signature"]["key_sha256"], fingerprint, trust_key), UNSIGNED)
+    path = os.path.join(directory, RECORD_SIGNATURE)
+    try:
+        raw = read_bytes(path)
+    except OSError as exc:
+        raise ReleaseError(UNSIGNED, "release %s is marked signed but %s is missing (%s)"
+                           % (record["version"], path, exc.strerror))
+    sig = parse_signature(raw, RECORD_SIGNATURE)
+    require(openssl_verify(der, sig, data, RECORD),
+            "%s does not verify over %s with the trust key %s: the signature is altered, "
+            "stale or from another key" % (RECORD_SIGNATURE, RECORD, fingerprint), UNSIGNED)
+    return fingerprint
 
 
 def render_compose():
@@ -362,6 +485,7 @@ def summary(record):
         "digest": record["image"]["digest"],
         "platform": record["image"]["platform"],
         "signature_status": record["signature"]["status"],
+        "key_sha256": record["signature"].get("key_sha256", ""),
     }
 
 
@@ -418,30 +542,53 @@ def prepare(version, commit, repository, image_repository, digest, sbom, out, so
     return record
 
 
-def finalize(directory):
+def finalize(directory, allow_unsigned=False, trust_key=None):
+    """candidate -> final. The final record names the trust key of this checkout
+    and status "signed" BEFORE anything signs it, so the signer signs the bytes
+    that publication keeps. --allow-unsigned (fixtures only) writes an unsigned
+    final record; the publisher never passes it."""
     record = load_record(directory)
     verify_assets(directory, record, all_assets=True)
     if record["stage"] == "final":
+        status = record["signature"]["status"]
+        if allow_unsigned:
+            require(status == "unsigned", "release %s is already final and %s" % (record["version"], status))
+        else:
+            require(status == "signed", "release %s is already final but unsigned; prepare a new "
+                    "version" % record["version"])
+            fingerprint = load_trust_key(trust_key or default_trust_key())[1]
+            require(record["signature"]["key_sha256"] == fingerprint,
+                    "release %s is final for key %s; this checkout trusts %s"
+                    % (record["version"], record["signature"]["key_sha256"], fingerprint), UNSIGNED)
         return record, False
+    # A signature beside a candidate signs other bytes: never carry it forward.
+    require(not os.path.exists(os.path.join(directory, RECORD_SIGNATURE)),
+            "%s exists beside a candidate record; it is stale. Remove it from the draft first"
+            % RECORD_SIGNATURE)
     record["stage"] = "final"
+    if not allow_unsigned:
+        record["signature"] = {"status": "signed", "record_signature_asset": RECORD_SIGNATURE,
+                               "key_sha256": load_trust_key(trust_key or default_trust_key())[1]}
     validate_record(record)
     write_atomic(os.path.join(directory, RECORD), dump_record(record).encode("utf-8"))
     return record, True
 
 
-def check_signature(record, allow_unsigned):
-    status = record["signature"]["status"]
-    require(status == "unsigned",
-            "signature.status is %r: signature present but no verifier in this version; "
-            "customer install/apply refuses it" % status, UNSIGNED)
-    require(allow_unsigned,
-            "release %s is not signed or the signature is not verified; customer "
-            "install/apply refuses it" % record["version"], UNSIGNED)
+def check_signature(directory, record, data, allow_unsigned, trust_key=None):
+    """Fail closed. "unsigned" passes only with allow_unsigned (preparation,
+    preview, fixtures). "signed" passes only when the record signature verifies
+    with this checkout's trust key; allow_unsigned does not relax that."""
+    if record["signature"]["status"] == "unsigned":
+        require(allow_unsigned,
+                "release %s is not signed; customer install/apply refuses it" % record["version"],
+                UNSIGNED)
+        return None
+    return check_record_signature(directory, record, data, trust_key or default_trust_key())
 
 
 def check(directory, stage="final", version=None, all_assets=False, source=None,
-          model=None, tag_only=False, allow_unsigned=False, gate_signature=True):
-    record = load_record(directory)
+          model=None, tag_only=False, allow_unsigned=False, gate_signature=True, trust_key=None):
+    record, data = load_record_bytes(directory)
     if stage != "any":
         require(record["stage"] == stage,
                 "release %s is a %s, expected %s" % (record["version"], record["stage"], stage))
@@ -450,7 +597,7 @@ def check(directory, stage="final", version=None, all_assets=False, source=None,
                 "release record is version %s, expected %s" % (record["version"], version))
     verify_assets(directory, record, all_assets)
     if gate_signature:
-        check_signature(record, allow_unsigned)
+        check_signature(directory, record, data, allow_unsigned, trust_key)
     if source is not None:
         check_source(source, record, tag_only)
     if model is not None:
@@ -458,8 +605,29 @@ def check(directory, stage="final", version=None, all_assets=False, source=None,
     return record
 
 
+def download(url, path, missing_ok=False):
+    """One published asset, no credential. False when missing_ok and HTTP 404."""
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = response.read(FETCH_LIMIT + 1)
+    except urllib.error.HTTPError as exc:
+        if missing_ok and exc.code == 404:
+            return False
+        raise ReleaseError(DATA if exc.code == 404 else TOOL,
+                           "cannot download %s (HTTP %d). The release may not exist, may be "
+                           "a draft, or may predate release sets." % (url, exc.code))
+    except (urllib.error.URLError, OSError) as exc:
+        if missing_ok and isinstance(getattr(exc, "reason", None), FileNotFoundError):
+            return False
+        raise ReleaseError(TOOL, "cannot download %s: %s" % (url, getattr(exc, "reason", exc)))
+    require(len(data) <= FETCH_LIMIT, "%s is larger than %d bytes" % (url, FETCH_LIMIT))
+    write_atomic(path, data)
+    return True
+
+
 def fetch(version, directory, base=RELEASE_DOWNLOAD):
-    """Download a published release set into an empty directory, then check it."""
+    """Download a published release set into an empty directory, then check it.
+    A signed record brings its record signature; check verifies it."""
     require_match(VERSION_RE, version, "--version")
     if os.path.exists(directory):
         require(os.path.isdir(directory) and not os.listdir(directory),
@@ -467,18 +635,11 @@ def fetch(version, directory, base=RELEASE_DOWNLOAD):
     else:
         os.makedirs(directory)
     for name in (RECORD, OVERLAY, sbom_name(version)):
-        url = "%s/v%s/%s" % (base, version, name)
-        try:
-            with urllib.request.urlopen(url, timeout=60) as response:
-                data = response.read(FETCH_LIMIT + 1)
-        except urllib.error.HTTPError as exc:
-            raise ReleaseError(DATA if exc.code == 404 else TOOL,
-                               "cannot download %s (HTTP %d). Release v%s may not exist, may be "
-                               "a draft, or may predate release sets." % (url, exc.code, version))
-        except (urllib.error.URLError, OSError) as exc:
-            raise ReleaseError(TOOL, "cannot download %s: %s" % (url, getattr(exc, "reason", exc)))
-        require(len(data) <= FETCH_LIMIT, "%s is larger than %d bytes" % (url, FETCH_LIMIT))
-        write_atomic(os.path.join(directory, name), data)
+        download("%s/v%s/%s" % (base, version, name), os.path.join(directory, name))
+    if load_record(directory)["signature"]["status"] == "signed":
+        # Missing is reported by check (exit 6), not here.
+        download("%s/v%s/%s" % (base, version, RECORD_SIGNATURE),
+                 os.path.join(directory, RECORD_SIGNATURE), missing_ok=True)
     return check(directory, stage="final", version=version, all_assets=True,
                  gate_signature=False)
 
@@ -659,30 +820,200 @@ def self_test():
             refuses("check refuses a record with a bad %s" % name, DATA,
                     lambda d=d: ck(d, stage="any"), needle)
 
-        # finalize changes only the stage; the overlay and SBOM bytes are reused.
+        # finalize --allow-unsigned (fixtures only) changes only the stage.
+        candset = os.path.join(tmp, "candset")
+        shutil.copytree(good, candset)
         before = {n: read_bytes(os.path.join(good, n)) for n in (OVERLAY, "sbom-1.2.3.spdx.json")}
         cand = load_record(good)
-        rec, changed = finalize(good)
-        ok(changed and rec["stage"] == "final", "finalize marks the set final")
+        rec, changed = finalize(good, allow_unsigned=True)
+        ok(changed and rec["stage"] == "final", "finalize --allow-unsigned marks the set final")
         cand["stage"] = "final"
-        ok(load_record(good) == cand, "finalize changes only the stage field")
+        ok(load_record(good) == cand, "finalize --allow-unsigned changes only the stage field")
         ok(all(read_bytes(os.path.join(good, n)) == b for n, b in before.items()),
            "finalize reuses the overlay and SBOM bytes")
-        ok(finalize(good)[1] is False, "finalize is idempotent on a final set")
+        ok(finalize(good, allow_unsigned=True)[1] is False, "finalize is idempotent on a final set")
         ok(ck(good)["stage"] == "final", "check accepts the final set by default")
         d = variant("final-nosbom", lambda d: os.unlink(os.path.join(d, "sbom-1.2.3.spdx.json")))
-        refuses("finalize requires every asset", DATA, lambda: finalize(d), "missing")
+        refuses("finalize requires every asset", DATA, lambda: finalize(d, allow_unsigned=True), "missing")
+        absent = os.path.join(tmp, "absent.pub")
+        refuses("finalize without a trust key refuses to mark a set signed", UNSIGNED,
+                lambda: finalize(candset, trust_key=absent), "no Compliance Claw")
+        ok(load_record(candset)["stage"] == "candidate", "a refused finalize leaves the candidate unchanged")
+        refuses("finalize refuses to sign an unsigned final record", DATA,
+                lambda: finalize(variant("final-unsigned", lambda d: None), trust_key=absent),
+                "already final but unsigned")
 
         # The signature gate fails closed.
         refuses("check refuses an unsigned release by default (exit 6)", UNSIGNED,
                 lambda: check(good), "customer install/apply refuses it")
-        d = variant("signed", edit_record(lambda r: r["signature"].update(status="signed")))
-        refuses("check refuses a claimed signature even with allow_unsigned", UNSIGNED,
-                lambda: check(d, allow_unsigned=True), "no verifier")
-        refuses("check refuses a claimed signature by default", UNSIGNED,
-                lambda: check(d), "no verifier")
+        d = variant("claimed", edit_record(lambda r: r["signature"].update(status="signed")))
+        refuses("a signed status without its key fingerprint is invalid", DATA,
+                lambda: check(d, allow_unsigned=True), "signature fields")
+        d = variant("claimed-cand", edit_record(lambda r: (r.update(stage="candidate"), r["signature"].update(
+            status="signed", key_sha256="0" * 64))))
+        refuses("a signed candidate record is invalid", DATA,
+                lambda: check(d, stage="any", allow_unsigned=True), "cannot be signed")
         refuses("the data checks run before the signature gate", DATA,
                 lambda: check(variant("unsigned-bad", append(OVERLAY, "#\n"))), "does not match")
+
+        # Signed sets, with synthetic keys generated here, never at the checkout's key path.
+        if shutil.which("openssl") is None:
+            print("SKIP  signature checks (openssl not installed)")
+        else:
+            keys = os.path.join(tmp, "keys")
+            os.makedirs(keys)
+
+            def ossl(*args, data=None):
+                return subprocess.run(("openssl",) + args, input=data, check=True,
+                                      capture_output=True).stdout
+
+            def keypair(name, curve="prime256v1"):
+                priv, pub = os.path.join(keys, name + ".key"), os.path.join(keys, name + ".pub")
+                ossl("ecparam", "-name", curve, "-genkey", "-noout", "-out", priv)
+                ossl("ec", "-in", priv, "-pubout", "-out", pub)
+                return priv, pub
+
+            def sign(priv, data):
+                return base64.b64encode(ossl("dgst", "-sha256", "-sign", priv, data=data)) + b"\n"
+
+            def signed_set(name, priv, pub, **kw):
+                """finalize with `pub`, then sign the final record with `priv`."""
+                d = os.path.join(tmp, name)
+                if kw:
+                    prep(d, **kw)
+                else:
+                    shutil.copytree(candset, d)
+                finalize(d, trust_key=pub)
+                write_atomic(os.path.join(d, RECORD_SIGNATURE), sign(priv, read_bytes(os.path.join(d, RECORD))))
+                return d
+
+            key_a, pub_a = keypair("a")
+            key_b, pub_b = keypair("b")
+            pub_384 = keypair("p384", "secp384r1")[1]
+            fp_a = sha256_bytes(ossl("pkey", "-pubin", "-in", pub_a, "-outform", "DER"))
+            ok(load_trust_key(pub_a)[1] == fp_a,
+               "the key fingerprint equals sha256 of openssl's DER SPKI export")
+            refuses("a P-384 trust key is refused", UNSIGNED, lambda: load_trust_key(pub_384), "P-256")
+            two = os.path.join(keys, "two.pub")
+            write_atomic(two, read_bytes(pub_a) + read_bytes(pub_b))
+            refuses("a trust key file with two keys is refused", UNSIGNED, lambda: load_trust_key(two),
+                    "exactly one")
+
+            fin = os.path.join(tmp, "fin")
+            shutil.copytree(candset, fin)
+            cand = load_record(fin)
+            rec, changed = finalize(fin, trust_key=pub_a)
+            cand["stage"] = "final"
+            cand["signature"] = {"status": "signed", "record_signature_asset": RECORD_SIGNATURE,
+                                 "key_sha256": fp_a}
+            ok(changed and load_record(fin) == cand,
+               "finalize writes stage final, status signed and the key fingerprint, nothing else")
+            ok(all(read_bytes(os.path.join(fin, n)) == b for n, b in before.items()),
+               "the signed final record reuses the overlay and SBOM bytes")
+            final_bytes = read_bytes(os.path.join(fin, RECORD))
+            ok(finalize(fin, trust_key=pub_a)[1] is False and read_bytes(os.path.join(fin, RECORD)) == final_bytes,
+               "finalize again with the same key leaves the record bytes unchanged")
+            refuses("finalize refuses a final record for another key", UNSIGNED,
+                    lambda: finalize(fin, trust_key=pub_b), "this checkout trusts")
+            refuses("check refuses a signed record without its signature asset", UNSIGNED,
+                    lambda: check(fin, trust_key=pub_a), "is missing")
+            stale = os.path.join(tmp, "stale-cand")
+            shutil.copytree(candset, stale)
+            write_atomic(os.path.join(stale, RECORD_SIGNATURE), b"x\n")
+            refuses("finalize refuses a signature beside a candidate record", DATA,
+                    lambda: finalize(stale, trust_key=pub_a), "stale")
+
+            sa = signed_set("signed-a", key_a, pub_a)
+            ok(check(sa, trust_key=pub_a, all_assets=True)["signature"]["status"] == "signed",
+               "check accepts a correctly signed synthetic set without --allow-unsigned")
+            ok(check(sa, trust_key=pub_a, allow_unsigned=True)["version"] == "1.2.3",
+               "--allow-unsigned changes nothing for a verified signed set")
+            refuses("check refuses a record signed by another key", UNSIGNED,
+                    lambda: check(signed_set("wrong-key", key_b, pub_a), trust_key=pub_a), "does not verify")
+            refuses("check refuses a record that names a key this checkout does not trust", UNSIGNED,
+                    lambda: check(sa, trust_key=pub_b, allow_unsigned=True), "names signing key")
+            refuses("check refuses a missing trust key even with --allow-unsigned", UNSIGNED,
+                    lambda: check(sa, trust_key=absent, allow_unsigned=True), "no Compliance Claw")
+
+            def resign(name, sig):
+                d = os.path.join(tmp, name)
+                shutil.copytree(sa, d)
+                write_atomic(os.path.join(d, RECORD_SIGNATURE), sig)
+                return d
+
+            good_sig = read_bytes(os.path.join(sa, RECORD_SIGNATURE))
+            flipped = base64.b64decode(good_sig)
+            flipped = flipped[:-1] + bytes([flipped[-1] ^ 1])
+            other_tag = signed_set("other-tag", key_a, pub_a, version="1.2.4", sbom=sbom_file("1.2.4"))
+            other_digest = signed_set("other-digest", key_a, pub_a, digest="sha256:" + "d" * 64)
+            for i, (label, sig, needle) in enumerate((
+                ("an altered signature", base64.b64encode(flipped) + b"\n", "does not verify"),
+                ("a signature that is not base64", b"not base64!\n", "base64"),
+                ("a signature that is not DER", base64.b64encode(b"\x30\x02\x02\x00") + b"\n", "DER"),
+                ("an empty signature", b"", "DER"),
+                ("a stale signature over the candidate record",
+                 sign(key_a, read_bytes(os.path.join(candset, RECORD))), "does not verify"),
+                ("a signature for another tag",
+                 read_bytes(os.path.join(other_tag, RECORD_SIGNATURE)), "does not verify"),
+                ("a signature for another digest",
+                 read_bytes(os.path.join(other_digest, RECORD_SIGNATURE)), "does not verify"),
+            )):
+                d = resign("sig-%d" % i, sig)
+                refuses("check refuses %s" % label, UNSIGNED, lambda d=d: check(d, trust_key=pub_a), needle)
+
+            # The SBOM is covered: its sha256 and size are inside the signed bytes.
+            d = resign("sbom-bytes", good_sig)
+            append("sbom-1.2.3.spdx.json", " ")(d)
+            refuses("check refuses a changed SBOM beside a valid signature", DATA,
+                    lambda: check(d, trust_key=pub_a, all_assets=True), "sbom-1.2.3")
+            d2 = resign("sbom-record", good_sig)
+            append("sbom-1.2.3.spdx.json", " ")(d2)
+            data = read_bytes(os.path.join(d2, "sbom-1.2.3.spdx.json"))
+            edit_record(lambda r: r["assets"][1].update(sha256=sha256_bytes(data), size=len(data)))(d2)
+            refuses("check refuses a changed SBOM whose new hash was written into the record",
+                    UNSIGNED, lambda: check(d2, trust_key=pub_a, all_assets=True), "does not verify")
+            d3 = resign("signed-bad-overlay", good_sig)
+            append(OVERLAY, "#\n")(d3)
+            refuses("the data checks run before the signature check", DATA,
+                    lambda: check(d3, trust_key=pub_a), "does not match")
+
+            # The command line reads the trust key from its own checkout only.
+            me = os.path.abspath(__file__)
+            if os.path.exists(default_trust_key()):
+                print("SKIP  absent-key command line check (%s exists)" % default_trust_key())
+            else:
+                p = subprocess.run((sys.executable, me, "check", "--dir", sa, "--allow-unsigned"),
+                                   capture_output=True, text=True)
+                ok(p.returncode == UNSIGNED and "no Compliance Claw" in p.stderr,
+                   "check with no trust key in its checkout refuses a signed set (exit 6)")
+            co = os.path.join(tmp, "checkout")
+            os.makedirs(os.path.join(co, "scripts"))
+            os.makedirs(os.path.join(co, os.path.dirname(TRUST_KEY)))
+            helper = os.path.join(co, "scripts", "release-assets.py")
+            shutil.copyfile(me, helper)
+            shutil.copyfile(pub_a, os.path.join(co, TRUST_KEY))
+            p = subprocess.run((sys.executable, helper, "check", "--dir", sa, "--all-assets", "--json"),
+                               capture_output=True, text=True)
+            ok(p.returncode == 0 and json.loads(p.stdout or "{}").get("key_sha256") == fp_a
+               and "VERIFIED" in p.stderr and UNVERIFIED not in p.stderr,
+               "check from a checkout with the matching trust key verifies the set (exit 0)")
+            shutil.copyfile(pub_b, os.path.join(co, TRUST_KEY))
+            p = subprocess.run((sys.executable, helper, "check", "--dir", sa), capture_output=True, text=True)
+            ok(p.returncode == UNSIGNED, "check from a checkout with another trust key refuses (exit 6)")
+
+            # fetch brings the record signature of a signed set; check decides.
+            spub = os.path.join(tmp, "signedpub-ok", "v1.2.3")
+            shutil.copytree(sa, spub)
+            f = os.path.join(tmp, "f-signed")
+            fetch("1.2.3", f, "file://" + os.path.dirname(spub))
+            ok(sorted(os.listdir(f)) == sorted([RECORD, RECORD_SIGNATURE, OVERLAY, "sbom-1.2.3.spdx.json"])
+               and check(f, trust_key=pub_a)["version"] == "1.2.3",
+               "fetch downloads the record signature of a signed set, and it verifies")
+            os.unlink(os.path.join(spub, RECORD_SIGNATURE))
+            f = os.path.join(tmp, "f-nosig")
+            fetch("1.2.3", f, "file://" + os.path.dirname(spub))
+            refuses("a published signed set without its signature fails check (exit 6)", UNSIGNED,
+                    lambda: check(f, trust_key=pub_a), "is missing")
 
         # Effective selection.
         def model(openclaw=ref, cli=ref, **extra):
@@ -772,10 +1103,13 @@ def self_test():
                 "does not match")
         signedpub = os.path.join(tmp, "signedpub", "v1.2.3")
         shutil.copytree(good, signedpub)
-        edit_record(lambda r: r["signature"].update(status="signed"))(signedpub)
-        ok(fetch("1.2.3", os.path.join(tmp, "f6"), "file://" + os.path.dirname(signedpub))
-           ["signature"]["status"] == "signed",
+        edit_record(lambda r: r["signature"].update(status="signed", key_sha256="0" * 64))(signedpub)
+        f6 = os.path.join(tmp, "f6")
+        ok(fetch("1.2.3", f6, "file://" + os.path.dirname(signedpub))["signature"]["status"] == "signed",
            "fetch checks integrity only and reports the signature status")
+        refuses("a signed status alone is not proof: check refuses it", UNSIGNED,
+                lambda: check(f6, trust_key=os.path.join(tmp, "absent.pub"), allow_unsigned=True),
+                "no Compliance Claw")
         refuses("fetch refuses a malformed version", DATA,
                 lambda: fetch("v1.2.3", os.path.join(tmp, "f5"), base), "--version")
 
@@ -838,8 +1172,10 @@ def main(argv):
     prep.add_argument("--out", required=True)
     prep.add_argument("--source")
 
-    fin = sub.add_parser("finalize", help="publisher: mark a checked candidate final")
+    fin = sub.add_parser("finalize", help="publisher: write the final record that the signer signs")
     fin.add_argument("--dir", required=True)
+    fin.add_argument("--allow-unsigned", action="store_true",
+                     help="write an unsigned final record (test fixtures only)")
 
     chk = sub.add_parser("check", help="consumer: validate a release set")
     chk.add_argument("--dir", default=".")
@@ -875,9 +1211,12 @@ def main(argv):
             print("release-assets: prepared candidate %s -> %s in %s"
                   % (record["version"], record["image"]["reference"], args.out), file=sys.stderr)
         elif args.mode == "finalize":
-            record, changed = finalize(args.dir)
-            print("release-assets: %s %s is final"
-                  % ("marked" if changed else "already", record["version"]), file=sys.stderr)
+            record, changed = finalize(args.dir, args.allow_unsigned)
+            print("release-assets: %s %s is final (%s%s)"
+                  % ("marked" if changed else "already", record["version"],
+                     record["signature"]["status"],
+                     ", key sha256 %s" % record["signature"]["key_sha256"]
+                     if "key_sha256" in record["signature"] else ""), file=sys.stderr)
         elif args.mode == "fetch":
             record = fetch(args.version, args.dir)
             if args.json:
@@ -896,7 +1235,11 @@ def main(argv):
                 model = render_compose()
             record = check(args.dir, args.stage, args.version, args.all_assets,
                            args.source, model, args.tag_only, args.allow_unsigned)
-            print("release-assets: %s" % UNVERIFIED, file=sys.stderr)
+            if record["signature"]["status"] == "unsigned":
+                print("release-assets: %s" % UNVERIFIED, file=sys.stderr)
+            else:
+                print("release-assets: VERIFIED: %s signature with trust key sha256 %s"
+                      % (RECORD, record["signature"]["key_sha256"]), file=sys.stderr)
             if args.json:
                 print(json.dumps(summary(record), sort_keys=True))
             print("release-assets: %s %s %s is valid%s (%s)"
