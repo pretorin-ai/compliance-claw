@@ -6,7 +6,7 @@ Usage: python3 scripts/test-release-render.py
 Needs the Docker Compose CLI only. The daemon is made unreachable on purpose:
 `docker compose config` resolves the model without it. No registry, image pull,
 credential, container, or network is used. Digests are the published v0.5.2
-values or inert placeholders; nothing is pulled.
+and v0.5.3 values or inert placeholders; nothing is pulled.
 
 Proves:
   1. REGRESSION EVIDENCE. The v0.5.2 source tag (fixtures copied byte for byte
@@ -31,11 +31,14 @@ ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "release-assets.py"
 OLD_TAG = ROOT / "scripts" / "fixtures" / "release-v0.5.2"
 REPO = "ghcr.io/pretorin-ai/compliance-claw"
-# The published v0.5.2 release: its tag commit and the digest the release run
-# verified (compose.yaml on master pins the same digest).
+# The published v0.5.2 release, kept as a historical fixture for the old-tag
+# regression and the restore overlay: its tag commit and the digest its release
+# run verified.
 V052_COMMIT = "ee12a031bd7a019837db4ed28b395ab4761a5d01"
 V052_DIGEST = "sha256:b2380d21dfe2265d0de209819875ad1ad25bc7a64f85c6f226b1e09f05b01b09"
 V051_DIGEST = "sha256:b40b96523d696fb20963e5aaee61e26c4526c6e91902a56a5354a262562526da"
+# The current base pin: the published v0.5.3 digest that compose.yaml pins.
+V053_DIGEST = "sha256:b3452d843c0854dbe354d978888a51c1ba2a97319df06818345436e1e20c550f"
 # Inert: a future version and a digest that names no image.
 NEXT_VERSION = "9.9.9"
 NEXT_COMMIT = "0123456789abcdef0123456789abcdef01234567"
@@ -170,7 +173,7 @@ def main():
         want = REPO + ":" + NEXT_VERSION + "@" + NEXT_DIGEST
         ok(images(with_rel) == {"openclaw": want, "cli": want},
            "release overlay selects the release digest for both services", str(images(with_rel)))
-        ok(images(without) == {"openclaw": REPO + ":0.5.2@" + V052_DIGEST, "cli": REPO + ":0.5.2@" + V052_DIGEST},
+        ok(images(without) == {"openclaw": REPO + ":0.5.3@" + V053_DIGEST, "cli": REPO + ":0.5.3@" + V053_DIGEST},
            "without the overlay, the base pin still applies (default pair unchanged)", str(images(without)))
         meta = with_rel.pop("x-compliance-claw-release", None)
         ok(meta == {"version": NEXT_VERSION, "source_commit": NEXT_COMMIT, "image": want},

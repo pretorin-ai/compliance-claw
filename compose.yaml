@@ -94,11 +94,12 @@ x-compliance-claw: &compliance-claw
   # file, and scripts/smoke.sh asserts the two agree. Same documented-duplication
   # shape as the digest pins on the Dockerfile's FROM lines.
   #
-  # PINNED TO THE PUBLISHED DIGEST of the v0.5.2 release run, which verified the
-  # round trip: it deleted the built image, pulled this digest back, ran it, and
-  # confirmed the SBOM regenerated from the pulled bytes matched the built one
-  # (1,536 packages both ways). Re-pin on every release — this line and
-  # IMAGE_VERSION move together in the post-release PR, once the digest exists.
+  # PINNED TO THE PUBLISHED DIGEST of v0.5.3. Its prepare run (41935701329) ran
+  # `docker rmi` on the built tag, pulled this digest back, ran it, and compared
+  # SBOM package COUNTS from the built and pulled images: "SBOM packages:
+  # built=1535 pulled=1535". Equal counts are not proof of byte equality. Re-pin
+  # on every release — this line and IMAGE_VERSION move together in the
+  # post-release PR, once the digest exists.
   #
   # This is the integrity control, not decoration. A tag is a mutable pointer: the
   # same :X.Y.Z can be made to resolve to different bytes later, and nothing here
@@ -107,7 +108,7 @@ x-compliance-claw: &compliance-claw
   # the digest pin is the whole of what guarantees what you are running; see
   # README.md ('Verifying what you pulled'). The release workflow prints the digest
   # in its job summary for exactly this step.
-  image: ghcr.io/pretorin-ai/compliance-claw:0.5.2@sha256:b2380d21dfe2265d0de209819875ad1ad25bc7a64f85c6f226b1e09f05b01b09
+  image: ghcr.io/pretorin-ai/compliance-claw:0.5.3@sha256:b3452d843c0854dbe354d978888a51c1ba2a97319df06818345436e1e20c550f
   env_file:
     # Gitignored and dockerignored, so nothing here is ever baked into a layer.
     # required:false because a fresh clone has no .env — Phase 4's bootstrap
