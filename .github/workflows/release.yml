@@ -80,6 +80,10 @@ jobs:
   # GHCR. It never writes a GitHub Release.
   candidate:
     if: ${{ inputs.operation == 'dry-run' || inputs.operation == 'prepare' }}
+    # prepare pushes to GHCR, so it waits for the protected `release` environment
+    # (v* tags only, required reviewers). A dry run writes nothing and may run on
+    # a branch, so it uses no environment.
+    environment: ${{ inputs.operation == 'prepare' && 'release' || '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -607,6 +611,7 @@ jobs:
   draft:
     needs: candidate
     if: ${{ inputs.operation == 'prepare' }}
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -650,6 +655,15 @@ jobs:
               echo "created draft release ${TAG}" ;;
             true)
               # A draft is not complete: a re-prepare replaces its candidate set.
+              # A new candidate invalidates any earlier signature, so the record
+              # signature goes FIRST; no stale .sig survives a re-prepare. (An
+              # earlier image signature names only the earlier digest.)
+              if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+                 | grep -qx 'compliance-claw-release.json.sig'; then
+                gh release delete-asset "$TAG" compliance-claw-release.json.sig \
+                  --repo "$GITHUB_REPOSITORY" --yes
+                echo "::notice::deleted the record signature of the earlier candidate; finalize and sign again"
+              fi
               gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber release-set/*
               echo "replaced the candidate set on draft release ${TAG}" ;;
             *)
@@ -665,6 +679,7 @@ jobs:
   # ---------------------------------------------------------------------------
   final-record:
     if: ${{ inputs.operation == 'finalize' }}
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -724,7 +739,7 @@ jobs:
             || { echo "::error::${IMAGE_REPO}:candidate-${VERSION} is ${RESOLVED}; the release record names ${CANDIDATE}"; exit 1; }
 
           if cmp -s release-set/compliance-claw-release.json draft-record.json; then
-            echo "the draft already holds this final record; nothing changed"
+            echo "the draft already holds this final record; nothing was written"
           else
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
               release-set/compliance-claw-release.json
@@ -735,8 +750,13 @@ jobs:
               || { echo "::error::the draft record differs from the final record that was written"; exit 1; }
             echo "wrote the final record on draft release ${TAG}"
           fi
+          echo "::notice::NOT PUBLISHED — awaiting signatures. ${TAG} is still a draft, and no version tag was applied."
           {
-            echo "### Final record on the draft (not published)"
+            echo "### NOT PUBLISHED — awaiting signatures"
+            echo ""
+            echo "Release ${TAG} is still a DRAFT. No version tag was applied. Customers"
+            echo "cannot see it, and install and update refuse it until publish verifies"
+            echo "both signatures."
             echo ""
             echo '```'
             echo "${IMAGE_REPO}@${CANDIDATE}"
@@ -764,6 +784,7 @@ jobs:
   # ---------------------------------------------------------------------------
   final-assets:
     if: ${{ inputs.operation == 'publish' }}
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -803,8 +824,9 @@ jobs:
 
           # Signed only: the record must be final, name the trust key at this
           # tag, and its signature must verify over the exact record bytes.
+          # The image signature is verified in final-image, which has the registry login.
           SUMMARY="$(python3 scripts/release-assets.py check --dir release-set --stage final \
-            --all-assets --version "$VERSION" --source . --json)"
+            --all-assets --version "$VERSION" --source . --record-only --json)"
           REC_DIGEST="$(printf '%s' "$SUMMARY" | jq -r .digest)"
           [ "$REC_DIGEST" = "$CANDIDATE" ] \
             || { echo "::error::the release record names ${REC_DIGEST}; the digest input is ${CANDIDATE}. Check the current candidate, or prepare again."; exit 1; }
@@ -831,6 +853,7 @@ jobs:
 
   final-image:
     needs: final-assets
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -877,8 +900,11 @@ jobs:
           VERSION: ${{ needs.final-assets.outputs.version }}
         run: |
           set -euo pipefail
+          # Default for a signed record: the record signature, then the image
+          # signature at the digest with the pinned cosign (versions.env) and
+          # the same key. Any failure stops here: no version tag, still a draft.
           python3 scripts/release-assets.py check --dir release-set --all-assets \
-            --version "$VERSION" --source . --verify-image
+            --version "$VERSION" --source .
 
       # The stable tag, on the same bytes. release-tag.sh refuses to move an
       # existing version tag, and is a no-op when it already names this digest.
@@ -894,6 +920,7 @@ jobs:
 
   final-release:
     needs: [final-assets, final-image]
+    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -913,7 +940,7 @@ jobs:
           VERSION: ${{ needs.final-assets.outputs.version }}
         run: |
           set -euo pipefail
-          python3 scripts/release-assets.py check --dir release-set --all-assets --version "$VERSION" --source .
+          python3 scripts/release-assets.py check --dir release-set --all-assets --version "$VERSION" --source . --record-only
           STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
           # Byte readback: the draft must hold exactly the verified set. Nothing
           # is uploaded here; the signed record is never rewritten.
@@ -925,7 +952,7 @@ jobs:
             cmp "$f" "published/$(basename "$f")" \
               || { echo "::error::release asset $(basename "$f") differs from the verified set"; exit 1; }
           done
-          python3 scripts/release-assets.py check --dir published --all-assets --version "$VERSION"
+          python3 scripts/release-assets.py check --dir published --all-assets --version "$VERSION" --record-only
           if [ "$STATE" = true ]; then
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
             echo "published release ${TAG}"
@@ -943,12 +970,20 @@ jobs:
           set -euo pipefail
           env -u GH_TOKEN -u GITHUB_TOKEN python3 scripts/release-assets.py fetch \
             --version "$VERSION" --dir customer-readback --json | tee customer.json
-          python3 scripts/release-assets.py check --dir customer-readback --all-assets --version "$VERSION"
+          python3 scripts/release-assets.py check --dir customer-readback --all-assets --version "$VERSION" --record-only
           for f in release-set/*; do
             cmp "$f" "customer-readback/$(basename "$f")" \
               || { echo "::error::the public asset $(basename "$f") differs from the verified set"; exit 1; }
           done
-          echo "image package access without a login: $(jq -r .image_access customer.json)"
+          # Anonymous pull is a SEPARATE customer-release gate. While the package
+          # is private this is a warning; it does not fail the run.
+          ACCESS="$(jq -r .image_access customer.json)"
+          if [ "$ACCESS" = anonymous ]; then
+            echo "image ${VERSION}: pull without a login works"
+          else
+            echo "::warning::image ${VERSION}: pull WITHOUT a login fails (${ACCESS}). Customers need docker login ghcr.io. Anonymous pull is a separate gate and is NOT qualified by this run."
+          fi
+          echo "Token-free image pull: \`${ACCESS}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summary
         env:

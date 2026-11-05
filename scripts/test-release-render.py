@@ -86,9 +86,25 @@ def workflow_order():
     ok("--pattern compliance-claw-release.json.sig" in j["final-assets"],
        "publish requires the record signature asset from the draft")
     image = j["final-image"]
-    verify = image.find("--verify-image")
-    ok(0 < verify < image.find("release-tag.sh") and "needs: final-assets" in image,
-       "the image signature is verified before the version tag")
+    verify = image.find("name: Verify the record and image signatures")
+    step = image[verify:image.find("- name:", verify + 1)]
+    ok(0 < verify < image.find("release-tag.sh") and "needs: final-assets" in image
+       and "release-assets.py check" in step and "--record-only" not in step
+       and "--allow-unsigned" not in step,
+       "the record and image signatures are verified before the version tag")
+    ok(text.count("--record-only") == 4 and "--record-only" not in image,
+       "only the jobs without a registry login skip the image signature (--record-only)")
+    ok(all("    environment: release\n" in j[name] for name in
+           ("draft", "final-record", "final-assets", "final-image", "final-release"))
+       and "environment: ${{ inputs.operation == 'prepare' && 'release' || '' }}" in j["candidate"],
+       "prepare, finalize and publish jobs wait for the release environment; dry-run does not")
+    notice = record.find("NOT PUBLISHED — awaiting signatures")
+    ok(notice > 0 and "::notice::NOT PUBLISHED" in record and "### NOT PUBLISHED" in record,
+       "finalize says NOT PUBLISHED — awaiting signatures in the log and the summary")
+    draft = j["draft"]
+    ok(0 < draft.find("delete-asset \"$TAG\" compliance-claw-release.json.sig")
+       < draft.find("--clobber release-set/*"),
+       "a re-prepare deletes the earlier record signature before it replaces the set")
     release = j["final-release"]
     ok("needs: [final-assets, final-image]" in release
        and 0 < release.find("cmp \"$f\"") < release.find("--draft=false"),
