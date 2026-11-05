@@ -158,10 +158,11 @@ never both. The workflow uses the automatic `GITHUB_TOKEN`, with no Pretorin,
 model, or Slack credentials, and no signing key.
 
 The prepare, finalize and publish jobs use the protected `release`
-environment: each job waits for a required reviewer. One release needs six
-approvals: two for prepare (`candidate`, `draft`), one for finalize
-(`final-record`) and three for publish (`final-assets`, `final-image`,
-`final-release`). A dry run uses no environment.
+environment: each job waits for a required reviewer. One release is expected
+to need up to six approvals: two for prepare (`candidate`, `draft`), one for
+finalize (`final-record`) and three for publish (`final-assets`,
+`final-image`, `final-release`). This count is from the workflow file; it has
+not been observed in a run. A dry run uses no environment.
 
 ## Retries and failures
 
