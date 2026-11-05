@@ -80,6 +80,9 @@ def workflow_order():
     record = j["final-record"]
     ok("release-tag.sh" not in record and "--draft=false" not in record,
        "finalize applies no version tag and leaves the release a draft")
+    ok(0 < record.find("actions/upload-artifact@") < record.find('gh release upload "$TAG"')
+       and "name: final-record-${{ steps.rec.outputs.version }}" in record,
+       "finalize keeps the final record as a run artifact before --clobber can delete the draft record")
     publish = j["final-assets"] + j["final-image"] + j["final-release"]
     ok("gh release upload" not in publish and "release-assets.py finalize" not in publish,
        "publish never rewrites or uploads the signed record")

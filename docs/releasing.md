@@ -165,10 +165,32 @@ approvals: two for prepare (`candidate`, `draft`), one for finalize
 
 ## Retries and failures
 
-- Finalize and publish are safe to repeat with the same `digest`. Finalize
-  changes nothing when the draft already holds the same final record. Publish
-  writes no asset; the version tag is applied only when it is absent or already
-  names the recorded digest, and un-draft is the last write.
+- Publish writes no asset. It is safe to repeat with the same `digest`: the
+  version tag is applied only when it is absent or already names the recorded
+  digest, and un-draft is the last write.
+- Finalize changes nothing when the draft already holds the same final record.
+  A finalize that fails before its upload changes nothing; run it again.
+- **Finalize upload failure.** `gh release upload --clobber` deletes the old
+  asset before it uploads the new one. If the upload fails, the draft can have
+  **no record**, and a new finalize run cannot download one. Before the upload,
+  the run keeps the final record as the artifact
+  `final-record-X.Y.Z-attempt-N`, and its error names the commands. From a
+  checkout of the tag:
+
+  ```sh
+  gh run download <run-id> --repo pretorin-ai/compliance-claw --name final-record-X.Y.Z-attempt-N --dir /tmp/cc-final
+  gh release download vX.Y.Z --repo pretorin-ai/compliance-claw --dir /tmp/cc-final \
+    --pattern compose.release.yaml --pattern sbom-X.Y.Z.spdx.json
+  python3 scripts/release-assets.py finalize --dir /tmp/cc-final --source .   # must say "already"
+  gh release upload vX.Y.Z --repo pretorin-ai/compliance-claw /tmp/cc-final/compliance-claw-release.json
+  gh workflow run release.yml --ref vX.Y.Z -f operation=finalize -f digest=sha256:<digest>
+  ```
+
+  The upload has no `--clobber`, so it cannot replace a record that is there.
+  The second finalize reads the record back and writes nothing. If the artifact
+  is not available, run prepare again on the tag (see below). A new build has a
+  new candidate digest, which needs a new exact-digest check before finalize.
+- A second prepare uses `--clobber` too. If its upload fails, run prepare again.
 - If publish stops at a signature check, do not edit the record or the
   signature. Find the cause (signer not run, other key, stale signature), fix
   it at the signer, then run publish again.

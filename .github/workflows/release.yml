@@ -693,7 +693,8 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Write the final record on the draft
+      - name: Check the draft and write the final record
+        id: rec
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CANDIDATE: ${{ inputs.digest }}
@@ -739,10 +740,54 @@ jobs:
             || { echo "::error::${IMAGE_REPO}:candidate-${VERSION} is ${RESOLVED}; the release record names ${CANDIDATE}"; exit 1; }
 
           if cmp -s release-set/compliance-claw-release.json draft-record.json; then
+            WRITE=false
+          else
+            WRITE=true
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "write=${WRITE}"
+            echo "image_repo=${IMAGE_REPO}"
+            echo "key_sha256=$(printf '%s' "$SUMMARY" | jq -r .key_sha256)"
+          } >> "$GITHUB_OUTPUT"
+
+      # The final record, kept by THIS run BEFORE the draft record is replaced.
+      # `gh release upload --clobber` deletes the old asset before the upload, so
+      # a failed upload can leave the draft with no record; this artifact is the
+      # recovery input (docs/releasing.md#retries-and-failures).
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ steps.rec.outputs.write == 'true' }}
+        with:
+          name: final-record-${{ steps.rec.outputs.version }}-attempt-${{ github.run_attempt }}
+          path: release-set/compliance-claw-release.json
+          if-no-files-found: error
+
+      - name: Put the final record on the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE: ${{ inputs.digest }}
+          TAG: ${{ steps.rec.outputs.tag }}
+          VERSION: ${{ steps.rec.outputs.version }}
+          WRITE: ${{ steps.rec.outputs.write }}
+          IMAGE_REPO: ${{ steps.rec.outputs.image_repo }}
+          KEY_SHA256: ${{ steps.rec.outputs.key_sha256 }}
+          ARTIFACT: final-record-${{ steps.rec.outputs.version }}-attempt-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [ "$WRITE" = false ]; then
             echo "the draft already holds this final record; nothing was written"
           else
-            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-              release-set/compliance-claw-release.json
+            if ! gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+                 release-set/compliance-claw-release.json; then
+              echo "::error::the final record upload failed. --clobber may have deleted the draft record. Recover with the record this run kept:"
+              echo "  gh run download ${GITHUB_RUN_ID} --repo ${GITHUB_REPOSITORY} --name ${ARTIFACT} --dir /tmp/cc-final"
+              echo "  gh release download ${TAG} --repo ${GITHUB_REPOSITORY} --dir /tmp/cc-final --pattern compose.release.yaml --pattern sbom-${VERSION}.spdx.json"
+              echo "  python3 scripts/release-assets.py finalize --dir /tmp/cc-final --source .   # from a checkout of ${TAG}; must say 'already'"
+              echo "  gh release upload ${TAG} --repo ${GITHUB_REPOSITORY} /tmp/cc-final/compliance-claw-release.json"
+              echo "  gh workflow run release.yml --ref ${TAG} -f operation=finalize -f digest=${CANDIDATE}"
+              exit 1
+            fi
             mkdir readback
             gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir readback \
               --pattern compliance-claw-release.json
@@ -761,7 +806,7 @@ jobs:
             echo '```'
             echo "${IMAGE_REPO}@${CANDIDATE}"
             echo "record sha256 $(sha256sum release-set/compliance-claw-release.json | cut -d' ' -f1)"
-            echo "trust key sha256 $(printf '%s' "$SUMMARY" | jq -r .key_sha256)"
+            echo "trust key sha256 ${KEY_SHA256}"
             echo '```'
             echo ""
             echo "Next: the release signer signs this record and this digest for ${TAG}."
