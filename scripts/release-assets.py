@@ -543,9 +543,13 @@ def pinned_cosign(root=None, base=COSIGN_DOWNLOAD, system=None, machine=None):
 
 
 # cosign messages that mean the registry could not be read, not a bad signature.
-REGISTRY_ACCESS_RE = re.compile(
-    r"unauthorized|denied|authentication required|no such host|connection refused|"
-    r"i/o timeout|tls handshake|network is unreachable|temporary failure", re.I)
+# Only an authentication or authorization failure says anything about a login;
+# a network or TLS failure says nothing about the package visibility.
+REGISTRY_AUTH_RE = re.compile(
+    r"unauthorized|denied|authentication required|\b40[13]\b|forbidden", re.I)
+REGISTRY_NETWORK_RE = re.compile(
+    r"no such host|connection refused|connection reset|i/o timeout|timeout|tls|x509|"
+    r"certificate|network is unreachable|temporary failure|\b50[0234]\b|\beof\b", re.I)
 
 
 def check_image_signature(record, trust_key, cosign=None):
@@ -570,9 +574,13 @@ def check_image_signature(record, trust_key, cosign=None):
             raise ReleaseError(TOOL, "cannot run cosign %s: %s" % (cosign, getattr(exc, "strerror", None) or exc))
     if p.returncode != 0:
         last = " ".join(p.stderr.strip().splitlines()[-3:])[:400] or "no output"
-        if REGISTRY_ACCESS_RE.search(p.stderr):
-            raise ReleaseError(TOOL, "cannot read the image signature of %s from the registry (%s). "
-                               "The package is not public: log in with docker login ghcr.io."
+        if REGISTRY_AUTH_RE.search(p.stderr):
+            raise ReleaseError(TOOL, "the registry refused access to the image signature of %s (%s). "
+                               "Log in with an account that can read the package: docker login ghcr.io."
+                               % (ref, last))
+        if REGISTRY_NETWORK_RE.search(p.stderr):
+            raise ReleaseError(TOOL, "cannot reach or read the registry for the image signature of %s "
+                               "(%s). Check this host's network route and TLS to the registry."
                                % (ref, last))
         raise ReleaseError(UNSIGNED, "no image signature of %s verifies with the trust key %s (%s)"
                            % (ref, fingerprint, last))
@@ -1260,11 +1268,29 @@ def self_test():
                 ("a verified run with no JSON", dict(stdout="ok"), UNSIGNED, "no JSON"),
                 ("a registry that refuses access",
                  dict(code=1, stdout="", stderr="Error: GET https://ghcr.io/...: UNAUTHORIZED: authentication required\n"),
-                 TOOL, "docker login"),
+                 TOOL, "refused access to the image signature"),
+                ("a registry that refuses access (403)",
+                 dict(code=1, stdout="", stderr="Error: GET https://ghcr.io/...: unexpected status code 403 Forbidden\n"),
+                 TOOL, "docker login ghcr.io"),
+                ("a registry name that does not resolve",
+                 dict(code=1, stdout="", stderr="Error: Get \"https://ghcr.io/v2/\": dial tcp: lookup ghcr.io: no such host\n"),
+                 TOOL, "cannot reach or read the registry"),
+                ("a registry TLS failure",
+                 dict(code=1, stdout="", stderr="Error: Get \"https://ghcr.io/v2/\": tls: failed to verify certificate: x509\n"),
+                 TOOL, "cannot reach or read the registry"),
+                ("a registry timeout",
+                 dict(code=1, stdout="", stderr="Error: Get \"https://ghcr.io/v2/\": dial tcp 1.2.3.4:443: i/o timeout\n"),
+                 TOOL, "cannot reach or read the registry"),
             ):
                 cosign_does(**kw)
                 refuses("check refuses %s" % label, code,
                         lambda: check(sa, trust_key=pub_a, cosign=stub), needle)
+                if needle == "cannot reach or read the registry":
+                    try:
+                        check(sa, trust_key=pub_a, cosign=stub)
+                    except ReleaseError as exc:
+                        ok("public" not in str(exc) and "login" not in str(exc),
+                           "%s makes no claim about the package visibility or a login" % label)
             cosign_does()
             refuses("the record signature is checked before cosign runs", UNSIGNED,
                     lambda: check(resign("img-order", base64.b64encode(flipped) + b"\n"),
@@ -1354,6 +1380,27 @@ def self_test():
                                     os.path.join(sa, RECORD_SIGNATURE), "--insecure-ignore-tlog=true",
                                     os.path.join(sa, RECORD)), env=env, capture_output=True, text=True)
                 ok(p.returncode != 0, "cosign verify-blob refuses that signature with another key")
+                # The payload that cosign signs for an image, without a key or a
+                # registry: an explicit digest resolves without a lookup.
+                gen_digest = "sha256:" + "e" * 64
+                p = subprocess.run((real, "generate", "%s@%s" % (repo, gen_digest)), env=env,
+                                   capture_output=True, text=True)
+                try:
+                    generated = json.loads(p.stdout)
+                except ValueError:
+                    generated = None
+                gen_record = {"image": {"repository": repo, "digest": gen_digest}}
+                try:
+                    check_image_payloads([generated], gen_record)
+                    good_form = generated["critical"]["type"] == IMAGE_SIGNATURE_TYPE
+                except (ReleaseError, TypeError, KeyError):
+                    good_form = False
+                ok(p.returncode == 0 and good_form,
+                   "the payload that cosign generates for repository@digest passes the payload check")
+                refuses("the generated payload does not pass for another digest", UNSIGNED,
+                        lambda: check_image_payloads([generated], {"image": {"repository": repo,
+                                                                            "digest": digest}}),
+                        "names " + gen_digest)
 
         # Effective selection.
         def model(openclaw=ref, cli=ref, **extra):
