@@ -779,7 +779,10 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "refs/tags/v0.6.0"), local)
 
     def test_dirty_tracked_source_blocks(self):
-        (self.repo / "versions.env").write_text("changed\n")
+        # A local change that keeps the cosign pin, so the signature checks pass
+        # and the dirty-source blocker is the one under test.
+        with (self.repo / "versions.env").open("a") as f:
+            f.write("# changed\n")
         self.assert_blocked("tracked files have local changes")
 
     def test_file_added_by_release_over_a_local_file_blocks(self):
