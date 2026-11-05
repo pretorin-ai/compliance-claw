@@ -4,7 +4,7 @@
     release-assets.py prepare  --version X.Y.Z --commit SHA --repository OWNER/NAME
                                --image-repository REPO --digest sha256:HEX
                                --sbom PATH --out DIR [--source DIR]
-    release-assets.py finalize --dir DIR [--allow-unsigned]
+    release-assets.py finalize --dir DIR [--source DIR] [--json] [--allow-unsigned]
     release-assets.py check    [--dir DIR] [--stage final|candidate|any]
                                [--version X.Y.Z] [--all-assets]
                                [--source DIR [--tag-only]] [--allow-unsigned]
@@ -431,6 +431,49 @@ def check_record_signature(directory, record, data, trust_key):
     return fingerprint
 
 
+def check_image_payloads(payloads, record):
+    """Each verified simple-signing payload must name exactly the recorded digest
+    and image repository. A signature for another digest or repository fails."""
+    image = record["image"]
+    require(isinstance(payloads, list) and payloads,
+            "no verified image signature for %s@%s" % (image["repository"], image["digest"]), UNSIGNED)
+    for payload in payloads:
+        critical = payload.get("critical") if isinstance(payload, dict) else None
+        critical = critical if isinstance(critical, dict) else {}
+        got = ((critical.get("image") or {}).get("docker-manifest-digest"),
+               (critical.get("identity") or {}).get("docker-reference"),
+               critical.get("type"))
+        want = (image["digest"], image["repository"], "cosign container image signature")
+        require(got == want, "an image signature names %s for %s (%s); the release record names "
+                "%s for %s" % (got[0], got[1], got[2], want[0], want[1]), UNSIGNED)
+
+
+def image_access(image_repository, digest, opener=urllib.request.urlopen):
+    """Can the recorded digest be pulled WITHOUT a credential? Only a report:
+    "anonymous", "login-required", or "unknown: <reason>". No token is sent but
+    the registry's own anonymous pull token."""
+    if not image_repository.startswith("ghcr.io/"):
+        return "unknown: not a ghcr.io repository"
+    path = image_repository[len("ghcr.io/"):]
+    try:
+        with opener("https://ghcr.io/token?scope=repository:%s:pull&service=ghcr.io" % path,
+                    timeout=20) as response:
+            token = json.loads(response.read(65536).decode("utf-8")).get("token")
+        require(isinstance(token, str) and token, "no anonymous token")
+        request = urllib.request.Request(
+            "https://ghcr.io/v2/%s/manifests/%s" % (path, digest), method="HEAD",
+            headers={"Accept": "application/vnd.oci.image.index.v1+json, "
+                               "application/vnd.oci.image.manifest.v1+json, "
+                               "application/vnd.docker.distribution.manifest.v2+json"})
+        request.add_unredirected_header("Authorization", "Bearer " + token)
+        with opener(request, timeout=20):
+            return "anonymous"
+    except urllib.error.HTTPError as exc:
+        return "login-required" if exc.code in (401, 403) else "unknown: HTTP %d" % exc.code
+    except (urllib.error.URLError, OSError, ValueError, ReleaseError) as exc:
+        return "unknown: %s" % (getattr(exc, "reason", None) or type(exc).__name__)
+
+
 def render_compose():
     # --profile cli: without it Compose leaves the profile-gated cli service out.
     # The rendered model holds environment values, so it is parsed, never printed.
@@ -542,13 +585,16 @@ def prepare(version, commit, repository, image_repository, digest, sbom, out, so
     return record
 
 
-def finalize(directory, allow_unsigned=False, trust_key=None):
+def finalize(directory, allow_unsigned=False, trust_key=None, source=None):
     """candidate -> final. The final record names the trust key of this checkout
     and status "signed" BEFORE anything signs it, so the signer signs the bytes
     that publication keeps. --allow-unsigned (fixtures only) writes an unsigned
     final record; the publisher never passes it."""
     record = load_record(directory)
     verify_assets(directory, record, all_assets=True)
+    if source is not None:
+        # The key that the record names comes from this checkout: it must be the tag.
+        check_source(source, record)
     if record["stage"] == "final":
         status = record["signature"]["status"]
         if allow_unsigned:
@@ -1113,6 +1159,65 @@ def self_test():
         refuses("fetch refuses a malformed version", DATA,
                 lambda: fetch("v1.2.3", os.path.join(tmp, "f5"), base), "--version")
 
+        # Image signature payloads: exactly the recorded digest and repository.
+        final = load_record(good)
+
+        def payload(digest=digest, reference=repo, kind="cosign container image signature"):
+            return {"critical": {"identity": {"docker-reference": reference},
+                                 "image": {"docker-manifest-digest": digest}, "type": kind},
+                    "optional": None}
+        check_image_payloads([payload()], final)
+        ok(True, "an image signature payload for the recorded digest and repository is accepted")
+        for label, payloads, needle in (
+            ("no verified image signature", [], "no verified image signature"),
+            ("an image signature for another digest", [payload(digest="sha256:" + "d" * 64)], "names sha256:d"),
+            ("an image signature for another repository", [payload(reference="ghcr.io/x/y")], "ghcr.io/x/y"),
+            ("an image signature of another type", [payload(kind="attestation")], "attestation"),
+            ("one wrong payload among good ones", [payload(), payload(digest="sha256:" + "e" * 64)], "names sha256:e"),
+            ("a payload that is not an object", ["x"], "names None"),
+        ):
+            refuses("image check refuses %s" % label, UNSIGNED,
+                    lambda p=payloads: check_image_payloads(p, final), needle)
+
+        # Token-free pull report, with a stand-in registry (no network here).
+        class Reply:
+            def __init__(self, body=b"{}"):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n=-1):
+                return self.body
+
+        def registry(token_code=200, manifest_code=200):
+            seen = []
+
+            def opener(request, timeout=None):
+                url = request if isinstance(request, str) else request.full_url
+                seen.append(request)
+                code = token_code if "/token?" in url else manifest_code
+                if code != 200:
+                    raise urllib.error.HTTPError(url, code, "x", {}, None)
+                return Reply(b'{"token": "anon"}')
+            return opener, seen
+
+        opener, seen = registry()
+        ok(image_access(repo, digest, opener) == "anonymous"
+           and seen[1].get_method() == "HEAD" and digest in seen[1].full_url,
+           "the pull report says anonymous when the registry serves the digest without a login")
+        ok(image_access(repo, digest, registry(token_code=401)[0]) == "login-required",
+           "the pull report says login-required when the anonymous token is refused")
+        ok(image_access(repo, digest, registry(manifest_code=403)[0]) == "login-required",
+           "the pull report says login-required when the digest is refused")
+        ok(image_access(repo, digest, registry(manifest_code=404)[0]).startswith("unknown: HTTP 404"),
+           "the pull report does not call a missing digest a login problem")
+        ok(image_access("registry.example/x/y", digest).startswith("unknown"),
+           "the pull report makes no claim for another registry")
+
         # Exit codes through the command line.
         me = os.path.abspath(__file__)
 
@@ -1176,6 +1281,8 @@ def main(argv):
     fin.add_argument("--dir", required=True)
     fin.add_argument("--allow-unsigned", action="store_true",
                      help="write an unsigned final record (test fixtures only)")
+    fin.add_argument("--source")
+    fin.add_argument("--json", action="store_true")
 
     chk = sub.add_parser("check", help="consumer: validate a release set")
     chk.add_argument("--dir", default=".")
@@ -1211,7 +1318,9 @@ def main(argv):
             print("release-assets: prepared candidate %s -> %s in %s"
                   % (record["version"], record["image"]["reference"], args.out), file=sys.stderr)
         elif args.mode == "finalize":
-            record, changed = finalize(args.dir, args.allow_unsigned)
+            record, changed = finalize(args.dir, args.allow_unsigned, source=args.source)
+            if args.json:
+                print(json.dumps(summary(record), sort_keys=True))
             print("release-assets: %s %s is final (%s%s)"
                   % ("marked" if changed else "already", record["version"],
                      record["signature"]["status"],
@@ -1219,12 +1328,14 @@ def main(argv):
                      if "key_sha256" in record["signature"] else ""), file=sys.stderr)
         elif args.mode == "fetch":
             record = fetch(args.version, args.dir)
+            access = image_access(record["image"]["repository"], record["image"]["digest"])
             if args.json:
-                print(json.dumps(summary(record), sort_keys=True))
+                print(json.dumps(dict(summary(record), image_access=access), sort_keys=True))
             print("release-assets: fetched final %s %s into %s; integrity checked. "
-                  "signature.status: %s (not verified here; check decides)"
+                  "signature.status: %s (not verified here; check decides). "
+                  "Image pull without a login: %s"
                   % (record["version"], record["image"]["reference"], args.dir,
-                     record["signature"]["status"]), file=sys.stderr)
+                     record["signature"]["status"], access), file=sys.stderr)
         else:
             if args.tag_only and not args.source:
                 raise ReleaseError(USAGE, "--tag-only needs --source")
