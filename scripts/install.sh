@@ -11,15 +11,17 @@
 #
 # The release set, required on the first run:
 #   --release X.Y.Z [--release-dir DIR]   (without DIR, the helper downloads it;
-#                                          DIR holds compliance-claw-release.json
-#                                          and compose.release.yaml)
-# scripts/release-assets.py checks the record, the overlay checksum, the
-# signature and that this checkout is the recorded tag commit, before any
-# write and before any other script from this checkout runs. This script and
-# the helper come from the same checkout, so the manual git/sha256sum check in
-# README.md comes first. THE SIGNATURE CHECK FAILS CLOSED: release sets are
-# unsigned today and there is no verifier yet, so every release is refused.
-# There is deliberately no option to accept an unsigned set here.
+#                                          DIR holds compliance-claw-release.json,
+#                                          its .sig and compose.release.yaml)
+# scripts/release-assets.py checks the record, the overlay checksum, the record
+# signature, the image signature at the recorded digest, and that this checkout
+# is the recorded tag commit, before any write and before any other script from
+# this checkout runs. Both signatures must verify with the release key in THIS
+# checkout (release-keys/), never a downloaded key. This script and the helper
+# come from the same checkout, so the manual git check and the first-trust key
+# fingerprint comparison in README.md come first. THE SIGNATURE CHECK FAILS
+# CLOSED: an unsigned release (v0.5.3 and earlier) is refused, and there is
+# deliberately no option to accept one here.
 #
 # Declaration, only for a new efforts.yaml. A rerun with the same values reuses it:
 #   --effort NAME --system-id UUID --framework-id ID
@@ -52,7 +54,7 @@ cd "$REPO_ROOT"
 EFFORTS_FILE="${CC_EFFORTS_FILE:-efforts.yaml}"
 PARSE_EFFORTS="scripts/parse-efforts.py"
 RELEASE_HELPER="scripts/release-assets.py"
-RELEASE_FILES="compliance-claw-release.json compose.release.yaml"
+RELEASE_FILES="compliance-claw-release.json compliance-claw-release.json.sig compose.release.yaml"
 HEALTH_TIMEOUT="${CC_INSTALL_HEALTH_TIMEOUT:-720}"
 ENTRYPOINT="/usr/local/bin/compliance-claw-entrypoint"
 GUIDE_ADMIN="docs/administration.md"
@@ -234,12 +236,18 @@ $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
 fi
 rc=0; release_check "$RELEASE_SRC" --source . || rc=$?
 case "$rc" in
-  0) log "release set: final record, overlay checksum, signature and source commit pass" ;;
-  6) die "release ${RELEASE:-set} is refused: it is not signed, or its signature cannot be verified.
+  0) log "release set: final record, checksums, record and image signatures, and source commit pass" ;;
+  6) die "release ${RELEASE:-set} is refused: it is not signed, or a signature does not verify
+  with the release key in this checkout.
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
-  Release sets are unsigned until signing and its verifier exist, so the guided
-  installation cannot install any release yet. Do not edit or re-sign the files.
-  Use the manual installation (README.md#manual-installation). Nothing was changed." ;;
+  Releases v0.5.3 and earlier are unsigned and cannot be installed by this guide.
+  Do not edit, re-sign or replace the files or the key. Use a signed release, or
+  the manual installation (README.md#manual-installation). Nothing was changed." ;;
+  5) die "the release signatures could not be checked:
+$(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
+  The image signature check downloads the cosign that versions.env pins and reads
+  the registry with this host's docker login (docker login ghcr.io). Fix the cause,
+  then re-run. Nothing was changed." ;;
   3) die "this checkout is not the source of the release:
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   Check out the release tag, repeat the trust check, then re-run. Nothing was changed." ;;
@@ -434,7 +442,8 @@ stage "3/10 image access"
 # (a later overlay that sets image is refused), and that image must be present
 # or reachable. The merged model is never printed: it can contain credentials.
 rc=0
-release_check "$RELEASE_SRC" --rendered - \
+# Stage 2 verified both signatures of this set; the image check is not repeated.
+release_check "$RELEASE_SRC" --record-only --rendered - \
   < <(COMPOSE_FILE="$CHECKED_FILE" docker compose --profile cli config --format json 2>/dev/null) || rc=$?
 [ "$rc" = 0 ] || die "Compose would not run the release image with this selection (exit ${rc}):
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
@@ -477,7 +486,7 @@ for f in $RELEASE_TO_PLACE; do
   chmod 644 "$f"
   log "placed ${f}"
 done
-rc=0; release_check . --source . --compose || rc=$?
+rc=0; release_check . --source . --record-only --compose || rc=$?
 [ "$rc" = 0 ] || die "the placed release set failed its check (exit ${rc}):
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   Nothing was started. Keep the files for diagnosis."
@@ -635,7 +644,7 @@ printf '\n'
 log "gateway            ${GATEWAY}  (container running and healthy)"
 log "model              ${MODEL}  (local check; the provider was not contacted)"
 log "Pretorin           ok  (scoped read probe passed in validate; writes not tested)"
-log "release set        ok  (record, checksums, signature and source commit)"
+log "release set        ok  (record, checksums, record and image signatures, source commit)"
 log "first useful task  NOT VERIFIED — still required"
 printf '\n'
 [ "$GATEWAY" = ok ] || log "  gateway: docker compose ps -a; docker compose logs openclaw. Keep the volumes; ${GUIDE_RECOVERY}"
