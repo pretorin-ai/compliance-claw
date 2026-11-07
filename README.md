@@ -157,7 +157,8 @@ not print one. Missing Pretorin and OpenAI keys can use hidden terminal input.
 cd ~/compliance-claw
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
 
-# Check the host, the release set, the existing files and image access. No writes.
+# Check the host, the release set, the existing files and image access.
+# No deployment writes; the image check can cache the pinned cosign.
 # Without --release-dir, the helper downloads the set into scratch space.
 scripts/install.sh --check --release X.Y.Z --release-dir ~/cc-release \
   --effort crm-soc2 --system-id <system-uuid> --framework-id soc2 \

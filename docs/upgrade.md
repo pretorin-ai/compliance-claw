@@ -12,8 +12,10 @@ release. The branch route follows a Git branch; it is the custom route.
 
 ### Release route
 
-Preview the release first. Preview does not change the checkout, the Compose
-selection, secret files, containers, or volumes:
+Preview the release first. Preview does not change tracked files, the installed
+release set, the Compose selection, secret files, containers, or volumes. To
+check a signed set, it can add the pinned cosign to `.cache/release-tools/`
+(gitignored):
 
 ```sh
 scripts/update.sh --release vX.Y.Z --preview
@@ -44,9 +46,11 @@ Apply repeats the checks. It stops before file changes or gateway downtime for:
 - an installed release set in the repository root that fails its check, for
   example a missing `.sig` after a manual restore. Preview also stops. Repair the
   set; do not remove it;
-- an unsigned or unverified signature. **Today every release set is unsigned,
-  so apply refuses every release** until signing and its verifier exist.
-  Preview marks it `UNVERIFIED`; there is no bypass. See
+- an unsigned release set. **Today every release set is unsigned, so apply
+  refuses every release** until release signing exists. Preview marks it
+  `UNVERIFIED` as a blocker (exit 2); there is no bypass. A signed set whose
+  record or image signature does not verify with the release key in this
+  checkout stops preview and apply (exit 1). See
   [what the checks prove](image-verification.md#what-this-does-and-does-not-prove);
 - local tracked changes or an added/renamed file that conflicts with a local
   file, including an ignored file or one above the destination path;

@@ -53,7 +53,7 @@ SELECTION_KEYS = ("COMPOSE_FILE", "COMPOSE_PATH_SEPARATOR", "COMPOSE_PROJECT_NAM
                   "COMPOSE_PROFILES", "COMPLIANCE_CLAW_SECRET_DIR")
 
 STUB = r'''#!/usr/bin/env python3
-import json, os, pathlib, shutil, sys
+import json, os, pathlib, re, shutil, sys
 tool = pathlib.Path(sys.argv[0]).name
 a = sys.argv[1:]
 if tool == "stub.py":
@@ -101,6 +101,11 @@ elif tool == "docker":
     elif a in (["compose", "config", "--format", "json"],
                ["compose", "--profile", "cli", "config", "--format", "json"]):
         image = settings.get("image", %r)
+        if settings.get("image_from_overlay"):
+            # As Compose would: the image that the selected release overlay names.
+            sep = os.environ.get("COMPOSE_PATH_SEPARATOR", ":")
+            overlay = [p for p in os.environ["COMPOSE_FILE"].split(sep) if p.endswith("compose.release.yaml")]
+            image = re.search(r'image: "([^"]+)"', open(overlay[0]).read()).group(1)
         print(json.dumps({"services": {"openclaw": {"image": image},
             "cli": {"image": image, "environment": {"SECRET": "CANARY-CONFIG-DO-NOT-PRINT"}}}}))
     elif a[:2] == ["image", "inspect"]: fail("image_rc")
@@ -140,12 +145,15 @@ runpy.run_path(real, run_name="__main__")
 # what a verified run prints for the requested repository@digest, unless
 # cosign-behavior.json in the fixture says otherwise.
 COSIGN_STUB = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, shutil, sys
 fixture = os.environ["FIXTURE"]
 with open(os.path.join(fixture, "cosign.jsonl"), "a") as f:
     f.write(json.dumps(sys.argv[1:]) + "\n")
 path = os.path.join(fixture, "cosign-behavior.json")
 b = json.load(open(path)) if os.path.exists(path) else {}
+if "swap" in b:  # a local writer replaces the given set while the check runs
+    for name in os.listdir(b["swap"][0]):
+        shutil.copyfile(os.path.join(b["swap"][0], name), os.path.join(b["swap"][1], name))
 repo, digest = sys.argv[-1].split("@")
 payload = {"critical": {"identity": {"docker-reference": repo},
                         "image": {"docker-manifest-digest": digest},
@@ -440,7 +448,7 @@ class InstallTest(unittest.TestCase):
     def test_check_mode_validates_without_any_write(self):
         before = self.snapshot()
         self.assertEqual(self.run_install(["--check", *self.full_args()]), 0, self.output)
-        self.assertIn("No file, container or volume was changed", self.output)
+        self.assertIn("No deployment file, container or volume was changed", self.output)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual([c["args"][0] for c in self.calls if c["tool"] == "clawctl"], ["migrate"])
         self.assertFalse(any(c["tool"] == "bootstrap" for c in self.calls))
@@ -552,11 +560,47 @@ class InstallTest(unittest.TestCase):
         overlay = tampered / "compose.release.yaml"
         overlay.write_text(overlay.read_text().replace("c" * 64, "d" * 64))
         self.assert_refused_without_change(self.rel(tampered) + self.full_args()[4:], "sha256")
+        unreadable = self.base / "not-copied"
+        shutil.copytree(self.release, unreadable)
+        (unreadable / "compose.release.yaml").unlink()
+        (unreadable / "compose.release.yaml").mkdir()
+        self.assert_refused_without_change(self.rel(unreadable) + self.full_args()[4:], "could not copy")
         colon = self.base / "rel:x"
         shutil.copytree(self.release, colon)
         self.assert_refused_without_change(self.rel(colon) + self.full_args()[4:], "Compose path separator")
+        (self.base / "tmp:x").mkdir()
+        self.assert_refused_without_change(self.full_args(), "Compose path separator",
+                                           env={"TMPDIR": str(self.base / "tmp:x")})
         self.assert_refused_without_change(self.full_args(), "would not run the release image",
                                            image="ghcr.io/example/other:1@sha256:" + "e" * 64)
+
+    def test_release_set_changed_during_its_check_is_never_placed(self):
+        # While the first check runs, a local writer replaces --release-dir with
+        # another validly signed set of the same tag for digest f. The cosign
+        # stand-in does it after the helper read the files. No full check reads
+        # that set, so only the bytes that the full check read may be placed.
+        checked = {name: (self.release / name).read_bytes() for name in RELEASE_FILES}
+        other = self.make_release(self.base / "other", digest="f" * 64)
+        self.cosign_does(swap=[str(other), str(self.release)])
+        self.assertEqual(self.run_install(self.full_args(), image_from_overlay=True), 0, self.output)
+        self.assertIn("f" * 64, (self.release / "compose.release.yaml").read_text())
+        for name in RELEASE_FILES:
+            self.assertEqual((self.root / name).read_bytes(), checked[name], name)
+        self.assertEqual([c[-1] for c in self.cosign_calls()],
+                         ["ghcr.io/pretorin-ai/compliance-claw@sha256:" + "c" * 64])
+
+    def test_a_present_sbom_is_checked_on_both_routes(self):
+        # The record's only optional asset: the helper checks it when present,
+        # so the staged copy must keep that check on both routes.
+        name = "sbom-%s.spdx.json" % VERSION
+        changed = self.base / "sbom-changed"
+        shutil.copytree(self.release, changed)
+        (changed / name).write_text("{}")
+        self.assert_refused_without_change(self.rel(changed) + self.full_args()[4:], name + " does not match")
+        # A rerun from the set placed in the checkout, without --release.
+        self.assertEqual(self.run_install(self.full_args()), 0, self.output)
+        (self.root / name).write_text("{}")
+        self.assert_refused_without_change(["--yes"], name + " does not match")
 
     def test_unsigned_release_is_refused_before_any_write(self):
         release = self.make_release(self.base / "release-unsigned", signed=False)

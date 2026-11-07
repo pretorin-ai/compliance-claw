@@ -3,7 +3,7 @@
 # update.sh — move an EXISTING deployment to a newer Compliance Claw.
 #
 #   scripts/update.sh                              # branch route (below)
-#   scripts/update.sh --release vX.Y.Z --preview   # show a release; change nothing
+#   scripts/update.sh --release vX.Y.Z --preview   # show a release; no deployment change
 #   scripts/update.sh --release vX.Y.Z             # apply that release
 #   scripts/update.sh --release vX.Y.Z --effort-records-ready
 #                       # apply after the effort-record transfer is complete
@@ -28,6 +28,10 @@
 #   4. verify its image, health, and diagnostic result, then report
 #
 # Idempotent: a second run pulls nothing, recreates nothing, and says so.
+#
+# "Nothing was changed" means no deployment file, container or volume. The tag
+# fetch adds Git objects, and the image signature check of a signed set can add
+# the pinned cosign to .cache/release-tools/ (gitignored).
 #
 # WHAT THIS IS NOT. It never runs `down -v`, never edits a config in the state
 # volume, and never touches .env or workspace/targets. An update replaces the
