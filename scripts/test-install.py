@@ -224,8 +224,9 @@ class InstallTest(unittest.TestCase):
                               capture_output=True, text=True).stdout.strip()
 
     def make_release(self, out, final=True, version=VERSION, digest="c" * 64, signed=True, key=None):
-        """A release set from the real helper, for the checkout's tagged commit,
-        finalized and signed like the publisher and the signer do."""
+        """A release set from the real helper, for the checkout's tagged commit.
+        Signed: `finalize --signed`, then the synthetic key signs the record.
+        Unsigned: the publisher's `finalize` as it is today."""
         if not (self.root / ".git").exists():
             self.git("init", "-q")
             self.git("add", "-A")
@@ -240,9 +241,9 @@ class InstallTest(unittest.TestCase):
                         "--digest", "sha256:" + digest, "--sbom", str(sbom), "--out", str(out)],
                        check=True, capture_output=True)
         if final and not signed:
-            subprocess.run([*helper, "finalize", "--dir", str(out), "--allow-unsigned"], check=True, capture_output=True)
-        elif final:
             subprocess.run([*helper, "finalize", "--dir", str(out)], check=True, capture_output=True)
+        elif final:
+            subprocess.run([*helper, "finalize", "--dir", str(out), "--signed"], check=True, capture_output=True)
             record = (out / "compliance-claw-release.json").read_bytes()
             sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(key or self.signing_key)],
                                  input=record, check=True, capture_output=True).stdout

@@ -18,8 +18,8 @@
 # is the recorded tag commit, before any write and before any other script from
 # this checkout runs. Both signatures must verify with the release key in THIS
 # checkout (release-keys/), never a downloaded key. This script and the helper
-# come from the same checkout, so the manual git check and the first-trust key
-# fingerprint comparison in README.md come first. THE SIGNATURE CHECK FAILS
+# come from the same checkout, so the git check in README.md and the key check
+# in docs/image-verification.md come first. THE SIGNATURE CHECK FAILS
 # CLOSED: an unsigned release (v0.5.3 and earlier) is refused, and there is
 # deliberately no option to accept one here. The image check can add the pinned
 # cosign to .cache/release-tools/ (gitignored); "Nothing was changed" below

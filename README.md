@@ -73,12 +73,9 @@ Three honest caveats, not passes:
   private clone over HTTPS with a fine-grained PAT. Details and evidence:
   [docs/plans/target-sync.md](docs/plans/target-sync.md).
 
-Published images up to v0.5.3 are **unsigned**. Their integrity controls are
-the digest pin, the per-release SBOM, the release-time vulnerability scan, and
-documented release provenance. Install and update verify signed releases (record
-and image signatures) with the release key in the checkout; that key is not
-committed yet, so no signed release exists. See
-[Verifying the image you pulled](docs/image-verification.md).
+The image is **unsigned**. Its integrity controls are the digest pin, the
+per-release SBOM, the release-time vulnerability scan, and documented release
+provenance — see [Verifying the image you pulled](docs/image-verification.md).
 
 ### Source versus the published image
 
@@ -87,9 +84,8 @@ Compose selection, the 720-second update wait, update secret-file creation,
 efforts without Slack, per-effort records, proxy authentication and Slack
 CLI-update authority. Updating a checkout does not replace a running gateway;
 follow the existing [update guide](docs/upgrade.md#routine-deployment-update).
-The v0.5.3 image and release record are unsigned, and customer install/apply
-refuse them. The signature verifier exists; signed releases start after the
-release key is committed.
+The image and release record remain unsigned, and customer install/apply refuse
+them while signing activation is pending.
 
 ## Requirements
 
@@ -122,10 +118,10 @@ release key is committed.
 `scripts/install.sh` checks one release and calls the existing declaration,
 secret, bootstrap and `clawctl` commands. It shows the plan before apply.
 
-> **Not available yet.** Every published release set (v0.5.3 and earlier) is
-> unsigned, and the release key is not committed yet, so no signed release
-> exists. The installer refuses an unsigned set before any write, and it has no
-> option to accept one. Until a signed release exists, use the
+> **Not available yet.** Every published release set is unsigned. The signature
+> verifier exists, but no release key is committed, so no release can pass it.
+> The installer refuses an unsigned set before any write, and it has no option
+> to accept one. Until signing exists, use the
 > [manual installation](#manual-installation). The steps below describe the
 > guided route for that time.
 
@@ -136,9 +132,8 @@ tools already on the VM:
 git clone https://github.com/pretorin-ai/compliance-claw.git ~/compliance-claw
 git -C ~/compliance-claw switch --detach vX.Y.Z
 mkdir ~/cc-release && cd ~/cc-release
-# Download the assets from the vX.Y.Z GitHub release page, for example:
+# Download the two assets from the vX.Y.Z GitHub release page, for example:
 curl -fLO https://github.com/pretorin-ai/compliance-claw/releases/download/vX.Y.Z/compliance-claw-release.json
-curl -fLO https://github.com/pretorin-ai/compliance-claw/releases/download/vX.Y.Z/compliance-claw-release.json.sig
 curl -fLO https://github.com/pretorin-ai/compliance-claw/releases/download/vX.Y.Z/compose.release.yaml
 
 grep -E '"(commit|stage|tag|version)"' compliance-claw-release.json
@@ -146,19 +141,13 @@ git -C ~/compliance-claw rev-parse 'vX.Y.Z^{commit}' 'HEAD^{commit}'
 git -C ~/compliance-claw status --porcelain --untracked-files=no
 grep -A2 '"name": "compose.release.yaml"' compliance-claw-release.json
 sha256sum compose.release.yaml        # macOS: shasum -a 256 compose.release.yaml
-
-# First trust: the release key fingerprint of this checkout.
-openssl pkey -pubin -in ~/compliance-claw/release-keys/compliance-claw-release.pub -outform DER | sha256sum
-grep '"key_sha256"' compliance-claw-release.json
 ```
 
 Require `stage: final`, the chosen tag/version, both commits equal to the record,
-no tracked change, and matching SHA-256 values. Then compare the key
-fingerprint with the record's `key_sha256` **and** with the fingerprint that
-Pretorin gives you through a separate channel; stop if any differs. The
-installer then verifies the record signature and the image signature with that
-key before any write. See
-[first trust in the release key](docs/image-verification.md#first-trust-in-the-release-key).
+no tracked change, and matching SHA-256 values. This proves agreement only.
+The files and checker come from the same source; they do not prove publisher
+identity. See [release trust](docs/image-verification.md#checking-a-release-set).
+The installer repeats the checks and requires signature verification.
 
 Put credentials in private files (`chmod 600`). The installer copies values only
 into empty secret files. It accepts no credential value as an argument and does
@@ -316,12 +305,12 @@ supply. Those need a Connected Source on the platform side, which is future work
 
 Pull by digest, not by tag; the pair this checkout deploys is in
 [compose.yaml](compose.yaml). A release can also carry a release set: a record,
-a `compose.release.yaml` overlay that selects its digest, the SBOM and, when
-signed, the record signature. `scripts/release-assets.py check` and the customer
-install and update tools accept only a signed set whose record signature and
-image signature verify with the release key in the checkout. Sets up to v0.5.3
-are unsigned and refused, and no signed release exists yet. Commands and what
-they do and do not prove:
+a `compose.release.yaml` overlay that selects its digest, and the SBOM. It is
+unsigned today, so `scripts/release-assets.py check` and the customer install
+and update tools refuse it while signing activation is pending. The image and
+the record are **unsigned**: the digest pin, the asset checksums, the per-release SBOM, the
+release-time scan and recorded provenance are its integrity controls. Commands
+and what they do and do not prove:
 [Verifying the image you pulled](docs/image-verification.md).
 
 ## Repositories and targets
@@ -527,11 +516,8 @@ scripts/update.sh --release vX.Y.Z
 Preview shows the source, image, and volume selection, the required steps,
 the recovery set, and the blockers. Apply checks everything again, pulls the
 image before it stops anything, then restarts the selected gateway, verifies,
-and reports. Apply verifies the record and image signatures with the release
-key of the current checkout first, and refuses an unsigned release (preview
-marks it `UNVERIFIED`). No signed release exists yet, so today it refuses every
-release; a deployment on v0.5.3 moves once by hand
-([moving from an unsigned release](docs/upgrade.md#moving-from-an-unsigned-release)). Add
+and reports. Apply refuses an unsigned release, so today it refuses every
+release until release signing exists; preview marks it `UNVERIFIED`. Add
 `--save-selection` once to let apply add the release overlay to the saved
 `COMPOSE_FILE` line. `scripts/update.sh` with no options follows a Git branch
 instead. The first use, blockers, what survives an update, the health wait, and
@@ -611,8 +597,9 @@ about new releases, use GitHub **Watch → Custom → Releases**.
 - `mcp.sessionIdleTtlMs` stays at its default `600000` — milliseconds, so 10
   minutes of idleness before a session's MCP child is reaped; `0` disables idle
   cleanup. Untuned until multi-session usage is measured.
-- Images up to v0.5.3 are **unsigned**; the digest pin is their integrity
-  control. Signed releases need the reviewed release key in `release-keys/`.
+- The image is **unsigned**; the digest pin is its integrity control. Azure Key
+  Vault–backed signing, following the Pretorin CLI's approach, is planned
+  production / internal-pilot work.
 - `MODEL` is the build-time seed. For runtime model changes, use the
   [administrator guide](docs/administration.md#providers-and-models).
 - Outstanding hardening is tracked in [SECURITY.md](SECURITY.md), including Docker

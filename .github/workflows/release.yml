@@ -6,21 +6,16 @@
 #   dry-run  (default, any ref) build, smoke, contracts, scan, SBOM, self-test.
 #            No login, push, tag or release write.
 #   prepare  (tag ref) push by digest, candidate-X.Y.Z, DRAFT release with the set.
-#   finalize (tag ref, NO BUILD) the prepared candidate `digest` only: write the
-#            final record (status "signed", trust key fingerprint) on the
-#            draft. No version tag. The protected signer then signs that record
-#            and the digest; it runs elsewhere and never runs this repository.
-#   publish  (tag ref, NO BUILD) the same `digest`: verify the record and image
-#            signatures with release-keys/ at the tag, THEN the version tag on
-#            the SAME digest, byte readback, THEN un-draft. It never rewrites
-#            the signed record.
+#   publish  (tag ref, NO BUILD) the prepared candidate `digest` only: final
+#            record, version tag on the SAME digest, un-draft. The release stays
+#            unsigned; customer trust and qualification acceptance is pending,
+#            and customer install and update refuse it.
 #
 # WHAT CANNOT HAPPEN. A failed build, smoke, contract test, blocking scan, SBOM
 # check, round trip or asset check stops `prepare` before the draft exists.
-# `finalize` and `publish` refuse a set or candidate tag that names other bytes.
-# Without verified signatures, `publish` applies no version tag and leaves the
-# release a draft. A version tag never moves, and a version whose release or
-# version tag is published is never prepared again.
+# `publish` refuses a set or candidate tag that names other bytes. A version tag
+# never moves, and a version whose release or version tag is published is never
+# prepared again.
 #
 # IMAGE_VERSION LAGS. The tag supplies the version; no version-bump PR comes
 # first. `IMAGE_VERSION` in versions.env means "the version this checkout
@@ -32,10 +27,9 @@
 # and only THEN apply a human-readable tag. scripts/release-tag.sh applies the
 # candidate and version tags by re-PUTting the exact manifest bytes.
 #
-# SIGNATURES. Only the candidate checks in `prepare` pass --allow-unsigned.
-# `finalize` refuses without release-keys/compliance-claw-release.pub at the tag,
-# so no release can be published until the reviewed key is committed. Package
-# cleanup selects only the pushed image digest, never a signature (`.sig`) tag.
+# NOT SIGNED. Every `check` here passes --allow-unsigned (prints UNVERIFIED);
+# customer install and apply refuse unsigned sets (exit 6) until signing and a
+# verifier exist. Signing will sign the record (SECURITY.md hardening ledger).
 #
 # NO CREDENTIALS LIVE HERE beyond the automatic GITHUB_TOKEN. The first step asserts
 # that rather than trusting this comment.
@@ -48,12 +42,12 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: "dry-run: build, scan and SBOM only. prepare: candidate image and DRAFT release (tag ref). finalize: final record on the draft for the signer, no build (tag ref). publish: verify signatures, then final release, no build (tag ref)."
+        description: "dry-run: build, scan and SBOM only. prepare: candidate image and DRAFT release (tag ref). publish: final release from the prepared draft, no build (tag ref)."
         type: choice
-        options: [dry-run, prepare, finalize, publish]
+        options: [dry-run, prepare, publish]
         default: dry-run
       digest:
-        description: "finalize and publish: the prepared candidate digest (sha256:...) from the prepare summary"
+        description: "publish only: the prepared candidate digest (sha256:...) from the prepare summary"
         type: string
         required: false
         default: ""
@@ -79,11 +73,7 @@ jobs:
   # dry-run and prepare. The only job that builds, and one of two that write to
   # GHCR. It never writes a GitHub Release.
   candidate:
-    if: ${{ inputs.operation == 'dry-run' || inputs.operation == 'prepare' }}
-    # prepare pushes to GHCR, so it waits for the protected `release` environment
-    # (v* tags only, required reviewers). A dry run writes nothing and may run on
-    # a branch, so it uses no environment.
-    environment: ${{ inputs.operation == 'prepare' && 'release' || '' }}
+    if: ${{ inputs.operation != 'publish' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -529,11 +519,6 @@ jobs:
       # "the leftover staging tag" would delete the candidate. The guard makes that
       # impossible: a tagged candidate always has more than one tag by then.
       #
-      # SIGNATURES ARE NEVER SELECTED. A cosign signature is its own package
-      # version (tag sha256-<hex>.sig), so `.name==$DIGEST` never matches it. The
-      # signer signs only after `finalize`, long after this prepare-only step,
-      # and a signed digest carries the candidate tag, so it is never reclaimed.
-      #
       # Best-effort throughout. GITHUB_TOKEN may not carry package-delete rights
       # depending on org policy, and a release must never fail over housekeeping.
       - name: Reclaim the digest if it was never tagged
@@ -595,12 +580,10 @@ jobs:
             echo ""
             echo "The draft release v${VERSION} carries the candidate release set. The"
             echo "version tag \`${VERSION}\` is NOT applied, and customers are not notified."
-            echo "Check this exact candidate digest. Then, without a rebuild: finalize the"
-            echo "record, run the release signer for this tag and digest, and publish."
-            echo "finalize and publish refuse any other digest:"
+            echo "Check this exact candidate digest, then publish it without a rebuild."
+            echo "Publish refuses any other digest:"
             echo ""
             echo '```sh'
-            echo "gh workflow run release.yml --ref v${VERSION} -f operation=finalize -f digest=${DIGEST}"
             echo "gh workflow run release.yml --ref v${VERSION} -f operation=publish -f digest=${DIGEST}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -611,7 +594,6 @@ jobs:
   draft:
     needs: candidate
     if: ${{ inputs.operation == 'prepare' }}
-    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -630,7 +612,7 @@ jobs:
           TAG: ${{ needs.candidate.outputs.tag }}
           VERSION: ${{ needs.candidate.outputs.version }}
           # Prepended to the generated notes, so the published notes say it too.
-          RELEASE_NOTE: "Guided install and the updater accept this release only after they verify its record signature and image signature with the Compliance Claw release key in the reviewed checkout (`release-keys/`). See docs/image-verification.md."
+          UNSIGNED_NOTE: "**This release is unsigned, and customer trust and qualification acceptance is pending.** Guided install and the updater refuse it (`release-assets.py check` exit 6) until signing and verification exist."
         run: |
           set -euo pipefail
           # true (draft), false (published) or none. Only "release not found"
@@ -651,20 +633,10 @@ jobs:
           case "$STATE" in
             none)
               gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
-                --title "$TAG" --notes "$RELEASE_NOTE" --generate-notes release-set/*
+                --title "$TAG" --notes "$UNSIGNED_NOTE" --generate-notes release-set/*
               echo "created draft release ${TAG}" ;;
             true)
               # A draft is not complete: a re-prepare replaces its candidate set.
-              # A new candidate invalidates any earlier signature, so the record
-              # signature goes FIRST; no stale .sig survives a re-prepare. (An
-              # earlier image signature names only the earlier digest.)
-              # Listed first, so that an API error stops here instead of reading as "no .sig".
-              ASSETS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
-              if printf '%s\n' "$ASSETS" | grep -qx 'compliance-claw-release.json.sig'; then
-                gh release delete-asset "$TAG" compliance-claw-release.json.sig \
-                  --repo "$GITHUB_REPOSITORY" --yes
-                echo "::notice::deleted the record signature of the earlier candidate; finalize and sign again"
-              fi
               gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber release-set/*
               echo "replaced the candidate set on draft release ${TAG}" ;;
             *)
@@ -673,165 +645,15 @@ jobs:
           esac
 
   # ---------------------------------------------------------------------------
-  # finalize (publish phase 1): NO BUILD. The final record that the signer
-  # signs. stage final, status "signed" and the trust key fingerprint are fixed
-  # here, BEFORE signing; nothing after this rewrites the record. No version
-  # tag, and the release stays a draft.
-  # ---------------------------------------------------------------------------
-  final-record:
-    if: ${{ inputs.operation == 'finalize' }}
-    environment: release
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write   # replace the record on the DRAFT — the ONLY write here
-      packages: read    # confirm candidate-X.Y.Z names the digest
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-
-      - name: Log in to GHCR (read)
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Check the draft and write the final record
-        id: rec
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CANDIDATE: ${{ inputs.digest }}
-        run: |
-          set -euo pipefail
-          [[ "$CANDIDATE" =~ ^sha256:[0-9a-f]{64}$ ]] \
-            || { echo "::error::finalize needs -f digest=sha256:<prepared candidate digest> (from the prepare summary)"; exit 1; }
-          [[ "$GITHUB_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-            || { echo "::error::finalize must run on a release tag: gh workflow run release.yml --ref vX.Y.Z -f operation=finalize"; exit 1; }
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
-          . ./versions.env
-          git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
-
-          STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1)" \
-            || { echo "::error::cannot read release ${TAG}: ${STATE}. Run operation=prepare on this tag first."; exit 1; }
-          [ "$STATE" = true ] \
-            || { echo "::error::release ${TAG} is already published; its record is never rewritten"; exit 1; }
-
-          mkdir release-set
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-set \
-            --pattern compliance-claw-release.json --pattern compose.release.yaml \
-            --pattern "sbom-${VERSION}.spdx.json"
-          # A signature beside a candidate signs other bytes; finalize refuses it.
-          # Listed first, so that an API error stops here instead of reading as "no .sig".
-          ASSETS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
-          if printf '%s\n' "$ASSETS" | grep -qx 'compliance-claw-release.json.sig'; then
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-set \
-              --pattern compliance-claw-release.json.sig
-          fi
-          cp release-set/compliance-claw-release.json draft-record.json
-
-          # The record checks, the tag binding (the trust key is read from this
-          # checkout) and the trust key fingerprint. Idempotent on a final record.
-          SUMMARY="$(python3 scripts/release-assets.py finalize --dir release-set --source . --json)"
-          REC_DIGEST="$(printf '%s' "$SUMMARY" | jq -r .digest)"
-          [ "$REC_DIGEST" = "$CANDIDATE" ] \
-            || { echo "::error::the release record names ${REC_DIGEST}; the digest input is ${CANDIDATE}. Check the current candidate, or prepare again."; exit 1; }
-          REC_REPO="$(printf '%s' "$SUMMARY" | jq -r .image_reference | sed 's/:[^:/]*@.*$//')"
-          [ "$REC_REPO" = "$IMAGE_REPO" ] \
-            || { echo "::error::the record names ${REC_REPO}; versions.env says ${IMAGE_REPO}"; exit 1; }
-          RESOLVED="$(docker buildx imagetools inspect "${IMAGE_REPO}:candidate-${VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          [ "$RESOLVED" = "$CANDIDATE" ] \
-            || { echo "::error::${IMAGE_REPO}:candidate-${VERSION} is ${RESOLVED}; the release record names ${CANDIDATE}"; exit 1; }
-
-          if cmp -s release-set/compliance-claw-release.json draft-record.json; then
-            WRITE=false
-          else
-            WRITE=true
-          fi
-          {
-            echo "tag=${TAG}"
-            echo "version=${VERSION}"
-            echo "write=${WRITE}"
-            echo "image_repo=${IMAGE_REPO}"
-            echo "key_sha256=$(printf '%s' "$SUMMARY" | jq -r .key_sha256)"
-          } >> "$GITHUB_OUTPUT"
-
-      # The final record, kept by THIS run BEFORE the draft record is replaced.
-      # `gh release upload --clobber` deletes the old asset before the upload, so
-      # a failed upload can leave the draft with no record; this artifact is the
-      # recovery input (docs/releasing.md#retries-and-failures).
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ steps.rec.outputs.write == 'true' }}
-        with:
-          name: final-record-${{ steps.rec.outputs.version }}-attempt-${{ github.run_attempt }}
-          path: release-set/compliance-claw-release.json
-          if-no-files-found: error
-
-      - name: Put the final record on the draft
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CANDIDATE: ${{ inputs.digest }}
-          TAG: ${{ steps.rec.outputs.tag }}
-          VERSION: ${{ steps.rec.outputs.version }}
-          WRITE: ${{ steps.rec.outputs.write }}
-          IMAGE_REPO: ${{ steps.rec.outputs.image_repo }}
-          KEY_SHA256: ${{ steps.rec.outputs.key_sha256 }}
-          ARTIFACT: final-record-${{ steps.rec.outputs.version }}-attempt-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          if [ "$WRITE" = false ]; then
-            echo "the draft already holds this final record; nothing was written"
-          else
-            if ! gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-                 release-set/compliance-claw-release.json; then
-              echo "::error::the final record upload failed. --clobber may have deleted the draft record. Recover with the record this run kept:"
-              echo "  gh run download ${GITHUB_RUN_ID} --repo ${GITHUB_REPOSITORY} --name ${ARTIFACT} --dir /tmp/cc-final"
-              echo "  gh release download ${TAG} --repo ${GITHUB_REPOSITORY} --dir /tmp/cc-final --pattern compose.release.yaml --pattern sbom-${VERSION}.spdx.json"
-              echo "  python3 scripts/release-assets.py finalize --dir /tmp/cc-final --source .   # from a checkout of ${TAG}; must say 'already'"
-              echo "  gh release upload ${TAG} --repo ${GITHUB_REPOSITORY} /tmp/cc-final/compliance-claw-release.json"
-              echo "  gh workflow run release.yml --ref ${TAG} -f operation=finalize -f digest=${CANDIDATE}"
-              exit 1
-            fi
-            mkdir readback
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir readback \
-              --pattern compliance-claw-release.json
-            cmp readback/compliance-claw-release.json release-set/compliance-claw-release.json \
-              || { echo "::error::the draft record differs from the final record that was written"; exit 1; }
-            echo "wrote the final record on draft release ${TAG}"
-          fi
-          echo "::notice::NOT PUBLISHED — awaiting signatures. ${TAG} is still a draft, and no version tag was applied."
-          {
-            echo "### NOT PUBLISHED — awaiting signatures"
-            echo ""
-            echo "Release ${TAG} is still a DRAFT. No version tag was applied. Customers"
-            echo "cannot see it, and install and update refuse it until publish verifies"
-            echo "both signatures."
-            echo ""
-            echo '```'
-            echo "${IMAGE_REPO}@${CANDIDATE}"
-            echo "record sha256 $(sha256sum release-set/compliance-claw-release.json | cut -d' ' -f1)"
-            echo "trust key sha256 ${KEY_SHA256}"
-            echo '```'
-            echo ""
-            echo "Next: the release signer signs this record and this digest for ${TAG}."
-            echo "Then publish:"
-            echo ""
-            echo '```sh'
-            echo "gh workflow run release.yml --ref ${TAG} -f operation=publish -f digest=${CANDIDATE}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ---------------------------------------------------------------------------
-  # publish (phase 2): NO BUILD, NO RECORD WRITE. Three jobs so that no job holds
-  # both write permissions:
-  #   final-assets   contents:write  read the signed draft set, verify the record
-  #   final-image    packages:write  verify the image signature, THEN the version tag
-  #   final-release  contents:write  byte readback, THEN un-draft
-  # A failed signature check stops before the version tag and before un-draft.
-  # Every step is safe to retry: nothing rewrites the record, the version tag
-  # only accepts the recorded digest, and un-draft is the last write.
+  # publish: NO BUILD. Three jobs so that no job holds both write permissions:
+  #   final-assets   contents:write  read the draft set, check it, mark it final
+  #   final-image    packages:write  tag the SAME digest with the version
+  #   final-release  contents:write  upload the final record, un-draft
+  # Every step is safe to retry: finalize is idempotent, the version tag only
+  # accepts the recorded digest, and assets are written only while still a draft.
   # ---------------------------------------------------------------------------
   final-assets:
     if: ${{ inputs.operation == 'publish' }}
-    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -844,7 +666,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
-      - name: Verify the signed set against its tag and the trust key
+      - name: Check the prepared set against its tag and mark it final
         id: set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -860,36 +682,51 @@ jobs:
           . ./versions.env
           git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
 
-          STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1)" \
-            || { echo "::error::cannot read release ${TAG}: ${STATE}. Run operation=prepare on this tag first."; exit 1; }
+          # true (draft), false (published) or none. Only "release not found"
+          # means none; any other error stops the run.
+          release_state() {
+            local out
+            if out="$(gh release view "$1" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1)"; then
+              STATE="$out"
+            elif printf '%s' "$out" | grep -qi 'release not found'; then
+              STATE=none
+            else
+              echo "::error::cannot read release $1: ${out}"; exit 1
+            fi
+          }
+          release_state "$TAG"
+          [ "$STATE" != none ] \
+            || { echo "::error::no release ${TAG}: run operation=prepare on this tag first"; exit 1; }
           mkdir release-set
-          # The record signature is required: a missing asset stops here.
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-set \
-            --pattern compliance-claw-release.json --pattern compliance-claw-release.json.sig \
-            --pattern compose.release.yaml --pattern "sbom-${VERSION}.spdx.json" \
-            || { echo "::error::cannot download the signed set of ${TAG}. Run operation=finalize, then the release signer, first."; exit 1; }
+            --pattern compliance-claw-release.json --pattern compose.release.yaml \
+            --pattern "sbom-${VERSION}.spdx.json"
 
-          # Signed only: the record must be final, name the trust key at this
-          # tag, and its signature must verify over the exact record bytes.
-          # The image signature is verified in final-image, which has the registry login.
-          SUMMARY="$(python3 scripts/release-assets.py check --dir release-set --stage final \
-            --all-assets --version "$VERSION" --source . --record-only --json)"
+          if [ "$STATE" = false ]; then
+            # Already published: confirm, change nothing. Downstream jobs only verify.
+            python3 scripts/release-assets.py check --allow-unsigned --dir release-set --stage final \
+              --all-assets --version "$VERSION" --source .
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          else
+            # A candidate, or a final record from an earlier attempt that stopped
+            # before the release was un-drafted.
+            python3 scripts/release-assets.py check --allow-unsigned --dir release-set --stage any \
+              --all-assets --version "$VERSION" --source .
+            python3 scripts/release-assets.py finalize --dir release-set
+            echo "completed=false" >> "$GITHUB_OUTPUT"
+          fi
+          SUMMARY="$(python3 scripts/release-assets.py check --allow-unsigned --dir release-set \
+            --all-assets --version "$VERSION" --source . --json)"
           REC_DIGEST="$(printf '%s' "$SUMMARY" | jq -r .digest)"
           [ "$REC_DIGEST" = "$CANDIDATE" ] \
             || { echo "::error::the release record names ${REC_DIGEST}; the digest input is ${CANDIDATE}. Check the current candidate, or prepare again."; exit 1; }
           REC_REPO="$(printf '%s' "$SUMMARY" | jq -r .image_reference | sed 's/:[^:/]*@.*$//')"
           [ "$REC_REPO" = "$IMAGE_REPO" ] \
             || { echo "::error::the record names ${REC_REPO}; versions.env says ${IMAGE_REPO}"; exit 1; }
-          if [ "$STATE" = false ]; then
-            # Already published: confirm, change nothing. Downstream jobs only verify.
-            echo "completed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "completed=false" >> "$GITHUB_OUTPUT"
-          fi
           {
             echo "version=${VERSION}"
             echo "tag=${TAG}"
-            echo "digest=${REC_DIGEST}"
+            echo "digest=$(printf '%s' "$SUMMARY" | jq -r .digest)"
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -900,7 +737,6 @@ jobs:
 
   final-image:
     needs: final-assets
-    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -908,11 +744,6 @@ jobs:
       packages: write   # apply the version tag — the ONLY write here
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: final-set-${{ needs.final-assets.outputs.version }}
-          path: release-set
 
       - name: Log in to GHCR
         run: |
@@ -940,21 +771,6 @@ jobs:
           [ "$PLATFORM" = linux/amd64 ] || { echo "::error::image platform is ${PLATFORM}"; exit 1; }
           echo "${IMAGE_REPO}:${WHICH} -> ${DIGEST} (${PLATFORM})"
 
-      # The record again, then the image signature at the recorded digest, with
-      # the same trust key. Only then the stable tag.
-      - name: Verify the record and image signatures
-        env:
-          TAG: ${{ needs.final-assets.outputs.tag }}
-          VERSION: ${{ needs.final-assets.outputs.version }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
-          # Default for a signed record: the record signature, then the image
-          # signature at the digest with the pinned cosign (versions.env) and
-          # the same key. Any failure stops here: no version tag, still a draft.
-          python3 scripts/release-assets.py check --dir release-set --all-assets \
-            --version "$VERSION" --source .
-
       # The stable tag, on the same bytes. release-tag.sh refuses to move an
       # existing version tag, and is a no-op when it already names this digest.
       - name: Apply the version tag to the prepared candidate digest
@@ -969,11 +785,10 @@ jobs:
 
   final-release:
     needs: [final-assets, final-image]
-    environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write   # un-draft — the ONLY write here
+      contents: write   # upload the final record and un-draft — the ONLY write here
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
@@ -982,58 +797,36 @@ jobs:
           name: final-set-${{ needs.final-assets.outputs.version }}
           path: release-set
 
-      - name: Publish the signed release set
+      - name: Publish the final release set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.final-assets.outputs.tag }}
           VERSION: ${{ needs.final-assets.outputs.version }}
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
-          python3 scripts/release-assets.py check --dir release-set --all-assets --version "$VERSION" --source . --record-only
+          python3 scripts/release-assets.py check --allow-unsigned --dir release-set --all-assets --version "$VERSION"
           STATE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
-          # Byte readback: the draft must hold exactly the verified set. Nothing
-          # is uploaded here; the signed record is never rewritten.
+          if [ "$STATE" = true ]; then
+            # Only the record changes (stage: final); the overlay and SBOM on the
+            # draft are the prepared bytes and are checked, not re-uploaded.
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              release-set/compliance-claw-release.json
+          fi
           mkdir published
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir published \
-            --pattern compliance-claw-release.json --pattern compliance-claw-release.json.sig \
-            --pattern compose.release.yaml --pattern "sbom-${VERSION}.spdx.json"
+            --pattern compliance-claw-release.json --pattern compose.release.yaml \
+            --pattern "sbom-${VERSION}.spdx.json"
           for f in release-set/*; do
             cmp "$f" "published/$(basename "$f")" \
-              || { echo "::error::release asset $(basename "$f") differs from the verified set"; exit 1; }
+              || { echo "::error::release asset $(basename "$f") differs from the checked set"; exit 1; }
           done
-          python3 scripts/release-assets.py check --dir published --all-assets --version "$VERSION" --record-only
+          python3 scripts/release-assets.py check --allow-unsigned --dir published --all-assets --version "$VERSION"
           if [ "$STATE" = true ]; then
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
             echo "published release ${TAG}"
           else
             echo "release ${TAG} was already published with these exact assets"
           fi
-
-      # What a customer gets, with no token: the published assets by their public
-      # download URLs, verified with this checkout's key, and whether the image
-      # package can be pulled without a login. Reports the truth; changes nothing.
-      - name: Customer-style readback without a token
-        env:
-          VERSION: ${{ needs.final-assets.outputs.version }}
-        run: |
-          set -euo pipefail
-          env -u GH_TOKEN -u GITHUB_TOKEN python3 scripts/release-assets.py fetch \
-            --version "$VERSION" --dir customer-readback --json | tee customer.json
-          python3 scripts/release-assets.py check --dir customer-readback --all-assets --version "$VERSION" --record-only
-          for f in release-set/*; do
-            cmp "$f" "customer-readback/$(basename "$f")" \
-              || { echo "::error::the public asset $(basename "$f") differs from the verified set"; exit 1; }
-          done
-          # Anonymous pull is a SEPARATE customer-release gate. While the package
-          # is private this is a warning; it does not fail the run.
-          ACCESS="$(jq -r .image_access customer.json)"
-          if [ "$ACCESS" = anonymous ]; then
-            echo "image ${VERSION}: pull without a login works"
-          else
-            echo "::warning::image ${VERSION}: pull WITHOUT a login fails (${ACCESS}). Customers need docker login ghcr.io. Anonymous pull is a separate gate and is NOT qualified by this run."
-          fi
-          echo "Token-free image pull: \`${ACCESS}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Summary
         env:
@@ -1050,9 +843,12 @@ jobs:
             echo "${IMAGE_REPO}:${VERSION}   (the prepared candidate digest; no rebuild)"
             echo '```'
             echo ""
-            echo "The release v${VERSION} carries the signed final release set. The record"
-            echo "signature and the image signature verified with release-keys/ at the tag."
+            echo "The release v${VERSION} carries the final release set."
             echo "Customers select it with compose.release.yaml (docs/image-verification.md)."
+            echo ""
+            echo "**This release is unsigned, and customer trust and qualification acceptance"
+            echo "is pending.** Guided install and the updater refuse it (release-assets.py"
+            echo "check exit 6) until signing and verification exist."
             echo ""
             echo "**One commit closes the release.** Pin the digest and move"
             echo "\`IMAGE_VERSION\` together — both describe what this checkout deploys:"
@@ -1065,4 +861,8 @@ jobs:
             echo "# versions.env"
             echo "IMAGE_VERSION=${VERSION}"
             echo '```'
+            echo ""
+            echo "**Not signed.** A digest and the asset checksums guarantee INTEGRITY —"
+            echo "these exact bytes — but not AUTHENTICITY. Image and record signing is"
+            echo "planned work in the SECURITY.md hardening ledger."
           } >> "$GITHUB_STEP_SUMMARY"

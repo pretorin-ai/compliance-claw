@@ -96,9 +96,10 @@ jobs:
       # inert fixtures, including the v0.5.2 old-tag regression. No daemon, pull
       # or credential. Signatures use synthetic keys made in temporary
       # directories. CC_TEST_PINNED_COSIGN downloads the cosign that versions.env
-      # pins (checksum-checked), checks record-signature interop with it, and
-      # checks that the payload `cosign generate` makes for repository@digest
-      # passes the image payload check (no key, no registry write).
+      # pins (checksum-checked), checks record-signature interop with it, checks
+      # that the payload `cosign generate` makes for repository@digest passes the
+      # image payload check, and checks the refusal for a closed loopback
+      # registry (no Pretorin key, no registry read or write).
       - name: Release set rules and Compose selection (real Compose, no daemon)
         env:
           CC_TEST_PINNED_COSIGN: "1"

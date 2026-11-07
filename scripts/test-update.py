@@ -381,9 +381,10 @@ def install_release_helper(repo, releases):
 
 def make_release_set(out, version, commit, digest=NEW_DIGEST, final=True,
                      image_repository=IMAGE_REPOSITORY, checkout=None, key=None):
-    """Prepare and finalize a release set with the real publisher commands, then
-    sign the final record with `key` as the signer does. Without a key the final
-    record is unsigned (a fixture for the unsigned refusal)."""
+    """Prepare and finalize a release set with the real helper. With `key`:
+    `finalize --signed` in the fixture checkout, then `key` signs the final
+    record. Without a key: the publisher's `finalize` as it is today, so the
+    final record is unsigned (a fixture for the unsigned refusal)."""
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -395,12 +396,12 @@ def make_release_set(out, version, commit, digest=NEW_DIGEST, final=True,
                     image_repository, "--digest", digest, "--sbom", str(sbom), "--out", str(out)],
                    check=True, capture_output=True)
     if final and key is None:
-        subprocess.run(["python3", str(HELPER), "finalize", "--dir", str(out), "--allow-unsigned"],
+        subprocess.run(["python3", str(HELPER), "finalize", "--dir", str(out)],
                        check=True, capture_output=True)
     elif final:
         # The fixture checkout's helper reads the fixture checkout's release key.
-        subprocess.run(["python3", str(checkout / "scripts/release-assets.py"), "finalize", "--dir", str(out)],
-                       check=True, capture_output=True)
+        subprocess.run(["python3", str(checkout / "scripts/release-assets.py"), "finalize", "--dir", str(out),
+                        "--signed"], check=True, capture_output=True)
         record = (out / "compliance-claw-release.json").read_bytes()
         sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(key)], input=record,
                              check=True, capture_output=True).stdout

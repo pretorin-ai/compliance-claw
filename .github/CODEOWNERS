@@ -1,7 +1,14 @@
-# Release trust paths: the release workflow, the release-set verifier and the
-# release trust key, and this file, so that a change here also needs owner
-# review. Review rules are set in the repository settings.
+# Release trust paths: every workflow, the release tools, the install and update
+# scripts that call the release verifier, the release trust key, the version and
+# vendor pins, the deployment image pin, and this file. Review enforcement is a
+# repository setting; this file does not change it.
 /.github/CODEOWNERS @harshavardhan-pretorin @iankloo
-/.github/workflows/release.yml @harshavardhan-pretorin @iankloo
+/.github/workflows/ @harshavardhan-pretorin @iankloo
 /scripts/release-assets.py @harshavardhan-pretorin @iankloo
+/scripts/release-tag.sh @harshavardhan-pretorin @iankloo
+/scripts/install.sh @harshavardhan-pretorin @iankloo
+/scripts/update.sh @harshavardhan-pretorin @iankloo
 /release-keys/ @harshavardhan-pretorin @iankloo
+/versions.env @harshavardhan-pretorin @iankloo
+/vendor/ @harshavardhan-pretorin @iankloo
+/compose.yaml @harshavardhan-pretorin @iankloo
