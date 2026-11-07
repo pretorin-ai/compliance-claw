@@ -344,6 +344,13 @@ def test_trust_key():
     write_atomic(two_crlf, read_bytes(two).replace(b"\n", b"\r\n"))
     refuses("a CRLF trust key file with two keys is refused", UNSIGNED, lambda: load_trust_key(two_crlf),
             "exactly one")
+    # openssl accepts a BEGIN line that ends in whitespace and uses the first block,
+    # so a key hidden before the reviewed key would be the key that checks signatures.
+    for name, pad in (("space", b" "), ("tab", b"\t")):
+        hidden = os.path.join(keys, "hidden-%s.pub" % name)
+        write_atomic(hidden, read_bytes(pub_b).replace(b"-----\n", b"-----" + pad + b"\n", 1) + read_bytes(pub_a))
+        refuses("a trust key file with a hidden first key (BEGIN line ends in a %s) is refused" % name,
+                UNSIGNED, lambda p=hidden: load_trust_key(p), "exactly one")
     priv_too = os.path.join(keys, "pub-and-private.pub")
     write_atomic(priv_too, read_bytes(pub_a) + read_bytes(key_a))
     refuses("a trust key file with a second (private) block is refused", UNSIGNED,

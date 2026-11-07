@@ -41,6 +41,9 @@ Apply repeats the checks. It stops before file changes or gateway downtime for:
 
 - a missing, candidate or invalid release set, or a record, asset checksum or
   source commit that fails verification;
+- an installed release set in the repository root that fails its check, for
+  example a missing `.sig` after a manual restore. Preview also stops. Repair the
+  set; do not remove it;
 - an unsigned or unverified signature. **Today every release set is unsigned,
   so apply refuses every release** until signing and its verifier exist.
   Preview marks it `UNVERIFIED`; there is no bypass. See
@@ -113,7 +116,8 @@ The branch route fast-forwards the checkout's upstream branch and pulls the
 image that the branch pins. Then it continues with the
 [shared steps](#shared-update-steps). It is not a verified release. It refuses
 when the saved selection includes a release overlay, because branch source with
-a release image is a mixed state.
+a release image is a mixed state. If the installed release set of that overlay
+does not pass its check, the branch route also stops.
 
 `update.sh` refuses rather than guessing, and names the exact command each time:
 a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has

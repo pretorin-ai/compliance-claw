@@ -308,18 +308,33 @@ print("" if value is None else (json.dumps(value, sort_keys=True) if isinstance(
 # --record-only; there is no option or variable that bypasses the apply gate.
 release_helper() { python3 "$RELEASE_HELPER" "$@"; }
 
-# The version of the release set installed in the repository root, if valid.
+# The version of the release set installed in the repository root; empty when
+# no release record is installed. An installed record must pass its check: a
+# failure stops the update, so the release-route and downgrade guards never
+# fall back to branch or versions.env metadata. Callers exit when this fails.
 installed_release_version() {
   local summary
-  [ -f "$RELEASE_HELPER" ] || return 1
-  summary="$(release_helper check --dir "$REPO_ROOT" --stage any --allow-unsigned --record-only --json 2>/dev/null)" || return 1
+  [ -f "${REPO_ROOT}/${RELEASE_RECORD}" ] || return 0
+  [ -f "$RELEASE_HELPER" ] \
+    && summary="$(release_helper check --dir "$REPO_ROOT" --stage any --allow-unsigned --record-only --json)" \
+    || die "the installed release set (${RELEASE_RECORD}) did not pass its check (reason above).
+  The installed release version is unknown, so the update cannot apply its release
+  and downgrade checks. Nothing was changed.
+  Repair the set, then run the update again: install OpenSSL 1.1.1 or later if the
+  check could not run, or put back the unchanged ${RELEASE_RECORD}, ${RELEASE_OVERLAY}
+  and, for a signed set, ${RELEASE_RECORD}.sig of the installed release
+  (docs/image-verification.md#inspect-a-published-set shows how to download a set).
+  Do not remove the set to pass this check."
   json_field "$summary" version
 }
 
-# A verified release set selected at the stable path, as opposed to the neutral
-# placeholder overlay that only reserves its place in COMPOSE_FILE.
+# A release set installed and selected at the stable path, as opposed to the
+# neutral placeholder overlay that only reserves its place in COMPOSE_FILE.
 release_overlay_active() {
-  compose_has_file "$RELEASE_OVERLAY" && installed_release_version >/dev/null
+  local version
+  compose_has_file "$RELEASE_OVERLAY" || return 1
+  version="$(installed_release_version)" || exit 1
+  [ -n "$version" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -531,7 +546,7 @@ sys.exit(any(candidate.get(s, {}).get(t) != v
   esac
 
   # VERSION. Never downgrade over state that a newer release can have migrated.
-  R_INSTALLED="$(installed_release_version || true)"
+  R_INSTALLED="$(installed_release_version)" || exit 1
   cur_version="$R_INSTALLED"
   if [ -z "$cur_version" ]; then
     cur_version="$(git show "${R_HEAD}:versions.env" 2>/dev/null | sed -n 's/^IMAGE_VERSION=//p' || true)"

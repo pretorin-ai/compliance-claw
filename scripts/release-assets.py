@@ -399,10 +399,11 @@ def load_trust_key(path):
                            "checkout cannot verify a signed release." % (path, exc.strerror))
     except UnicodeDecodeError:
         raise ReleaseError(UNSIGNED, "trust key %s is not PEM text" % path)
-    # openssl reads only the first PEM block; a second key must not hide behind it.
-    # CRLF and LF files are the same key.
-    begins = re.findall(r"^-----BEGIN [A-Z0-9 ]+-----$", text.replace("\r\n", "\n"), re.M)
-    require(begins == ["-----BEGIN PUBLIC KEY-----"],
+    # openssl reads only the first PEM block and ignores trailing whitespace on its
+    # BEGIN line; a second key must not hide before or behind the reviewed one, so
+    # every "-----BEGIN" in the file counts. CRLF and LF files are the same key.
+    require(text.count("-----BEGIN") == 1
+            and "-----BEGIN PUBLIC KEY-----" in text.replace("\r\n", "\n").split("\n"),
             "trust key %s must hold exactly one PEM PUBLIC KEY block" % path, UNSIGNED)
     p = openssl(("pkey", "-help"), "the trust key")
     require(b"-pubcheck" in p.stdout + p.stderr,

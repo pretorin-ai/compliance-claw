@@ -894,6 +894,39 @@ class ReleaseTest(unittest.TestCase):
             shutil.copyfile(installed / name, self.repo / name)
         self.assert_blocked("older than the current release 0.7.0")
 
+    def test_installed_release_set_that_fails_its_check_stops(self):
+        # A signed 0.7.0 set is installed, then loses its .sig (for example in a
+        # manual restore) or its overlay changes. Its version is unknown. The update
+        # must stop: versions.env (0.5.2) would let 0.6.0 downgrade it, and the
+        # branch route would mix branch source with the release overlay.
+        installed = self.fixture / "installed"
+        make_release_set(installed, "0.7.0", self.new, checkout=self.repo, key=self.signing_key)
+        text = "installed release set (compliance-claw-release.json) did not pass its check"
+        # Without the customer overlay, the branch route reaches its upstream check.
+        shutil.rmtree(self.repo / "deployment")
+        self.selection["COMPOSE_FILE"] = "compose.yaml:compose.release.yaml:compose.secrets.yaml"
+        for damaged in ("compliance-claw-release.json.sig", "compose.release.yaml"):
+            with self.subTest(damaged=damaged):
+                for name in ("compose.release.yaml", "compliance-claw-release.json",
+                             "compliance-claw-release.json.sig"):
+                    shutil.copyfile(installed / name, self.repo / name)
+                if damaged.endswith(".sig"):
+                    (self.repo / damaged).unlink()
+                else:
+                    (self.repo / damaged).write_text((self.repo / damaged).read_text() + "#\n")
+                self.assert_blocked(text, preview_rc=1)
+                before = self.snapshot()
+                self.assertNotEqual(self.run_update(), 0, self.output)
+                self.assertIn(text, self.output)
+                self.assertNotIn("has no upstream", self.output)
+                self.assertEqual(self.changed(), [])
+                self.assertEqual(self.snapshot(), before)
+        # A custom selection without the release overlay keeps the branch route.
+        self.selection["COMPOSE_FILE"] = "compose.yaml:compose.secrets.yaml"
+        self.assertNotEqual(self.run_update(), 0, self.output)
+        self.assertNotIn(text, self.output)
+        self.assertIn("has no upstream", self.output)
+
     def test_effort_record_transition_needs_confirmation(self):
         self.git("tag", "fixture-transition", self.new)
         self.assert_blocked("transfer-existing-effort-records")
