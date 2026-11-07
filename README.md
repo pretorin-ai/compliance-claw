@@ -85,7 +85,7 @@ efforts without Slack, per-effort records, proxy authentication and Slack
 CLI-update authority. Updating a checkout does not replace a running gateway;
 follow the existing [update guide](docs/upgrade.md#routine-deployment-update).
 The image and release record remain unsigned, and customer install/apply refuse
-them until signature verification exists.
+them while signing activation is pending.
 
 ## Requirements
 
@@ -118,11 +118,12 @@ them until signature verification exists.
 `scripts/install.sh` checks one release and calls the existing declaration,
 secret, bootstrap and `clawctl` commands. It shows the plan before apply.
 
-> **Not available yet.** Every published release set is unsigned, and no
-> signature verifier exists. The installer refuses an unsigned set before any
-> write, and it has no option to accept one. Until signing and verification
-> exist, use the [manual installation](#manual-installation). The steps below
-> describe the guided route for that time.
+> **Not available yet.** Every published release set is unsigned. The signature
+> verifier exists, but no release key is committed, so no release can pass it.
+> The installer refuses an unsigned set before any write, and it has no option
+> to accept one. Until signing exists, use the
+> [manual installation](#manual-installation). The steps below describe the
+> guided route for that time.
 
 Check the source and release assets before you run a downloaded script. Use
 tools already on the VM:
@@ -306,7 +307,7 @@ Pull by digest, not by tag; the pair this checkout deploys is in
 [compose.yaml](compose.yaml). A release can also carry a release set: a record,
 a `compose.release.yaml` overlay that selects its digest, and the SBOM. It is
 unsigned today, so `scripts/release-assets.py check` and the customer install
-and update tools refuse it until signing and verification exist. The image and
+and update tools refuse it while signing activation is pending. The image and
 the record are **unsigned**: the digest pin, the asset checksums, the per-release SBOM, the
 release-time scan and recorded provenance are its integrity controls. Commands
 and what they do and do not prove:

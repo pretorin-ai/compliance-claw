@@ -5,6 +5,8 @@ Protects exit status, reports, and deployment selection. These tests do not
 prove real Compose merging, container startup, or channel/MCP operation.
 CC_TEST_UPDATE_SCRIPT can select the old script to prove the regression.
 """
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -338,47 +340,51 @@ HELPER = ROOT / "scripts/release-assets.py"
 DOWNLOAD_LINE = 'RELEASE_DOWNLOAD = "https://github.com/%s/releases/download" % RELEASE_REPOSITORY'
 
 
-SIGNATURE_SHIM = r"""#!/usr/bin/env python3
-# TEST SHIM, only in a test's temporary repository. The real helper refuses
-# every release set today (unsigned, exit 6). With CC_TEST_RELEASE_SIGNED=1
-# this shim stands in for a later verified signature so that the apply path
-# can be tested: it admits the unsigned set and reports it as verified.
-# Without the variable it passes everything to the real helper unchanged.
-import json, os, subprocess, sys
-real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-assets-real.py")
-args = sys.argv[1:]
-signed = os.environ.get("CC_TEST_RELEASE_SIGNED") == "1"
-if signed and args[:1] == ["check"] and "--allow-unsigned" not in args:
-    args.append("--allow-unsigned")
-p = subprocess.run([sys.executable, real] + args, capture_output=True, text=True)
-out = p.stdout
-if signed and p.returncode == 0 and args[:1] in (["fetch"], ["check"]) and "--json" in args:
-    out = "".join(json.dumps({**json.loads(line), "signature_status": "fixture-verified"},
-                             sort_keys=True) + "\n" for line in out.splitlines() if line.strip())
-sys.stdout.write(out)
-sys.stderr.write(p.stderr)
-sys.exit(p.returncode)
-"""
+PLATFORM_LINES = ('    system = system or platform.system()\n', '    machine = machine or platform.machine()\n')
+COSIGN_VERSION = "v2.4.1"
+# TEST ONLY. Stands in for the pinned cosign. It records each call and prints
+# what a verified run prints for the requested repository@digest, unless
+# cosign-behavior.json in the fixture says otherwise.
+COSIGN_STUB = r'''#!/usr/bin/env python3
+import json, os, sys
+fixture = os.environ["FIXTURE"]
+with open(os.path.join(fixture, "cosign.jsonl"), "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+path = os.path.join(fixture, "cosign-behavior.json")
+b = json.load(open(path)) if os.path.exists(path) else {}
+repo, digest = sys.argv[-1].split("@")
+payload = {"critical": {"identity": {"docker-reference": repo},
+                        "image": {"docker-manifest-digest": digest},
+                        "type": "cosign container image signature"}, "optional": None}
+sys.stderr.write(b.get("stderr", ""))
+sys.stdout.write(b.get("stdout", json.dumps([payload])))
+sys.exit(b.get("code", 0))
+'''
+COSIGN_SHA256 = hashlib.sha256(COSIGN_STUB.encode()).hexdigest()
 
 
-def install_release_helper(repo, releases, shim=True):
-    """Install the real release helper, behind the test shim unless shim=False.
+def install_release_helper(repo, releases):
+    """Install the real release helper in the fixture repository.
 
-    Only the helper's download base changes, to local files.
+    TEST ONLY, two text changes: the download base is local files, and the
+    fixture host reports Linux amd64 (the image check runs only there). The
+    real platform refusal has its own self-test.
     """
     text = HELPER.read_text()
     assert text.count(DOWNLOAD_LINE) == 1, "the helper download base changed"
     text = text.replace(DOWNLOAD_LINE, "RELEASE_DOWNLOAD = %r" % releases.resolve().as_uri())
-    if shim:
-        (repo / "scripts/release-assets-real.py").write_text(text)
-        (repo / "scripts/release-assets.py").write_text(SIGNATURE_SHIM)
-    else:
-        (repo / "scripts/release-assets.py").write_text(text)
+    for line, value in zip(PLATFORM_LINES, ('"Linux"', '"x86_64"')):
+        assert text.count(line) == 1, "the helper platform check changed"
+        text = text.replace(line, line.split(" or ")[0] + " or %s  # TEST FIXTURE host\n" % value)
+    (repo / "scripts/release-assets.py").write_text(text)
 
 
 def make_release_set(out, version, commit, digest=NEW_DIGEST, final=True,
-                     image_repository=IMAGE_REPOSITORY):
-    """Prepare (and finalize) a release set with the real publisher commands."""
+                     image_repository=IMAGE_REPOSITORY, checkout=None, key=None):
+    """Prepare and finalize a release set with the real helper. With `key`:
+    `finalize --signed` in the fixture checkout, then `key` signs the final
+    record. Without a key: the publisher's `finalize` as it is today, so the
+    final record is unsigned (a fixture for the unsigned refusal)."""
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -389,9 +395,17 @@ def make_release_set(out, version, commit, digest=NEW_DIGEST, final=True,
                     "--repository", "pretorin-ai/compliance-claw", "--image-repository",
                     image_repository, "--digest", digest, "--sbom", str(sbom), "--out", str(out)],
                    check=True, capture_output=True)
-    if final:
+    if final and key is None:
         subprocess.run(["python3", str(HELPER), "finalize", "--dir", str(out)],
                        check=True, capture_output=True)
+    elif final:
+        # The fixture checkout's helper reads the fixture checkout's release key.
+        subprocess.run(["python3", str(checkout / "scripts/release-assets.py"), "finalize", "--dir", str(out),
+                        "--signed"], check=True, capture_output=True)
+        record = (out / "compliance-claw-release.json").read_bytes()
+        sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(key)], input=record,
+                             check=True, capture_output=True).stdout
+        (out / "compliance-claw-release.json.sig").write_bytes(base64.b64encode(sig) + b"\n")
     return image_repository + ":" + version + "@" + digest
 
 
@@ -505,13 +519,22 @@ class ReleaseTest(unittest.TestCase):
             "EFFORT_RECORD_TRANSITION=refs/tags/fixture-transition"))
         for name in ("compose-selection.sh", "init-file-secrets.sh"):
             shutil.copyfile(ROOT / "scripts" / name, self.repo / "scripts" / name)
-        install_release_helper(self.repo, self.fixture / "releases",
-                               shim=not self._testMethodName.endswith("_real_helper"))
+        install_release_helper(self.repo, self.fixture / "releases")
         # The repository's own ignore rules, so generated files behave as on a host.
         shutil.copyfile(ROOT / ".gitignore", self.repo / ".gitignore")
+        # The release key is part of the reviewed checkout; its private half is not.
+        self.signing_key = self.fixture / "release-signing.key"
+        subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+                        "-out", str(self.signing_key)], check=True, capture_output=True)
+        (self.repo / "release-keys").mkdir()
+        subprocess.run(["openssl", "ec", "-in", str(self.signing_key), "-pubout", "-out",
+                        str(self.repo / "release-keys/compliance-claw-release.pub")],
+                       check=True, capture_output=True)
         (self.repo / "versions.env").write_text(
             "OPENCLAW_VERSION=2026.10.5\nSLACK_PLUGIN_VERSION=2026.10.5\n"
-            "IMAGE_REPO=ghcr.io/example/cc\nIMAGE_VERSION=0.5.2\n")
+            "IMAGE_REPO=ghcr.io/example/cc\nIMAGE_VERSION=0.5.2\n"
+            "COSIGN_VERSION=%s\nCOSIGN_ASSET=cosign-linux-amd64\nCOSIGN_SHA256=%s\n"
+            % (COSIGN_VERSION, COSIGN_SHA256))
         (self.repo / "compose.yaml").write_text(
             f"image: {OLD_IMAGE}\nvolume: /home/node/.openclaw=cc-release-test_openclaw-state\n"
             "volume: /home/node/.pretorin=cc-release-test_pretorin-state\n")
@@ -539,6 +562,12 @@ class ReleaseTest(unittest.TestCase):
         self.git("remote", "add", "origin", str(self.fixture / "origin.git"))
         self.git("tag", "-d", "v0.6.0")
         self.git("reset", "-q", "--hard", self.old)
+        # The cached pinned cosign, as an earlier run would leave it (ignored).
+        cache = self.repo / ".cache/release-tools"
+        cache.mkdir(parents=True)
+        cosign = cache / ("cosign-%s-%s" % (COSIGN_VERSION, COSIGN_SHA256[:16]))
+        cosign.write_text(COSIGN_STUB)
+        cosign.chmod(0o755)
         self.write_release("v0.6.0", self.new)
 
         # Deployment state: placeholder overlay selected, a customer overlay, the
@@ -555,22 +584,30 @@ class ReleaseTest(unittest.TestCase):
         (self.fixture / "bin/docker").write_text(RELEASE_STUB)
         (self.fixture / "bin/docker").chmod(0o700)
         (self.fixture / "running-image").write_text(OLD_IMAGE)
-        self.signed = "1"
         self.extra_env = {}
         self.selection = {
             "COMPOSE_PROJECT_NAME": "cc-release-test",
             "COMPOSE_FILE": "compose.yaml:compose.release.yaml:compose.secrets.yaml:deployment/customer.yaml",
         }
 
-    def write_release(self, tag, commit, **kwargs):
-        return make_release_set(self.fixture / "releases" / tag, tag[1:], commit, **kwargs)
+    def write_release(self, tag, commit, signed=True, key=None, **kwargs):
+        return make_release_set(self.fixture / "releases" / tag, tag[1:], commit, checkout=self.repo,
+                                key=(key or self.signing_key) if signed else None, **kwargs)
+
+    def cosign_calls(self):
+        path = self.fixture / "cosign.jsonl"
+        return [json.loads(s) for s in path.read_text().splitlines()] if path.exists() else []
+
+    def cosign_does(self, **behavior):
+        (self.fixture / "cosign-behavior.json").write_text(json.dumps(behavior))
 
     def run_update(self, *args, **settings):
         (self.fixture / "settings.json").write_text(json.dumps({"ids": IMAGE_IDS, **settings}))
         (self.fixture / "calls.jsonl").write_text("")
+        (self.fixture / "cosign.jsonl").write_text("")
         env = {**self.git_env, "PATH": str(self.fixture / "bin") + os.pathsep + os.environ["PATH"],
                "HOME": str(self.fixture), "FIXTURE": str(self.fixture), "REPO": str(self.repo),
-               "TMPDIR": str(self.fixture), "CC_TEST_RELEASE_SIGNED": self.signed,
+               "TMPDIR": str(self.fixture),
                **self.selection, **self.extra_env}
         p = subprocess.run(["bash", str(self.repo / "scripts/update.sh"), *args], env=env,
                            cwd=self.repo, text=True, capture_output=True)
@@ -593,7 +630,8 @@ class ReleaseTest(unittest.TestCase):
                 if c["args"][:2] in (["compose", "pull"], ["compose", "run"])
                 or c["args"][:3] == ["compose", "up", "-d"]]
 
-    def test_preview_reports_changes_without_any_change_real_helper(self):
+    def test_preview_reports_changes_without_any_change(self):
+        self.write_release("v0.6.0", self.new, signed=False)
         before = self.snapshot()
         self.assertEqual(self.run_update("--release", "v0.6.0", "--preview"), 2, self.output)
         self.assertEqual(self.snapshot(), before)
@@ -609,12 +647,26 @@ class ReleaseTest(unittest.TestCase):
                      "Pretorin CLI:  not changed", "UNVERIFIED: not signed"):
             self.assertIn(text, self.output)
         self.assertFalse((self.repo / "secrets/runtime/openclaw-gateway-password").exists())
+        self.assertEqual(self.cosign_calls(), [], "an unsigned set has no image signature to check")
+
+    def test_preview_of_a_signed_release_verifies_both_signatures(self):
+        before = self.snapshot()
+        self.assertEqual(self.run_update("--release", "v0.6.0", "--preview"), 0, self.output)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.changed(), [])
+        self.assertIn("VERIFIED: record and image signatures, release key sha256 ", self.output)
+        self.assertNotIn("BLOCKERS", self.output)
+        self.assertEqual([c[-1] for c in self.cosign_calls()], [NEW_IMAGE.split(":0.6.0")[0] + "@" + NEW_DIGEST])
 
     def test_apply_pulls_before_checkout_then_installs_and_starts(self):
         self.assertEqual(self.run_update("--release", "v0.6.0"), 0, self.output)
         self.assertIn("update: done.", self.output)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.new)
-        for name in ("compose.release.yaml", "compliance-claw-release.json"):
+        # Both signatures were verified once, with the old checkout's key, before
+        # the pull and the checkout.
+        self.assertEqual(len(self.cosign_calls()), 1, self.cosign_calls())
+        for name in ("compose.release.yaml", "compliance-claw-release.json",
+                     "compliance-claw-release.json.sig"):
             self.assertEqual((self.repo / name).read_bytes(),
                              (self.fixture / "releases/v0.6.0" / name).read_bytes())
         self.assertEqual(self.git("rev-parse", "refs/tags/v0.6.0^{commit}"), self.new)
@@ -651,7 +703,8 @@ class ReleaseTest(unittest.TestCase):
 
         # The next release keeps the previous record and overlay together.
         previous = {n: (self.repo / n).read_bytes()
-                    for n in ("compose.release.yaml", "compliance-claw-release.json")}
+                    for n in ("compose.release.yaml", "compliance-claw-release.json",
+                              "compliance-claw-release.json.sig")}
         self.publish_v070((self.repo / "compose.yaml").read_text())
         self.assertEqual(self.run_update("--release", "v0.7.0"), 0, self.output)
         for name, data in previous.items():
@@ -669,18 +722,54 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.changed(), [])
         self.assertEqual(self.snapshot(), before)
 
-    def test_unsigned_release_is_shown_but_apply_refuses_real_helper(self):
-        self.signed = "0"
+    def test_unsigned_release_is_shown_but_apply_refuses(self):
+        self.write_release("v0.6.0", self.new, signed=False)
         self.assert_blocked("UNVERIFIED: publisher authenticity not checked")
-        self.assertIn("apply will refuse this release until signing/verification exists", self.output)
+        self.assertIn("apply refuses an unsigned release", self.output)
         self.assertIn("signature unsigned", self.output)
 
-    def test_test_signature_variable_cannot_pass_the_real_helper_real_helper(self):
-        # The variable exists only in the test shim; update.sh and the real
-        # helper never read it, so apply still refuses (exit 6 path).
-        self.signed = "1"
-        self.assert_blocked("UNVERIFIED: publisher authenticity not checked")
-        self.assertNotIn("fixture-verified", self.output)
+    def test_signature_failures_stop_before_any_change(self):
+        assets = self.fixture / "releases/v0.6.0"
+        other_key = self.fixture / "other.key"
+        subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+                        "-out", str(other_key)], check=True, capture_output=True)
+
+        def flip():
+            sig = bytearray(base64.b64decode((assets / "compliance-claw-release.json.sig").read_bytes()))
+            sig[-1] ^= 1
+            (assets / "compliance-claw-release.json.sig").write_bytes(base64.b64encode(bytes(sig)) + b"\n")
+
+        for name, prepare_set, text in (
+            ("altered record signature", flip, "does not verify"),
+            ("missing record signature", lambda: (assets / "compliance-claw-release.json.sig").unlink(),
+             "is missing"),
+            ("record signed by another key",
+             lambda: self.write_release("v0.6.0", self.new, key=other_key), "does not verify"),
+        ):
+            with self.subTest(name):
+                self.write_release("v0.6.0", self.new)
+                prepare_set()
+                self.assert_blocked(text, preview_rc=1)
+                self.assertNotIn("recovery set", self.output, "the tag source was read before the refusal")
+                self.assertIn("a release signature does not verify with this checkout's release key", self.output)
+                self.assertEqual(self.cosign_calls(), [], "cosign ran after a record refusal")
+        self.write_release("v0.6.0", self.new)
+        for name, behavior, text in (
+            ("no image signature", dict(code=1, stdout="", stderr="Error: no signatures found\n"),
+             "no image signature"),
+            ("image signature for another digest",
+             dict(stdout=json.dumps([{"critical": {"identity": {"docker-reference": IMAGE_REPOSITORY},
+                                                   "image": {"docker-manifest-digest": "sha256:" + "9" * 64},
+                                                   "type": "cosign container image signature"}}])),
+             "names sha256:" + "9" * 64),
+            ("registry access", dict(code=1, stdout="", stderr="Error: UNAUTHORIZED: authentication required\n"),
+             "could not be checked"),
+        ):
+            with self.subTest(name):
+                self.cosign_does(**behavior)
+                self.assert_blocked(text, preview_rc=1)
+                self.assertNotIn("recovery set", self.output, "the tag source was read before the refusal")
+        (self.fixture / "cosign-behavior.json").unlink()
 
     def test_matching_local_tag_is_kept(self):
         # A local annotated tag that names the release commit is a different tag
@@ -691,7 +780,10 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "refs/tags/v0.6.0"), local)
 
     def test_dirty_tracked_source_blocks(self):
-        (self.repo / "versions.env").write_text("changed\n")
+        # A local change that keeps the cosign pin, so the signature checks pass
+        # and the dirty-source blocker is the one under test.
+        with (self.repo / "versions.env").open("a") as f:
+            f.write("# changed\n")
         self.assert_blocked("tracked files have local changes")
 
     def test_file_added_by_release_over_a_local_file_blocks(self):
@@ -796,8 +888,9 @@ class ReleaseTest(unittest.TestCase):
 
     def test_downgrade_blocks(self):
         installed = self.fixture / "installed"
-        make_release_set(installed, "0.7.0", self.new)
-        for name in ("compose.release.yaml", "compliance-claw-release.json"):
+        make_release_set(installed, "0.7.0", self.new, checkout=self.repo, key=self.signing_key)
+        for name in ("compose.release.yaml", "compliance-claw-release.json",
+                     "compliance-claw-release.json.sig"):
             shutil.copyfile(installed / name, self.repo / name)
         self.assert_blocked("older than the current release 0.7.0")
 

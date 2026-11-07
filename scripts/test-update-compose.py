@@ -122,9 +122,13 @@ def release_repo(base, root, docker_env, digest, populate,
     """Build a Git checkout with a v0.6.0 tag on a local bare origin.
 
     The checkout stays one commit behind the tag. The release set is made with
-    the real release helper; only its download base points at local files.
-    Returns the checkout, a Git runner, both commits, the environment and the
-    release image reference.
+    the real release helper and signed with a synthetic key whose public half
+    is the checkout's release key; only the helper's download base and host
+    platform are fixture values (see test-update.py). The image signature check
+    runs the test-update.py cosign stand-in, pinned by checksum in versions.env.
+    Returns the checkout, a Git runner, both commits, the environment, the
+    release image reference, and publish(signed=True), which rewrites the
+    v0.6.0 release set.
     """
     spec = importlib.util.spec_from_file_location("test_update", root / "scripts/test-update.py")
     fixture_module = importlib.util.module_from_spec(spec)
@@ -132,8 +136,22 @@ def release_repo(base, root, docker_env, digest, populate,
     repo = base / "repo"
     repo.mkdir()
     populate(repo)
-    (repo / ".gitignore").write_text(".env\nsecrets/\nefforts.yaml\ncompose.release.yaml*\ndeployment/\n")
+    (repo / ".gitignore").write_text(".env\nsecrets/\nefforts.yaml\ncompose.release.yaml*\ndeployment/\n"
+                                     "/.cache/release-tools/\n")
     fixture_module.install_release_helper(repo, base / "releases")
+    signing_key = base / "release-signing.key"
+    subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+                    "-out", str(signing_key)], check=True, capture_output=True)
+    (repo / "release-keys").mkdir()
+    subprocess.run(["openssl", "ec", "-in", str(signing_key), "-pubout", "-out",
+                    str(repo / "release-keys/compliance-claw-release.pub")], check=True, capture_output=True)
+    pins = {"COSIGN_VERSION": fixture_module.COSIGN_VERSION, "COSIGN_ASSET": "cosign-linux-amd64",
+            "COSIGN_SHA256": fixture_module.COSIGN_SHA256}
+    versions = (repo / "versions.env").read_text()
+    for key, value in pins.items():
+        versions, count = re.subn(r"(?m)^%s=.*$" % key, "%s=%s" % (key, value), versions)
+        assert count == 1, key
+    (repo / "versions.env").write_text(versions)
     git_env = {**docker_env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
@@ -156,13 +174,23 @@ def release_repo(base, root, docker_env, digest, populate,
     git("remote", "add", "origin", str(base / "origin.git"))
     git("tag", "-d", "v0.6.0")
     git("reset", "-q", "--hard", old)
+    # The cached pinned cosign stand-in, as an earlier run would leave it (ignored).
+    cache = repo / ".cache/release-tools"
+    cache.mkdir(parents=True)
+    cosign = cache / ("cosign-%s-%s" % (fixture_module.COSIGN_VERSION, fixture_module.COSIGN_SHA256[:16]))
+    cosign.write_text(fixture_module.COSIGN_STUB)
+    cosign.chmod(0o755)
 
-    image = fixture_module.make_release_set(base / "releases/v0.6.0", "0.6.0", new, digest,
-                                            image_repository=repository)
+    def publish(signed=True):
+        return fixture_module.make_release_set(base / "releases/v0.6.0", "0.6.0", new, digest,
+                                               image_repository=repository, checkout=repo,
+                                               key=signing_key if signed else None)
+
+    image = publish()
     # The neutral overlay reserves the release overlay's place in COMPOSE_FILE.
     (repo / "compose.release.yaml").write_text("services: {}\n")
-    # The shim's stand-in for a later verified signature; see test-update.py.
-    return repo, git, old, new, {**git_env, "TMPDIR": str(base), "CC_TEST_RELEASE_SIGNED": "1"}, image
+    # FIXTURE: where the cosign stand-in records its calls.
+    return repo, git, old, new, {**git_env, "TMPDIR": str(base), "FIXTURE": str(base)}, image, publish
 
 
 def release_regression(root, docker, docker_env):
@@ -176,7 +204,7 @@ def release_regression(root, docker, docker_env):
 
     with tempfile.TemporaryDirectory(prefix="cc-release-") as tmp:
         base = Path(tmp).resolve()
-        repo, git, old, new, git_env, new_image = release_repo(
+        repo, git, old, new, git_env, new_image, publish = release_repo(
             base, root, docker_env, "sha256:" + "2" * 64, populate)
 
         # Saved selection: placeholder release overlay, separator ';', a secret
@@ -212,15 +240,21 @@ def release_regression(root, docker, docker_env):
             return output
 
         before = state()
-        # Every release set is unsigned today: preview shows it, apply refuses.
-        output = update("--preview", rc=2, extra={"CC_TEST_RELEASE_SIGNED": "0"})
+        # An unsigned set (v0.5.3 and earlier): preview shows it, apply refuses.
+        publish(signed=False)
+        output = update("--preview", rc=2)
         assert "UNVERIFIED: publisher authenticity not checked" in output, output
         assert state() == before
+        # A signed set whose record and image signatures verify.
+        publish()
         output = update("--preview", rc=0)
         for text in (new_image, "cc-release-restored-openclaw-state", "cc-release-saved",
                      "./compose.yaml;compose.release.yaml;./compose.secrets.yaml;./compose.efforts.yaml;"
-                     "deployment/recovered.yaml", "no blockers"):
+                     "deployment/recovered.yaml", "no blockers",
+                     "VERIFIED: record and image signatures"):
             assert text in output, (text, output)
+        calls = (base / "cosign.jsonl").read_text().splitlines()
+        assert calls and json.loads(calls[-1])[-1] == new_image.split(":0.6.0@")[0] + "@sha256:" + "2" * 64, calls
         assert state() == before
         # Apply cannot pull without a daemon: it stops before any change.
         output = update(rc=1)
@@ -269,7 +303,7 @@ def release_apply_regression(root, docker, docker_env, images, image_ids):
 
     with tempfile.TemporaryDirectory(prefix="cc-release-apply-") as tmp:
         base = Path(tmp).resolve()
-        repo, git, old, new, env, release_image = release_repo(
+        repo, git, old, new, env, release_image, _ = release_repo(
             base, root, docker_env, digest, populate, repository)
         project = "cc-release-" + base.name[len("cc-release-apply-"):].lower()
         restored = {k: project + "-restored-" + k for k in ("openclaw-state", "pretorin-state")}

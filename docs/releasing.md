@@ -40,12 +40,16 @@ The record says `signature.status: unsigned`. The name
 Nothing signs the record or the image yet.
 
 **A published set is unsigned today, and customer install and update refuse
-it** until signing and signature verification exist: `check` exits 6 unless
-`--allow-unsigned` is given. Final trust acceptance is pending. The workflow,
-update preview and test fixtures pass `--allow-unsigned`, which admits
-`unsigned` only and prints `UNVERIFIED: publisher authenticity not checked`.
-Customer install and apply never pass it. Any other status is refused because
-this version has no signature verifier.
+it** until signing exists: `check` exits 6 unless `--allow-unsigned` is given.
+Final trust acceptance is pending. The workflow, update preview and test
+fixtures pass `--allow-unsigned`, which admits `unsigned` only and prints
+`UNVERIFIED: publisher authenticity not checked`. Customer install and apply
+never pass it. A `signed` set passes only when its record and image signatures
+verify with the release key of the checkout
+([what `check` verifies](image-verification.md#what-check-verifies-for-a-signed-release)).
+No release key is committed and this workflow does not sign, so no set can pass
+yet. Any other status is refused. `finalize` keeps the record unsigned;
+`finalize --signed` is only for tests with synthetic keys.
 
 ## Steps
 
@@ -177,9 +181,9 @@ Drafts do not notify subscribers. There is no other notification service.
 
 The image and the release record are not signed. A digest and the asset
 checksums give integrity, not authenticity. Publication therefore does not make
-a release installable by the customer tools: they refuse it until verification
-exists. Signing, a customer-side signature
-check, and a required qualification gate that blocks publish are later work;
+a release installable by the customer tools: they refuse it while signing
+activation is pending. Signing activation and a required qualification gate
+that blocks publish are later work;
 see the hardening ledger in [SECURITY.md](../SECURITY.md). Do not describe a
 release as signed or as verified by a customer signature check.
 

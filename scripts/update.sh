@@ -301,16 +301,18 @@ print("" if value is None else (json.dumps(value, sort_keys=True) if isinstance(
 }
 
 # Helper exit codes: 1 release data, 3 source checkout, 4 image selection,
-# 5 a tool (download, git, Compose) could not run, 6 the release set is unsigned
-# or its signature is not verified. Only reads pass --allow-unsigned; the apply
-# gate never does, and there is no option or variable that bypasses it.
+# 5 a tool (download, git, Compose, cosign, registry) could not run, 6 the release
+# set is unsigned or a signature does not verify. The apply gate verifies the
+# record signature AND the image signature with the release key of THIS checkout,
+# before any download of the tag is used. Only reads pass --allow-unsigned or
+# --record-only; there is no option or variable that bypasses the apply gate.
 release_helper() { python3 "$RELEASE_HELPER" "$@"; }
 
 # The version of the release set installed in the repository root, if valid.
 installed_release_version() {
   local summary
   [ -f "$RELEASE_HELPER" ] || return 1
-  summary="$(release_helper check --dir "$REPO_ROOT" --stage any --allow-unsigned --json 2>/dev/null)" || return 1
+  summary="$(release_helper check --dir "$REPO_ROOT" --stage any --allow-unsigned --record-only --json 2>/dev/null)" || return 1
   json_field "$summary" version
 }
 
@@ -378,19 +380,34 @@ resolve_release() {
     || die "the release record names another source than tag ${tag} on ${RELEASE_REMOTE} (${R_COMMIT}). Nothing was changed."
   R_IMAGE="$(json_field "$r_json" image_reference)"
   R_SIGNATURE="$(json_field "$r_json" signature_status)"
+  R_JSON="$r_json"
   [ -n "$R_IMAGE" ] || die "the release verifier returned no image reference."
   R_OVERLAY="${RELEASE_CACHE}/assets/${RELEASE_OVERLAY}"
   R_RECORD="${RELEASE_CACHE}/assets/${RELEASE_RECORD}"
 
-  # AUTHENTICITY. Apply needs a verified publisher signature. Until signing and
-  # its verifier exist, every release set is unsigned and apply refuses it.
+  # AUTHENTICITY, before anything changes: the record signature and the image
+  # signature, with the release key of THIS checkout (the one being updated),
+  # never a key from the new tag. A signed set that does not verify stops here,
+  # before the source of the tag is read. An unsigned set (v0.5.3 and earlier)
+  # is still shown for inspection, and apply refuses it on the blocker.
   rc=0
-  release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" >/dev/null 2>&1 || rc=$?
-  if [ "$rc" = 6 ] || [ "$R_SIGNATURE" = unsigned ]; then
-    blocker "UNVERIFIED: publisher authenticity not checked (signature ${R_SIGNATURE}); apply will refuse this release until signing/verification exists."
-  elif [ "$rc" != 0 ]; then
-    die "the release set for ${tag} did not pass the apply check (exit ${rc}). Nothing was changed."
-  fi
+  R_VERIFY_OUT="$(release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" 2>&1 >/dev/null)" || rc=$?
+  R_VERIFY_LAST="$(printf '%s\n' "$R_VERIFY_OUT" | grep 'ERROR' | tail -1 | sed 's/^release-assets: ERROR — //' || true)"
+  R_VERIFIED=0
+  case "$rc" in
+    0) R_VERIFIED=1 ;;
+    6) if [ "$R_SIGNATURE" = unsigned ]; then
+         blocker "UNVERIFIED: publisher authenticity not checked (signature unsigned); apply refuses an unsigned release."
+       else
+         die "a release signature does not verify with this checkout's release key: ${R_VERIFY_LAST}
+  Do not edit, re-sign or replace the release files or the key. Nothing was changed."
+       fi ;;
+    5) die "the release signatures could not be checked: ${R_VERIFY_LAST}
+  The image check needs a Linux amd64 host, the cosign that versions.env pins, and
+  registry access with this host's docker login (docker login ghcr.io).
+  Nothing was changed except the cached pinned cosign (.cache/release-tools/)." ;;
+    *) die "the release set for ${tag} did not pass the apply check (exit ${rc}): ${R_VERIFY_LAST}. Nothing was changed." ;;
+  esac
 
   git archive --format=tar "$R_COMMIT" | tar -x -C "${RELEASE_CACHE}/src" \
     || die "could not read the source of ${tag}."
@@ -502,9 +519,13 @@ sys.exit(any(candidate.get(s, {}).get(t) != v
     || blocker "the state-volume selection would change. A restored or recovered volume selection must stay; review the overlays and ${tag} before you continue."
   rc=0
   selection_err="$(json_field "$R_CANDIDATE" selection \
-    | release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" --allow-unsigned --rendered - 2>&1 >/dev/null)" || rc=$?
+    | release_helper check --dir "${RELEASE_CACHE}/assets" --version "$R_VERSION" --allow-unsigned --record-only --rendered - 2>&1 >/dev/null)" || rc=$?
   case "$rc" in
     0) ;;
+    6) # Only an unsigned set reaches this point unverified; its blocker stops apply.
+       if [ "$R_VERIFIED" = 1 ]; then
+         die "the verified release set did not pass its selection check (exit 6). Nothing was changed."
+       fi ;;
     4) blocker "the effective openclaw or cli image is not the release image: a later overlay sets image (for example a restore overlay). That is a custom selection, which the release route does not apply. Take a new backup, then remove only the two image lines from that overlay and keep its volume lines." ;;
     *) printf '%s\n' "$selection_err" >&2; die "could not check the release image selection. Nothing was changed." ;;
   esac
@@ -600,6 +621,11 @@ print_release_report() {
   printf '  signature:     %s\n' "$R_SIGNATURE"
   if [ "$R_SIGNATURE" = unsigned ]; then
     printf '                 UNVERIFIED: not signed; publisher authenticity not checked\n'
+  elif [ "$R_VERIFIED" = 1 ]; then
+    printf '                 VERIFIED: record and image signatures, release key sha256 %s\n' \
+      "$(json_field "$R_JSON" key_sha256)"
+  else
+    printf '                 NOT VERIFIED: see BLOCKERS\n'
   fi
   if [ -n "$R_BRANCH" ]; then
     printf '  checkout:      branch %s -> detached tag %s (release mode; the branch route then refuses)\n' \
@@ -666,12 +692,15 @@ if [ -n "$RELEASE_TAG" ]; then
       || die "could not record tag ${R_TAG} locally. Nothing was changed."
   fi
 
-  # The previous record and overlay are one recovery input: keep them together.
+  # The previous record, its signature (if any) and overlay are one recovery
+  # input: keep them together.
   if [ -f "${REPO_ROOT}/${RELEASE_RECORD}" ] && [ -f "${REPO_ROOT}/${RELEASE_OVERLAY}" ]; then
-    PREVIOUS_SET="restore the previous release set: move ${RELEASE_RECORD}.previous and
-    ${RELEASE_OVERLAY}.previous back to ${RELEASE_RECORD} and ${RELEASE_OVERLAY}"
+    PREVIOUS_SET="restore the previous release set: move ${RELEASE_RECORD}.previous,
+    ${RELEASE_RECORD}.sig.previous (if present) and ${RELEASE_OVERLAY}.previous back to
+    ${RELEASE_RECORD}, ${RELEASE_RECORD}.sig and ${RELEASE_OVERLAY}; remove
+    ${RELEASE_RECORD}.sig if there is no .sig.previous"
   else
-    PREVIOUS_SET="remove ${RELEASE_RECORD} and ${RELEASE_OVERLAY} (no release set was installed before)"
+    PREVIOUS_SET="remove ${RELEASE_RECORD}, ${RELEASE_RECORD}.sig and ${RELEASE_OVERLAY} (no release set was installed before)"
   fi
   if [ -n "$R_BRANCH" ]; then
     R_RETURN="git checkout ${R_BRANCH}     # the branch at ${R_HEAD}"
@@ -693,16 +722,20 @@ if [ -n "$RELEASE_TAG" ]; then
   else
     log "the checkout is already at ${R_TAG}"
   fi
-  if cmp -s "$R_OVERLAY" "${REPO_ROOT}/${RELEASE_OVERLAY}" && cmp -s "$R_RECORD" "${REPO_ROOT}/${RELEASE_RECORD}"; then
+  R_SIG="${RELEASE_RECORD}.sig"
+  if cmp -s "$R_OVERLAY" "${REPO_ROOT}/${RELEASE_OVERLAY}" && cmp -s "$R_RECORD" "${REPO_ROOT}/${RELEASE_RECORD}" \
+     && cmp -s "${RELEASE_CACHE}/assets/${R_SIG}" "${REPO_ROOT}/${R_SIG}"; then
     log "the ${R_TAG} release set is already installed"
   else
     if [ -f "${REPO_ROOT}/${RELEASE_RECORD}" ] && [ -f "${REPO_ROOT}/${RELEASE_OVERLAY}" ]; then
-      for f in "$RELEASE_RECORD" "$RELEASE_OVERLAY"; do
-        cp -p "${REPO_ROOT}/${f}" "${REPO_ROOT}/${f}.previous"
+      rm -f "${REPO_ROOT}/${R_SIG}.previous"
+      for f in "$RELEASE_RECORD" "$R_SIG" "$RELEASE_OVERLAY"; do
+        [ ! -f "${REPO_ROOT}/${f}" ] || cp -p "${REPO_ROOT}/${f}" "${REPO_ROOT}/${f}.previous"
       done
     fi
-    # The record first, then the overlay that Compose reads; each replaced atomically.
-    for f in "$RELEASE_RECORD" "$RELEASE_OVERLAY"; do
+    # The record and its signature first, then the overlay that Compose reads;
+    # each replaced atomically. Apply only gets here with a verified signature.
+    for f in "$RELEASE_RECORD" "$R_SIG" "$RELEASE_OVERLAY"; do
       cp "${RELEASE_CACHE}/assets/${f}" "${REPO_ROOT}/${f}.new"
       chmod 644 "${REPO_ROOT}/${f}.new"
       mv -f "${REPO_ROOT}/${f}.new" "${REPO_ROOT}/${f}"
@@ -723,7 +756,9 @@ if [ -n "$RELEASE_TAG" ]; then
   compose_resolve_selection
   [ "${COMPOSE_FILE:-compose.yaml}" = "$R_FINAL_FILES" ] \
     || die "the saved COMPOSE_FILE is not the verified selection after the change. The gateway was not stopped."
-  release_helper check --dir "$REPO_ROOT" --version "$R_VERSION" --source "$REPO_ROOT" --compose \
+  # Both signatures were verified before the checkout; this checks the placed
+  # bytes, the record signature, the tag, HEAD and the selection.
+  release_helper check --dir "$REPO_ROOT" --version "$R_VERSION" --source "$REPO_ROOT" --record-only --compose \
     || die "the installed release set, source or selection did not verify after checkout. The gateway was not stopped."
   APPLIED="$(model_summary)" || die "could not read the Compose selection after checkout. The gateway was not stopped."
   for key in project mounts images; do

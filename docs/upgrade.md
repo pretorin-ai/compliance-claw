@@ -59,9 +59,11 @@ Apply repeats the checks. It stops before file changes or gateway downtime for:
 
 After these checks, apply pulls the release image. Then it records the tag,
 checks out the tag (detached `HEAD`), and installs the release set
-(`compliance-claw-release.json` and `compose.release.yaml`) in the repository
-root. It keeps the previous set as `compliance-claw-release.json.previous` and
-`compose.release.yaml.previous`. It checks the installed set, the source, and the saved selection again
+(`compliance-claw-release.json`, `compose.release.yaml` and, for a signed set,
+`compliance-claw-release.json.sig`) in the repository root. It keeps the
+previous set as `compliance-claw-release.json.previous`,
+`compose.release.yaml.previous` and, if present,
+`compliance-claw-release.json.sig.previous`. It checks the installed set, the source, and the saved selection again
 with the release helper, and stops if the result differs from the verified
 result. Then it continues with the [shared steps](#shared-update-steps).
 Apply of the release that is already installed changes no file, and Compose

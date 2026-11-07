@@ -7,13 +7,18 @@ with a fixture release set made by the real helper. Docker, bootstrap.sh and
 the other clawctl commands are stubs that record their calls. These tests prove
 input handling, ordering, refusals and rerun preservation only. They do not
 prove an image pull, a clone, Compose merging, gateway startup, a provider or
-Pretorin call, a customer task, or release authenticity. Every release set is
-unsigned today and the real helper refuses it (exit 6); one test runs the real
-helper to prove the installer stops there. The other tests replace the helper
-in the fixture checkout with HELPER_SHIM, which admits the unsigned fixture and
-serves `fetch` from a local directory. CC_TEST_INSTALL_SCRIPT can select
-another script to show that a test rejects a removed check.
+Pretorin call, or a customer task. Release sets are SIGNED with a synthetic
+key: the fixture checkout holds its public key at release-keys/, the real
+helper verifies the record signature with openssl, and runs a recording cosign
+stand-in that versions.env of the fixture pins by checksum. HELPER_SHIM only
+makes the fixture host report Linux amd64 and serves `fetch` from a local
+directory; it relaxes no check. The cosign stand-in proves the call and the
+payload checks, not cosign's own verification or a registry read.
+CC_TEST_INSTALL_SCRIPT can select another script to show that a test rejects a
+removed check.
 """
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,7 +39,8 @@ SYSTEM = "7b74d8f3-d77c-49e4-8792-c372dd154d38"
 VERSION = "9.9.9"
 IMAGE = "ghcr.io/pretorin-ai/compliance-claw:%s@sha256:%s" % (VERSION, "c" * 64)
 DEFAULT_SELECTION = "compose.yaml:compose.release.yaml:compose.secrets.yaml:compose.efforts.yaml"
-RELEASE_FILES = ("compliance-claw-release.json", "compose.release.yaml")
+RELEASE_FILES = ("compliance-claw-release.json", "compliance-claw-release.json.sig",
+                 "compose.release.yaml")
 GIT = ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
        "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]
 CANARIES = {
@@ -113,21 +119,42 @@ CLAWCTL = '''#!/usr/bin/env bash
 python3 "$FIXTURE/stub.py" clawctl "$@" || exit $?
 [ "$1" != migrate ] || exec bash "$(dirname "$0")/clawctl.real" "$@"
 '''
-# TEST ONLY. Stands in for the signature gate, which no release can pass yet,
-# and records each call so a test can show the installer never relaxes it.
+# TEST ONLY. The fixture host stands in for a Linux amd64 VM: this replaces
+# platform.system and platform.machine for the real helper and nothing else. It
+# records each call, and serves `fetch` from a local directory (no network).
 HELPER_SHIM = '''#!/usr/bin/env python3
-import json, os, shutil, sys
+import json, os, platform, runpy, shutil, sys
 a = sys.argv[1:]
 with open(os.path.join(os.environ["FIXTURE"], "helper.jsonl"), "a") as f:
     f.write(json.dumps(a) + "\\n")
 if a[:1] == ["fetch"]:
     shutil.copytree(os.environ["CC_TEST_FETCH_FROM"], a[a.index("--dir") + 1])
     sys.exit(0)
-if a[:1] == ["check"]:
-    a = ["check", "--allow-unsigned"] + a[1:]
+platform.system = lambda: "Linux"
+platform.machine = lambda: "x86_64"
 real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-assets.real.py")
-os.execv(sys.executable, [sys.executable, real] + a)
+sys.argv[0] = real
+runpy.run_path(real, run_name="__main__")
 '''
+# TEST ONLY. Stands in for the pinned cosign. It records each call and prints
+# what a verified run prints for the requested repository@digest, unless
+# cosign-behavior.json in the fixture says otherwise.
+COSIGN_STUB = r'''#!/usr/bin/env python3
+import json, os, sys
+fixture = os.environ["FIXTURE"]
+with open(os.path.join(fixture, "cosign.jsonl"), "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+path = os.path.join(fixture, "cosign-behavior.json")
+b = json.load(open(path)) if os.path.exists(path) else {}
+repo, digest = sys.argv[-1].split("@")
+payload = {"critical": {"identity": {"docker-reference": repo},
+                        "image": {"docker-manifest-digest": digest},
+                        "type": "cosign container image signature"}, "optional": None}
+sys.stderr.write(b.get("stderr", ""))
+sys.stdout.write(b.get("stdout", json.dumps([payload])))
+sys.exit(b.get("code", 0))
+'''
+COSIGN_VERSION = "v2.4.1"
 BOOTSTRAP = '''#!/usr/bin/env bash
 exec python3 "$FIXTURE/stub.py" bootstrap "$@"
 '''
@@ -149,6 +176,19 @@ class InstallTest(unittest.TestCase):
         shutil.copyfile(ROOT / "scripts/clawctl", self.root / "scripts/clawctl.real")
         (self.root / "scripts/clawctl").write_text(CLAWCTL)
         (self.root / "scripts/bootstrap.sh").write_text(BOOTSTRAP)
+        # The release key is part of the reviewed checkout; its private half is not.
+        self.signing_key = self.base / "release-signing.key"
+        subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+                        "-out", str(self.signing_key)], check=True, capture_output=True)
+        (self.root / "release-keys").mkdir()
+        subprocess.run(["openssl", "ec", "-in", str(self.signing_key), "-pubout", "-out",
+                        str(self.root / "release-keys/compliance-claw-release.pub")],
+                       check=True, capture_output=True)
+        cosign_sha = hashlib.sha256(COSIGN_STUB.encode()).hexdigest()
+        (self.root / "versions.env").write_text(
+            "COSIGN_VERSION=%s\nCOSIGN_ASSET=cosign-linux-amd64\nCOSIGN_SHA256=%s\n"
+            % (COSIGN_VERSION, cosign_sha))
+        (self.root / ".gitignore").write_text("/.cache/release-tools/\n")
         for name in ("compose.yaml", "compose.secrets.yaml", "compose.efforts.yaml",
                      "compose.build.yaml", ".env.example"):
             shutil.copyfile(ROOT / name, self.root / name)
@@ -172,13 +212,21 @@ class InstallTest(unittest.TestCase):
                     # checkout that a Linux VM makes: scripts/__pycache__/.
                     "PYTHONPYCACHEPREFIX": str(self.root / ".pycache-probe")}
         self.release = self.make_release(self.base / "release")
+        # The cached pinned cosign, as an earlier run would leave it (untracked).
+        cache = self.root / ".cache/release-tools"
+        cache.mkdir(parents=True)
+        cosign = cache / ("cosign-%s-%s" % (COSIGN_VERSION, cosign_sha[:16]))
+        cosign.write_text(COSIGN_STUB)
+        cosign.chmod(0o755)
 
     def git(self, *args):
         return subprocess.run([*GIT, "-C", str(self.root), *args], check=True,
                               capture_output=True, text=True).stdout.strip()
 
-    def make_release(self, out, final=True, version=VERSION, digest="c" * 64):
-        """A release set from the real helper, for the checkout's tagged commit."""
+    def make_release(self, out, final=True, version=VERSION, digest="c" * 64, signed=True, key=None):
+        """A release set from the real helper, for the checkout's tagged commit.
+        Signed: `finalize --signed`, then the synthetic key signs the record.
+        Unsigned: the publisher's `finalize` as it is today."""
         if not (self.root / ".git").exists():
             self.git("init", "-q")
             self.git("add", "-A")
@@ -192,8 +240,14 @@ class InstallTest(unittest.TestCase):
                         "--image-repository", "ghcr.io/pretorin-ai/compliance-claw",
                         "--digest", "sha256:" + digest, "--sbom", str(sbom), "--out", str(out)],
                        check=True, capture_output=True)
-        if final:
+        if final and not signed:
             subprocess.run([*helper, "finalize", "--dir", str(out)], check=True, capture_output=True)
+        elif final:
+            subprocess.run([*helper, "finalize", "--dir", str(out), "--signed"], check=True, capture_output=True)
+            record = (out / "compliance-claw-release.json").read_bytes()
+            sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(key or self.signing_key)],
+                                 input=record, check=True, capture_output=True).stdout
+            (out / "compliance-claw-release.json.sig").write_bytes(base64.b64encode(sig) + b"\n")
         return out
 
     def rel(self, directory=None, version=VERSION):
@@ -217,6 +271,7 @@ class InstallTest(unittest.TestCase):
         (self.base / "settings.json").write_text(json.dumps(settings))
         (self.base / "calls.jsonl").write_text("")
         (self.base / "helper.jsonl").write_text("")
+        (self.base / "cosign.jsonl").write_text("")
         p = subprocess.run(["bash", str(self.root / "scripts/install.sh"), *args],
                            env={**self.env, **(env or {})}, cwd=self.base,
                            text=True, capture_output=True, stdin=subprocess.DEVNULL)
@@ -224,6 +279,13 @@ class InstallTest(unittest.TestCase):
         self.calls = [json.loads(s) for s in (self.base / "calls.jsonl").read_text().splitlines()]
         self.check_no_secret()
         return p.returncode
+
+    def cosign_calls(self):
+        path = self.base / "cosign.jsonl"
+        return [json.loads(s) for s in path.read_text().splitlines()] if path.exists() else []
+
+    def cosign_does(self, **behavior):
+        (self.base / "cosign-behavior.json").write_text(json.dumps(behavior))
 
     def helper_calls(self):
         return [json.loads(s) for s in (self.base / "helper.jsonl").read_text().splitlines()]
@@ -270,9 +332,18 @@ class InstallTest(unittest.TestCase):
         for name in RELEASE_FILES:
             self.assertEqual((self.root / name).read_bytes(), (self.release / name).read_bytes())
         self.assertIn("release set        ok", self.output)
-        # The installer itself never relaxes the signature gate.
-        self.assertTrue(self.helper_calls())
+        # The installer itself never relaxes the signature gate. Its first check
+        # verifies both signatures; later checks of the same set skip only the image.
+        checks = [c for c in self.helper_calls() if c[:1] == ["check"]]
+        self.assertTrue(checks)
         self.assertFalse(any("--allow-unsigned" in c for c in self.helper_calls()))
+        self.assertNotIn("--record-only", checks[0])
+        self.assertTrue(all("--record-only" in c for c in checks[1:]), checks)
+        cosign = self.cosign_calls()
+        self.assertEqual(len(cosign), 1, cosign)
+        self.assertEqual(cosign[0][:2], ["verify", "--key"])
+        self.assertEqual(cosign[0][3:], ["--insecure-ignore-tlog=true", "--output", "json",
+                                         "ghcr.io/pretorin-ai/compliance-claw@sha256:" + "c" * 64])
         efforts = (self.root / "efforts.yaml").read_text()
         self.assertIn("name: crm-soc2", efforts)
         self.assertIn(f"system_id: {SYSTEM}", efforts)
@@ -487,16 +558,54 @@ class InstallTest(unittest.TestCase):
         self.assert_refused_without_change(self.full_args(), "would not run the release image",
                                            image="ghcr.io/example/other:1@sha256:" + "e" * 64)
 
-    def test_real_helper_refuses_every_unsigned_release_before_any_write(self):
-        shutil.copyfile(ROOT / "scripts/release-assets.py", self.root / "scripts/release-assets.py")
-        # The real helper is part of the release commit, not a local change.
-        self.git("commit", "-qam", "real helper")
-        self.git("tag", "-f", "v" + VERSION)
-        release = self.make_release(self.base / "release-real")
+    def test_unsigned_release_is_refused_before_any_write(self):
+        release = self.make_release(self.base / "release-unsigned", signed=False)
         self.assert_refused_without_change(self.rel(release) + self.full_args()[4:],
                                            "is refused: it is not signed")
         self.assertIn("manual installation", self.output)
         self.assertNotIn("UNVERIFIED", self.output)
+        self.assertEqual(self.cosign_calls(), [])
+
+    def test_signature_refusals_stop_before_any_write(self):
+        def variant(name, mutate=None, **kw):
+            d = self.make_release(self.base / name, **kw)
+            if mutate:
+                mutate(d / "compliance-claw-release.json.sig")
+            return d
+
+        def flip(path):
+            sig = bytearray(base64.b64decode(path.read_bytes()))
+            sig[-1] ^= 1
+            path.write_bytes(base64.b64encode(bytes(sig)) + b"\n")
+
+        other_key = self.base / "other.key"
+        subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+                        "-out", str(other_key)], check=True, capture_output=True)
+        for name, release, text in (
+            ("altered", variant("sig-altered", flip), "does not verify"),
+            ("missing", variant("sig-missing", lambda p: p.unlink()), "is missing"),
+            ("other key", variant("sig-other-key", key=other_key), "does not verify"),
+        ):
+            with self.subTest(name):
+                self.assert_refused_without_change(self.rel(release) + self.full_args()[4:], text)
+                self.assertIn("is refused", self.output)
+                self.assertEqual(self.cosign_calls(), [], "cosign ran after a record refusal")
+        for name, behavior, text in (
+            ("no image signature", dict(code=1, stdout="", stderr="Error: no signatures found\n"),
+             "no image signature"),
+            ("image signature for another digest",
+             dict(stdout=json.dumps([{"critical": {"identity": {"docker-reference":
+                  "ghcr.io/pretorin-ai/compliance-claw"}, "image": {"docker-manifest-digest":
+                  "sha256:" + "d" * 64}, "type": "cosign container image signature"}}])),
+             "names sha256:" + "d" * 64),
+        ):
+            with self.subTest(name):
+                self.cosign_does(**behavior)
+                self.assert_refused_without_change(self.full_args(), text)
+                self.assertIn("is refused", self.output)
+        self.cosign_does(code=1, stdout="", stderr="Error: UNAUTHORIZED: authentication required\n")
+        self.assert_refused_without_change(self.full_args(), "could not be checked")
+        self.assertIn("docker login ghcr.io", self.output)
 
     def test_release_is_fetched_by_the_helper_when_no_directory_is_given(self):
         args = ["--release", VERSION, *self.full_args()[4:]]
@@ -561,6 +670,7 @@ class InstallTest(unittest.TestCase):
         (self.base / "settings.json").write_text("{}")
         (self.base / "calls.jsonl").write_text("")
         (self.base / "helper.jsonl").write_text("")
+        (self.base / "cosign.jsonl").write_text("")
         master, slave = pty.openpty()
         proc = subprocess.Popen(["bash", str(self.root / "scripts/install.sh"), *self.rel(), *self.declaration()],
                                 env=self.env, cwd=self.base, stdin=slave, stdout=slave,
