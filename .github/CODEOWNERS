@@ -5,6 +5,7 @@
 /.github/CODEOWNERS @harshavardhan-pretorin @iankloo
 /.github/workflows/ @harshavardhan-pretorin @iankloo
 /scripts/release-assets.py @harshavardhan-pretorin @iankloo
+/scripts/test-release-assets.py @harshavardhan-pretorin @iankloo
 /scripts/release-tag.sh @harshavardhan-pretorin @iankloo
 /scripts/install.sh @harshavardhan-pretorin @iankloo
 /scripts/update.sh @harshavardhan-pretorin @iankloo
