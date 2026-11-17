@@ -875,6 +875,53 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.changed(), [])
         self.assertEqual(self.snapshot(), before)
 
+    def test_release_that_changes_the_trust_key_blocks(self):
+        # The set is signed with the current key, so the check before any change
+        # passes. The tag's own key would fail the check after checkout.
+        new_key = self.fixture / "rotated.key"
+        subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+                        "-out", str(new_key)], check=True, capture_output=True)
+
+        def rotate(clone):
+            subprocess.run(["openssl", "ec", "-in", str(new_key), "-pubout", "-out",
+                            str(clone / "release-keys/compliance-claw-release.pub")],
+                           check=True, capture_output=True)
+
+        self.publish_v070((self.repo / "compose.yaml").read_text(), change=rotate)
+        before = self.snapshot()
+        self.assertEqual(self.run_update("--release", "v0.7.0", "--preview"), 2, self.output)
+        self.assertIn("changes the release trust key", self.output)
+        self.assertNotEqual(self.run_update("--release", "v0.7.0"), 0, self.output)
+        self.assertIn("changes the release trust key", self.output)
+        self.assertEqual(self.changed(), [])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_manual_unsigned_set_moves_to_a_signed_release_from_its_tag(self):
+        # docs/upgrade.md "From a manually installed unsigned release set": an
+        # unsigned 0.5.2 set is installed and selected by hand on a detached tag.
+        installed = self.fixture / "installed"
+        make_release_set(installed, "0.5.2", self.old, checkout=self.repo)
+        for name in ("compose.release.yaml", "compliance-claw-release.json"):
+            shutil.copyfile(installed / name, self.repo / name)
+        self.git("switch", "-q", "--detach", "v0.5.2")
+        self.assertNotEqual(self.run_update(), 0, self.output)
+        self.assertIn("follows a release", self.output)
+        # The documented steps: fetch the signed tag, switch to it, then update.
+        self.git("fetch", "-q", "origin", "tag", "v0.6.0")
+        self.git("switch", "-q", "--detach", "v0.6.0")
+        self.assertEqual(self.run_update("--release", "v0.6.0", "--preview"), 0, self.output)
+        self.assertIn("0.5.2 -> 0.6.0", self.output)
+        self.assertEqual(self.run_update("--release", "v0.6.0"), 0, self.output)
+        self.assertIn("update: done.", self.output)
+        for name in ("compose.release.yaml", "compliance-claw-release.json",
+                     "compliance-claw-release.json.sig"):
+            self.assertEqual((self.repo / name).read_bytes(),
+                             (self.fixture / "releases/v0.6.0" / name).read_bytes())
+        self.assertEqual((self.repo / "compliance-claw-release.json.previous").read_bytes(),
+                         (installed / "compliance-claw-release.json").read_bytes())
+        self.assertFalse((self.repo / "compliance-claw-release.json.sig.previous").exists())
+        self.assertEqual((self.fixture / "running-image").read_text(), NEW_IMAGE)
+
     def test_recovered_volume_selection_is_kept(self):
         (self.repo / "deployment/customer.yaml").write_text(
             "volume: /home/node/.openclaw=restored-openclaw\nvolume: /home/node/.pretorin=restored-pretorin\n")

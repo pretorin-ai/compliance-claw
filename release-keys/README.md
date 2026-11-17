@@ -42,6 +42,8 @@ The private key is not stored in this repository. A change here needs
 code-owner review (`.github/CODEOWNERS`). A changed key does not verify
 releases signed with the earlier key, and `scripts/update.sh` in a checkout with
 the earlier key refuses a release signed with the new key (exit 6).
+`scripts/update.sh --release` also refuses a release whose tag changes this key,
+before it changes anything. A key change needs a separate, reviewed procedure.
 
 ## First trust on a deployment
 

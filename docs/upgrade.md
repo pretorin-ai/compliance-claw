@@ -128,6 +128,37 @@ a dirty working tree, a detached HEAD, a branch with no upstream, a branch that 
 diverged from its upstream, or a deployment selection that includes the local build
 overlay (that is a rebuild, not an update).
 
+### From a manually installed unsigned release set
+
+A deployment that installed an unsigned release set (v0.5.3 or earlier) by hand
+and [selected it](image-verification.md#selection) cannot use either route
+directly. The branch route refuses the selected release overlay. If the checkout
+has no release key, the release route refuses every signed release. Do not
+remove the set or add a key by hand. To move to the first signed release
+`vX.Y.Z`:
+
+1. Fetch the tag and switch the checkout to it. The gateway continues to run the
+   image of the installed set:
+
+   ```sh
+   git fetch origin tag vX.Y.Z
+   git switch --detach vX.Y.Z
+   ```
+
+2. Do the [first trust check](image-verification.md#first-trust-in-the-release-key)
+   on the key that the tag contains. Stop if it fails.
+3. Preview, then apply the same release with the
+   [release route](#release-route):
+
+   ```sh
+   scripts/update.sh --release vX.Y.Z --preview
+   scripts/update.sh --release vX.Y.Z
+   ```
+
+Apply keeps the unsigned set as the `.previous` files. Do not delete them
+until the signed release runs correctly. If preview stops, switch back to the
+earlier tag (`git switch --detach` with the earlier tag) before you investigate.
+
 ### Shared update steps
 
 On the [file-secret path](file-secrets.md), the script runs

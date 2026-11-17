@@ -441,6 +441,11 @@ resolve_release() {
   if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     blocker "tracked files have local changes. Review them with 'git status' and commit or remove them yourself."
   fi
+  # The check after checkout uses the tag's key. A tag that changes the key would
+  # fail that check only after the checkout and the release files have changed.
+  if ! git diff --quiet "$R_HEAD" "$R_COMMIT" -- release-keys/compliance-claw-release.pub; then
+    blocker "${tag} changes the release trust key (release-keys/compliance-claw-release.pub). This update cannot apply a key change. See release-keys/README.md."
+  fi
   # Git replaces ignored files without a warning, also a file at a parent path.
   local parent
   while IFS= read -r -d '' f; do
