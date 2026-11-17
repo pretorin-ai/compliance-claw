@@ -12,8 +12,10 @@ release. The branch route follows a Git branch; it is the custom route.
 
 ### Release route
 
-Preview the release first. Preview does not change the checkout, the Compose
-selection, secret files, containers, or volumes:
+Preview the release first. Preview does not change tracked files, the installed
+release set, the Compose selection, secret files, containers, or volumes. To
+check a signed set, it can add the pinned cosign to `.cache/release-tools/`
+(gitignored):
 
 ```sh
 scripts/update.sh --release vX.Y.Z --preview
@@ -41,9 +43,14 @@ Apply repeats the checks. It stops before file changes or gateway downtime for:
 
 - a missing, candidate or invalid release set, or a record, asset checksum or
   source commit that fails verification;
-- an unsigned or unverified signature. **Today every release set is unsigned,
-  so apply refuses every release** until signing and its verifier exist.
-  Preview marks it `UNVERIFIED`; there is no bypass. See
+- an installed release set in the repository root that fails its check, for
+  example a missing `.sig` after a manual restore. Preview also stops. Repair the
+  set; do not remove it;
+- an unsigned release set. **Today every release set is unsigned, so apply
+  refuses every release** until release signing exists. Preview marks it
+  `UNVERIFIED` as a blocker (exit 2); there is no bypass. A signed set whose
+  record or image signature does not verify with the release key in this
+  checkout stops preview and apply (exit 1). See
   [what the checks prove](image-verification.md#what-this-does-and-does-not-prove);
 - local tracked changes or an added/renamed file that conflicts with a local
   file, including an ignored file or one above the destination path;
@@ -59,9 +66,11 @@ Apply repeats the checks. It stops before file changes or gateway downtime for:
 
 After these checks, apply pulls the release image. Then it records the tag,
 checks out the tag (detached `HEAD`), and installs the release set
-(`compliance-claw-release.json` and `compose.release.yaml`) in the repository
-root. It keeps the previous set as `compliance-claw-release.json.previous` and
-`compose.release.yaml.previous`. It checks the installed set, the source, and the saved selection again
+(`compliance-claw-release.json`, `compose.release.yaml` and, for a signed set,
+`compliance-claw-release.json.sig`) in the repository root. It keeps the
+previous set as `compliance-claw-release.json.previous`,
+`compose.release.yaml.previous` and, if present,
+`compliance-claw-release.json.sig.previous`. It checks the installed set, the source, and the saved selection again
 with the release helper, and stops if the result differs from the verified
 result. Then it continues with the [shared steps](#shared-update-steps).
 Apply of the release that is already installed changes no file, and Compose
@@ -111,12 +120,44 @@ The branch route fast-forwards the checkout's upstream branch and pulls the
 image that the branch pins. Then it continues with the
 [shared steps](#shared-update-steps). It is not a verified release. It refuses
 when the saved selection includes a release overlay, because branch source with
-a release image is a mixed state.
+a release image is a mixed state. If the installed release set of that overlay
+does not pass its check, the branch route also stops.
 
 `update.sh` refuses rather than guessing, and names the exact command each time:
 a dirty working tree, a detached HEAD, a branch with no upstream, a branch that has
 diverged from its upstream, or a deployment selection that includes the local build
 overlay (that is a rebuild, not an update).
+
+### From a manually installed unsigned release set
+
+A deployment that installed an unsigned release set (v0.5.3 or earlier) by hand
+and [selected it](image-verification.md#selection) cannot use either route
+directly. The branch route refuses the selected release overlay. If the checkout
+has no release key, the release route refuses every signed release. Do not
+remove the set or add a key by hand. To move to the first signed release
+`vX.Y.Z`:
+
+1. Fetch the tag and switch the checkout to it. The gateway continues to run the
+   image of the installed set:
+
+   ```sh
+   git fetch origin tag vX.Y.Z
+   git switch --detach vX.Y.Z
+   ```
+
+2. Do the [first trust check](image-verification.md#first-trust-in-the-release-key)
+   on the key that the tag contains. Stop if it fails.
+3. Preview, then apply the same release with the
+   [release route](#release-route):
+
+   ```sh
+   scripts/update.sh --release vX.Y.Z --preview
+   scripts/update.sh --release vX.Y.Z
+   ```
+
+Apply keeps the unsigned set as the `.previous` files. Do not delete them
+until the signed release runs correctly. If preview stops, switch back to the
+earlier tag (`git switch --detach` with the earlier tag) before you investigate.
 
 ### Shared update steps
 

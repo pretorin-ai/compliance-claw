@@ -6,20 +6,24 @@
 # clawctl migrates, validates, plans and applies; init-file-secrets.sh creates
 # the secret files; bootstrap.sh clones the targets and pulls the image.
 #
-#   scripts/install.sh --check [OPTIONS]   # preflight and inspection; no writes
+#   scripts/install.sh --check [OPTIONS]   # checks only; no deployment writes
 #   scripts/install.sh [OPTIONS]           # install, then report readiness
 #
 # The release set, required on the first run:
 #   --release X.Y.Z [--release-dir DIR]   (without DIR, the helper downloads it;
-#                                          DIR holds compliance-claw-release.json
-#                                          and compose.release.yaml)
-# scripts/release-assets.py checks the record, the overlay checksum, the
-# signature and that this checkout is the recorded tag commit, before any
-# write and before any other script from this checkout runs. This script and
-# the helper come from the same checkout, so the manual git/sha256sum check in
-# README.md comes first. THE SIGNATURE CHECK FAILS CLOSED: release sets are
-# unsigned today and there is no verifier yet, so every release is refused.
-# There is deliberately no option to accept an unsigned set here.
+#                                          DIR holds compliance-claw-release.json,
+#                                          its .sig and compose.release.yaml)
+# scripts/release-assets.py checks a scratch copy of the set: the record, the
+# overlay checksum, both signatures, and that this checkout is the tag commit,
+# before any deployment write or other script from this checkout. Only that
+# copy is placed. Both signatures must verify with the release key in THIS
+# checkout (release-keys/), never a downloaded key. This script and the helper
+# come from the same checkout, so the git check in README.md and the key check
+# in docs/image-verification.md come first. THE SIGNATURE CHECK FAILS
+# CLOSED: an unsigned release (v0.5.3 and earlier) is refused, and there is
+# deliberately no option to accept one here. The image check can add the pinned
+# cosign to .cache/release-tools/ (gitignored); "Nothing was changed" below
+# means no deployment file, container or volume.
 #
 # Declaration, only for a new efforts.yaml. A rerun with the same values reuses it:
 #   --effort NAME --system-id UUID --framework-id ID
@@ -52,7 +56,7 @@ cd "$REPO_ROOT"
 EFFORTS_FILE="${CC_EFFORTS_FILE:-efforts.yaml}"
 PARSE_EFFORTS="scripts/parse-efforts.py"
 RELEASE_HELPER="scripts/release-assets.py"
-RELEASE_FILES="compliance-claw-release.json compose.release.yaml"
+RELEASE_FILES="compliance-claw-release.json compliance-claw-release.json.sig compose.release.yaml"
 HEALTH_TIMEOUT="${CC_INSTALL_HEALTH_TIMEOUT:-720}"
 ENTRYPOINT="/usr/local/bin/compliance-claw-entrypoint"
 GUIDE_ADMIN="docs/administration.md"
@@ -68,7 +72,7 @@ die()   {
 }
 stage() { STAGE="$*"; printf '\ninstall: == %s ==\n' "$*"; }
 
-usage() { sed -n '2,39p' "$0"; }
+usage() { sed -n '2,43p' "$0"; }
 
 CHECK_ONLY=0 ASSUME_YES=0 RELEASE="" RELEASE_DIR=""
 EFFORT="" SYSTEM_ID="" FRAMEWORK_ID="" CHANNEL=""
@@ -232,14 +236,35 @@ $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   give --release-dir DIR. Nothing was changed."
   log "downloaded release ${RELEASE} into scratch space"
 fi
-rc=0; release_check "$RELEASE_SRC" --source . || rc=$?
+# Copy first, then check: the helper checks this owned copy, every later check
+# and the render read it, and placement copies it. The source directory is not
+# read again, so a change there after this copy is never checked or placed.
+# The record's only optional asset is the SBOM (sbom-X.Y.Z.spdx.json), which the
+# helper checks when it is present. A rerun without --release does not know X.Y.Z
+# yet, so each present SBOM is copied for that check; none is ever placed.
+STAGED="${WORK_DIR}/staged"
+mkdir "$STAGED"
+for f in $RELEASE_FILES "$RELEASE_SRC"/sbom-*.spdx.json; do
+  f="${f##*/}"
+  [ ! -e "${RELEASE_SRC}/${f}" ] || cp -p -- "${RELEASE_SRC}/${f}" "${STAGED}/${f}" \
+    || die "could not copy ${RELEASE_SRC}/${f} into scratch space for its check. Nothing was changed."
+done
+rc=0; release_check "$STAGED" --source . || rc=$?
 case "$rc" in
-  0) log "release set: final record, overlay checksum, signature and source commit pass" ;;
-  6) die "release ${RELEASE:-set} is refused: it is not signed, or its signature cannot be verified.
+  0) log "release set: final record, checksums, record and image signatures, and source commit pass" ;;
+  6) die "release ${RELEASE:-set} is refused: it is not signed, or a signature does not verify
+  with the release key in this checkout.
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
-  Release sets are unsigned until signing and its verifier exist, so the guided
-  installation cannot install any release yet. Do not edit or re-sign the files.
-  Use the manual installation (README.md#manual-installation). Nothing was changed." ;;
+  Releases v0.5.3 and earlier are unsigned and cannot be installed by this guide.
+  Do not edit, re-sign or replace the files or the key. Use a signed release, or
+  the manual installation (README.md#manual-installation). Nothing was changed
+  except the cached pinned cosign (.cache/release-tools/, gitignored)." ;;
+  5) die "the release signatures could not be checked:
+$(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
+  The image signature check downloads the cosign that versions.env pins and reads
+  the registry with this host's docker login (docker login ghcr.io). Fix the cause,
+  then re-run. Nothing was changed except the cached pinned cosign
+  (.cache/release-tools/, gitignored)." ;;
   3) die "this checkout is not the source of the release:
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   Check out the release tag, repeat the trust check, then re-run. Nothing was changed." ;;
@@ -253,7 +278,7 @@ if [ "$RELEASE_SRC" != "$REPO_ROOT" ]; then
   for f in $RELEASE_FILES; do
     if [ ! -e "$f" ]; then
       RELEASE_TO_PLACE="${RELEASE_TO_PLACE} ${f}"
-    elif cmp -s "${RELEASE_SRC}/${f}" "$f"; then
+    elif cmp -s "${STAGED}/${f}" "$f"; then
       log "keeping ${f} (same release)"
     else
       conflict "${f} in this checkout is from another release or was changed. It is
@@ -286,10 +311,13 @@ compose_resolve_selection || die "the deployment selection did not resolve. A se
   compose.release.yaml before it is placed cannot resolve: unset COMPOSE_FILE in this
   shell and let the installer select it. Nothing was changed."
 SEP="${COMPOSE_PATH_SEPARATOR:-:}"
-case "$RELEASE_SRC" in
-  *"$SEP"*) die "${RELEASE_SRC} contains '${SEP}', the Compose path separator. Move the release
-  files to another directory. Nothing was changed." ;;
-esac
+# The render below names the staged overlay; TMPDIR holds the staging directory.
+for dir in "$RELEASE_SRC" "$STAGED"; do
+  case "$dir" in
+    *"$SEP"*) die "${dir} contains '${SEP}', the Compose path separator. Move the release
+  files, or set TMPDIR, to another directory. Nothing was changed." ;;
+  esac
+done
 if [ -z "${COMPOSE_FILE:-}" ]; then
   COMPOSE_FILE="compose.yaml${SEP}compose.release.yaml${SEP}compose.secrets.yaml${SEP}compose.efforts.yaml"
   TO_SAVE+=("COMPOSE_FILE=${COMPOSE_FILE}")
@@ -310,7 +338,7 @@ case "$SECOND_FILE" in
     after compose.yaml. Put it second; keep the other overlays in their order." ;;
 esac
 # The same selection with the checked overlay, for a render before placement.
-CHECKED_FILE="${FIRST_FILE}${SEP}${RELEASE_SRC}/compose.release.yaml${AFTER_FIRST#"$SECOND_FILE"}"
+CHECKED_FILE="${FIRST_FILE}${SEP}${STAGED}/compose.release.yaml${AFTER_FIRST#"$SECOND_FILE"}"
 compose_has_file compose.secrets.yaml || conflict "COMPOSE_FILE=${COMPOSE_FILE} does not select compose.secrets.yaml.
     The guided installation uses file-backed credentials. Add it after compose.yaml."
 compose_has_file compose.efforts.yaml || conflict "COMPOSE_FILE=${COMPOSE_FILE} does not select compose.efforts.yaml.
@@ -434,7 +462,8 @@ stage "3/10 image access"
 # (a later overlay that sets image is refused), and that image must be present
 # or reachable. The merged model is never printed: it can contain credentials.
 rc=0
-release_check "$RELEASE_SRC" --rendered - \
+# Stage 2 verified both signatures of this set; the image check is not repeated.
+release_check "$STAGED" --record-only --rendered - \
   < <(COMPOSE_FILE="$CHECKED_FILE" docker compose --profile cli config --format json 2>/dev/null) || rc=$?
 [ "$rc" = 0 ] || die "Compose would not run the release image with this selection (exit ${rc}):
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
@@ -463,7 +492,7 @@ fi
 
 if [ "$CHECK_ONLY" = 1 ]; then
   printf '\n'
-  log "check complete. No file, container or volume was changed."
+  log "check complete. No deployment file, container or volume was changed."
   log "Run the same command without --check to install."
   exit 0
 fi
@@ -473,11 +502,11 @@ stage "4/10 release set"
 # ---------------------------------------------------------------------------
 for f in $RELEASE_TO_PLACE; do
   [ ! -e "$f" ] || die "${f} appeared during this run. Nothing more was changed. Re-run."
-  cp -- "${RELEASE_SRC}/${f}" "$f"
+  cp -- "${STAGED}/${f}" "$f"
   chmod 644 "$f"
   log "placed ${f}"
 done
-rc=0; release_check . --source . --compose || rc=$?
+rc=0; release_check . --source . --record-only --compose || rc=$?
 [ "$rc" = 0 ] || die "the placed release set failed its check (exit ${rc}):
 $(printf '%s\n' "$CHECK_OUT" | sed 's/^/    /')
   Nothing was started. Keep the files for diagnosis."
@@ -635,7 +664,7 @@ printf '\n'
 log "gateway            ${GATEWAY}  (container running and healthy)"
 log "model              ${MODEL}  (local check; the provider was not contacted)"
 log "Pretorin           ok  (scoped read probe passed in validate; writes not tested)"
-log "release set        ok  (record, checksums, signature and source commit)"
+log "release set        ok  (record, checksums, record and image signatures, source commit)"
 log "first useful task  NOT VERIFIED — still required"
 printf '\n'
 [ "$GATEWAY" = ok ] || log "  gateway: docker compose ps -a; docker compose logs openclaw. Keep the volumes; ${GUIDE_RECOVERY}"

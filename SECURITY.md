@@ -494,11 +494,12 @@ Ordered roughly by how much it matters, not by effort.
   an otherwise fully pinned chain. Pinning exact Debian package versions breaks
   builds whenever a mirror drops an old version, which is the worse failure mode
   at POC stage.
-- **cosign is pinned once, and only for the Pretorin binary.** `COSIGN_VERSION`
-  `v2.4.1` verifies the Pretorin release blob at build time and cannot move:
-  cosign v3 removed `verify-blob --signature`. There is deliberately no second
-  pin, because nothing signs the container image — a pin no job consumes would
-  advertise a verification that does not happen.
+- **cosign is pinned once.** `COSIGN_VERSION` `v2.4.1` verifies the Pretorin
+  release blob at build time and cannot move: cosign v3 removed
+  `verify-blob --signature`. `scripts/release-assets.py` uses the same pin
+  (downloaded and checksum-checked) for the image signature check of a signed
+  release. There is deliberately no second pin. Nothing signs the container
+  image yet, so that check has no signed release to verify.
 - **Trivy's release gate does not block unfixed HIGH or CRITICAL findings.**
   A CVE in the base image with no upstream patch would otherwise make every release unshippable,
   and an unsatisfiable gate gets disabled. Unfixed findings are printed in the
